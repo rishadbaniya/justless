@@ -1287,6 +1287,90 @@ fn is_helm_notes_header(trimmed: &str) -> bool {
     trimmed == "NOTES:" || trimmed.starts_with("NOTES: ")
 }
 
+/// Whether `line` opens a YAML block scalar (`|`, `>`, `|-`, `|+`, `|2-`, etc.).
+fn starts_yaml_block_scalar(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return false;
+    }
+    let rest = if let Some((_, after)) = trimmed.split_once(": ") {
+        after
+    } else if let Some((_, after)) = trimmed.split_once(":\t") {
+        after
+    } else if let Some(after) = trimmed.strip_prefix("- ") {
+        after
+    } else {
+        return false;
+    };
+    let val = rest
+        .split_once(" #")
+        .map_or(rest, |(v, _)| v)
+        .split_once("\t#")
+        .map_or(rest, |(v, _)| v)
+        .trim();
+    let Some(tail) = val.strip_prefix(['|', '>']) else {
+        return false;
+    };
+    if tail.len() > 2 {
+        return false;
+    }
+    let mut saw_chomp = false;
+    let mut saw_indent = false;
+    for b in tail.bytes() {
+        match b {
+            b'-' | b'+' if !saw_chomp => saw_chomp = true,
+            b'1'..=b'9' if !saw_indent => saw_indent = true,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Track YAML double-quoted (`\"`/`\\` escape-aware) and single-quoted (`''` escape-aware)
+/// multiline scalar state across lines so scalar bodies cannot forge top-level directives.
+fn advance_yaml_quote_state(line: &str, mut open: Option<u8>) -> Option<u8> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match open {
+            Some(b'"') => {
+                if b == b'\\' {
+                    // Escape the next byte on this line; a trailing `\` escapes the line break.
+                    i += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    open = None;
+                }
+                i += 1;
+            }
+            Some(b'\'') => {
+                if b == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    open = None;
+                }
+                i += 1;
+            }
+            _ => {
+                if b == b'#' && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t')) {
+                    break;
+                }
+                if matches!(b, b'"' | b'\'')
+                    && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b':' | b',' | b'[' | b'{'))
+                {
+                    open = Some(b);
+                }
+                i += 1;
+            }
+        }
+    }
+    open
+}
+
 fn format_helm_manifest(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -> Option<String> {
     // Reject JSON outright (fail closed).
     if let Some(first_non_empty) = lines.iter().map(|l| l.trim()).find(|l| !l.is_empty())
@@ -1297,9 +1381,13 @@ fn format_helm_manifest(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -
 
     let mut warnings: Vec<(usize, &str)> = Vec::new();
     let mut notes: Vec<(usize, &str)> = Vec::new();
-    let mut doc_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut doc_ranges: Vec<(usize, usize, bool)> = Vec::new();
     let mut cur_start: Option<usize> = None;
     let mut in_notes = false;
+    let mut in_secret = false;
+    let mut doc_has_kind = false;
+    let mut open_quote: Option<u8> = None;
+    let mut block_scalar_indent: Option<usize> = None;
 
     for (idx, cow) in lines.iter().enumerate() {
         let line_no = idx + 1;
@@ -1307,15 +1395,35 @@ fn format_helm_manifest(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -
         let trimmed = line.trim();
         let ind = indent_of(line);
 
-        if trimmed == "---" || trimmed.starts_with("--- ") {
+        if ind == 0 && (trimmed == "---" || trimmed.starts_with("--- ")) {
             in_notes = false;
+            open_quote = None;
+            block_scalar_indent = None;
             if let Some(start) = cur_start.take()
                 && line_no > start
             {
-                doc_ranges.push((start, line_no - 1));
+                doc_ranges.push((start, line_no - 1, in_secret));
             }
+            in_secret = false;
+            doc_has_kind = false;
             cur_start = Some(line_no);
             continue;
+        }
+
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if !in_notes && open_quote.is_some() {
+            open_quote = advance_yaml_quote_state(line, open_quote);
+            continue;
+        }
+
+        if !in_notes && let Some(base_ind) = block_scalar_indent {
+            if ind > base_ind {
+                continue;
+            }
+            block_scalar_indent = None;
         }
 
         if in_notes {
@@ -1325,34 +1433,37 @@ fn format_helm_manifest(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -
                     || trimmed.starts_with("kind:"))
             {
                 in_notes = false;
+                in_secret = false;
+                doc_has_kind = false;
+                open_quote = None;
+                block_scalar_indent = None;
                 cur_start = Some(line_no);
-                continue;
-            }
-            if ind == 0 && is_warning_or_error(line) {
-                warnings.push((line_no, trimmed));
-                continue;
-            }
-            if !trimmed.is_empty() {
+            } else {
+                if ind == 0 && is_warning_or_error(line) {
+                    warnings.push((line_no, trimmed));
+                    continue;
+                }
                 notes.push((line_no, line.trim_end()));
+                continue;
             }
-            continue;
         }
 
-        if ind == 0 && is_helm_notes_header(trimmed) {
+        if !in_secret && ind == 0 && is_helm_notes_header(trimmed) {
             if let Some(start) = cur_start.take()
                 && line_no > start
             {
-                doc_ranges.push((start, line_no - 1));
+                doc_ranges.push((start, line_no - 1, in_secret));
             }
             in_notes = true;
+            in_secret = false;
+            doc_has_kind = false;
+            open_quote = None;
+            block_scalar_indent = None;
             notes.push((line_no, trimmed));
             continue;
         }
 
         if cur_start.is_none() {
-            if trimmed.is_empty() {
-                continue;
-            }
             if is_warning_or_error(line) {
                 warnings.push((line_no, trimmed));
                 continue;
@@ -1363,22 +1474,51 @@ fn format_helm_manifest(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -
             {
                 cur_start = Some(line_no);
             }
-        } else if ind == 0 && is_warning_or_error(line) && !trimmed.starts_with("apiVersion:") {
-            warnings.push((line_no, trimmed));
+        }
+
+        if cur_start.is_some() {
+            if !doc_has_kind
+                && ind == 0
+                && let Some((k, v)) = trimmed.split_once(':')
+                && unquote_yaml(k) == "kind"
+            {
+                let kind_val = unquote_yaml(v);
+                if !kind_val.is_empty() {
+                    doc_has_kind = true;
+                    if kind_val == "Secret" {
+                        in_secret = true;
+                    }
+                }
+            }
+            if !in_secret
+                && ind == 0
+                && is_warning_or_error(line)
+                && !trimmed.starts_with("apiVersion:")
+            {
+                warnings.push((line_no, trimmed));
+            }
+            if !trimmed.starts_with('#') {
+                if starts_yaml_block_scalar(line) {
+                    block_scalar_indent = Some(ind);
+                } else {
+                    open_quote = advance_yaml_quote_state(line, None);
+                }
+            }
         }
     }
     if let Some(start) = cur_start.take() {
-        doc_ranges.push((start, lines.len()));
+        doc_ranges.push((start, lines.len(), in_secret));
     }
 
     let mut docs: Vec<HelmManifestDoc<'_>> = Vec::with_capacity(doc_ranges.len());
-    for (start, end) in doc_ranges {
-        // Trim trailing blank and warning/error lines so `[stdout:A-B]` covers the YAML doc tightly.
+    for (start, end, doc_is_secret) in doc_ranges {
+        // Trim trailing blank and (outside Secret docs) warning/error lines so
+        // `[stdout:A-B]` covers the YAML doc tightly without truncating Secret ranges.
         let mut tight_end = end;
         while tight_end > start {
             let l = lines[tight_end - 1].as_ref();
             let t = l.trim();
-            if t.is_empty() || (indent_of(l) == 0 && is_warning_or_error(l)) {
+            if t.is_empty() || (!doc_is_secret && indent_of(l) == 0 && is_warning_or_error(l)) {
                 tight_end -= 1;
             } else {
                 break;
@@ -1621,24 +1761,52 @@ fn parse_helm_doc<'a>(
     let mut scale_ref_indent = 0usize;
     let mut in_crd_names = false;
     let mut crd_names_indent = 0usize;
+    let mut open_quote: Option<u8> = None;
+    let mut block_scalar_indent: Option<usize> = None;
 
     for line_no in start..=end {
         let raw = lines[line_no - 1].as_ref();
         let trimmed = raw.trim();
-        if trimmed.is_empty() || trimmed == "---" {
+        if trimmed.is_empty() {
             continue;
         }
+        let ind = indent_of(raw);
+        if ind == 0 && (trimmed == "---" || trimmed.starts_with("--- ")) {
+            open_quote = None;
+            block_scalar_indent = None;
+            continue;
+        }
+        if open_quote.is_some() {
+            open_quote = advance_yaml_quote_state(raw, open_quote);
+            continue;
+        }
+        if let Some(base_ind) = block_scalar_indent {
+            if ind > base_ind {
+                continue;
+            }
+            block_scalar_indent = None;
+        }
         if let Some(src) = trimmed.strip_prefix("# Source:") {
-            source = Some(src.trim());
+            if source.is_none() {
+                source = Some(src.trim());
+            }
             continue;
         }
         if trimmed.starts_with('#') {
             continue;
         }
 
-        let ind = indent_of(raw);
+        if starts_yaml_block_scalar(raw) {
+            block_scalar_indent = Some(ind);
+        } else {
+            open_quote = advance_yaml_quote_state(raw, None);
+        }
+
         // Handle indent-0 YAML sequence items under top-level lists (`rules:`, `imagePullSecrets:`, `secrets:`).
         if ind == 0 && (trimmed == "-" || trimmed.starts_with("- ")) {
+            if kind == "Secret" {
+                continue;
+            }
             match top_section {
                 "rules" => {
                     let item_ind = *rules_item_indent.get_or_insert(0);
@@ -1670,26 +1838,45 @@ fn parse_helm_doc<'a>(
         }
 
         if ind == 0 {
-            if is_warning_or_error(raw) && !trimmed.starts_with("apiVersion:") {
+            if kind != "Secret" && is_warning_or_error(raw) && !trimmed.starts_with("apiVersion:") {
                 continue;
             }
-            data_entry_indent = None;
-            rules_item_indent = None;
-            sa_list_item_indent = None;
-            in_scale_target_ref = false;
-            in_crd_names = false;
-            in_vct = false;
-            vct_item_indent = None;
             if let Some((k, v)) = trimmed.split_once(':') {
                 let key = unquote_yaml(k);
                 let val = unquote_yaml(v);
+                if kind == "Secret"
+                    && !matches!(
+                        key,
+                        "apiVersion"
+                            | "kind"
+                            | "metadata"
+                            | "type"
+                            | "immutable"
+                            | "data"
+                            | "binaryData"
+                            | "stringData"
+                    )
+                {
+                    continue;
+                }
+                data_entry_indent = None;
+                rules_item_indent = None;
+                sa_list_item_indent = None;
+                in_scale_target_ref = false;
+                in_crd_names = false;
+                in_vct = false;
+                vct_item_indent = None;
                 top_section = key;
                 match key {
-                    "apiVersion" => api_version = val,
-                    "kind" => kind = val,
-                    "type" if !val.is_empty() => secret_type = Some(val),
-                    "automountServiceAccountToken" if !val.is_empty() => sa_automount = Some(val),
-                    "aggregationRule" => has_aggregation_rule = true,
+                    "apiVersion" if api_version.is_empty() && !val.is_empty() => {
+                        api_version = val;
+                    }
+                    "kind" if kind.is_empty() && !val.is_empty() => kind = val,
+                    "type" if secret_type.is_none() && !val.is_empty() => secret_type = Some(val),
+                    "automountServiceAccountToken" if kind != "Secret" && !val.is_empty() => {
+                        sa_automount = Some(val);
+                    }
+                    "aggregationRule" if kind != "Secret" => has_aggregation_rule = true,
                     "data" | "binaryData" | "stringData" if v.trim().starts_with('{') => {
                         data_keys += count_yaml_flow_keys(v);
                     }
@@ -1704,25 +1891,26 @@ fn parse_helm_doc<'a>(
                 if ind == 2 {
                     if let Some(v) = trimmed.strip_prefix("name:") {
                         let v = unquote_yaml(v);
-                        if !v.is_empty() {
+                        if name.is_empty() && !v.is_empty() {
                             name = v;
                         }
                     } else if let Some(v) = trimmed.strip_prefix("namespace:") {
                         let v = unquote_yaml(v);
-                        if !v.is_empty() {
+                        if namespace.is_none() && !v.is_empty() {
                             namespace = Some(v);
                         }
                     }
                 }
             }
             "data" | "binaryData" | "stringData" => {
-                // Count ONLY direct keys of data/binaryData/stringData, ignoring block scalar bodies
-                // and NEVER retaining any values (especially for Secret manifests).
+                // Count ONLY direct keys of data/binaryData/stringData, ignoring block/quoted
+                // scalar bodies and NEVER retaining any values (especially for Secret manifests).
                 let entry_ind = *data_entry_indent.get_or_insert(ind);
                 if ind == entry_ind && trimmed.contains(':') {
                     data_keys += 1;
                 }
             }
+            _ if kind == "Secret" => {}
             "rules" => {
                 let item_ind = *rules_item_indent.get_or_insert(ind);
                 if ind == item_ind && (trimmed == "-" || trimmed.starts_with("- ")) {
@@ -4347,16 +4535,6 @@ rules:
   resources: [\"deployments\", \"statefulsets\"]
   verbs: [\"get\", \"list\"]
 ---
-# Source: stack/templates/serviceaccount.yaml
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: stack-sa
-  namespace: prod
-automountServiceAccountToken: false
-imagePullSecrets:
-- name: ghcr-pull
----
 # Source: stack/templates/secret-block.yaml
 apiVersion: v1
 kind: Secret
@@ -4378,6 +4556,16 @@ metadata:
   name: inline-creds
   namespace: prod
 data: {{ KEY_A: \"{secret_val_c}\", KEY_B: \"{secret_val_a}\" }}
+---
+# Source: stack/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: stack-sa
+  namespace: prod
+automountServiceAccountToken: false
+imagePullSecrets:
+- name: ghcr-pull
 Error: non-fatal template render hint
 NOTES:
 1. Verify rollout status:
@@ -4433,18 +4621,18 @@ NOTES:
         );
         assert!(
             view.contains(
-                "ServiceAccount/stack-sa (automount=false, pullSecret=ghcr-pull) [stdout:70-79]"
+                "ServiceAccount/stack-sa (automount=false, pullSecret=ghcr-pull) [stdout:92-101]"
             ),
             "{view}"
         );
 
         // Secret safety: key counts only, ZERO leaked values from data, stringData, or flow mappings.
         assert!(
-            view.contains("Secret/app-creds (kubernetes.io/tls, 2 keys) [stdout:80-93]"),
+            view.contains("Secret/app-creds (kubernetes.io/tls, 2 keys) [stdout:70-83]"),
             "{view}"
         );
         assert!(
-            view.contains("Secret/inline-creds (2 keys) [stdout:94-101]"),
+            view.contains("Secret/inline-creds (2 keys) [stdout:84-91]"),
             "{view}"
         );
         assert!(
@@ -4460,5 +4648,96 @@ NOTES:
             "leaked secret warning line:\n{view}"
         );
         assert!(!view.contains('\x1b'), "ANSI leaked:\n{view}");
+    }
+
+    #[test]
+    fn helm_secret_multiline_quoted_scalar_and_indented_doc_sep_never_leak() {
+        let leak_warn = "TOP_SECRET_WARN_TOKEN_991";
+        let leak_type = "TOP_SECRET_TYPE_OVERRIDE_992";
+        let leak_pass = "TOP_SECRET_DB_PASSWORD_993";
+        let leak_img = "registry.evil/leaked-secret-img:994";
+        let leak_single = "TOP_SECRET_SINGLE_QUOTED_995";
+        let leak_block = "TOP_SECRET_AFTER_INDENTED_SEP_996";
+        let raw = format!(
+            "\
+---
+# Source: app/templates/secret-quoted.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: quoted-creds
+  namespace: prod
+type: kubernetes.io/tls
+stringData:
+  pem: \"-----BEGIN PRIVATE KEY-----
+WARNING: {leak_warn}
+type: {leak_type}
+NOTES:
+  db_password: {leak_pass}
+kind: Deployment
+spec:
+  template:
+    spec:
+      containers:
+        - image: {leak_img}
+\\\"escaped-quote-stays-inside
+\\\\double-backslash-closes\\\\\"
+  single_cert: 'line1 ''escaped''
+WARNING: {leak_single}
+NOTES:
+  nested_secret: {leak_single}
+kind: Deployment
+'
+  tls.crt: |
+    -----BEGIN CERTIFICATE-----
+    ---
+    {leak_block}
+    WARNING: {leak_block}
+    -----END CERTIFICATE-----
+---
+# Source: app/templates/deploy.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: prod
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: web
+          image: ghcr.io/acme/web:1.0.0
+"
+        );
+        let view = format(&["helm", "template", "app", "./charts/app"], &raw, 4_096)
+            .expect("helm template compacted");
+
+        // Secret keeps its real kind/type, exact 3 keys, and full line span [stdout:1-34].
+        assert!(
+            view.contains("Secret/quoted-creds (kubernetes.io/tls, 3 keys) [stdout:1-34]"),
+            "{view}"
+        );
+        assert!(
+            view.contains(
+                "Deployment/web (2 replicas, image=ghcr.io/acme/web:1.0.0) [stdout:35-48]"
+            ),
+            "{view}"
+        );
+        // Zero leaked secret substrings, zero forged warnings/notes/deployments.
+        for forbidden in [
+            leak_warn,
+            leak_type,
+            leak_pass,
+            leak_img,
+            leak_single,
+            leak_block,
+            "WARNING:",
+            "NOTES:",
+            "db_password",
+            "Deployment ×2",
+        ] {
+            assert!(!view.contains(forbidden), "leaked {forbidden:?}:\n{view}");
+        }
     }
 }

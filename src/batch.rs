@@ -226,7 +226,10 @@ impl<'a> Batch<'a> {
         let stdout = response["stdout"].as_str()?;
         let persisted = response["persistedOutputPath"].as_str();
         let settings = ws.settings().ok()?;
-        if settings.max_runs == 0 || (persisted.is_none() && stdout.len() <= FLOOR) {
+        if settings.lossless_only
+            || settings.max_runs == 0
+            || (persisted.is_none() && stdout.len() <= FLOOR)
+        {
             return None;
         }
         let stored;

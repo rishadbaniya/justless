@@ -53,9 +53,10 @@ pub(crate) struct HookEffective {
     /// `NAME=VALUE` assignments carried by any unwrapped `env` wrapper.
     pub env_assignments: Vec<(String, String)>,
     /// Whether an unwrapped toolchain runner (`uv run`, `mise exec`/`x`,
-    /// `direnv exec`, `pixi run`, `fvm`, `volta run`, `fnm exec`,
-    /// `pyenv`/`rbenv exec`, `pdm run`, `corepack`) may sync tools, evaluate
-    /// `.envrc`/hooks, or switch toolchains, so auto-approving clients must ask first.
+    /// `asdf exec`, `direnv exec`, `pixi run`, `fvm`, `volta run`, `fnm exec`,
+    /// `pyenv`/`rbenv exec`, `pdm run`, `poetry run`, `pipenv run`, `corepack`)
+    /// may sync tools, evaluate `.env`/`.envrc`/hooks, run repo-defined scripts,
+    /// or switch toolchains, so auto-approving clients must ask first.
     pub runner_unapprovable: bool,
 }
 
@@ -347,10 +348,11 @@ pub(crate) fn fnm_exec_rest<'a, 'b>(mut args: &'a [&'b str]) -> Option<&'a [&'b 
 }
 
 /// Remaining command words after shim-exec wrappers (`asdf exec`, `pyenv exec`,
-/// `rbenv exec`), requiring a bare command name with no leading `-` or `/`.
+/// `rbenv exec`), requiring a non-empty bare command name with no leading `-`,
+/// `/` or `\`.
 pub(crate) fn shim_exec_rest<'a, 'b>(args: &'a [&'b str]) -> Option<&'a [&'b str]> {
     args.first()
-        .is_some_and(|cmd| !cmd.starts_with('-') && !cmd.contains('/'))
+        .is_some_and(|cmd| !cmd.is_empty() && !cmd.starts_with('-') && !cmd.contains(['/', '\\']))
         .then_some(args)
 }
 
@@ -399,8 +401,8 @@ pub(crate) fn pdm_run_rest<'a, 'b>(mut args: &'a [&'b str]) -> Option<&'a [&'b s
     (!args.is_empty() && !args[0].starts_with('-')).then_some(args)
 }
 
-/// Remaining command words after `poetry run` or `pipenv run`, skipping only
-/// `-q`/`--quiet` and `--` while rejecting `-h`/`--help` and unknown flags.
+/// Remaining command words after `poetry run`, skipping only `-q`/`--quiet`
+/// and `--` while rejecting `-h`/`--help` and unknown flags.
 pub(crate) fn poetry_run_rest<'a, 'b>(mut args: &'a [&'b str]) -> Option<&'a [&'b str]> {
     while let Some((&word, rest)) = args.split_first() {
         match word {
@@ -413,13 +415,18 @@ pub(crate) fn poetry_run_rest<'a, 'b>(mut args: &'a [&'b str]) -> Option<&'a [&'
             _ => break,
         }
     }
-    (!args.is_empty() && !args[0].starts_with('-')).then_some(args)
+    (!args.is_empty() && !args[0].is_empty() && !args[0].starts_with('-')).then_some(args)
 }
 
-/// Remaining command words after `pipenv run`, skipping only `-q`/`--quiet`
-/// and `--` while rejecting `-h`/`--help` and unknown flags.
+/// Remaining command words after `pipenv run`, allowing only an optional `--`
+/// separator before a non-flag command. (`-q`/`--quiet` is a global Pipenv
+/// flag before `run`, not a `run` subcommand option.)
 pub(crate) fn pipenv_run_rest<'a, 'b>(args: &'a [&'b str]) -> Option<&'a [&'b str]> {
-    poetry_run_rest(args)
+    let rest = match args {
+        ["--", tail @ ..] => tail,
+        _ => args,
+    };
+    (!rest.is_empty() && !rest[0].is_empty() && !rest[0].starts_with('-')).then_some(rest)
 }
 
 /// Strictly unwrap ONLY `timeout`, `nice`, `stdbuf`, `env`, and validated
@@ -680,8 +687,7 @@ fn unwrap_hook_slice<'a, 'b>(
                 runner_unapprovable = true;
                 slice_tail(refs, 3)?
             }
-            "asdf" if refs.get(1) == Some(&"exec") => shim_exec_rest(&refs[2..])?,
-            "pyenv" | "rbenv" if refs.get(1) == Some(&"exec") => {
+            "asdf" | "pyenv" | "rbenv" if refs.get(1) == Some(&"exec") => {
                 runner_unapprovable = true;
                 shim_exec_rest(&refs[2..])?
             }
@@ -716,8 +722,14 @@ fn unwrap_hook_slice<'a, 'b>(
                 runner_unapprovable = true;
                 pdm_run_rest(&refs[2..])?
             }
-            "poetry" if refs.get(1) == Some(&"run") => poetry_run_rest(&refs[2..])?,
-            "pipenv" if refs.get(1) == Some(&"run") => pipenv_run_rest(&refs[2..])?,
+            "poetry" if refs.get(1) == Some(&"run") => {
+                runner_unapprovable = true;
+                poetry_run_rest(&refs[2..])?
+            }
+            "pipenv" if refs.get(1) == Some(&"run") => {
+                runner_unapprovable = true;
+                pipenv_run_rest(&refs[2..])?
+            }
             "corepack" if matches!(refs.get(1), Some(&"pnpm" | &"yarn" | &"npm")) => {
                 runner_unapprovable = true;
                 corepack_rest(refs)?
@@ -1168,7 +1180,7 @@ mod tests {
             ),
             ("mise exec -- cargo test", &["cargo", "test"][..], true),
             ("mise x -- pytest -q", &["pytest", "-q"][..], true),
-            ("asdf exec cargo test", &["cargo", "test"][..], false),
+            ("asdf exec cargo test", &["cargo", "test"][..], true),
             ("direnv exec . pytest", &["pytest"][..], true),
             (
                 "direnv exec packages/api cargo test",
@@ -1254,9 +1266,10 @@ mod tests {
                 &["ruff", "check", "."][..],
                 true,
             ),
-            ("poetry run pytest", &["pytest"][..], false),
-            ("poetry run -q -- mypy src", &["mypy", "src"][..], false),
-            ("pipenv run pytest", &["pytest"][..], false),
+            ("poetry run pytest", &["pytest"][..], true),
+            ("poetry run -q -- mypy src", &["mypy", "src"][..], true),
+            ("pipenv run pytest", &["pytest"][..], true),
+            ("pipenv run -- pytest", &["pytest"][..], true),
             ("corepack pnpm test", &["pnpm", "test"][..], true),
             ("corepack yarn build", &["yarn", "build"][..], true),
             ("corepack npm test", &["npm", "test"][..], true),
@@ -1309,6 +1322,10 @@ mod tests {
             "pyenv exec",
             "pyenv exec --help",
             "pyenv exec ./evil.sh",
+            "pyenv exec ''",
+            "pyenv exec 'foo\\bar'",
+            "asdf exec ''",
+            "asdf exec 'foo\\bar'",
             "rbenv exec -h",
             "rbenv exec /tmp/evil",
             "pdm run",
@@ -1319,7 +1336,12 @@ mod tests {
             "poetry run",
             "poetry run --help",
             "poetry run --unknown pytest",
+            "pipenv run",
             "pipenv run -h",
+            "pipenv run -q git status",
+            "pipenv run --quiet pytest",
+            "pipenv run --",
+            "pipenv run -- -q",
             "corepack pnpm",
             "corepack pnpm --help",
             "corepack npm -V",

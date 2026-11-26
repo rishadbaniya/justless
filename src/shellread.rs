@@ -870,6 +870,9 @@ impl Selection {
 
     fn outline(&mut self, ws: &Workspace, baseline: usize, claude: bool) -> Option<String> {
         let settings = ws.settings().ok()?;
+        if settings.lossless_only {
+            return None;
+        }
         let bytes = self.text.len() as u64;
         // Claude Code drops the final newlines of a result it shows whole. A
         // baseline smaller than that is the preview of a result it saved to a file.
@@ -1045,7 +1048,10 @@ pub(crate) fn rewrite(
     // A count from the end is resolved here, before the command runs, so a file
     // that grows in between would print other lines. Only the post-run hook,
     // which checks the bytes the command printed, takes `tail -n N`.
-    if (claude && !shell.whole()) || shell.range.spans.iter().any(|span| span.from_end) {
+    if ws.settings().is_ok_and(|s| s.lossless_only)
+        || (claude && !shell.whole())
+        || shell.range.spans.iter().any(|span| span.from_end)
+    {
         return None;
     }
     let mut read = Selection::open(
@@ -1099,7 +1105,10 @@ pub(crate) fn piece(
     shell: &ShellRead,
     session: Option<&str>,
 ) -> Option<String> {
-    if shell.range.object || shell.range.spans.iter().any(|span| span.from_end) {
+    if ws.settings().is_ok_and(|s| s.lossless_only)
+        || shell.range.object
+        || shell.range.spans.iter().any(|span| span.from_end)
+    {
         return None;
     }
     let mut read = Selection::open(

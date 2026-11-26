@@ -1453,12 +1453,14 @@ const STARTUP_GRAPH_MIN_SYMBOLS: usize = 30;
 /// readiness cue once the indexed codebase is non-trivial. Either way the index
 /// is built now, so the first query does not wait for it.
 fn startup(workspace: &Workspace) -> Option<String> {
-    let index = Index::open(workspace).ok()?;
+    let index = Index::open(workspace).ok();
     crate::history::has_activity(workspace).then(|| {
         let justless = workspace.justless();
-        let files = index.files.len();
-        let symbols = index.definitions.len();
-        if symbols >= STARTUP_GRAPH_MIN_SYMBOLS {
+        if let Some(index) = index
+            && index.definitions.len() >= STARTUP_GRAPH_MIN_SYMBOLS
+        {
+            let files = index.files.len();
+            let symbols = index.definitions.len();
             let edges = if index.edges.is_empty() {
                 String::new()
             } else {
@@ -2981,13 +2983,19 @@ fn wrap_event(
         return None;
     }
     if let Some(read) = read {
-        let rewritten = crate::shellread::rewrite(workspace, cwd, &read, session, rules.claude);
-        if rewritten.is_none() && read.whole() && !rules.claude {
-            crate::history::bypass(workspace, command);
-        }
-        // A `git show` blob the read would not outline keeps the run route.
-        if rewritten.is_some() || !read.object() || rules.claude {
-            return rewritten;
+        if workspace.settings().is_ok_and(|s| s.lossless_only) {
+            if !read.object() || rules.claude {
+                return None;
+            }
+        } else {
+            let rewritten = crate::shellread::rewrite(workspace, cwd, &read, session, rules.claude);
+            if rewritten.is_none() && read.whole() && !rules.claude {
+                crate::history::bypass(workspace, command);
+            }
+            // A `git show` blob the read would not outline keeps the run route.
+            if rewritten.is_some() || !read.object() || rules.claude {
+                return rewritten;
+            }
         }
     }
     // Follow each `cd` so a later one is checked from the directory it starts in,
@@ -3137,7 +3145,8 @@ pub(crate) fn read_instead(workspace: &Workspace, cwd: &Path, file: &str) -> Opt
     let file: PathBuf = path.components().collect();
     let file = file.to_str()?;
     let mut snapshot = crate::source::Snapshot::open(workspace, file).ok()?;
-    if snapshot.text.len() <= workspace.settings().ok()?.context_budget {
+    let settings = workspace.settings().ok()?;
+    if settings.lossless_only || snapshot.text.len() <= settings.context_budget {
         return None;
     }
     snapshot.index(file).ok()?;
@@ -5353,7 +5362,6 @@ mod tests {
             "npm -w web test",
             "yarn --cwd packages/web test",
             "git -c color.ui=always diff",
-            "asdf exec cargo test",
             "docker compose -f compose.yml -p app ps",
         ] {
             let out = agy_call(tier1).unwrap_or_else(|| panic!("tier1 missing: {tier1}"));
@@ -5362,6 +5370,7 @@ mod tests {
         for tier2 in [
             "git -C subdir status",
             "git -C packages/web diff",
+            "asdf exec cargo test",
             "uv run --frozen pytest",
             "uv run --group dev --directory packages/api ruff check .",
             "mise exec -- cargo test",
@@ -5652,5 +5661,106 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lossless_only_skips_shell_read_and_batch_outlines_in_claude_and_codex_hooks() {
+        use super::{Agent, Workspace, bash_hook, json};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut py = String::new();
+        for i in 0..80 {
+            py.push_str(&format!(
+                "def handler_{i:02}(value: int) -> int:\n\
+                 \x20   \"\"\"Compute step {i:02} deterministically.\"\"\"\n\
+                 \x20   total = value + {i}\n\
+                 \x20   for step in range(4):\n\
+                 \x20       total += step * {i}\n\
+                 \x20   return total\n\n"
+            ));
+        }
+        assert!(py.len() > 8_192);
+        fs::write(root.join("big.py"), &py).unwrap();
+        // Keep `read_outline_lines` small so default mode outlines `cat big.py`.
+        fs::write(root.join(".justless.toml"), "read_outline_lines = 40\n").unwrap();
+
+        let ws = Workspace::discover_from(&root).unwrap().working_in(&root);
+        let codex_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_cwd": root,
+            "tool_input": {"command": "cat big.py", "workdir": root}
+        });
+        let claude_after_input = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "session_id": "lossless-only-test",
+            "cwd": root,
+            "tool_input": {"command": "cat big.py"},
+            "tool_response": {
+                "stdout": py,
+                "stderr": "",
+                "interrupted": false,
+                "isImage": false,
+            }
+        });
+        let batch_after_input = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "session_id": "lossless-only-batch",
+            "cwd": root,
+            "tool_input": {"command": "cat big.py && echo done"},
+            "tool_response": {
+                "stdout": format!("{py}done\n"),
+                "stderr": "",
+                "interrupted": false,
+                "isImage": false,
+            }
+        });
+
+        // Baseline: without `lossless_only`, Codex rewrites `cat big.py` and Claude outlines it.
+        assert!(
+            bash_hook(&ws, Agent::Codex, &codex_input, false).is_some(),
+            "baseline Codex hook should rewrite `cat big.py`"
+        );
+        assert!(
+            crate::postroute::claude_bash(&ws, &claude_after_input).is_some(),
+            "baseline Claude after-bash should outline `cat big.py`"
+        );
+        assert!(
+            crate::batch::Batch::parse("cat big.py && echo done")
+                .unwrap()
+                .compact(&ws, &batch_after_input)
+                .is_some(),
+            "baseline read batch should compact `cat big.py && echo done`"
+        );
+
+        // With `lossless_only = true`, EVERY lossy shell-read and read-batch outline path stays silent.
+        fs::write(
+            root.join(".justless.toml"),
+            "read_outline_lines = 40\nlossless_only = true\n",
+        )
+        .unwrap();
+        let ws = Workspace::discover_from(&root).unwrap().working_in(&root);
+        assert_eq!(
+            bash_hook(&ws, Agent::Codex, &codex_input, false),
+            None,
+            "lossless_only must not rewrite `cat big.py` in hook-codex before-command"
+        );
+        assert_eq!(
+            crate::postroute::claude_bash(&ws, &claude_after_input),
+            None,
+            "lossless_only must not outline `cat big.py` in hook-claude after-bash"
+        );
+        assert_eq!(
+            crate::batch::Batch::parse("cat big.py && echo done")
+                .unwrap()
+                .compact(&ws, &batch_after_input),
+            None,
+            "lossless_only must not outline read batches"
+        );
     }
 }

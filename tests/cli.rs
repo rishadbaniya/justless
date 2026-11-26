@@ -5710,10 +5710,19 @@ fn codex_and_cursor_approve_only_local_build_and_test_commands() {
         "pytest -o 'addopts=--basetemp /Users/me/Documents'",
         "pytest --cov-report=html:/tmp/coverage",
         "dotnet build @/tmp/publish.rsp",
-        // A runner that may download is refused behind any other prefix.
+        // A runner that may download, load repo `.env`/scripts, or switch shims is refused.
         "python -m uv run pytest",
         "python3 -m hatch run pytest",
         "poetry run npx -y pytest",
+        "poetry run pytest",
+        "poetry run mypy src",
+        "poetry run git status",
+        "python -m poetry run pytest",
+        "pipenv run pytest",
+        "pipenv run git status",
+        "pipenv run -q git status",
+        "asdf exec cargo test",
+        "asdf exec git status",
         "bundle exec npx rubocop",
         "yarn dlx jest",
         "uv run --with pytest-xdist pytest",
@@ -5760,10 +5769,6 @@ fn codex_and_cursor_approve_only_local_build_and_test_commands() {
         "bundle exec rubocop",
         "pnpm exec tsc",
         "yarn exec jest",
-        "poetry run pytest",
-        "pipenv run pytest",
-        "poetry run mypy src",
-        "python -m poetry run pytest",
         "pytest -o cache_dir=.cache/pytest tests",
     ] {
         let decision = codex(command)["hookSpecificOutput"].clone();

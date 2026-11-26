@@ -438,7 +438,17 @@ fn runners<'a, 'b>(mut words: &'a [&'b str]) -> (&'a [&'b str], bool) {
                 }
                 None => return (words, true),
             },
-            ["pyenv" | "rbenv", "exec", rest @ ..] => match crate::wrappers::shim_exec_rest(rest) {
+            ["asdf" | "pyenv" | "rbenv", "exec", rest @ ..] => {
+                match crate::wrappers::shim_exec_rest(rest) {
+                    Some(inner) => {
+                        fetches = true;
+                        words = inner;
+                        continue;
+                    }
+                    None => return (words, true),
+                }
+            }
+            ["poetry", "run", rest @ ..] => match crate::wrappers::poetry_run_rest(rest) {
                 Some(inner) => {
                     fetches = true;
                     words = inner;
@@ -446,15 +456,9 @@ fn runners<'a, 'b>(mut words: &'a [&'b str]) -> (&'a [&'b str], bool) {
                 }
                 None => return (words, true),
             },
-            ["poetry", "run", rest @ ..] => match crate::wrappers::poetry_run_rest(rest) {
-                Some(inner) => {
-                    words = inner;
-                    continue;
-                }
-                None => return (words, true),
-            },
             ["pipenv", "run", rest @ ..] => match crate::wrappers::pipenv_run_rest(rest) {
                 Some(inner) => {
+                    fetches = true;
                     words = inner;
                     continue;
                 }
@@ -464,13 +468,6 @@ fn runners<'a, 'b>(mut words: &'a [&'b str]) -> (&'a [&'b str], bool) {
             ["pnpm" | "yarn" | "bun", "exec", rest @ ..] | ["bundle", "exec", rest @ ..] => {
                 (rest, false)
             }
-            ["asdf", "exec", rest @ ..] => match crate::wrappers::shim_exec_rest(rest) {
-                Some(inner) => {
-                    words = inner;
-                    continue;
-                }
-                None => return (words, true),
-            },
             ["pnpm" | "yarn", rest @ ..] => match js_workspace_args(words[0], rest) {
                 Some(["exec", tail @ ..]) => (tail, false),
                 _ => return (words, fetches),
@@ -2430,9 +2427,10 @@ fn cargo_fmt_check(words: &[&str]) -> bool {
 
 /// Whether a routed command may also run without the client asking, for a client
 /// that approves every rewritten command, such as Codex. A package runner that may
-/// download the tool or install packages, such as `npx` or `uv run`, fails at any
-/// position, while `bundle exec`, `poetry run` and the other runners of installed
-/// tools leave the decision to the tool. Build tools are limited to conventional
+/// download the tool, run repo-defined scripts/hooks or switch toolchains, such as
+/// `npx`, `uv run`, `poetry run`, `pipenv run` or `asdf exec`, fails at any
+/// position, while `bundle exec` and `pnpm`/`yarn`/`bun exec` leave the decision to
+/// the tool. Build tools are limited to conventional
 /// build and test targets and a few display options. No argument may name a path
 /// outside the working tree, so options such as `make -C /elsewhere` or
 /// `pytest --basetemp=/tmp/x` fail, and `-f`, `-I` and `--config` fail for the tools
@@ -4108,7 +4106,8 @@ mod tests {
             ("mise exec -- cargo test", true, false),
             ("mise x -- pytest -q", true, false),
             ("mise exec python@3.12 -- pytest", false, false),
-            ("asdf exec cargo test", true, true),
+            ("asdf exec cargo test", true, false),
+            ("asdf exec git status", true, false),
             ("asdf exec pytest -p evil", true, false),
             ("direnv exec . pytest", true, false),
             ("direnv exec packages/api cargo test", true, false),
@@ -4158,8 +4157,11 @@ mod tests {
                 false,
                 false,
             ),
-            ("poetry run -q mypy src", Some(Profile::Lint), false, true),
-            ("pipenv run pytest", None, true, true),
+            ("poetry run -q mypy src", Some(Profile::Lint), false, false),
+            ("poetry run git status", None, true, false),
+            ("pipenv run pytest", None, true, false),
+            ("pipenv run git status", None, true, false),
+            ("pipenv run -q git status", None, false, false),
             ("volta run --help", None, false, false),
             ("fnm exec npm test", None, false, false),
             ("sudo cargo test", None, false, true),

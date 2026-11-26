@@ -1051,40 +1051,65 @@ fn parse_pnpm_key(raw: &str) -> Option<(String, String)> {
     Some((name.to_owned(), version.to_owned()))
 }
 
-fn parse_inline_yaml_map(map: &str) -> Vec<(String, String)> {
-    let inner = map
-        .trim()
-        .strip_prefix('{')
-        .and_then(|s| s.strip_suffix('}'))
-        .unwrap_or("");
+fn parse_inline_yaml_map(map: &str) -> Option<Vec<(String, String)>> {
+    let inner = map.trim().strip_prefix('{')?.strip_suffix('}')?;
     let mut pairs = Vec::new();
     let mut start = 0;
-    let mut quote = None;
-    for (idx, ch) in inner.char_indices() {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut chars = inner.char_indices().peekable();
+    let push_item = |raw: &str, pairs: &mut Vec<(String, String)>| -> Option<()> {
+        let item = raw.trim();
+        if item.is_empty() {
+            return Some(());
+        }
+        let (k, v) = item.split_once(':')?;
+        let key = unquote_lock_scalar(k);
+        if key.is_empty() {
+            return None;
+        }
+        pairs.push((key.to_owned(), unquote_lock_scalar(v).to_owned()));
+        Some(())
+    };
+    while let Some((idx, ch)) = chars.next() {
         match quote {
-            Some(q) if ch == q => quote = None,
-            None if ch == '"' || ch == '\'' => quote = Some(ch),
-            None if ch == ',' => {
-                if let Some((k, v)) = inner[start..idx].split_once(':') {
-                    pairs.push((
-                        unquote_lock_scalar(k).to_owned(),
-                        unquote_lock_scalar(v).to_owned(),
-                    ));
+            Some('"') => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    quote = None;
                 }
-                start = idx + 1;
             }
-            _ => {}
+            Some('\'') => {
+                if ch == '\'' {
+                    if chars.peek().is_some_and(|&(_, next)| next == '\'') {
+                        chars.next();
+                    } else {
+                        quote = None;
+                    }
+                }
+            }
+            Some(_) => unreachable!(),
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                '{' | '}' => return None,
+                ',' => {
+                    push_item(&inner[start..idx], &mut pairs)?;
+                    start = idx + 1;
+                }
+                _ => {}
+            },
         }
     }
-    if start < inner.len()
-        && let Some((k, v)) = inner[start..].split_once(':')
-    {
-        pairs.push((
-            unquote_lock_scalar(k).to_owned(),
-            unquote_lock_scalar(v).to_owned(),
-        ));
+    if quote.is_some() || escaped {
+        return None;
     }
-    pairs
+    if start < inner.len() {
+        push_item(&inner[start..], &mut pairs)?;
+    }
+    Some(pairs)
 }
 
 /// The locked packages of a pnpm `pnpm-lock.yaml` (v6 and v9).
@@ -1181,8 +1206,8 @@ fn pnpm_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
                     pkg.sub = None;
                     if let Some(rest) = trimmed.strip_prefix("resolution:") {
                         let rest = rest.trim();
-                        if rest.starts_with('{') && rest.ends_with('}') {
-                            for (k, v) in parse_inline_yaml_map(rest) {
+                        if rest.starts_with('{') {
+                            for (k, v) in parse_inline_yaml_map(rest)? {
                                 if v.is_empty() {
                                     continue;
                                 }
@@ -2148,12 +2173,8 @@ fn pubspec_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
                         "description" => {
                             if val.is_empty() {
                                 cur.in_description = true;
-                            } else if val.starts_with('{') && val.ends_with('}') {
-                                let pairs = parse_inline_yaml_map(val);
-                                if pairs.is_empty() && !val.trim_matches(['{', '}', ' ']).is_empty()
-                                {
-                                    return None;
-                                }
+                            } else if val.starts_with('{') {
+                                let pairs = parse_inline_yaml_map(val)?;
                                 for (dk, dv) in pairs {
                                     match dk.as_str() {
                                         "name" => {
@@ -2336,6 +2357,7 @@ fn podfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
         SpecChecksums,
         ExternalSources,
         CheckoutOptions,
+        CocoaPodsPlugins,
         Other,
     }
     #[derive(Default)]
@@ -2359,6 +2381,7 @@ fn podfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
     let mut repos: BTreeMap<String, String> = BTreeMap::new();
     let mut ext_sources: BTreeMap<String, PodExternal> = BTreeMap::new();
     let mut checksums: BTreeMap<String, String> = BTreeMap::new();
+    let mut plugins: Vec<(String, String)> = Vec::new();
     let mut current_repo: Option<String> = None;
     let mut current_ext_pod: Option<String> = None;
 
@@ -2381,10 +2404,10 @@ fn podfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
                 "SPEC CHECKSUMS:" => Section::SpecChecksums,
                 "EXTERNAL SOURCES:" => Section::ExternalSources,
                 "CHECKOUT OPTIONS:" => Section::CheckoutOptions,
-                "DEPENDENCIES:" => Section::Other,
+                "COCOAPODS PLUGINS:" => Section::CocoaPodsPlugins,
+                "COCOAPODS PLUGINS: {}" | "DEPENDENCIES:" => Section::Other,
                 _ if trimmed.starts_with("PODFILE CHECKSUM:")
-                    || trimmed.starts_with("COCOAPODS:")
-                    || trimmed.starts_with("COCOAPODS PLUGINS:") =>
+                    || trimmed.starts_with("COCOAPODS:") =>
                 {
                     Section::Other
                 }
@@ -2471,6 +2494,15 @@ fn podfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
                 }
                 checksums.insert(pod.to_owned(), hash.to_owned());
             }
+            Section::CocoaPodsPlugins if indent == 2 => {
+                let (k, v) = trimmed.split_once(':')?;
+                let plugin = unquote_lock_scalar(k);
+                let version = unquote_lock_scalar(v);
+                if plugin.is_empty() || version.is_empty() {
+                    return None;
+                }
+                plugins.push((plugin.to_owned(), version.to_owned()));
+            }
             Section::Other => {}
             _ => return None,
         }
@@ -2479,11 +2511,64 @@ fn podfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
         return None;
     }
     let exact_names: BTreeSet<String> = pods.iter().map(|(n, _, _)| n.clone()).collect();
+    let pod_roots: BTreeSet<String> = pods
+        .iter()
+        .map(|(n, _, _)| n.split('/').next().unwrap_or(n).to_owned())
+        .collect();
+    let mut normalized_ext: BTreeMap<String, PodExternal> = BTreeMap::new();
+    for (key, ext) in ext_sources {
+        let target = if exact_names.contains(&key) {
+            key
+        } else {
+            let root = key.split('/').next().unwrap_or(&key);
+            if pod_roots.contains(root) {
+                root.to_owned()
+            } else {
+                key
+            }
+        };
+        let dst = normalized_ext.entry(target).or_default();
+        for (field, val) in ext.sources {
+            insert_field(&mut dst.sources, field, val)?;
+        }
+        for (field, val) in ext.pins {
+            insert_field(&mut dst.pins, field, val)?;
+        }
+    }
+    let mut normalized_checksums: BTreeMap<String, String> = BTreeMap::new();
+    for (key, hash) in checksums {
+        let target = if exact_names.contains(&key) {
+            key
+        } else {
+            let root = key.split('/').next().unwrap_or(&key);
+            if pod_roots.contains(root) {
+                root.to_owned()
+            } else {
+                key
+            }
+        };
+        if let Some(prev) = normalized_checksums.get(&target)
+            && prev != &hash
+        {
+            return None;
+        }
+        normalized_checksums.insert(target, hash);
+    }
+    let mut attached_ext: BTreeSet<String> = BTreeSet::new();
+    let mut attached_checksums: BTreeSet<String> = BTreeSet::new();
     let mut attached_root_checksum: BTreeSet<String> = BTreeSet::new();
     let mut packages = BTreeMap::new();
     for (name, version, deps) in pods {
         let root = name.split('/').next().unwrap_or(&name);
-        let ext = ext_sources.get(root);
+        let ext = if let Some(exact) = normalized_ext.get(&name) {
+            attached_ext.insert(name.clone());
+            Some(exact)
+        } else if let Some(by_root) = normalized_ext.get(root) {
+            attached_ext.insert(root.to_owned());
+            Some(by_root)
+        } else {
+            None
+        };
         let source = if let Some(ext) = ext
             && !ext.sources.is_empty()
         {
@@ -2493,16 +2578,48 @@ fn podfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
         };
         let attach_root = name == root
             || (!exact_names.contains(root) && attached_root_checksum.insert(root.to_owned()));
-        let spec_hash = if let Some(hash) = checksums.get(&name) {
+        let spec_hash = if let Some(hash) = normalized_checksums.get(&name) {
+            attached_checksums.insert(name.clone());
             Some(hash.clone())
         } else if attach_root {
-            checksums.get(root).cloned()
+            normalized_checksums.get(root).map(|h| {
+                attached_checksums.insert(root.to_owned());
+                h.clone()
+            })
         } else {
             None
         };
-        let ext_pins = attach_root
-            .then_some(ext)
-            .flatten()
+        let ext_pins = if normalized_ext.contains_key(&name) || attach_root {
+            ext.filter(|e| !e.pins.is_empty())
+                .map(|e| e.pins.values().cloned().collect::<Vec<_>>().join(", "))
+        } else {
+            None
+        };
+        let checksum = match (spec_hash, ext_pins) {
+            (Some(h), Some(pins)) => Some(format!("{h} ({pins})")),
+            (Some(h), None) => Some(h),
+            (None, Some(pins)) => Some(pins),
+            (None, None) => None,
+        };
+        insert_merged(&mut packages, name, version, source, checksum, deps)?;
+    }
+    let orphan_keys: BTreeSet<String> = normalized_ext
+        .keys()
+        .filter(|k| !attached_ext.contains(*k))
+        .chain(
+            normalized_checksums
+                .keys()
+                .filter(|k| !attached_checksums.contains(*k)),
+        )
+        .cloned()
+        .collect();
+    for key in orphan_keys {
+        let ext = normalized_ext.get(&key);
+        let source = ext
+            .filter(|e| !e.sources.is_empty())
+            .map(|e| e.sources.values().cloned().collect::<Vec<_>>().join(" "));
+        let spec_hash = normalized_checksums.get(&key).cloned();
+        let ext_pins = ext
             .filter(|e| !e.pins.is_empty())
             .map(|e| e.pins.values().cloned().collect::<Vec<_>>().join(", "));
         let checksum = match (spec_hash, ext_pins) {
@@ -2511,7 +2628,24 @@ fn podfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
             (None, Some(pins)) => Some(pins),
             (None, None) => None,
         };
-        insert_merged(&mut packages, name, version, source, checksum, deps)?;
+        insert_merged(
+            &mut packages,
+            format!("external:{key}"),
+            "external".to_owned(),
+            source,
+            checksum,
+            BTreeSet::new(),
+        )?;
+    }
+    for (plugin, version) in plugins {
+        insert_merged(
+            &mut packages,
+            format!("plugin:{plugin}"),
+            version,
+            None,
+            None,
+            BTreeSet::new(),
+        )?;
     }
     Some(packages)
 }
@@ -2573,8 +2707,20 @@ fn pipfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
         }
     }
     let meta = root_obj.get("_meta")?.as_object()?;
+    for key in meta.keys() {
+        if !matches!(
+            key.as_str(),
+            "pipfile-spec" | "hash" | "requires" | "sources"
+        ) {
+            return None;
+        }
+    }
     meta.get("pipfile-spec")?.as_u64()?;
+    if let Some(hash_val) = meta.get("hash") {
+        hash_val.as_object()?;
+    }
     let default_map = root_obj.get("default")?.as_object()?;
+    let mut packages = BTreeMap::new();
     let mut sources_map: BTreeMap<&str, String> = BTreeMap::new();
     let mut default_source: Option<String> = None;
     if let Some(sources_val) = meta.get("sources") {
@@ -2600,10 +2746,40 @@ fn pipfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
             } else {
                 format!("{url} (verify_ssl=false)")
             };
+            if let Some(prev) = sources_map.get(name)
+                && prev != &encoded
+            {
+                return None;
+            }
             if default_source.is_none() {
                 default_source = Some(encoded.clone());
             }
             sources_map.insert(name, encoded);
+            insert_merged(
+                &mut packages,
+                format!("source:{name}"),
+                url.to_owned(),
+                Some(format!("verify_ssl={verify_ssl}")),
+                None,
+                BTreeSet::new(),
+            )?;
+        }
+    }
+    if let Some(req_val) = meta.get("requires") {
+        let req_obj = req_val.as_object()?;
+        for (req_key, req_ver) in req_obj {
+            let ver = req_ver.as_str()?;
+            if req_key.is_empty() || ver.is_empty() {
+                return None;
+            }
+            insert_merged(
+                &mut packages,
+                format!("requires:{req_key}"),
+                ver.to_owned(),
+                None,
+                None,
+                BTreeSet::new(),
+            )?;
         }
     }
     let develop_map = match root_obj.get("develop") {
@@ -2622,7 +2798,6 @@ fn pipfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
             None => Some(None),
         }
     }
-    let mut packages = BTreeMap::new();
     for (scope, map) in [("default", Some(default_map)), ("develop", develop_map)] {
         let Some(map) = map else {
             continue;
@@ -3337,15 +3512,21 @@ fn compare_podfile_hunks(
                     "PODS:" => HunkSection::Pods,
                     "SPEC CHECKSUMS:" => HunkSection::SpecChecksums,
                     "DEPENDENCIES:" => HunkSection::Ignored,
-                    "SPEC REPOS:" | "EXTERNAL SOURCES:" | "CHECKOUT OPTIONS:" => {
+                    "SPEC REPOS:" | "EXTERNAL SOURCES:" | "CHECKOUT OPTIONS:"
+                    | "COCOAPODS PLUGINS:" => {
+                        if kind != ' ' {
+                            return None;
+                        }
+                        HunkSection::FailClosed
+                    }
+                    _ if trimmed.starts_with("COCOAPODS PLUGINS:") => {
                         if kind != ' ' {
                             return None;
                         }
                         HunkSection::FailClosed
                     }
                     _ if trimmed.starts_with("PODFILE CHECKSUM:")
-                        || trimmed.starts_with("COCOAPODS:")
-                        || trimmed.starts_with("COCOAPODS PLUGINS:") =>
+                        || trimmed.starts_with("COCOAPODS:") =>
                     {
                         HunkSection::Ignored
                     }
@@ -3463,9 +3644,16 @@ fn compare_json_map_hunks(
     old_pkgs: &mut BTreeMap<Key, Package>,
     new_pkgs: &mut BTreeMap<Key, Package>,
 ) -> Option<()> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PipfileSection {
+        Unknown,
+        Meta(isize),
+        Default,
+        Develop,
+    }
     let hunks = split_raw_hunks(hunk_lines)?;
     let parse_side = |side_char: char, out: &mut BTreeMap<Key, Package>| -> Option<()> {
-        let mut entries: Vec<String> = Vec::new();
+        let mut entries: Vec<(Option<&'static str>, String)> = Vec::new();
         for hunk in &hunks {
             let side: Vec<(bool, &str)> = hunk
                 .iter()
@@ -3473,7 +3661,10 @@ fn compare_json_map_hunks(
                     (kind == ' ' || kind == side_char).then_some((kind == side_char, rest))
                 })
                 .collect();
+            let mut pipfile_section = PipfileSection::Unknown;
+            let mut in_meta_hash = false;
             let mut key: Option<String> = None;
+            let mut key_section: Option<&'static str> = None;
             let mut buf = String::new();
             let mut depth = 0isize;
             let mut obj_changed = false;
@@ -3483,13 +3674,74 @@ fn compare_json_map_hunks(
                     continue;
                 }
                 if depth == 0 {
+                    if format == LockFormat::Pipfile
+                        && let PipfileSection::Meta(meta_depth) = pipfile_section
+                    {
+                        let delta = json_brace_delta(trimmed);
+                        if meta_depth == 1
+                            && !changed
+                            && trimmed.starts_with("\"hash\":")
+                            && delta > 0
+                        {
+                            in_meta_hash = true;
+                        }
+                        if changed && !(in_meta_hash && trimmed.starts_with("\"sha256\":")) {
+                            return None;
+                        }
+                        let next_depth = meta_depth + delta;
+                        if next_depth <= 0 {
+                            pipfile_section = PipfileSection::Unknown;
+                            in_meta_hash = false;
+                        } else {
+                            if next_depth <= 1 {
+                                in_meta_hash = false;
+                            }
+                            pipfile_section = PipfileSection::Meta(next_depth);
+                        }
+                        continue;
+                    }
                     if let Some((k, rest)) = trimmed.split_once(':') {
                         let rest_t = rest.trim();
                         if rest_t.starts_with('{') {
                             let name = unquote_lock_scalar(k);
-                            let is_pkg = match format {
+                            if format == LockFormat::Pipfile {
+                                match name {
+                                    "_meta" => {
+                                        if pipfile_section != PipfileSection::Unknown || changed {
+                                            return None;
+                                        }
+                                        let delta = json_brace_delta(rest_t);
+                                        if delta > 0 {
+                                            pipfile_section = PipfileSection::Meta(delta);
+                                            in_meta_hash = false;
+                                        }
+                                        continue;
+                                    }
+                                    "default" | "develop" => {
+                                        if pipfile_section != PipfileSection::Unknown {
+                                            return None;
+                                        }
+                                        let delta = json_brace_delta(rest_t);
+                                        if delta > 0 {
+                                            pipfile_section = if name == "default" {
+                                                PipfileSection::Default
+                                            } else {
+                                                PipfileSection::Develop
+                                            };
+                                            continue;
+                                        }
+                                        if rest_t.trim_end_matches(',') == "{}" {
+                                            continue;
+                                        }
+                                        return None;
+                                    }
+                                    "hash" | "requires" | "" => return None,
+                                    _ => {}
+                                }
+                            }
+                            let pkg_section = match format {
                                 LockFormat::NuGet => {
-                                    !name.is_empty()
+                                    let is_pkg = !name.is_empty()
                                         && name != "dependencies"
                                         && (rest_t.contains("\"type\"")
                                             || side[idx + 1..]
@@ -3497,19 +3749,22 @@ fn compare_json_map_hunks(
                                                 .find(|(_, l)| !l.trim().is_empty())
                                                 .is_some_and(|(_, l)| {
                                                     l.trim().starts_with("\"type\"")
-                                                }))
+                                                }));
+                                    is_pkg.then_some(None)
                                 }
-                                LockFormat::Pipfile => {
-                                    !name.is_empty()
-                                        && !matches!(
-                                            name,
-                                            "_meta" | "default" | "develop" | "hash" | "requires"
-                                        )
-                                }
-                                _ => false,
+                                LockFormat::Pipfile => match pipfile_section {
+                                    PipfileSection::Default => Some(Some("default")),
+                                    PipfileSection::Develop => Some(Some("develop")),
+                                    // Ambiguous Pipfile.lock section context: fail closed.
+                                    PipfileSection::Unknown | PipfileSection::Meta(_) => {
+                                        return None;
+                                    }
+                                },
+                                _ => None,
                             };
-                            if is_pkg {
+                            if let Some(sec) = pkg_section {
                                 key = Some(name.to_owned());
+                                key_section = sec;
                                 buf.clear();
                                 buf.push_str(rest_t);
                                 obj_changed = changed;
@@ -3519,10 +3774,12 @@ fn compare_json_map_hunks(
                                     if let Some(name) = key.take()
                                         && obj_changed
                                     {
-                                        entries.push(format!(
-                                            "\"{name}\":{}",
-                                            buf.trim_end_matches(',')
+                                        entries.push((
+                                            key_section.take(),
+                                            format!("\"{name}\":{}", buf.trim_end_matches(',')),
                                         ));
+                                    } else {
+                                        key_section = None;
                                     }
                                     buf.clear();
                                     obj_changed = false;
@@ -3531,10 +3788,17 @@ fn compare_json_map_hunks(
                             }
                         }
                     }
+                    if format == LockFormat::Pipfile
+                        && matches!(
+                            pipfile_section,
+                            PipfileSection::Default | PipfileSection::Develop
+                        )
+                        && matches!(trimmed, "}" | "},")
+                    {
+                        pipfile_section = PipfileSection::Unknown;
+                    }
                     if changed {
-                        let ok_outside = matches!(trimmed, "{" | "}" | "}," | "]" | "]," | ",")
-                            || (format == LockFormat::Pipfile
-                                && trimmed.starts_with("\"sha256\":"));
+                        let ok_outside = matches!(trimmed, "{" | "}" | "}," | "]" | "]," | ",");
                         if !ok_outside {
                             return None;
                         }
@@ -3542,14 +3806,23 @@ fn compare_json_map_hunks(
                 } else {
                     buf.push('\n');
                     buf.push_str(trimmed);
-                    obj_changed |= changed;
-                    depth += json_brace_delta(trimmed);
+                    let delta = json_brace_delta(trimmed);
+                    let closing_brace_only = matches!(trimmed, "}" | "},") && depth + delta <= 0;
+                    if !closing_brace_only {
+                        obj_changed |= changed;
+                    }
+                    depth += delta;
                     if depth <= 0 {
                         depth = 0;
                         if let Some(name) = key.take()
                             && obj_changed
                         {
-                            entries.push(format!("\"{name}\":{}", buf.trim_end_matches(',')));
+                            entries.push((
+                                key_section.take(),
+                                format!("\"{name}\":{}", buf.trim_end_matches(',')),
+                            ));
+                        } else {
+                            key_section = None;
                         }
                         buf.clear();
                         obj_changed = false;
@@ -3563,14 +3836,22 @@ fn compare_json_map_hunks(
         if entries.is_empty() {
             return Some(());
         }
-        for entry in &entries {
+        for (sec, entry) in &entries {
             let wrapped = match format {
                 LockFormat::NuGet => {
                     format!("{{\"version\":1,\"dependencies\":{{\"hunk\":{{{entry}}}}}}}")
                 }
-                LockFormat::Pipfile => {
-                    format!("{{\"_meta\":{{\"pipfile-spec\":6}},\"default\":{{{entry}}}}}")
-                }
+                LockFormat::Pipfile => match *sec {
+                    Some("default") => {
+                        format!("{{\"_meta\":{{\"pipfile-spec\":6}},\"default\":{{{entry}}}}}")
+                    }
+                    Some("develop") => {
+                        format!(
+                            "{{\"_meta\":{{\"pipfile-spec\":6}},\"default\":{{}},\"develop\":{{{entry}}}}}"
+                        )
+                    }
+                    _ => return None,
+                },
                 _ => unreachable!(),
             };
             let parsed = parse_format(format, &wrapped)?;
@@ -5716,6 +5997,7 @@ index 1111111..2222222 100644
             "+      \"sha256\": \"metanew\"\n",
             "     },\n",
             "@@ -20,40 +20,40 @@\n",
+            "   \"default\": {\n",
         ));
         for i in 0..8 {
             patch.push_str(&format!(
@@ -6058,5 +6340,238 @@ packages:
   "default": { "foo": { "version": "==1.0.0", "evil_hook": "rm -rf /" } }
 }"#;
         assert!(pipfile_packages(pip_unknown).is_none());
+    }
+
+    #[test]
+    fn q4_supply_chain_hardening_pipfile_podfile_and_pubspec() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // (a) Pipfile.lock: secondary `_meta.sources[1]` `verify_ssl: false` hijack,
+        //     `_meta.requires` tracking, and unknown `_meta` key fail-closed.
+        let pip_old = r#"{
+  "_meta": {
+    "pipfile-spec": 6,
+    "requires": { "python_version": "3.11" },
+    "sources": [
+      { "name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": true },
+      { "name": "corp", "url": "https://corp.example/simple", "verify_ssl": true }
+    ]
+  },
+  "default": {
+    "requests": { "hashes": ["sha256:aaa"], "index": "pypi", "version": "==2.31.0" }
+  },
+  "develop": {}
+}"#;
+        let pip_new = r#"{
+  "_meta": {
+    "pipfile-spec": 6,
+    "requires": { "python_version": "3.12" },
+    "sources": [
+      { "name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": true },
+      { "name": "corp", "url": "https://corp.example/simple", "verify_ssl": false },
+      { "name": "evil", "url": "https://evil.example/simple", "verify_ssl": false }
+    ]
+  },
+  "default": {
+    "requests": { "hashes": ["sha256:aaa"], "index": "pypi", "version": "==2.31.0" }
+  },
+  "develop": {}
+}"#;
+        let pip_changes = compare_format(LockFormat::Pipfile, pip_old, pip_new).unwrap();
+        assert!(
+            pip_changes.flags.iter().any(|f| f.contains(
+                "source changed on existing version source:corp https://corp.example/simple: verify_ssl=true -> verify_ssl=false"
+            )),
+            "{:?}",
+            pip_changes.flags
+        );
+        assert!(
+            pip_changes
+                .added
+                .iter()
+                .any(|a| a == "source:evil https://evil.example/simple"),
+            "{:?}",
+            pip_changes.added
+        );
+        assert!(
+            pip_changes
+                .updated
+                .iter()
+                .any(|u| u == "requires:python_version 3.11 -> 3.12"),
+            "{:?}",
+            pip_changes.updated
+        );
+        let pip_unknown_meta = r#"{
+  "_meta": { "pipfile-spec": 6, "unexpected": { "a": 1 } },
+  "default": {}
+}"#;
+        assert!(pipfile_packages(pip_unknown_meta).is_none());
+
+        // (b) Pipfile.lock remote `gh pr diff` hunk fallback: `develop -> default` promotion
+        //     flagged AND unchanged neighbor whose closing `}` gained `,` is NOT falsely removed,
+        //     while an ambiguous-section hunk fails closed.
+        let mut promote_patch = String::from(concat!(
+            "diff --git a/Pipfile.lock b/Pipfile.lock\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/Pipfile.lock\n",
+            "+++ b/Pipfile.lock\n",
+            "@@ -10,20 +10,20 @@\n",
+            "   \"default\": {\n",
+            "     \"neighbor\": {\n",
+            "       \"hashes\": [\n",
+            "         \"sha256:neighbor_hash_0001\",\n",
+            "         \"sha256:neighbor_hash_0002\"\n",
+            "       ],\n",
+            "       \"index\": \"pypi\",\n",
+            "       \"version\": \"==1.0.0\"\n",
+            "-    }\n",
+            "+    },\n",
+            "+    \"promoted\": {\n",
+            "+      \"hashes\": [\n",
+            "+        \"sha256:promoted_hash_0001\",\n",
+            "+        \"sha256:promoted_hash_0002\"\n",
+            "+      ],\n",
+            "+      \"index\": \"pypi\",\n",
+            "+      \"version\": \"==2.0.0\"\n",
+            "+    }\n",
+            "   },\n",
+            "   \"develop\": {\n",
+            "     \"dev_keep\": {\n",
+            "       \"hashes\": [\n",
+            "         \"sha256:dev_keep_hash_0001\",\n",
+            "         \"sha256:dev_keep_hash_0002\"\n",
+            "       ],\n",
+            "       \"index\": \"pypi\",\n",
+            "       \"version\": \"==3.0.0\"\n",
+            "-    },\n",
+            "-    \"promoted\": {\n",
+            "-      \"hashes\": [\n",
+            "-        \"sha256:promoted_hash_0001\",\n",
+            "-        \"sha256:promoted_hash_0002\"\n",
+            "-      ],\n",
+            "-      \"index\": \"pypi\",\n",
+            "-      \"version\": \"==2.0.0\"\n",
+            "     }\n",
+            "   }\n",
+        ));
+        let promote_sections = sections(&promote_patch, dir.path());
+        assert_eq!(promote_sections.len(), 1);
+        let promote_text = promote_sections[0].text();
+        assert!(
+            promote_sections[0].flags.iter().any(|f| f
+                .contains("source changed on existing version promoted 2.0.0")
+                && f.contains("[develop]")
+                && f.contains("[default]")),
+            "flags={:?}\ntext={promote_text}",
+            promote_sections[0].flags
+        );
+        assert!(
+            !promote_text.contains("neighbor") && !promote_text.contains("dev_keep"),
+            "trailing-comma neighbors must not appear as added/removed:\n{promote_text}"
+        );
+        // Ambiguous Pipfile.lock hunk (no `"default": {` or `"develop": {` header) fails closed.
+        promote_patch.clear();
+        promote_patch.push_str(concat!(
+            "diff --git a/Pipfile.lock b/Pipfile.lock\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/Pipfile.lock\n",
+            "+++ b/Pipfile.lock\n",
+            "@@ -40,8 +40,8 @@\n",
+            "     \"mystery\": {\n",
+            "-      \"version\": \"==1.0.0\"\n",
+            "+      \"version\": \"==1.0.1\"\n",
+            "     },\n",
+        ));
+        assert!(sections(&promote_patch, dir.path()).is_empty());
+
+        // (c) Podfile.lock: `COCOAPODS PLUGINS:` injection tracked full-file & fails closed
+        //     in hunks, and orphan/subspec EXTERNAL SOURCES/SPEC CHECKSUMS are never dropped.
+        let pod_old = "\
+PODS:
+  - MyPod (1.0.0)
+
+SPEC CHECKSUMS:
+  MyPod: 1111111111111111111111111111111111111111
+
+COCOAPODS PLUGINS:
+  cocoapods-keys: 2.2.1
+";
+        let pod_new = "\
+PODS:
+  - MyPod (1.0.0)
+
+EXTERNAL SOURCES:
+  MyPod/Sub:
+    :git: https://evil.example/MyPod.git
+  OrphanPod:
+    :git: https://evil.example/OrphanPod.git
+
+SPEC CHECKSUMS:
+  MyPod: 1111111111111111111111111111111111111111
+  OrphanPod: 2222222222222222222222222222222222222222
+
+COCOAPODS PLUGINS:
+  cocoapods-keys: 2.2.1
+  cocoapods-evil: 0.1.0
+";
+        let pod_changes = compare_format(LockFormat::Podfile, pod_old, pod_new).unwrap();
+        assert!(
+            pod_changes
+                .added
+                .iter()
+                .any(|a| a == "plugin:cocoapods-evil 0.1.0"),
+            "{:?}",
+            pod_changes.added
+        );
+        assert!(
+            pod_changes
+                .added
+                .iter()
+                .any(|a| a == "external:OrphanPod external"),
+            "{:?}",
+            pod_changes.added
+        );
+        assert!(
+            pod_changes.flags.iter().any(|f| f
+                .contains("source changed on existing version MyPod 1.0.0")
+                && f.contains("git:https://evil.example/MyPod.git")),
+            "{:?}",
+            pod_changes.flags
+        );
+        let pod_plugin_hunk = "\
+diff --git a/ios/Podfile.lock b/ios/Podfile.lock
+index 1111111..2222222 100644
+--- a/ios/Podfile.lock
++++ b/ios/Podfile.lock
+@@ -20,2 +20,3 @@
+ COCOAPODS PLUGINS:
+   cocoapods-keys: 2.2.1
++  cocoapods-evil: 0.1.0
+";
+        assert!(sections(pod_plugin_hunk, dir.path()).is_empty());
+
+        // (d) pubspec.lock: malformed inline YAML flow maps fail closed instead of dropping garbage.
+        for bad_desc in [
+            "{name: foo, garbage_without_colon}",
+            "{name: foo, nested: {url: \"https://evil.example\"}}",
+            "{name: foo, url: \"https://unclosed}",
+            "{name: foo, url: 'unclosed",
+            "{: missing_key}",
+        ] {
+            let bad_pubspec = format!(
+                "\
+packages:
+  foo:
+    dependency: \"direct main\"
+    description: {bad_desc}
+    source: hosted
+    version: \"1.0.0\"
+"
+            );
+            assert!(
+                pubspec_packages(&bad_pubspec).is_none(),
+                "must fail closed on malformed inline map: {bad_desc}"
+            );
+        }
     }
 }

@@ -2179,7 +2179,9 @@ impl Capture<'_> {
             }
         }
         let justless = workspace.justless();
-        let source_outline = origin.and_then(|o| o.outline.as_ref());
+        let source_outline = (!lossless_only)
+            .then(|| origin.and_then(|o| o.outline.as_ref()))
+            .flatten();
         if let Some(outline) = source_outline {
             previews[0].1 =
                 format!("{}Exact: {justless} log {}\n", outline.text, run.id).into_bytes();
