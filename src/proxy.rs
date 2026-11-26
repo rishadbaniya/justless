@@ -35,7 +35,7 @@ use crate::history::{human_bytes, now_ms};
 use crate::workspace::{Workspace, private_dir};
 use http::{Framing, Head};
 pub(crate) use ledger::report;
-use ledger::{Job, LiveCompacted, Log, Record, Totals, short};
+use ledger::{Job, LiveCompacted, Log, PrefixDrift, Record, Totals, short};
 use observe::{Observed, Observer};
 use plan::{Body, Request, Role};
 use upstream::{Outbound, SendError, Upstream};
@@ -274,6 +274,8 @@ struct Shared {
     store: Mutex<state::Store>,
     /// Models that refused the clearing edit in this process.
     refused: Mutex<HashSet<String>>,
+    /// Bounded per-(endpoint, model) prompt-cache prefix fingerprints.
+    prefixes: Mutex<plan::PrefixTracker>,
     jobs: Sender<Job>,
     totals: Arc<Mutex<Totals>>,
     log: Log,
@@ -362,6 +364,7 @@ impl Proxy {
             upstream,
             store: Mutex::new(state::Store::load(dir.join("conversations.json"))),
             refused: Mutex::new(HashSet::new()),
+            prefixes: Mutex::new(plan::PrefixTracker::default()),
             jobs,
             totals,
             log,
@@ -545,6 +548,16 @@ impl Endpoint {
     fn is_anthropic(self) -> bool {
         matches!(self, Self::Messages | Self::CountTokens)
     }
+
+    fn prefix_format(self) -> Option<plan::PrefixFormat> {
+        match self {
+            Self::Messages => Some(plan::PrefixFormat::Anthropic),
+            Self::ChatCompletions => Some(plan::PrefixFormat::OpenAiChat),
+            Self::Responses => Some(plan::PrefixFormat::OpenAiResponses),
+            Self::GeminiGenerate => Some(plan::PrefixFormat::Gemini),
+            Self::CountTokens | Self::Other => None,
+        }
+    }
 }
 
 /// A Claude Code hint header kept in the ledger: session, agent and request class.
@@ -568,6 +581,8 @@ struct Planned {
     clearing_added: bool,
     /// Live-zone compaction stats when newest uncached `tool_result` blocks were compacted.
     live_compacted: Option<LiveCompacted>,
+    /// Read-only prompt-cache prefix drift detected on this request.
+    prefix_drift: Option<PrefixDrift>,
     request: Option<Request>,
     model: Option<String>,
     mode: &'static str,
@@ -665,6 +680,17 @@ fn count_repeats(calls: &mut state::Calls, req: &Request, boundary: usize) -> u6
 }
 
 impl Shared {
+    fn observe_prefix(
+        &self,
+        endpoint: Endpoint,
+        model: Option<&str>,
+        parsed: &Body,
+    ) -> Option<PrefixDrift> {
+        let format = endpoint.prefix_format()?;
+        let fingerprint = plan::PrefixFingerprint::extract(parsed, format)?;
+        lock(&self.prefixes).observe(endpoint.name(), model.unwrap_or_default(), fingerprint)
+    }
+
     fn plan(&self, head: &Head, body: &[u8], endpoint: Endpoint, now: u64) -> Planned {
         if !endpoint.is_anthropic() {
             return self.plan_live_only(head, body, endpoint);
@@ -676,10 +702,12 @@ impl Shared {
             Ok(req) => req,
             Err(reason) => return Planned::pass(reason),
         };
+        let prefix_drift = self.observe_prefix(endpoint, req.model.as_deref(), &parsed);
         let mut planned = Planned {
             model: req.model.clone(),
             uses: Some(req.uses.len()),
             mode: "pass",
+            prefix_drift,
             ..Default::default()
         };
         let live_body = if self.options.compact_live
@@ -715,29 +743,25 @@ impl Shared {
         planned
     }
 
-    /// Live-zone-only compaction for provider-neutral endpoints (OpenAI Chat
-    /// Completions, OpenAI Responses, Google Gemini `generateContent`).
-    /// Never applies Anthropic clearing edits or `anthropic-beta` headers.
+    /// Live-zone-only compaction and read-only prefix-drift telemetry for
+    /// provider-neutral endpoints (OpenAI Chat Completions, OpenAI Responses,
+    /// Google Gemini `generateContent`). Never applies Anthropic clearing edits
+    /// or `anthropic-beta` headers.
     fn plan_live_only(&self, head: &Head, body: &[u8], endpoint: Endpoint) -> Planned {
         let path_model = (endpoint == Endpoint::GeminiGenerate)
             .then(|| gemini_model_from_path(head.path()).map(str::to_owned))
             .flatten();
-        if !self.options.compact_live {
-            return Planned {
-                model: path_model,
-                ..Planned::pass("compact-live-off")
-            };
-        }
-        if !self.archive {
-            return Planned {
-                model: path_model,
-                ..Planned::pass("no-archive")
-            };
-        }
         let Some(parsed) = Body::parse(body) else {
+            let reason = if !self.options.compact_live {
+                "compact-live-off"
+            } else if !self.archive {
+                "no-archive"
+            } else {
+                "unparsed"
+            };
             return Planned {
                 model: path_model,
-                ..Planned::pass("unparsed")
+                ..Planned::pass(reason)
             };
         };
         let model = path_model.or_else(|| {
@@ -745,6 +769,21 @@ impl Shared {
                 .value("model")
                 .and_then(|v| v.as_str().map(str::to_owned))
         });
+        let prefix_drift = self.observe_prefix(endpoint, model.as_deref(), &parsed);
+        if !self.options.compact_live {
+            return Planned {
+                model,
+                prefix_drift,
+                ..Planned::pass("compact-live-off")
+            };
+        }
+        if !self.archive {
+            return Planned {
+                model,
+                prefix_drift,
+                ..Planned::pass("no-archive")
+            };
+        }
         let live = match endpoint {
             Endpoint::ChatCompletions => {
                 compact::compact_openai_chat_live_zone(&self.ws, &parsed, &self.options)
@@ -761,12 +800,14 @@ impl Shared {
             Some(live) => Planned {
                 body: Some(live.body),
                 live_compacted: Some(live.stats),
+                prefix_drift,
                 model,
                 mode: "compact",
                 ..Default::default()
             },
             None => Planned {
                 model,
+                prefix_drift,
                 mode: "pass",
                 reason: Some("no-live-compact"),
                 ..Default::default()
@@ -1135,6 +1176,7 @@ fn finish(
     record.repeats = planned.repeats;
     record.client_managed_new = planned.client_new;
     record.live_compacted = planned.live_compacted.clone();
+    record.prefix_drift = planned.prefix_drift.clone();
     record.uses = planned.uses.map(|u| u as u64);
     let edited = planned.boundary.zip(planned.uses);
     if let Some((boundary, uses)) = edited {
@@ -1225,6 +1267,9 @@ fn verbose_line(record: &Record, planned: &Planned, elapsed: Duration) -> String
             human_bytes(live.bytes_after),
             human_bytes(live.saved_bytes),
         ));
+    }
+    if let Some(drift) = &record.prefix_drift {
+        parts.push(format!("prefix drift: {} {}", drift.section, drift.reason));
     }
     parts.push(format!("{:.1}s", elapsed.as_secs_f64()));
     parts.join(" · ")
@@ -1368,6 +1413,7 @@ mod tests {
             upstream: Upstream::new("http://127.0.0.1:9").unwrap(),
             store: Mutex::new(state::Store::load(dir.path().join("conversations.json"))),
             refused: Mutex::new(HashSet::new()),
+            prefixes: Mutex::new(plan::PrefixTracker::default()),
             jobs,
             totals: Arc::new(Mutex::new(Totals::default())),
             log: Log::open(dir.path().join("proxy.log")),

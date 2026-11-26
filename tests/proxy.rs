@@ -2557,3 +2557,158 @@ fn live_zone_gemini_stream_generate_content_compact_recall_and_passthrough() {
     assert!(records_off[0].get("live_compacted").is_none());
     assert!(!dir_off.path().join(".justless/observations").exists());
 }
+
+#[test]
+fn prefix_drift_detection_leaves_wire_bytes_untouched_and_reports_in_ledger_and_stats() {
+    let (dir, mock, proxy) = session(|_| ok_json(), "");
+    let root = dir.path();
+    let anth_headers = [
+        ("content-type", "application/json"),
+        ("x-api-key", "sk-ant-test"),
+    ];
+    let openai_headers = [
+        ("content-type", "application/json"),
+        ("authorization", "Bearer sk-openai-test"),
+    ];
+    let read_tool =
+        json!({"name": "Read", "description": "Read a file", "input_schema": {"type": "object"}});
+    let bash_tool = json!({"name": "Bash", "description": "Run a shell command", "input_schema": {"type": "object"}});
+    let secret_sys = "SECRET_SYSTEM_PROMPT_DO_NOT_LOG";
+    let secret_msg = "SECRET_USER_MESSAGE_DO_NOT_LOG";
+
+    let raw_odd = |val: &Value| {
+        serde_json::to_string_pretty(val)
+            .unwrap()
+            .replace("\"role\": ", "\"role\" :   ")
+    };
+
+    // 1. Anthropic baseline + stable growing turn -> 0 prefix drift.
+    let anth_t1 = json!({
+        "model": "claude-opus-5-5",
+        "max_tokens": 1024,
+        "system": format!("Now: 2026-11-26T12:00:00Z {secret_sys}"),
+        "tools": [read_tool, bash_tool],
+        "messages": [
+            {"role": "user", "content": "Inspect parser.rs"},
+            {"role": "assistant", "content": "Looking at parser.rs"},
+            {"role": "user", "content": "Check line 42"}
+        ]
+    });
+    let anth_t2_stable = json!({
+        "model": "claude-opus-5-5",
+        "max_tokens": 1024,
+        "system": format!("Now: 2026-11-26T12:00:00Z {secret_sys}"),
+        "tools": [read_tool, bash_tool],
+        "messages": [
+            {"role": "user", "content": "Inspect parser.rs"},
+            {"role": "assistant", "content": "Looking at parser.rs"},
+            {"role": "user", "content": "Check line 42"},
+            {"role": "assistant", "content": "Found off-by-one"},
+            {"role": "user", "content": "Patch it"}
+        ]
+    });
+    // 2. Anthropic system timestamp mutation -> drift: system changed.
+    let mut anth_t3_sys_drift = anth_t2_stable.clone();
+    anth_t3_sys_drift["system"] = json!(format!("Now: 2026-11-26T12:00:05Z {secret_sys}"));
+    // 3. Anthropic reordered tools -> drift: tools reordered.
+    let mut anth_t4_tools_drift = anth_t3_sys_drift.clone();
+    anth_t4_tools_drift["tools"] = json!([bash_tool, read_tool]);
+
+    // 4. OpenAI Chat baseline + mutated messages[1] -> drift: message[1] changed.
+    let openai_t1 = json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": "You are a coding assistant."},
+            {"role": "user", "content": format!("Original question {secret_msg}")},
+            {"role": "assistant", "content": "Working on it."},
+            {"role": "user", "content": "Any update?"}
+        ]
+    });
+    let mut openai_t2_msg_drift = openai_t1.clone();
+    openai_t2_msg_drift["messages"][1]["content"] =
+        json!(format!("Edited earlier question {secret_msg}"));
+
+    let sent_cases = [
+        ("/v1/messages", &anth_headers[..], raw_odd(&anth_t1)),
+        ("/v1/messages", &anth_headers[..], raw_odd(&anth_t2_stable)),
+        (
+            "/v1/messages",
+            &anth_headers[..],
+            raw_odd(&anth_t3_sys_drift),
+        ),
+        (
+            "/v1/messages",
+            &anth_headers[..],
+            raw_odd(&anth_t4_tools_drift),
+        ),
+        (
+            "/v1/chat/completions",
+            &openai_headers[..],
+            raw_odd(&openai_t1),
+        ),
+        (
+            "/v1/chat/completions",
+            &openai_headers[..],
+            raw_odd(&openai_t2_msg_drift),
+        ),
+    ];
+
+    for (idx, (path, headers, raw)) in sent_cases.iter().enumerate() {
+        let resp = proxy.send("POST", path, headers, raw.as_bytes());
+        assert_eq!(resp.status(), 200, "case {idx}");
+        let forwarded = mock.seen().pop().unwrap();
+        assert_eq!(
+            forwarded.body,
+            raw.as_bytes(),
+            "case {idx}: prefix-drift detection must never mutate wire bytes"
+        );
+    }
+
+    proxy.stop();
+
+    // Ledger captures exact drifts and omits prefix_drift on cache-aligned requests.
+    let records = ledger(root);
+    assert_eq!(records.len(), 6);
+    assert!(records[0].get("prefix_drift").is_none());
+    assert!(records[1].get("prefix_drift").is_none());
+    assert_eq!(
+        records[2]["prefix_drift"],
+        json!({"section": "system", "reason": "changed"})
+    );
+    assert_eq!(
+        records[3]["prefix_drift"],
+        json!({"section": "tools", "reason": "reordered"})
+    );
+    assert!(records[4].get("prefix_drift").is_none());
+    assert_eq!(
+        records[5]["prefix_drift"],
+        json!({"section": "message[1]", "reason": "changed"})
+    );
+
+    // Zero raw prompt text or secrets leaked into ledger/logs.
+    for entry in fs::read_dir(root.join(".justless/proxy")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            let content = fs::read_to_string(&path).unwrap();
+            assert!(!content.contains(secret_sys), "{}", path.display());
+            assert!(!content.contains(secret_msg), "{}", path.display());
+        }
+    }
+
+    // `justless stats --json` and `justless stats` surface drift count & top causes.
+    let report = stats(root);
+    assert_eq!(report["proxy"]["prefix_drifts"], 3);
+    assert_eq!(
+        report["proxy"]["prefix_drift_causes"],
+        json!([
+            {"section": "message[1]", "reason": "changed", "count": 1},
+            {"section": "system", "reason": "changed", "count": 1},
+            {"section": "tools", "reason": "reordered", "count": 1},
+        ])
+    );
+    let summary = text(&justless(root, &["stats"]).stdout);
+    contains(
+        &summary,
+        "3 prefix drifts detected (prompt cache prefix diverged: message[1] changed (1), system changed (1), tools reordered (1))",
+    );
+}

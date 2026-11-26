@@ -13,6 +13,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub use super::plan::PrefixDrift;
 use super::plan::{self, Request};
 use crate::history::{human_bytes, now_ms, utc_date};
 use crate::observations::{ToolCall, archive_tool_use, valid_tool_use_id};
@@ -78,6 +79,9 @@ pub struct Record {
     /// Newest `tool_result` text blocks compacted in the uncached live zone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_compacted: Option<LiveCompacted>,
+    /// Prompt-cache prefix drift relative to the prior request for `(endpoint, model)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_drift: Option<PrefixDrift>,
     /// Set on the request that first left a conversation to the client's clearing.
     pub client_managed_new: bool,
     pub ms: u64,
@@ -303,6 +307,18 @@ fn append(ws: &Workspace, record: &Record) -> Result<()> {
     Ok(())
 }
 
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
+/// Aggregated count for one `(section, reason)` prompt-cache prefix drift cause.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DriftCause {
+    pub section: String,
+    pub reason: String,
+    pub count: u64,
+}
+
 /// Totals over the ledger since a time, for `justless stats`.
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
@@ -322,6 +338,10 @@ pub struct Report {
     archived_results: u64,
     archived_bytes: u64,
     live_compacted: LiveCompacted,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    prefix_drifts: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    prefix_drift_causes: Vec<DriftCause>,
     usage: Usage,
     token_estimate: &'static str,
     token_source: &'static str,
@@ -391,6 +411,7 @@ pub fn report(ws: &Workspace, since_ms: u64, recalled_bytes: u64) -> Result<Opti
             report.add(&record);
         }
     }
+    report.prefix_drift_causes.truncate(5);
     report.recalled_bytes = recalled_bytes;
     report.net_cleared_bytes =
         crate::history::net_bytes(report.newly_cleared.bytes, 0, recalled_bytes);
@@ -427,6 +448,28 @@ impl Report {
             self.live_compacted.bytes_after += live.bytes_after;
             self.live_compacted.saved_bytes += live.saved_bytes;
             self.live_compacted.est_tokens += live.est_tokens;
+        }
+        if let Some(drift) = &record.prefix_drift {
+            self.prefix_drifts += 1;
+            if let Some(cause) = self
+                .prefix_drift_causes
+                .iter_mut()
+                .find(|c| c.section == drift.section && c.reason == drift.reason)
+            {
+                cause.count += 1;
+            } else {
+                self.prefix_drift_causes.push(DriftCause {
+                    section: drift.section.clone(),
+                    reason: drift.reason.clone(),
+                    count: 1,
+                });
+            }
+            self.prefix_drift_causes.sort_by(|a, b| {
+                b.count
+                    .cmp(&a.count)
+                    .then_with(|| a.section.cmp(&b.section))
+                    .then_with(|| a.reason.cmp(&b.reason))
+            });
         }
         self.usage.input += record.input.unwrap_or(0);
         self.usage.cache_read += record.cache_read.unwrap_or(0);
@@ -544,6 +587,19 @@ impl Report {
                 human_bytes(self.live_compacted.bytes_after),
                 human_bytes(self.live_compacted.saved_bytes),
                 short(self.live_compacted.est_tokens),
+            );
+        }
+        if self.prefix_drifts > 0 {
+            let causes: Vec<String> = self
+                .prefix_drift_causes
+                .iter()
+                .take(3)
+                .map(|c| format!("{} {} ({})", c.section, c.reason, thousands(c.count)))
+                .collect();
+            println!(
+                "  {} detected (prompt cache prefix diverged: {})",
+                plural(self.prefix_drifts, "prefix drift", "prefix drifts"),
+                causes.join(", ")
             );
         }
     }

@@ -9,10 +9,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io;
 
-use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 pub const BETA: &str = "context-management-2025-06-27";
 pub const EDIT: &str = "clear_tool_uses_20250919";
@@ -652,6 +653,397 @@ pub fn call_hash(name: &str, input: &Value) -> u64 {
     hasher.finish()
 }
 
+// ---------------------------------------------------------------------------
+// Read-only prompt-cache prefix-drift detection
+
+/// Maximum `(endpoint, model)` slots retained in memory by [`PrefixTracker`].
+const MAX_TRACKER_SLOTS: usize = 32;
+/// Maximum prior turns fingerprinted per request.
+const MAX_PREFIX_MSGS: usize = 64;
+
+type Hash32 = [u8; 32];
+
+/// Provider wire schema used to extract static/cached prefix sections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefixFormat {
+    Anthropic,
+    OpenAiChat,
+    OpenAiResponses,
+    Gemini,
+}
+
+/// Recorded when a request's static/cached prompt prefix diverged from the
+/// previous request for the same `(endpoint, model)`. Never holds prompt text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrefixDrift {
+    /// Drifted section: `"system"`, `"tools"`, or `"message[i]"`.
+    pub section: String,
+    /// Why it diverged: `"changed"`, `"reordered"`, or `"truncated"`.
+    pub reason: String,
+}
+
+/// SHA-256 prefix fingerprint for one outbound LLM generation request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrefixFingerprint {
+    system_hash: Option<Hash32>,
+    system_bag_hash: Option<Hash32>,
+    tools_hash: Option<Hash32>,
+    tools_bag_hash: Option<Hash32>,
+    /// Starting index in the wire messages array for `prefix_msg_hashes[0]`.
+    msg_base_index: usize,
+    /// Per-message SHA-256 digests of prior turns (excluding the newest turn, capped).
+    prefix_msg_hashes: Vec<Hash32>,
+    /// SHA-256 digest of the newest turn when `turns.len() <= MAX_PREFIX_MSGS`,
+    /// verified only if a subsequent request grows past it and turns it into a prior turn.
+    last_msg_hash: Option<Hash32>,
+}
+
+fn sha256_bytes(bytes: &[u8]) -> Hash32 {
+    Sha256::digest(bytes).into()
+}
+
+fn non_null_raw<'a>(body: &Body<'a>, key: &str) -> Option<&'a RawValue> {
+    body.raw(key).filter(|raw| raw.get().trim() != "null")
+}
+
+/// Hashes an ordered sequence of borrowed JSON slices and (when 2+ items) an
+/// order-independent multiset digest so reordering is distinguished from edits.
+fn hash_sequence(items: &[&RawValue]) -> (Option<Hash32>, Option<Hash32>) {
+    if items.is_empty() {
+        return (None, None);
+    }
+    let mut item_hashes = Vec::with_capacity(items.len());
+    let mut ordered = Sha256::new();
+    ordered.update((items.len() as u64).to_le_bytes());
+    for item in items {
+        let digest = sha256_bytes(item.get().as_bytes());
+        ordered.update(digest);
+        item_hashes.push(digest);
+    }
+    let ordered_hash: Hash32 = ordered.finalize().into();
+    let bag_hash = if item_hashes.len() >= 2 {
+        item_hashes.sort_unstable();
+        let mut bag = Sha256::new();
+        bag.update((item_hashes.len() as u64).to_le_bytes());
+        for digest in &item_hashes {
+            bag.update(digest);
+        }
+        Some(bag.finalize().into())
+    } else {
+        None
+    };
+    (Some(ordered_hash), bag_hash)
+}
+
+fn hash_raw_section(raw: Option<&RawValue>) -> (Option<Hash32>, Option<Hash32>) {
+    let Some(raw) = raw else {
+        return (None, None);
+    };
+    if let Ok(items) = serde_json::from_str::<Vec<&RawValue>>(raw.get()) {
+        return hash_sequence(&items);
+    }
+    (Some(sha256_bytes(raw.get().as_bytes())), None)
+}
+
+fn hash_gemini_tools(raw: Option<&RawValue>) -> (Option<Hash32>, Option<Hash32>) {
+    let Some(raw) = raw else {
+        return (None, None);
+    };
+    let Ok(items) = serde_json::from_str::<Vec<&RawValue>>(raw.get()) else {
+        return (Some(sha256_bytes(raw.get().as_bytes())), None);
+    };
+    if items.is_empty() {
+        return (None, None);
+    }
+    if items.len() >= 2 {
+        return hash_sequence(&items);
+    }
+    // Common Gemini shape: `tools: [{"functionDeclarations": [fnA, fnB, ...]}]`.
+    let ordered_hash = sha256_bytes(items[0].get().as_bytes());
+    let bag_hash = parse_members(items[0].get()).and_then(|members| {
+        let mut decl_bag = None;
+        let mut other_members: Vec<(String, Hash32)> = Vec::new();
+        for (key, value) in members {
+            if matches!(
+                key.as_str(),
+                "functionDeclarations" | "function_declarations"
+            ) && let Ok(decls) = serde_json::from_str::<Vec<&RawValue>>(value.get())
+                && decls.len() >= 2
+            {
+                decl_bag = hash_sequence(&decls).1;
+            } else {
+                other_members.push((key, sha256_bytes(value.get().as_bytes())));
+            }
+        }
+        let decl_bag = decl_bag?;
+        other_members.sort_unstable();
+        let mut bag = Sha256::new();
+        bag.update(b"gemini-fn-decls\0");
+        bag.update(decl_bag);
+        for (key, digest) in other_members {
+            bag.update((key.len() as u64).to_le_bytes());
+            bag.update(key.as_bytes());
+            bag.update(digest);
+        }
+        Some(bag.finalize().into())
+    });
+    (Some(ordered_hash), bag_hash)
+}
+
+fn message_role_is_system(raw: &RawValue) -> bool {
+    let Some(members) = parse_members(raw.get()) else {
+        return false;
+    };
+    members.iter().any(|(key, value)| {
+        key == "role"
+            && serde_json::from_str::<String>(value.get())
+                .is_ok_and(|role| role == "system" || role == "developer")
+    })
+}
+
+fn combine_responses_system(
+    instructions: Option<&RawValue>,
+    leading: &[&RawValue],
+) -> (Option<Hash32>, Option<Hash32>) {
+    match (instructions, leading.is_empty()) {
+        (None, true) => (None, None),
+        (Some(instr), true) => hash_raw_section(Some(instr)),
+        (None, false) => hash_sequence(leading),
+        (Some(instr), false) => {
+            let instr_hash = sha256_bytes(instr.get().as_bytes());
+            let (lead_ord, lead_bag) = hash_sequence(leading);
+            let mut ordered = Sha256::new();
+            ordered.update(b"responses-sys\0");
+            ordered.update(instr_hash);
+            if let Some(lead_ord) = lead_ord {
+                ordered.update(lead_ord);
+            }
+            let bag_hash = lead_bag.map(|lead_bag| {
+                let mut bag = Sha256::new();
+                bag.update(b"responses-sys\0");
+                bag.update(instr_hash);
+                bag.update(lead_bag);
+                bag.finalize().into()
+            });
+            (Some(ordered.finalize().into()), bag_hash)
+        }
+    }
+}
+
+fn is_reordered_slice(prev: &[Hash32], curr: &[Hash32]) -> bool {
+    if prev.len() < 2 || prev.len() != curr.len() {
+        return false;
+    }
+    let mut a = prev.to_vec();
+    let mut b = curr.to_vec();
+    a.sort_unstable();
+    b.sort_unstable();
+    a == b
+}
+
+impl PrefixFingerprint {
+    /// Extracts a strictly read-only SHA-256 prefix fingerprint from a parsed
+    /// JSON request body. Returns `None` when the expected turns field is absent.
+    pub fn extract(body: &Body, format: PrefixFormat) -> Option<Self> {
+        let ((system_hash, system_bag_hash), (tools_hash, tools_bag_hash), turns, msg_base_index) =
+            match format {
+                PrefixFormat::Anthropic => {
+                    let raw_messages = non_null_raw(body, "messages")?;
+                    let turns: Vec<&RawValue> = serde_json::from_str(raw_messages.get()).ok()?;
+                    (
+                        hash_raw_section(non_null_raw(body, "system")),
+                        hash_raw_section(non_null_raw(body, "tools")),
+                        turns,
+                        0,
+                    )
+                }
+                PrefixFormat::OpenAiChat => {
+                    let raw_messages = non_null_raw(body, "messages")?;
+                    let all: Vec<&RawValue> = serde_json::from_str(raw_messages.get()).ok()?;
+                    let leading = all
+                        .iter()
+                        .take_while(|msg| message_role_is_system(msg))
+                        .count();
+                    let tools =
+                        non_null_raw(body, "tools").or_else(|| non_null_raw(body, "functions"));
+                    (
+                        hash_sequence(&all[..leading]),
+                        hash_raw_section(tools),
+                        all[leading..].to_vec(),
+                        leading,
+                    )
+                }
+                PrefixFormat::OpenAiResponses => {
+                    let raw_input = non_null_raw(body, "input")?;
+                    let instructions = non_null_raw(body, "instructions");
+                    let tools = hash_raw_section(non_null_raw(body, "tools"));
+                    if let Ok(all) = serde_json::from_str::<Vec<&RawValue>>(raw_input.get()) {
+                        let leading = all
+                            .iter()
+                            .take_while(|item| message_role_is_system(item))
+                            .count();
+                        (
+                            combine_responses_system(instructions, &all[..leading]),
+                            tools,
+                            all[leading..].to_vec(),
+                            leading,
+                        )
+                    } else {
+                        // Single-turn string `input`: instructions + tools are the static prefix.
+                        (hash_raw_section(instructions), tools, Vec::new(), 0)
+                    }
+                }
+                PrefixFormat::Gemini => {
+                    let raw_contents = non_null_raw(body, "contents")?;
+                    let turns: Vec<&RawValue> = serde_json::from_str(raw_contents.get()).ok()?;
+                    let system = non_null_raw(body, "systemInstruction")
+                        .or_else(|| non_null_raw(body, "system_instruction"));
+                    (
+                        hash_raw_section(system),
+                        hash_gemini_tools(non_null_raw(body, "tools")),
+                        turns,
+                        0,
+                    )
+                }
+            };
+
+        let prior_len = turns.len().saturating_sub(1).min(MAX_PREFIX_MSGS);
+        let prefix_msg_hashes = turns[..prior_len]
+            .iter()
+            .map(|raw| sha256_bytes(raw.get().as_bytes()))
+            .collect();
+        let last_msg_hash = (turns.len() <= MAX_PREFIX_MSGS)
+            .then(|| turns.last().map(|raw| sha256_bytes(raw.get().as_bytes())))
+            .flatten();
+
+        Some(Self {
+            system_hash,
+            system_bag_hash,
+            tools_hash,
+            tools_bag_hash,
+            msg_base_index,
+            prefix_msg_hashes,
+            last_msg_hash,
+        })
+    }
+
+    /// Compares `self` (the previous request's prefix) against `next`.
+    /// Returns `None` when `next` preserves the cached prefix.
+    pub fn diff(&self, next: &Self) -> Option<PrefixDrift> {
+        if self.system_hash != next.system_hash {
+            let reason =
+                if self.system_bag_hash.is_some() && self.system_bag_hash == next.system_bag_hash {
+                    "reordered"
+                } else {
+                    "changed"
+                };
+            return Some(PrefixDrift {
+                section: "system".into(),
+                reason: reason.into(),
+            });
+        }
+        if self.tools_hash != next.tools_hash {
+            let reason =
+                if self.tools_bag_hash.is_some() && self.tools_bag_hash == next.tools_bag_hash {
+                    "reordered"
+                } else {
+                    "changed"
+                };
+            return Some(PrefixDrift {
+                section: "tools".into(),
+                reason: reason.into(),
+            });
+        }
+        let prev_len = self.prefix_msg_hashes.len();
+        let next_len = next.prefix_msg_hashes.len();
+        let common = prev_len.min(next_len);
+        for i in 0..common {
+            if self.prefix_msg_hashes[i] != next.prefix_msg_hashes[i] {
+                let reordered = (next_len >= prev_len
+                    && is_reordered_slice(
+                        &self.prefix_msg_hashes[i..prev_len],
+                        &next.prefix_msg_hashes[i..prev_len],
+                    ))
+                    || (next_len > prev_len
+                        && self.last_msg_hash.is_some_and(|last| {
+                            let mut prev_ext = self.prefix_msg_hashes[i..prev_len].to_vec();
+                            prev_ext.push(last);
+                            is_reordered_slice(&prev_ext, &next.prefix_msg_hashes[i..=prev_len])
+                        }));
+                return Some(PrefixDrift {
+                    section: format!("message[{}]", next.msg_base_index + i),
+                    reason: if reordered { "reordered" } else { "changed" }.into(),
+                });
+            }
+        }
+        if next_len < prev_len {
+            return Some(PrefixDrift {
+                section: format!("message[{}]", next.msg_base_index + next_len),
+                reason: "truncated".into(),
+            });
+        }
+        if next_len > prev_len
+            && let Some(prev_last) = self.last_msg_hash
+            && next.prefix_msg_hashes[prev_len] != prev_last
+        {
+            return Some(PrefixDrift {
+                section: format!("message[{}]", next.msg_base_index + prev_len),
+                reason: "changed".into(),
+            });
+        }
+        None
+    }
+}
+
+struct PrefixSlot {
+    last_used: u64,
+    fingerprint: PrefixFingerprint,
+}
+
+/// Strictly bounded in-memory prefix tracker keyed by `(endpoint, model)`.
+#[derive(Default)]
+pub struct PrefixTracker {
+    slots: HashMap<(&'static str, String), PrefixSlot>,
+    tick: u64,
+}
+
+impl PrefixTracker {
+    /// Compares `next` against the prior fingerprint for `(endpoint, model)`,
+    /// updates the slot, and returns any detected [`PrefixDrift`].
+    pub fn observe(
+        &mut self,
+        endpoint: &'static str,
+        model: &str,
+        next: PrefixFingerprint,
+    ) -> Option<PrefixDrift> {
+        self.tick = self.tick.wrapping_add(1);
+        let key = (endpoint, model.to_owned());
+        if let Some(slot) = self.slots.get_mut(&key) {
+            let drift = slot.fingerprint.diff(&next);
+            slot.fingerprint = next;
+            slot.last_used = self.tick;
+            return drift;
+        }
+        if self.slots.len() >= MAX_TRACKER_SLOTS
+            && let Some(oldest) = self
+                .slots
+                .iter()
+                .min_by_key(|(_, slot)| slot.last_used)
+                .map(|(k, _)| k.clone())
+        {
+            self.slots.remove(&oldest);
+        }
+        self.slots.insert(
+            key,
+            PrefixSlot {
+                last_used: self.tick,
+                fingerprint: next,
+            },
+        );
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1069,5 +1461,380 @@ mod tests {
             after.value("context_management").unwrap()["edits"][0]["type"],
             EDIT
         );
+    }
+
+    fn observe(
+        tracker: &mut PrefixTracker,
+        endpoint: &'static str,
+        model: &str,
+        format: PrefixFormat,
+        body: &Value,
+    ) -> Option<PrefixDrift> {
+        let bytes = serde_json::to_vec(body).unwrap();
+        let parsed = Body::parse(&bytes).unwrap();
+        let fp = PrefixFingerprint::extract(&parsed, format).unwrap();
+        tracker.observe(endpoint, model, fp)
+    }
+
+    #[test]
+    fn prefix_tracker_reports_zero_drift_across_growing_multi_turn_conversations() {
+        let mut tracker = PrefixTracker::default();
+        let tools = json!([
+            {"name": "Read", "description": "Read a file"},
+            {"name": "Bash", "description": "Run a shell command"}
+        ]);
+
+        // 1. Anthropic Messages: growing turns + same-turn retry keep 0 drift.
+        let system = json!([{"type": "text", "text": "You are a coding agent."}]);
+        let anthropic_turns = [
+            vec![json!({"role": "user", "content": "Fix src/lib.rs"})],
+            vec![
+                json!({"role": "user", "content": "Fix src/lib.rs"}),
+                json!({"role": "assistant", "content": "Reading file."}),
+                json!({"role": "user", "content": "Here is the file."}),
+            ],
+            vec![
+                json!({"role": "user", "content": "Fix src/lib.rs"}),
+                json!({"role": "assistant", "content": "Reading file."}),
+                json!({"role": "user", "content": "Here is the file."}),
+                json!({"role": "assistant", "content": "Patch applied."}),
+                json!({"role": "user", "content": "Run tests."}),
+            ],
+            vec![
+                json!({"role": "user", "content": "Fix src/lib.rs"}),
+                json!({"role": "assistant", "content": "Reading file."}),
+                json!({"role": "user", "content": "Here is the file."}),
+                json!({"role": "assistant", "content": "Patch applied."}),
+                json!({"role": "user", "content": "Run tests with --locked."}),
+            ],
+        ];
+        for msgs in &anthropic_turns {
+            let body = json!({"model": OPUS, "system": system, "tools": tools, "messages": msgs});
+            assert_eq!(
+                observe(
+                    &mut tracker,
+                    "messages",
+                    OPUS,
+                    PrefixFormat::Anthropic,
+                    &body
+                ),
+                None
+            );
+        }
+
+        // 2. OpenAI Chat Completions: leading system + developer messages + growing turns.
+        let chat_1 = json!({
+            "model": "gpt-4o",
+            "tools": tools,
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "developer", "content": "Keep edits minimal."},
+                {"role": "user", "content": "Inspect billing.py"}
+            ]
+        });
+        let chat_2 = json!({
+            "model": "gpt-4o",
+            "tools": tools,
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {"role": "developer", "content": "Keep edits minimal."},
+                {"role": "user", "content": "Inspect billing.py"},
+                {"role": "assistant", "content": "Checked."},
+                {"role": "user", "content": "Now patch it."}
+            ]
+        });
+        for body in [&chat_1, &chat_2] {
+            assert_eq!(
+                observe(
+                    &mut tracker,
+                    "chat_completions",
+                    "gpt-4o",
+                    PrefixFormat::OpenAiChat,
+                    body
+                ),
+                None
+            );
+        }
+
+        // 3. OpenAI Responses: instructions + growing input items.
+        let resp_1 = json!({
+            "model": "gpt-5.4",
+            "instructions": "You are Codex.",
+            "tools": tools,
+            "input": [{"type": "message", "role": "user", "content": "Fix bug"}]
+        });
+        let resp_2 = json!({
+            "model": "gpt-5.4",
+            "instructions": "You are Codex.",
+            "tools": tools,
+            "input": [
+                {"type": "message", "role": "user", "content": "Fix bug"},
+                {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+            ]
+        });
+        for body in [&resp_1, &resp_2] {
+            assert_eq!(
+                observe(
+                    &mut tracker,
+                    "responses",
+                    "gpt-5.4",
+                    PrefixFormat::OpenAiResponses,
+                    body
+                ),
+                None
+            );
+        }
+
+        // 4. Google Gemini: systemInstruction + tools + growing contents.
+        let gem_tools = json!([{"functionDeclarations": [
+            {"name": "run_shell", "description": "Run shell"},
+            {"name": "read_file", "description": "Read file"}
+        ]}]);
+        let gem_1 = json!({
+            "systemInstruction": {"parts": [{"text": "You are Gemini."}]},
+            "tools": gem_tools,
+            "contents": [{"role": "user", "parts": [{"text": "Start"}]}]
+        });
+        let gem_2 = json!({
+            "systemInstruction": {"parts": [{"text": "You are Gemini."}]},
+            "tools": gem_tools,
+            "contents": [
+                {"role": "user", "parts": [{"text": "Start"}]},
+                {"role": "model", "parts": [{"text": "Working"}]},
+                {"role": "user", "parts": [{"text": "Continue"}]}
+            ]
+        });
+        for body in [&gem_1, &gem_2] {
+            assert_eq!(
+                observe(
+                    &mut tracker,
+                    "gemini",
+                    "gemini-2.5-pro",
+                    PrefixFormat::Gemini,
+                    body
+                ),
+                None
+            );
+        }
+
+        // 5. Memory cap: tracker never exceeds MAX_TRACKER_SLOTS.
+        for i in 0..(MAX_TRACKER_SLOTS + 10) {
+            let model = format!("model-{i}");
+            let body = json!({"model": model, "messages": [{"role": "user", "content": "hi"}]});
+            observe(
+                &mut tracker,
+                "messages",
+                &model,
+                PrefixFormat::Anthropic,
+                &body,
+            );
+        }
+        assert_eq!(tracker.slots.len(), MAX_TRACKER_SLOTS);
+    }
+
+    #[test]
+    fn prefix_tracker_detects_system_tools_and_message_drift_without_raw_prompt_text() {
+        let mut tracker = PrefixTracker::default();
+        let secret = "SUPER_SECRET_PROMPT_TOKEN_98765";
+        let read_tool = json!({"name": "Read", "description": "Read file"});
+        let bash_tool = json!({"name": "Bash", "description": "Run command"});
+        let base = json!({
+            "model": OPUS,
+            "system": format!("Time: 2026-11-26T12:00:00Z {secret}"),
+            "tools": [read_tool, bash_tool],
+            "messages": [
+                {"role": "user", "content": format!("First turn {secret}")},
+                {"role": "assistant", "content": "Second turn reply"},
+                {"role": "user", "content": "Third turn prompt"}
+            ]
+        });
+        assert_eq!(
+            observe(
+                &mut tracker,
+                "messages",
+                OPUS,
+                PrefixFormat::Anthropic,
+                &base
+            ),
+            None
+        );
+
+        // 1. Mutating a timestamp inside `system`.
+        let mut drifted_sys = base.clone();
+        drifted_sys["system"] = json!(format!("Time: 2026-11-26T12:00:01Z {secret}"));
+        let d_sys = observe(
+            &mut tracker,
+            "messages",
+            OPUS,
+            PrefixFormat::Anthropic,
+            &drifted_sys,
+        )
+        .unwrap();
+        assert_eq!(
+            d_sys,
+            PrefixDrift {
+                section: "system".into(),
+                reason: "changed".into(),
+            }
+        );
+
+        // 2. Reordering `tools` array.
+        let mut reordered_tools = drifted_sys.clone();
+        reordered_tools["tools"] = json!([bash_tool, read_tool]);
+        let d_tools = observe(
+            &mut tracker,
+            "messages",
+            OPUS,
+            PrefixFormat::Anthropic,
+            &reordered_tools,
+        )
+        .unwrap();
+        assert_eq!(
+            d_tools,
+            PrefixDrift {
+                section: "tools".into(),
+                reason: "reordered".into(),
+            }
+        );
+
+        // 3. Editing earlier message `messages[1]` on a growing turn.
+        let mut edited_msg = reordered_tools.clone();
+        edited_msg["messages"] = json!([
+            {"role": "user", "content": format!("First turn {secret}")},
+            {"role": "assistant", "content": format!("Mutated second turn {secret}")},
+            {"role": "user", "content": "Third turn prompt"},
+            {"role": "assistant", "content": "Fourth turn"},
+            {"role": "user", "content": "Fifth turn"}
+        ]);
+        let d_msg = observe(
+            &mut tracker,
+            "messages",
+            OPUS,
+            PrefixFormat::Anthropic,
+            &edited_msg,
+        )
+        .unwrap();
+        assert_eq!(
+            d_msg,
+            PrefixDrift {
+                section: "message[1]".into(),
+                reason: "changed".into(),
+            }
+        );
+
+        // 4. Truncating history reports `truncated` at the dropped boundary index.
+        let mut truncated = edited_msg.clone();
+        truncated["messages"] = json!([
+            {"role": "user", "content": format!("First turn {secret}")},
+            {"role": "assistant", "content": format!("Mutated second turn {secret}")},
+            {"role": "user", "content": "Third turn prompt"}
+        ]);
+        let d_trunc = observe(
+            &mut tracker,
+            "messages",
+            OPUS,
+            PrefixFormat::Anthropic,
+            &truncated,
+        )
+        .unwrap();
+        assert_eq!(
+            d_trunc,
+            PrefixDrift {
+                section: "message[2]".into(),
+                reason: "truncated".into(),
+            }
+        );
+
+        // 5. OpenAI Chat: leading `role: "system"` maps to `"system"`, and editing
+        // `messages[1]` reports `"message[1]"` (exact wire array index).
+        let chat_base = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "Rules v1"},
+                {"role": "user", "content": "Task A"},
+                {"role": "assistant", "content": "Ack"},
+                {"role": "user", "content": "Next"}
+            ]
+        });
+        assert_eq!(
+            observe(
+                &mut tracker,
+                "chat_completions",
+                "gpt-4o",
+                PrefixFormat::OpenAiChat,
+                &chat_base
+            ),
+            None
+        );
+        let mut chat_sys = chat_base.clone();
+        chat_sys["messages"][0]["content"] = json!("Rules v2");
+        let d_chat_sys = observe(
+            &mut tracker,
+            "chat_completions",
+            "gpt-4o",
+            PrefixFormat::OpenAiChat,
+            &chat_sys,
+        )
+        .unwrap();
+        assert_eq!(d_chat_sys.section, "system");
+        assert_eq!(d_chat_sys.reason, "changed");
+        let mut chat_m1 = chat_sys.clone();
+        chat_m1["messages"][1]["content"] = json!("Task A edited");
+        let d_chat_m1 = observe(
+            &mut tracker,
+            "chat_completions",
+            "gpt-4o",
+            PrefixFormat::OpenAiChat,
+            &chat_m1,
+        )
+        .unwrap();
+        assert_eq!(d_chat_m1.section, "message[1]");
+        assert_eq!(d_chat_m1.reason, "changed");
+
+        // 6. Gemini: reordering `functionDeclarations` inside `tools[0]` reports `"tools"` `"reordered"`.
+        let gem_a = json!({
+            "systemInstruction": {"parts": [{"text": "Sys"}]},
+            "tools": [{"functionDeclarations": [{"name": "a"}, {"name": "b"}]}],
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+        });
+        let gem_b = json!({
+            "systemInstruction": {"parts": [{"text": "Sys"}]},
+            "tools": [{"functionDeclarations": [{"name": "b"}, {"name": "a"}]}],
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+        });
+        assert_eq!(
+            observe(
+                &mut tracker,
+                "gemini",
+                "gemini-2.5-pro",
+                PrefixFormat::Gemini,
+                &gem_a
+            ),
+            None
+        );
+        let d_gem = observe(
+            &mut tracker,
+            "gemini",
+            "gemini-2.5-pro",
+            PrefixFormat::Gemini,
+            &gem_b,
+        )
+        .unwrap();
+        assert_eq!(
+            d_gem,
+            PrefixDrift {
+                section: "tools".into(),
+                reason: "reordered".into(),
+            }
+        );
+
+        // Zero raw prompt text or secrets ever appear in any serialized PrefixDrift.
+        for drift in [d_sys, d_tools, d_msg, d_trunc, d_chat_sys, d_chat_m1, d_gem] {
+            let serialized = serde_json::to_string(&drift).unwrap();
+            assert!(!serialized.contains(secret), "{serialized}");
+            assert!(!serialized.contains("2026-11-26"), "{serialized}");
+            assert!(!serialized.contains("Mutated"), "{serialized}");
+        }
     }
 }
