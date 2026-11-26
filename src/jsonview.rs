@@ -28,8 +28,10 @@
 //!   value as compact JSON, `KEY: N objects; fields: …` with the rows indented two
 //!   spaces, or `KEY:` with the members of a nested object indented two spaces.
 
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 
 /// The largest output this module reads.
 pub const LIMIT: usize = 8 * 1024 * 1024;
@@ -83,7 +85,13 @@ impl Root {
             Self::Lines => "JSON lines as a table",
             Self::Object => "JSON object with arrays of objects as tables",
         };
-        let mut out = format!("[{what}: {LEGEND_PREFIX_NOTE}");
+        let cap =
+            3 + what.len() + LEGEND_PREFIX_NOTE.len() + flags.extra_len() + LEGEND_SUFFIX.len() + 1;
+        let mut out = String::with_capacity(cap);
+        out.push('[');
+        out.push_str(what);
+        out.push_str(": ");
+        out.push_str(LEGEND_PREFIX_NOTE);
         if flags.nested {
             out.push_str(", {..} nested");
         }
@@ -200,13 +208,19 @@ impl<'a> Reader<'a> {
                 }
                 Some(Node::Object(members))
             }
-            b't' | b'f' | b'n' => {
-                let word = ["true", "false", "null"]
-                    .into_iter()
-                    .find(|word| self.text[start..].starts_with(word))?;
-                self.at += word.len();
-                Some(Node::Raw(word))
+            b't' if self.text[start..].starts_with("true") => {
+                self.at += 4;
+                Some(Node::Raw("true"))
             }
+            b'f' if self.text[start..].starts_with("false") => {
+                self.at += 5;
+                Some(Node::Raw("false"))
+            }
+            b'n' if self.text[start..].starts_with("null") => {
+                self.at += 4;
+                Some(Node::Raw("null"))
+            }
+            b't' | b'f' | b'n' => None,
             _ => self.number().map(Node::Raw),
         }
     }
@@ -306,9 +320,14 @@ fn compact(node: &Node, out: &mut String) {
 }
 
 fn compacted(node: &Node) -> String {
-    let mut out = String::new();
-    compact(node, &mut out);
-    out
+    match node {
+        Node::Raw(raw) => (*raw).to_owned(),
+        _ => {
+            let mut out = String::with_capacity(compacted_len(node));
+            compact(node, &mut out);
+            out
+        }
+    }
 }
 
 fn compacted_len(node: &Node) -> usize {
@@ -363,13 +382,20 @@ impl<'a> Json<'a> {
         if first != b'[' && first != b'{' {
             return None;
         }
+        // Valid RFC 8259 JSON never contains raw ESC (0x1B); reject ANSI-colored
+        // output (e.g. `jq -C`) immediately without allocating AST nodes.
+        if text.contains('\x1b') {
+            return None;
+        }
         let (root, node) = match parse(text) {
             Some(node @ Node::Array(_)) => (Root::Array, node),
             Some(node @ Node::Object(_)) => (Root::Object, node),
             Some(Node::Raw(_)) => return None,
             None => {
-                let mut records = Vec::new();
-                for line in text.trim_end().split('\n') {
+                let trimmed = text.trim_end();
+                let line_count = trimmed.bytes().filter(|&b| b == b'\n').count() + 1;
+                let mut records = Vec::with_capacity(line_count);
+                for line in trimmed.split('\n') {
                     match parse(line)? {
                         node @ Node::Object(_) => records.push(node),
                         _ => return None,
@@ -380,7 +406,16 @@ impl<'a> Json<'a> {
         };
         let original = match (root, &node) {
             (Root::Lines, Node::Array(records)) => {
-                records.iter().map(compacted).collect::<Vec<_>>().join("\n")
+                let total = records.iter().map(compacted_len).sum::<usize>()
+                    + records.len().saturating_sub(1);
+                let mut out = String::with_capacity(total);
+                for (idx, record) in records.iter().enumerate() {
+                    if idx > 0 {
+                        out.push('\n');
+                    }
+                    compact(record, &mut out);
+                }
+                out
             }
             (_, node) => compacted(node),
         };
@@ -392,7 +427,7 @@ impl<'a> Json<'a> {
     }
 
     fn render_tables(&self, group: bool, deep: bool) -> Option<(String, LegendFlags, usize)> {
-        let mut body = String::new();
+        let mut body = String::with_capacity(self.original.len() / 2);
         let mut flags = LegendFlags::default();
         let mut deep_savings = 0usize;
         let shown = match (self.root, &self.node) {
@@ -420,7 +455,9 @@ impl<'a> Json<'a> {
         if !shown {
             return None;
         }
-        let mut view = self.root.legend(flags);
+        let legend = self.root.legend(flags);
+        let mut view = String::with_capacity(legend.len() + body.len());
+        view.push_str(&legend);
         view.push_str(&body);
         (decode(&view)? == self.original).then_some((view, flags, deep_savings))
     }
@@ -449,7 +486,11 @@ impl<'a> Json<'a> {
     /// The same JSON without the whitespace between its tokens, after a legend
     /// line, when it decodes to the same data.
     fn compact(&self) -> Option<String> {
-        let view = format!("{COMPACT}\n{}\n", self.original);
+        let mut view = String::with_capacity(COMPACT.len() + self.original.len() + 2);
+        view.push_str(COMPACT);
+        view.push('\n');
+        view.push_str(&self.original);
+        view.push('\n');
         (decode(&view)? == self.original).then_some(view)
     }
 }
@@ -559,6 +600,17 @@ fn columns_from_refs<'n, 'a>(
     let mut fast_ok = true;
     let (mut widest, mut present) = (0usize, 0usize);
     for members in &member_slices {
+        if !keys.is_empty()
+            && members.len() == keys.len()
+            && keys
+                .iter()
+                .zip(members.iter())
+                .all(|(&k, (mk, _))| k == *mk)
+        {
+            widest = members.len().max(widest);
+            present += members.len();
+            continue;
+        }
         if let Some(merged) = try_merge_keys(&keys, members) {
             keys = merged;
             widest = members.len().max(widest);
@@ -721,7 +773,14 @@ fn format_trimmed_tuple(cells: &[Option<String>]) -> String {
     let Some(last) = cells.iter().rposition(Option::is_some) else {
         return String::from("()");
     };
-    let mut out = String::from("(");
+    let cap = 2
+        + last
+        + cells[..=last]
+            .iter()
+            .map(|c| c.as_deref().map_or(0, str::len))
+            .sum::<usize>();
+    let mut out = String::with_capacity(cap);
+    out.push('(');
     for (index, cell) in cells[..=last].iter().enumerate() {
         if index > 0 {
             out.push(',');
@@ -745,17 +804,30 @@ fn choose_majority_default(
         return None;
     }
     let mut absent_count = 0usize;
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut counts: HashMap<&str, usize> = HashMap::with_capacity(total.min(64));
     for cell in rendered {
         match cell {
             Some(val) => *counts.entry(val.as_str()).or_insert(0) += 1,
             None => absent_count += 1,
         }
     }
-    let mut ranked: Vec<(&str, usize)> = counts.into_iter().collect();
-    ranked.sort_by_key(|&(val, count)| (Reverse(count), Reverse(val.len()), val));
-    let &(best_val, best_count) = ranked.first()?;
-    let second_count = ranked.get(1).map_or(0, |&(_, c)| c);
+    let mut best: Option<(&str, usize)> = None;
+    let mut second_count = 0usize;
+    for (val, count) in counts {
+        let better = match best {
+            None => true,
+            Some((bv, bc)) => (count, val.len(), Reverse(val)) > (bc, bv.len(), Reverse(bv)),
+        };
+        if better {
+            if let Some((_, bc)) = best {
+                second_count = second_count.max(bc);
+            }
+            best = Some((val, count));
+        } else {
+            second_count = second_count.max(count);
+        }
+    }
+    let (best_val, best_count) = best?;
     if best_count * 2 < total || best_count <= second_count {
         return None;
     }
@@ -822,7 +894,7 @@ fn build_nested_schema<'n, 'a>(
 
     for (col_idx, &key) in keys.iter().enumerate() {
         let col_nodes: Vec<Option<&Node>> = conforming_rows.iter().map(|r| r[col_idx]).collect();
-        let choice = plan_column(&col_nodes, depth, true);
+        let choice = plan_column(&col_nodes, depth, true, false);
         if col_idx > 0 {
             header.push(',');
         }
@@ -854,14 +926,23 @@ fn build_nested_schema<'n, 'a>(
 }
 
 /// Plan the smallest lossless encoding for one column across `conforming` rows.
-fn plan_column<'n, 'a>(cells: &[Option<&'n Node<'a>>], depth: usize, deep: bool) -> ColumnChoice {
+fn plan_column<'n, 'a>(
+    cells: &[Option<&'n Node<'a>>],
+    depth: usize,
+    deep: bool,
+    need_group: bool,
+) -> ColumnChoice {
     let raw_texts: Vec<Option<String>> = cells.iter().map(|cell| cell.map(compacted)).collect();
 
     // Constant column: every conforming row holds this key with the exact same value.
     if let Some(first) = &raw_texts[0]
-        && raw_texts.iter().all(|cell| cell.as_ref() == Some(first))
+        && raw_texts[1..]
+            .iter()
+            .all(|cell| cell.as_ref() == Some(first))
     {
-        let header_suffix = format!("={first}");
+        let mut header_suffix = String::with_capacity(1 + first.len());
+        header_suffix.push('=');
+        header_suffix.push_str(first);
         let cost = header_suffix.len();
         return ColumnChoice {
             header_suffix,
@@ -877,11 +958,34 @@ fn plan_column<'n, 'a>(cells: &[Option<&'n Node<'a>>], depth: usize, deep: bool)
     }
 
     let plain_cost = cells_byte_len(&raw_texts);
+    if !deep {
+        let group_values = if need_group {
+            raw_texts.clone()
+        } else {
+            Vec::new()
+        };
+        return ColumnChoice {
+            header_suffix: String::new(),
+            cells: raw_texts,
+            group_header_suffix: String::new(),
+            group_values,
+            group_flags: LegendFlags::default(),
+            cost: plain_cost,
+            flags: LegendFlags::default(),
+            savings_vs_plain: 0,
+            is_constant: false,
+        };
+    }
+
     let mut best = ColumnChoice {
         header_suffix: String::new(),
         cells: raw_texts.clone(),
         group_header_suffix: String::new(),
-        group_values: raw_texts.clone(),
+        group_values: if need_group {
+            raw_texts.clone()
+        } else {
+            Vec::new()
+        },
         group_flags: LegendFlags::default(),
         cost: plain_cost,
         flags: LegendFlags::default(),
@@ -889,16 +993,14 @@ fn plan_column<'n, 'a>(cells: &[Option<&'n Node<'a>>], depth: usize, deep: bool)
         is_constant: false,
     };
 
-    if !deep {
-        return best;
-    }
-
     let inside_tuple = depth > 0;
 
     // Candidate 1: Plain column with majority default `?=V`.
     if let Some((default_val, default_cells, _)) = choose_majority_default(&raw_texts, inside_tuple)
     {
-        let header_suffix = format!("?={default_val}");
+        let mut header_suffix = String::with_capacity(2 + default_val.len());
+        header_suffix.push_str("?=");
+        header_suffix.push_str(&default_val);
         let cost = header_suffix.len() + cells_byte_len(&default_cells);
         if cost < best.cost {
             let flags = LegendFlags {
@@ -909,7 +1011,11 @@ fn plan_column<'n, 'a>(cells: &[Option<&'n Node<'a>>], depth: usize, deep: bool)
                 header_suffix,
                 cells: default_cells,
                 group_header_suffix: String::new(),
-                group_values: raw_texts.clone(),
+                group_values: if need_group {
+                    raw_texts.clone()
+                } else {
+                    Vec::new()
+                },
                 group_flags: LegendFlags::default(),
                 cost,
                 flags,
@@ -946,27 +1052,20 @@ fn plan_column<'n, 'a>(cells: &[Option<&'n Node<'a>>], depth: usize, deep: bool)
                 Some(_) => raw_texts[i].clone(),
             })
             .collect();
-        let base_suffix = format!("{{{sub_header}}}");
+        let mut base_suffix = String::with_capacity(sub_header.len() + 2);
+        base_suffix.push('{');
+        base_suffix.push_str(&sub_header);
+        base_suffix.push('}');
         let base_cost = base_suffix.len() + cells_byte_len(&mapped);
-        if base_cost < best.cost {
-            best = ColumnChoice {
-                header_suffix: base_suffix.clone(),
-                cells: mapped.clone(),
-                group_header_suffix: base_suffix.clone(),
-                group_values: mapped.clone(),
-                group_flags: sub_flags,
-                cost: base_cost,
-                flags: sub_flags,
-                savings_vs_plain: plain_cost - base_cost,
-                is_constant: false,
-            };
-        }
-        if let Some((default_val, default_cells, _)) =
-            choose_majority_default(&mapped, inside_tuple)
-        {
-            let header_suffix = format!("{base_suffix}?={default_val}");
+        let default_cand = choose_majority_default(&mapped, inside_tuple);
+        if let Some((default_val, default_cells, _)) = default_cand {
+            let mut header_suffix =
+                String::with_capacity(base_suffix.len() + 2 + default_val.len());
+            header_suffix.push_str(&base_suffix);
+            header_suffix.push_str("?=");
+            header_suffix.push_str(&default_val);
             let cost = header_suffix.len() + cells_byte_len(&default_cells);
-            if cost < best.cost {
+            if cost < best.cost && cost < base_cost {
                 let flags = LegendFlags {
                     default: true,
                     ..sub_flags
@@ -974,15 +1073,59 @@ fn plan_column<'n, 'a>(cells: &[Option<&'n Node<'a>>], depth: usize, deep: bool)
                 best = ColumnChoice {
                     header_suffix,
                     cells: default_cells,
-                    group_header_suffix: base_suffix,
-                    group_values: mapped,
+                    group_header_suffix: if need_group {
+                        base_suffix
+                    } else {
+                        String::new()
+                    },
+                    group_values: if need_group { mapped } else { Vec::new() },
                     group_flags: sub_flags,
                     cost,
                     flags,
                     savings_vs_plain: plain_cost - cost,
                     is_constant: false,
                 };
+            } else if base_cost < best.cost {
+                best = ColumnChoice {
+                    header_suffix: base_suffix.clone(),
+                    group_header_suffix: if need_group {
+                        base_suffix
+                    } else {
+                        String::new()
+                    },
+                    group_values: if need_group {
+                        mapped.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    cells: mapped,
+                    group_flags: sub_flags,
+                    cost: base_cost,
+                    flags: sub_flags,
+                    savings_vs_plain: plain_cost - base_cost,
+                    is_constant: false,
+                };
             }
+        } else if base_cost < best.cost {
+            best = ColumnChoice {
+                header_suffix: base_suffix.clone(),
+                group_header_suffix: if need_group {
+                    base_suffix
+                } else {
+                    String::new()
+                },
+                group_values: if need_group {
+                    mapped.clone()
+                } else {
+                    Vec::new()
+                },
+                cells: mapped,
+                group_flags: sub_flags,
+                cost: base_cost,
+                flags: sub_flags,
+                savings_vs_plain: plain_cost - base_cost,
+                is_constant: false,
+            };
         }
     }
 
@@ -1003,19 +1146,26 @@ fn plan_column<'n, 'a>(cells: &[Option<&'n Node<'a>>], depth: usize, deep: bool)
                 build_nested_schema(&all_elems, depth + 1)
         {
             sub_flags.subtable = true;
-            let mut elem_iter = elem_renders.into_iter();
+            let mut elem_cursor = 0usize;
             let mapped: Vec<Option<String>> = cells
                 .iter()
                 .enumerate()
                 .map(|(i, cell)| match cell {
                     None => None,
                     Some(Node::Array(elems)) => {
-                        let mut arr = String::from("[");
-                        for idx in 0..elems.len() {
+                        let count = elems.len();
+                        let slice = &elem_renders[elem_cursor..elem_cursor + count];
+                        elem_cursor += count;
+                        let cap = 2
+                            + count.saturating_sub(1)
+                            + slice.iter().map(String::len).sum::<usize>();
+                        let mut arr = String::with_capacity(cap);
+                        arr.push('[');
+                        for (idx, item) in slice.iter().enumerate() {
                             if idx > 0 {
                                 arr.push(',');
                             }
-                            arr.push_str(&elem_iter.next().unwrap_or_default());
+                            arr.push_str(item);
                         }
                         arr.push(']');
                         Some(arr)
@@ -1023,27 +1173,20 @@ fn plan_column<'n, 'a>(cells: &[Option<&'n Node<'a>>], depth: usize, deep: bool)
                     Some(_) => raw_texts[i].clone(),
                 })
                 .collect();
-            let base_suffix = format!(":[{sub_header}]");
+            let mut base_suffix = String::with_capacity(sub_header.len() + 3);
+            base_suffix.push_str(":[");
+            base_suffix.push_str(&sub_header);
+            base_suffix.push(']');
             let base_cost = base_suffix.len() + cells_byte_len(&mapped);
-            if base_cost < best.cost {
-                best = ColumnChoice {
-                    header_suffix: base_suffix.clone(),
-                    cells: mapped.clone(),
-                    group_header_suffix: base_suffix.clone(),
-                    group_values: mapped.clone(),
-                    group_flags: sub_flags,
-                    cost: base_cost,
-                    flags: sub_flags,
-                    savings_vs_plain: plain_cost - base_cost,
-                    is_constant: false,
-                };
-            }
-            if let Some((default_val, default_cells, _)) =
-                choose_majority_default(&mapped, inside_tuple)
-            {
-                let header_suffix = format!("{base_suffix}?={default_val}");
+            let default_cand = choose_majority_default(&mapped, inside_tuple);
+            if let Some((default_val, default_cells, _)) = default_cand {
+                let mut header_suffix =
+                    String::with_capacity(base_suffix.len() + 2 + default_val.len());
+                header_suffix.push_str(&base_suffix);
+                header_suffix.push_str("?=");
+                header_suffix.push_str(&default_val);
                 let cost = header_suffix.len() + cells_byte_len(&default_cells);
-                if cost < best.cost {
+                if cost < best.cost && cost < base_cost {
                     let flags = LegendFlags {
                         default: true,
                         ..sub_flags
@@ -1051,20 +1194,76 @@ fn plan_column<'n, 'a>(cells: &[Option<&'n Node<'a>>], depth: usize, deep: bool)
                     best = ColumnChoice {
                         header_suffix,
                         cells: default_cells,
-                        group_header_suffix: base_suffix,
-                        group_values: mapped,
+                        group_header_suffix: if need_group {
+                            base_suffix
+                        } else {
+                            String::new()
+                        },
+                        group_values: if need_group { mapped } else { Vec::new() },
                         group_flags: sub_flags,
                         cost,
                         flags,
                         savings_vs_plain: plain_cost - cost,
                         is_constant: false,
                     };
+                } else if base_cost < best.cost {
+                    best = ColumnChoice {
+                        header_suffix: base_suffix.clone(),
+                        group_header_suffix: if need_group {
+                            base_suffix
+                        } else {
+                            String::new()
+                        },
+                        group_values: if need_group {
+                            mapped.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        cells: mapped,
+                        group_flags: sub_flags,
+                        cost: base_cost,
+                        flags: sub_flags,
+                        savings_vs_plain: plain_cost - base_cost,
+                        is_constant: false,
+                    };
                 }
+            } else if base_cost < best.cost {
+                best = ColumnChoice {
+                    header_suffix: base_suffix.clone(),
+                    group_header_suffix: if need_group {
+                        base_suffix
+                    } else {
+                        String::new()
+                    },
+                    group_values: if need_group {
+                        mapped.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    cells: mapped,
+                    group_flags: sub_flags,
+                    cost: base_cost,
+                    flags: sub_flags,
+                    savings_vs_plain: plain_cost - base_cost,
+                    is_constant: false,
+                };
             }
         }
     }
 
     best
+}
+
+fn push_spaces(out: &mut String, count: usize) {
+    const SPACES: &str = "                ";
+    let mut remaining = count;
+    while remaining >= SPACES.len() {
+        out.push_str(SPACES);
+        remaining -= SPACES.len();
+    }
+    if remaining > 0 {
+        out.push_str(&SPACES[..remaining]);
+    }
 }
 
 /// Write `items` as a table when that is smaller than their compact JSON.
@@ -1097,7 +1296,7 @@ fn table(
     let mut choices: Vec<ColumnChoice> = Vec::with_capacity(keys.len());
     for col_idx in 0..keys.len() {
         let col_nodes: Vec<Option<&Node>> = conforming_rows.iter().map(|r| r[col_idx]).collect();
-        choices.push(plan_column(&col_nodes, 0, deep));
+        choices.push(plan_column(&col_nodes, 0, deep, group));
     }
 
     let varying: Vec<usize> = (0..keys.len())
@@ -1127,8 +1326,8 @@ fn table(
         }
     }
 
-    let pad = " ".repeat(indent);
-    let mut block = format!("{} objects; fields: ", items.len());
+    let mut block = String::with_capacity(inline / 2 + 64);
+    let _ = write!(block, "{} objects; fields: ", items.len());
     for (column, key) in keys.iter().enumerate() {
         if column > 0 {
             block.push(',');
@@ -1148,7 +1347,7 @@ fn table(
     let mut conf_cursor = 0usize;
     for (item_idx, row) in rows.iter().enumerate() {
         if row.is_none() {
-            block.push_str(&pad);
+            push_spaces(&mut block, indent);
             block.push('!');
             compact(&items[item_idx], &mut block);
             block.push('\n');
@@ -1158,7 +1357,7 @@ fn table(
             let value = choices[column].group_values[conf_cursor].as_deref();
             if current != Some(value) {
                 current = Some(value);
-                block.push_str(&pad);
+                push_spaces(&mut block, indent);
                 block.push('@');
                 if let Some(value) = value {
                     block.push(' ');
@@ -1167,7 +1366,7 @@ fn table(
                 block.push('\n');
             }
         }
-        block.push_str(&pad);
+        push_spaces(&mut block, indent);
         let mut first = true;
         for &column in varying.iter().filter(|&&c| grouped != Some(c)) {
             if !first {
@@ -1235,16 +1434,16 @@ fn expand(
     if depth > EXPAND_DEPTH || members.is_empty() {
         return false;
     }
-    let pad = " ".repeat(indent);
     let mut block = String::new();
+    let mut nested = String::new();
     let mut any = false;
     let mut local_flags = LegendFlags::default();
     let mut local_savings = 0usize;
     for (key, value) in members {
-        block.push_str(&pad);
+        push_spaces(&mut block, indent);
         block.push_str(field_name(key));
         block.push(':');
-        let mut nested = String::new();
+        nested.clear();
         let shown = match value {
             Node::Array(items) => table(
                 items,
@@ -1297,33 +1496,37 @@ fn decode(view: &str) -> Option<String> {
     if legend == COMPACT {
         // Each line is one value written compact: the document, or one JSON line's
         // record.
-        return lines
-            .map(|line| {
-                value_at(line, 0)
-                    .filter(|(value, end)| *end == line.len() && value == line)
-                    .map(|(value, _)| value)
-            })
-            .collect::<Option<Vec<_>>>()
-            .filter(|values| !values.is_empty())
-            .map(|values| values.join("\n"));
+        let mut out = String::with_capacity(view.len().saturating_sub(legend.len() + 1));
+        let mut count = 0usize;
+        for line in lines {
+            let (value, end) = value_at(line, 0)?;
+            if end != line.len() || value.as_ref() != line {
+                return None;
+            }
+            if count > 0 {
+                out.push('\n');
+            }
+            out.push_str(&value);
+            count += 1;
+        }
+        return (count > 0).then_some(out);
     }
     let root = Root::from_legend(legend)?;
     let mut lines = lines.peekable();
-    let mut out = String::new();
+    let mut out = String::with_capacity(view.len());
     match root {
         Root::Object => {
             members(&mut lines, 0, &mut out)?;
         }
-        Root::Array | Root::Lines => {
+        Root::Array => {
             let header = lines.next()?;
-            let rows = decode_table(header, &mut lines, 0)?;
-            if root == Root::Array {
-                out.push('[');
-                out.push_str(&rows.join(","));
-                out.push(']');
-            } else {
-                out.push_str(&rows.join("\n"));
-            }
+            out.push('[');
+            decode_table_into(header, &mut lines, 0, ',', &mut out)?;
+            out.push(']');
+        }
+        Root::Lines => {
+            let header = lines.next()?;
+            decode_table_into(header, &mut lines, 0, '\n', &mut out)?;
         }
     }
     lines.next().is_none().then_some(out)
@@ -1335,7 +1538,7 @@ fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start_matches(' ').len()
 }
 
-fn members(lines: &mut Lines, indent: usize, out: &mut String) -> Option<()> {
+fn members<'v>(lines: &mut Lines<'v>, indent: usize, out: &mut String) -> Option<()> {
     out.push('{');
     let mut first = true;
     while let Some(line) = lines.peek() {
@@ -1356,9 +1559,8 @@ fn members(lines: &mut Lines, indent: usize, out: &mut String) -> Option<()> {
         } else {
             let rest = rest.strip_prefix(' ')?;
             if table_header(rest).is_some() {
-                let rows = decode_table(rest, lines, indent + 2)?;
                 out.push('[');
-                out.push_str(&rows.join(","));
+                decode_table_into(rest, lines, indent + 2, ',', out)?;
                 out.push(']');
             } else {
                 let (value, end) = value_at(rest, 0)?;
@@ -1377,17 +1579,23 @@ fn members(lines: &mut Lines, indent: usize, out: &mut String) -> Option<()> {
 }
 
 /// One key at the start of `text`, bare or quoted, as a JSON string, and the rest.
-fn header_key(text: &str) -> Option<(String, &str)> {
+fn header_key(text: &str) -> Option<(Cow<'_, str>, &str)> {
     if text.starts_with('"') {
         let mut reader = Reader::new(text, 0);
         let key = reader.string()?;
-        return Some((key.to_owned(), &text[reader.at..]));
+        return Some((Cow::Borrowed(key), &text[reader.at..]));
     }
     let end = text
         .find([',', '=', ':', '?', '{', '}', ']'])
         .unwrap_or(text.len());
     let name = &text[..end];
-    bare(name).then(|| (format!("\"{name}\""), &text[end..]))
+    bare(name).then(|| {
+        let mut quoted = String::with_capacity(name.len() + 2);
+        quoted.push('"');
+        quoted.push_str(name);
+        quoted.push('"');
+        (Cow::Owned(quoted), &text[end..])
+    })
 }
 
 /// The row count and fields of a table header.
@@ -1400,35 +1608,40 @@ fn table_header(line: &str) -> Option<(usize, &str)> {
 }
 
 /// One compact JSON value at `at` in `text`, and where it ends.
-fn value_at(text: &str, at: usize) -> Option<(String, usize)> {
+fn value_at(text: &str, at: usize) -> Option<(Cow<'_, str>, usize)> {
     let mut reader = Reader::new(text, at);
     if matches!(reader.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
         return None;
     }
     let node = reader.value(0)?;
-    Some((compacted(&node), reader.at))
+    let val = match node {
+        Node::Raw(raw) => Cow::Borrowed(raw),
+        other => Cow::Owned(compacted(&other)),
+    };
+    Some((val, reader.at))
 }
 
-struct DecodedSchema {
-    fields: Vec<DecodedField>,
+struct DecodedSchema<'v> {
+    fields: Vec<DecodedField<'v>>,
+    varying_indices: Vec<usize>,
 }
 
-struct DecodedField {
-    key: String,
-    shape: DecodedShape,
-    mode: DecodedMode,
+struct DecodedField<'v> {
+    key: Cow<'v, str>,
+    shape: DecodedShape<'v>,
+    mode: DecodedMode<'v>,
 }
 
-enum DecodedShape {
+enum DecodedShape<'v> {
     Plain,
-    Object(DecodedSchema),
-    SubTable(DecodedSchema),
+    Object(DecodedSchema<'v>),
+    SubTable(DecodedSchema<'v>),
 }
 
-enum DecodedMode {
-    Constant(String),
+enum DecodedMode<'v> {
+    Constant(Cow<'v, str>),
     Group,
-    Varying { default: Option<String> },
+    Varying { default: Option<Cow<'v, str>> },
 }
 
 fn parse_schema(
@@ -1437,11 +1650,12 @@ fn parse_schema(
     stop_at: Option<u8>,
     allow_group: bool,
     depth: usize,
-) -> Option<(DecodedSchema, usize)> {
+) -> Option<(DecodedSchema<'_>, usize)> {
     if depth > MAX_UNPACK_DEPTH {
         return None;
     }
     let mut fields = Vec::new();
+    let mut varying_indices = Vec::new();
     let mut seen_group = false;
     while at < text.len() {
         if stop_at.is_some_and(|b| text.as_bytes()[at] == b) {
@@ -1501,12 +1715,25 @@ fn parse_schema(
             DecodedMode::Varying { default: None }
         };
 
+        if matches!(mode, DecodedMode::Varying { .. }) {
+            varying_indices.push(fields.len());
+        }
         fields.push(DecodedField { key, shape, mode });
     }
-    (!fields.is_empty()).then_some((DecodedSchema { fields }, at))
+    (!fields.is_empty()).then_some((
+        DecodedSchema {
+            fields,
+            varying_indices,
+        },
+        at,
+    ))
 }
 
-fn decode_present_value(shape: &DecodedShape, text: &str, at: usize) -> Option<(String, usize)> {
+fn decode_present_value<'v>(
+    shape: &DecodedShape<'v>,
+    text: &'v str,
+    at: usize,
+) -> Option<(Cow<'v, str>, usize)> {
     match shape {
         DecodedShape::Plain => value_at(text, at),
         DecodedShape::Object(sub) => {
@@ -1526,46 +1753,53 @@ fn decode_present_value(shape: &DecodedShape, text: &str, at: usize) -> Option<(
     }
 }
 
-fn assemble_object(
-    schema: &DecodedSchema,
-    group: Option<&Option<String>>,
-    cells: Vec<Option<String>>,
-) -> Option<String> {
-    let mut cells = cells.into_iter();
-    let mut object = String::from("{");
+fn assemble_object_into(
+    schema: &DecodedSchema<'_>,
+    group: Option<&Option<Cow<'_, str>>>,
+    cells: &[Option<Cow<'_, str>>],
+    out: &mut String,
+) -> Option<()> {
+    let mut cell_idx = 0usize;
+    out.push('{');
+    let mut wrote_any = false;
     for field in &schema.fields {
         let value = match &field.mode {
-            DecodedMode::Constant(value) => Some(value.clone()),
-            DecodedMode::Group => group?.clone(),
-            DecodedMode::Varying { .. } => cells.next()?,
+            DecodedMode::Constant(value) => Some(value.as_ref()),
+            DecodedMode::Group => group?.as_deref(),
+            DecodedMode::Varying { .. } => {
+                let cell = cells.get(cell_idx)?;
+                cell_idx += 1;
+                cell.as_deref()
+            }
         };
         if let Some(value) = value {
-            if object.len() > 1 {
-                object.push(',');
+            if wrote_any {
+                out.push(',');
             }
-            object.push_str(&field.key);
-            object.push(':');
-            object.push_str(&value);
+            wrote_any = true;
+            out.push_str(&field.key);
+            out.push(':');
+            out.push_str(value);
         }
     }
-    object.push('}');
-    Some(object)
+    out.push('}');
+    Some(())
 }
 
-fn decode_tuple(schema: &DecodedSchema, text: &str, mut at: usize) -> Option<(String, usize)> {
+fn decode_tuple<'v>(
+    schema: &DecodedSchema<'v>,
+    text: &'v str,
+    mut at: usize,
+) -> Option<(Cow<'v, str>, usize)> {
     (text.as_bytes().get(at) == Some(&b'(')).then_some(())?;
     at += 1;
-    let varying: Vec<&DecodedField> = schema
-        .fields
-        .iter()
-        .filter(|field| matches!(field.mode, DecodedMode::Varying { .. }))
-        .collect();
-    let mut cells = Vec::with_capacity(varying.len());
+    let mut cells: Vec<Option<Cow<'v, str>>> = Vec::with_capacity(schema.varying_indices.len());
     if text.as_bytes().get(at) == Some(&b')') {
         at += 1;
     } else {
         loop {
-            let field = *varying.get(cells.len())?;
+            let field_idx = *schema.varying_indices.get(cells.len())?;
+            let field = &schema.fields[field_idx];
             let DecodedMode::Varying { default } = &field.mode else {
                 unreachable!()
             };
@@ -1592,28 +1826,35 @@ fn decode_tuple(schema: &DecodedSchema, text: &str, mut at: usize) -> Option<(St
             }
         }
     }
-    for field in &varying[cells.len()..] {
-        let DecodedMode::Varying { default } = &field.mode else {
+    for &field_idx in &schema.varying_indices[cells.len()..] {
+        let DecodedMode::Varying { default } = &schema.fields[field_idx].mode else {
             unreachable!()
         };
         cells.push(default.clone());
     }
-    let object = assemble_object(schema, None, cells)?;
-    Some((object, at))
+    let est = 2
+        + schema.fields.len() * 4
+        + cells
+            .iter()
+            .map(|c| c.as_deref().map_or(0, str::len))
+            .sum::<usize>();
+    let mut object = String::with_capacity(est);
+    assemble_object_into(schema, None, &cells, &mut object)?;
+    Some((Cow::Owned(object), at))
 }
 
-fn decode_subtable_array(
-    schema: &DecodedSchema,
-    text: &str,
+fn decode_subtable_array<'v>(
+    schema: &DecodedSchema<'v>,
+    text: &'v str,
     mut at: usize,
-) -> Option<(String, usize)> {
+) -> Option<(Cow<'v, str>, usize)> {
     (text.as_bytes().get(at) == Some(&b'[')).then_some(())?;
     at += 1;
-    let mut out = String::from("[");
     if text.as_bytes().get(at) == Some(&b']') {
-        out.push(']');
-        return Some((out, at + 1));
+        return Some((Cow::Borrowed("[]"), at + 1));
     }
+    let mut out = String::with_capacity(64);
+    out.push('[');
     loop {
         if out.len() > 1 {
             out.push(',');
@@ -1629,14 +1870,20 @@ fn decode_subtable_array(
             b',' => at += 1,
             b']' => {
                 out.push(']');
-                return Some((out, at + 1));
+                return Some((Cow::Owned(out), at + 1));
             }
             _ => return None,
         }
     }
 }
 
-fn decode_table(header: &str, lines: &mut Lines, indent: usize) -> Option<Vec<String>> {
+fn decode_table_into<'v>(
+    header: &'v str,
+    lines: &mut Lines<'v>,
+    indent: usize,
+    sep: char,
+    out: &mut String,
+) -> Option<()> {
     let (count, rest) = table_header(header)?;
     let (schema, end) = parse_schema(rest, 0, None, true, 0)?;
     if end != rest.len() {
@@ -1646,15 +1893,11 @@ fn decode_table(header: &str, lines: &mut Lines, indent: usize) -> Option<Vec<St
         .fields
         .iter()
         .find(|field| matches!(field.mode, DecodedMode::Group));
-    let varying: Vec<&DecodedField> = schema
-        .fields
-        .iter()
-        .filter(|field| matches!(field.mode, DecodedMode::Varying { .. }))
-        .collect();
 
-    let mut group: Option<Option<String>> = None;
-    let mut rows = Vec::with_capacity(count);
-    while rows.len() < count {
+    let mut group: Option<Option<Cow<'v, str>>> = None;
+    let mut cells: Vec<Option<Cow<'v, str>>> = Vec::with_capacity(schema.varying_indices.len());
+    let mut decoded_rows = 0usize;
+    while decoded_rows < count {
         let line = lines.next()?;
         let line = line.get(indent..).filter(|_| indent_of(line) >= indent)?;
         if let Some(rest) = line.strip_prefix('@') {
@@ -1669,6 +1912,9 @@ fn decode_table(header: &str, lines: &mut Lines, indent: usize) -> Option<Vec<St
             });
             continue;
         }
+        if decoded_rows > 0 {
+            out.push(sep);
+        }
         if let Some(rest) = line.strip_prefix('!') {
             if !rest.starts_with('{') {
                 return None;
@@ -1677,16 +1923,18 @@ fn decode_table(header: &str, lines: &mut Lines, indent: usize) -> Option<Vec<St
             if end != rest.len() {
                 return None;
             }
-            rows.push(value);
+            out.push_str(&value);
+            decoded_rows += 1;
             continue;
         }
-        let mut cells = Vec::with_capacity(varying.len());
+        cells.clear();
         let mut at = 0;
-        for (index, field) in varying.iter().enumerate() {
+        for (index, &field_idx) in schema.varying_indices.iter().enumerate() {
             if index > 0 {
                 (line.as_bytes().get(at) == Some(&b',')).then_some(())?;
                 at += 1;
             }
+            let field = &schema.fields[field_idx];
             let DecodedMode::Varying { default } = &field.mode else {
                 unreachable!()
             };
@@ -1705,9 +1953,10 @@ fn decode_table(header: &str, lines: &mut Lines, indent: usize) -> Option<Vec<St
         if at != line.len() {
             return None;
         }
-        rows.push(assemble_object(&schema, group.as_ref(), cells)?);
+        assemble_object_into(&schema, group.as_ref(), &cells, out)?;
+        decoded_rows += 1;
     }
-    Some(rows)
+    Some(())
 }
 
 #[cfg(test)]
@@ -2532,6 +2781,82 @@ mod tests {
                         "trial {trial} group={group} failed round-trip:\n{v}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn ansi_fast_path_rejects_raw_esc_but_preserves_escaped_u001b_serde_value() {
+        // Raw ANSI ESC (e.g. `jq -C` colorized JSON) must fail closed cleanly.
+        let mut colored = String::from("[\n");
+        for i in 1..=12 {
+            let comma = if i == 12 { "" } else { "," };
+            let _ = writeln!(
+                colored,
+                "  {{\"id\": {i}, \"status\": \"\x1b[32mok\x1b[0m\", \"region\": \"us-east-1\"}}{comma}"
+            );
+        }
+        colored.push_str("]\n");
+        assert!(Json::read(&colored).is_none());
+        assert!(views(&colored, true).is_empty());
+
+        // Valid JSON containing escaped `\u001b` inside strings, nested objects,
+        // sub-tables, and grouped runs must round-trip to both the exact compact JSON
+        // AND the exact `serde_json::Value`.
+        let mut valid = String::from("{\n  \"meta\": {\"version\": 2},\n  \"items\": [\n");
+        for i in 1..=16 {
+            let group = if i <= 8 { "alpha" } else { "beta" };
+            let msg = if i % 4 == 0 {
+                r#"\u001b[32mok\u001b[0m"#
+            } else {
+                "plain"
+            };
+            let comma = if i == 16 { "" } else { "," };
+            let _ = writeln!(
+                valid,
+                "    {{\"id\": {i}, \"group\": \"{group}\", \"env\": \"prod\", \"msg\": \"{msg}\", \"tags\": [{{\"k\": \"tier\", \"v\": \"web\"}}]}}{comma}"
+            );
+        }
+        valid.push_str("  ]\n}\n");
+        let expected_value: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        for group in [false, true] {
+            let all_views = views(&valid, group);
+            assert!(!all_views.is_empty());
+            for view in &all_views {
+                let decoded = decode(view).expect("view must decode");
+                let decoded_value: serde_json::Value = serde_json::from_str(&decoded).unwrap();
+                assert_eq!(
+                    decoded_value, expected_value,
+                    "serde_json::Value mismatch (group={group}):\n{view}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jsonl_homogeneous_fast_path_preserves_exact_serde_values() {
+        let mut jsonl = String::new();
+        for i in 1..=24 {
+            let status = if i % 6 == 0 { "err" } else { "ok" };
+            let _ = writeln!(
+                jsonl,
+                r#"{{"id": {i}, "service": "billing", "region": "us-east-1", "status": "{status}", "meta": {{"host": "h-{i:02}", "zone": "a"}}}}"#
+            );
+        }
+        let expected_lines: Vec<serde_json::Value> = jsonl
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        for group in [false, true] {
+            let all_views = views(&jsonl, group);
+            assert!(!all_views.is_empty());
+            for view in &all_views {
+                let decoded = decode(view).expect("JSONL view must decode");
+                let decoded_lines: Vec<serde_json::Value> = decoded
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect();
+                assert_eq!(decoded_lines, expected_lines);
             }
         }
     }

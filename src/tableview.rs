@@ -59,35 +59,35 @@ struct SourceLine<'a> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ParsedRow {
+struct ParsedRow<'a> {
     line_no: usize,
-    cells: Vec<String>,
+    cells: Vec<Cow<'a, str>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ParsedTable {
+struct ParsedTable<'a> {
     kind: TableKind,
-    titles: Vec<String>,
-    headers: Vec<String>,
-    col_types: Option<Vec<String>>,
-    rows: Vec<ParsedRow>,
-    footers: Vec<String>,
+    titles: Vec<Cow<'a, str>>,
+    headers: Vec<Cow<'a, str>>,
+    col_types: Option<Vec<Cow<'a, str>>>,
+    rows: Vec<ParsedRow<'a>>,
+    footers: Vec<Cow<'a, str>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct DecodedTable {
-    titles: Vec<String>,
-    headers: Vec<String>,
-    col_types: Option<Vec<String>>,
-    rows: Vec<Vec<String>>,
-    footers: Vec<String>,
+struct DecodedTable<'a> {
+    titles: Vec<Cow<'a, str>>,
+    headers: Vec<Cow<'a, str>>,
+    col_types: Option<Vec<Cow<'a, str>>>,
+    rows: Vec<Vec<Cow<'a, str>>>,
+    footers: Vec<Cow<'a, str>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum ColMode {
+enum ColMode<'a> {
     Plain,
-    Constant(String),
-    Default(String),
+    Constant(Cow<'a, str>),
+    Default(Cow<'a, str>),
 }
 
 struct CompiledTable {
@@ -141,18 +141,24 @@ fn saves_enough(rendered_len: usize, raw_len: usize) -> bool {
 // Input scanning & strict table parsers
 // ---------------------------------------------------------------------------
 
-fn parse_table(stdout: &str) -> Option<ParsedTable> {
+fn parse_table(stdout: &str) -> Option<ParsedTable<'_>> {
     // Reject NUL, ANSI escape sequences, and unexpected control characters so
     // color-coded output or binary payloads fail closed.
-    if stdout
-        .bytes()
-        .any(|b| b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r'))
+    // Fast-path ESC via SIMD `str::contains` before scanning remaining bytes.
+    if stdout.contains('\x1b')
+        || stdout
+            .bytes()
+            .any(|b| b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r'))
     {
         return None;
     }
 
     let raw = stdout.strip_suffix('\n').unwrap_or(stdout);
-    let mut lines: Vec<SourceLine<'_>> = Vec::new();
+    let line_count = raw.bytes().filter(|&b| b == b'\n').count() + 1;
+    if line_count < MIN_ROWS + 2 {
+        return None;
+    }
+    let mut lines: Vec<SourceLine<'_>> = Vec::with_capacity(line_count);
     for (idx, piece) in raw.split('\n').enumerate() {
         let text = piece.strip_suffix('\r').unwrap_or(piece);
         if text.len() > MAX_LINE_BYTES {
@@ -183,8 +189,39 @@ fn leading_spaces(s: &str) -> usize {
     s.bytes().take_while(|&b| b == b' ').count()
 }
 
+fn trim_horizontal_end(s: &str) -> &str {
+    s.trim_end_matches([' ', '\t'])
+}
+
+fn trim_markdown_line(s: &str) -> &str {
+    s.trim_start_matches(' ').trim_end_matches([' ', '\t'])
+}
+
+/// True when `trimmed` starts with `|` and ends with an unescaped `|`
+/// (preceded by an even number of backslashes), so malformed rows ending in
+/// `\|` fail closed instead of stripping the escaped pipe.
+fn has_unescaped_closing_pipe(trimmed: &str) -> bool {
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 3 || bytes[0] != b'|' || bytes[bytes.len() - 1] != b'|' {
+        return false;
+    }
+    let mut bs = 0usize;
+    let mut j = bytes.len() - 1;
+    while j > 1 && bytes[j - 1] == b'\\' {
+        bs += 1;
+        j -= 1;
+    }
+    bs.is_multiple_of(2)
+}
+
 fn is_blank(s: &str) -> bool {
     s.trim().is_empty()
+}
+
+fn starts_with_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .get(..needle.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(needle))
 }
 
 /// Validate an optional 1-2 line title/preamble line before a table.
@@ -278,20 +315,18 @@ fn is_valid_footer_line(line: &str) -> bool {
         }
     }
 
-    let lower = t.to_ascii_lowercase();
-
     // mysql: `42 rows in set (0.01 sec)` / `1 row in set (0.00 sec)` / `Empty set (0.00 sec)`
-    if lower.starts_with("empty set") {
+    if starts_with_ignore_ascii_case(t, "empty set") {
         return true;
     }
 
     // duckdb / mysql / generic leading row count:
     // `50 rows`, `50 rows (40 shown)`, `50 rows (40 shown)   4 columns`,
     // `42 rows in set (0.01 sec)`
-    let tokens: Vec<&str> = lower.split_whitespace().collect();
-    if tokens.len() >= 2
-        && tokens[0].bytes().all(|b| b.is_ascii_digit())
-        && matches!(tokens[1], "row" | "rows")
+    let mut tokens = t.split_whitespace();
+    if let (Some(first), Some(second)) = (tokens.next(), tokens.next())
+        && first.bytes().all(|b| b.is_ascii_digit())
+        && (second.eq_ignore_ascii_case("row") || second.eq_ignore_ascii_case("rows"))
     {
         return true;
     }
@@ -313,7 +348,7 @@ fn is_valid_footer_line(line: &str) -> bool {
         "rows:",
         "count:",
     ] {
-        if lower.starts_with(prefix) {
+        if starts_with_ignore_ascii_case(t, prefix) {
             return true;
         }
     }
@@ -322,7 +357,10 @@ fn is_valid_footer_line(line: &str) -> bool {
 }
 
 /// Collect and validate optional trailing footer lines after a table's final line.
-fn collect_footers(tail: &[SourceLine<'_>], existing: &[String]) -> Option<Vec<String>> {
+fn collect_footers<'a>(
+    tail: &[SourceLine<'a>],
+    existing: &[Cow<'a, str>],
+) -> Option<Vec<Cow<'a, str>>> {
     let mut footers = existing.to_vec();
     for line in tail {
         if is_blank(line.text) {
@@ -331,7 +369,7 @@ fn collect_footers(tail: &[SourceLine<'_>], existing: &[String]) -> Option<Vec<S
         if footers.len() >= MAX_META_LINES || !is_valid_footer_line(line.text) {
             return None;
         }
-        footers.push(line.text.trim().to_owned());
+        footers.push(Cow::Borrowed(line.text.trim()));
     }
     Some(footers)
 }
@@ -506,13 +544,13 @@ fn char_display_width(c: char) -> usize {
     1
 }
 
-fn slice_by_offset_mode(
-    line: &str,
+fn slice_by_offset_mode<'a>(
+    line: &'a str,
     delim: char,
     joints: &[usize],
     boxed: bool,
     use_display_width: bool,
-) -> Option<(Vec<String>, Vec<String>)> {
+) -> Option<(Vec<&'a str>, Vec<Cow<'a, str>>)> {
     let mut joint_bytes = Vec::with_capacity(joints.len());
     let mut col = 0usize;
     let mut j_idx = 0usize;
@@ -543,8 +581,8 @@ fn slice_by_offset_mode(
         let mut trimmed = Vec::with_capacity(joints.len() - 1);
         for pair in joint_bytes.windows(2) {
             let piece = &line[pair[0] + delim_len..pair[1]];
-            raw.push(piece.to_owned());
-            trimmed.push(piece.trim_matches(' ').to_owned());
+            raw.push(piece);
+            trimmed.push(Cow::Borrowed(piece.trim_matches(' ')));
         }
         Some((raw, trimmed))
     } else {
@@ -553,13 +591,13 @@ fn slice_by_offset_mode(
         let mut start_byte = 0;
         for &end_byte in &joint_bytes {
             let piece = &line[start_byte..end_byte];
-            raw.push(piece.to_owned());
-            trimmed.push(piece.trim_matches(' ').to_owned());
+            raw.push(piece);
+            trimmed.push(Cow::Borrowed(piece.trim_matches(' ')));
             start_byte = end_byte + delim_len;
         }
         let last = &line[start_byte..];
-        raw.push(last.to_owned());
-        trimmed.push(last.trim_matches(' ').to_owned());
+        raw.push(last);
+        trimmed.push(Cow::Borrowed(last.trim_matches(' ')));
         Some((raw, trimmed))
     }
 }
@@ -567,51 +605,64 @@ fn slice_by_offset_mode(
 /// Slice a line into cells using exact border/separator column boundary offsets
 /// when a cell contains a literal delimiter (e.g. `a | b`), verifying every
 /// boundary char matches `delim`.
-fn slice_by_char_joints(
-    line: &str,
+fn slice_by_char_joints<'a>(
+    line: &'a str,
     delim: char,
     joints: &[usize],
     boxed: bool,
-) -> Option<(Vec<String>, Vec<String>)> {
+) -> Option<(Vec<&'a str>, Vec<Cow<'a, str>>)> {
     slice_by_offset_mode(line, delim, joints, boxed, false)
         .or_else(|| slice_by_offset_mode(line, delim, joints, boxed, true))
 }
 
 /// Split a boxed row (`| a | b |` or `│ a │ b │`) into exact `ncols` trimmed cells.
-fn split_boxed_row(line: &str, delim: char, joints: &[usize], ncols: usize) -> Option<Vec<String>> {
+fn split_boxed_row<'a>(
+    line: &'a str,
+    delim: char,
+    joints: &[usize],
+    ncols: usize,
+) -> Option<Vec<Cow<'a, str>>> {
     let inner = line.strip_prefix(delim)?.strip_suffix(delim)?;
-    let pieces: Vec<&str> = inner.split(delim).collect();
-    if pieces.len() == ncols {
-        return Some(
-            pieces
-                .into_iter()
-                .map(|p| p.trim_matches(' ').to_owned())
-                .collect(),
-        );
+    let mut cells = Vec::with_capacity(ncols);
+    let mut overflow = false;
+    for piece in inner.split(delim) {
+        if cells.len() == ncols {
+            overflow = true;
+            break;
+        }
+        cells.push(Cow::Borrowed(piece.trim_matches(' ')));
     }
-    if pieces.len() > ncols {
+    if !overflow && cells.len() == ncols {
+        return Some(cells);
+    }
+    if overflow {
         return slice_by_char_joints(line, delim, joints, true).map(|(_, trimmed)| trimmed);
     }
     None
 }
 
 /// Split an unboxed aligned row (` a | b | c `) into raw & trimmed cells.
-fn split_unboxed_row(
-    line: &str,
+fn split_unboxed_row<'a>(
+    line: &'a str,
     delim: char,
     joints: &[usize],
     ncols: usize,
-) -> Option<(Vec<String>, Vec<String>)> {
-    let pieces: Vec<&str> = line.split(delim).collect();
-    if pieces.len() == ncols {
-        let raw: Vec<String> = pieces.iter().map(|&p| p.to_owned()).collect();
-        let trimmed: Vec<String> = pieces
-            .into_iter()
-            .map(|p| p.trim_matches(' ').to_owned())
-            .collect();
+) -> Option<(Vec<&'a str>, Vec<Cow<'a, str>>)> {
+    let mut raw = Vec::with_capacity(ncols);
+    let mut trimmed = Vec::with_capacity(ncols);
+    let mut overflow = false;
+    for piece in line.split(delim) {
+        if raw.len() == ncols {
+            overflow = true;
+            break;
+        }
+        raw.push(piece);
+        trimmed.push(Cow::Borrowed(piece.trim_matches(' ')));
+    }
+    if !overflow && raw.len() == ncols {
         return Some((raw, trimmed));
     }
-    if pieces.len() > ncols {
+    if overflow {
         return slice_by_char_joints(line, delim, joints, false);
     }
     None
@@ -674,8 +725,8 @@ fn is_aws_dash_banner(s: &str, width: usize) -> bool {
     s.len() == width && width >= 5 && s.bytes().all(|b| b == b'-')
 }
 
-fn parse_ascii_grid(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
-    let mut titles = Vec::new();
+fn parse_ascii_grid<'a>(lines: &[SourceLine<'a>]) -> Option<ParsedTable<'a>> {
+    let mut titles: Vec<Cow<'a, str>> = Vec::new();
     let mut idx = 0usize;
 
     // Locate the opening multi-column ASCII border (optionally preceded by up to
@@ -686,7 +737,7 @@ fn parse_ascii_grid(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
             idx += 1;
             continue;
         }
-        let trimmed = raw.trim_end_matches(' ');
+        let trimmed = trim_horizontal_end(raw);
         let indent = leading_spaces(trimmed);
         let body = &trimmed[indent..];
 
@@ -696,8 +747,8 @@ fn parse_ascii_grid(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
             }
             // Single-cell title box (`+------+` / `| Title |` / `+--+--+`)
             if border.ncols() == 1 && idx + 2 < lines.len() {
-                let mid = lines[idx + 1].text.trim_end_matches(' ');
-                let next = lines[idx + 2].text.trim_end_matches(' ');
+                let mid = trim_horizontal_end(lines[idx + 1].text);
+                let next = trim_horizontal_end(lines[idx + 2].text);
                 if leading_spaces(mid) == indent
                     && leading_spaces(next) == indent
                     && let Some(next_border) = parse_ascii_border(&next[indent..])
@@ -709,7 +760,7 @@ fn parse_ascii_grid(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
                 {
                     let title = title_inner.trim();
                     if !title.is_empty() && titles.len() < MAX_META_LINES {
-                        titles.push(title.to_owned());
+                        titles.push(Cow::Borrowed(title));
                         idx += 2;
                         break;
                     }
@@ -721,8 +772,8 @@ fn parse_ascii_grid(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
         // AWS CLI `--output table` top title banner uses `-----` (all dashes)
         // of the exact same width as the `+---+---+` line two lines below.
         if idx + 2 < lines.len() {
-            let mid = lines[idx + 1].text.trim_end_matches(' ');
-            let next = lines[idx + 2].text.trim_end_matches(' ');
+            let mid = trim_horizontal_end(lines[idx + 1].text);
+            let next = trim_horizontal_end(lines[idx + 2].text);
             if leading_spaces(mid) == indent
                 && leading_spaces(next) == indent
                 && let Some(next_border) = parse_ascii_border(&next[indent..])
@@ -734,7 +785,7 @@ fn parse_ascii_grid(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
             {
                 let title = title_inner.trim();
                 if !title.is_empty() && titles.len() < MAX_META_LINES {
-                    titles.push(title.to_owned());
+                    titles.push(Cow::Borrowed(title));
                     idx += 2;
                     break;
                 }
@@ -744,14 +795,14 @@ fn parse_ascii_grid(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
         if titles.len() >= MAX_META_LINES || !is_valid_title_line(raw, false) {
             return None;
         }
-        titles.push(raw.trim().to_owned());
+        titles.push(Cow::Borrowed(raw.trim()));
         idx += 1;
     }
 
     if idx + 4 >= lines.len() {
         return None;
     }
-    let top_trimmed = lines[idx].text.trim_end_matches(' ');
+    let top_trimmed = trim_horizontal_end(lines[idx].text);
     let indent = leading_spaces(top_trimmed);
     let top = parse_ascii_border(&top_trimmed[indent..])?;
     let ncols = top.ncols();
@@ -761,7 +812,7 @@ fn parse_ascii_grid(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
     idx += 1;
 
     // Header row 1
-    let h1_trimmed = lines.get(idx)?.text.trim_end_matches(' ');
+    let h1_trimmed = trim_horizontal_end(lines.get(idx)?.text);
     if leading_spaces(h1_trimmed) != indent {
         return None;
     }
@@ -773,7 +824,7 @@ fn parse_ascii_grid(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
 
     // Optional DuckDB-style column type row before header divider
     let mut col_types = None;
-    let next_trimmed = lines.get(idx)?.text.trim_end_matches(' ');
+    let next_trimmed = trim_horizontal_end(lines.get(idx)?.text);
     if leading_spaces(next_trimmed) != indent {
         return None;
     }
@@ -790,7 +841,7 @@ fn parse_ascii_grid(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
         }
         col_types = Some(maybe_types);
         idx += 1;
-        let div_trimmed = lines.get(idx)?.text.trim_end_matches(' ');
+        let div_trimmed = trim_horizontal_end(lines.get(idx)?.text);
         if leading_spaces(div_trimmed) != indent {
             return None;
         }
@@ -802,14 +853,14 @@ fn parse_ascii_grid(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
     }
 
     // Data rows + optional per-row dividers + closing bottom border
-    let mut rows: Vec<ParsedRow> = Vec::new();
+    let mut rows: Vec<ParsedRow<'a>> = Vec::with_capacity(lines.len().saturating_sub(idx));
     let mut used_row_dividers = false;
     let mut rows_since_divider = 0usize;
     let mut closed = false;
 
     while idx < lines.len() {
         let raw = lines[idx].text;
-        let trimmed = raw.trim_end_matches(' ');
+        let trimmed = trim_horizontal_end(raw);
         if leading_spaces(trimmed) != indent {
             return None;
         }
@@ -824,7 +875,7 @@ fn parse_ascii_grid(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
             }
             // Determine whether another `|...|` data row immediately follows.
             let has_next_data = lines.get(idx + 1).is_some_and(|next| {
-                let nt = next.text.trim_end_matches(' ');
+                let nt = trim_horizontal_end(next.text);
                 leading_spaces(nt) == indent
                     && nt[indent..].starts_with('|')
                     && nt[indent..].ends_with('|')
@@ -946,32 +997,39 @@ fn parse_unicode_border(
     joint_ok: fn(char) -> bool,
     right_ok: fn(char) -> bool,
 ) -> Option<UnicodeBorder> {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() < 3 || !left_ok(chars[0]) || !right_ok(*chars.last()?) {
+    let mut chars = s.chars();
+    let first = chars.next()?;
+    if !left_ok(first) {
+        return None;
+    }
+    let last = chars.next_back()?;
+    if !right_ok(last) {
         return None;
     }
     let mut joints = vec![0usize];
     let mut seg_len = 0usize;
-    for (i, &c) in chars.iter().enumerate().skip(1).take(chars.len() - 2) {
+    let mut char_idx = 1usize;
+    for c in chars {
         if joint_ok(c) {
             if seg_len == 0 {
                 return None;
             }
-            joints.push(i);
+            joints.push(char_idx);
             seg_len = 0;
         } else if is_h_bar(c) {
             seg_len += 1;
         } else {
             return None;
         }
+        char_idx += 1;
     }
     if seg_len == 0 {
         return None;
     }
-    joints.push(chars.len() - 1);
+    joints.push(char_idx);
     Some(UnicodeBorder {
         joints,
-        char_width: chars.len(),
+        char_width: char_idx + 1,
     })
 }
 
@@ -987,8 +1045,8 @@ fn strip_unicode_vbar_outer(s: &str) -> Option<(char, &str)> {
     }
 }
 
-fn parse_unicode_box(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
-    let mut titles = Vec::new();
+fn parse_unicode_box<'a>(lines: &[SourceLine<'a>]) -> Option<ParsedTable<'a>> {
+    let mut titles: Vec<Cow<'a, str>> = Vec::new();
     let mut idx = 0usize;
 
     while idx < lines.len() {
@@ -997,7 +1055,7 @@ fn parse_unicode_box(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
             idx += 1;
             continue;
         }
-        let trimmed = raw.trim_end_matches(' ');
+        let trimmed = trim_horizontal_end(raw);
         let indent = leading_spaces(trimmed);
         let body = &trimmed[indent..];
 
@@ -1007,8 +1065,8 @@ fn parse_unicode_box(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
             }
             // Optional single-cell title box (`┌─────┐` / `│ Title │` / `├──┬──┤`)
             if border.ncols() == 1 && idx + 2 < lines.len() {
-                let mid = lines[idx + 1].text.trim_end_matches(' ');
-                let next = lines[idx + 2].text.trim_end_matches(' ');
+                let mid = trim_horizontal_end(lines[idx + 1].text);
+                let next = trim_horizontal_end(lines[idx + 2].text);
                 if leading_spaces(mid) == indent
                     && leading_spaces(next) == indent
                     && let Some((_, title_inner)) = strip_unicode_vbar_outer(&mid[indent..])
@@ -1031,7 +1089,7 @@ fn parse_unicode_box(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
                 {
                     let title = title_inner.trim();
                     if !title.is_empty() && titles.len() < MAX_META_LINES {
-                        titles.push(title.to_owned());
+                        titles.push(Cow::Borrowed(title));
                         idx += 2;
                         break;
                     }
@@ -1043,14 +1101,14 @@ fn parse_unicode_box(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
         if titles.len() >= MAX_META_LINES || !is_valid_title_line(raw, false) {
             return None;
         }
-        titles.push(raw.trim().to_owned());
+        titles.push(Cow::Borrowed(raw.trim()));
         idx += 1;
     }
 
     if idx + 4 >= lines.len() {
         return None;
     }
-    let top_trimmed = lines[idx].text.trim_end_matches(' ');
+    let top_trimmed = trim_horizontal_end(lines[idx].text);
     let indent = leading_spaces(top_trimmed);
     let top_body = &top_trimmed[indent..];
     let top = parse_unicode_border(top_body, is_top_left, is_top_joint, is_top_right)
@@ -1062,7 +1120,7 @@ fn parse_unicode_box(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
     idx += 1;
 
     // Header row 1
-    let h1_trimmed = lines.get(idx)?.text.trim_end_matches(' ');
+    let h1_trimmed = trim_horizontal_end(lines.get(idx)?.text);
     if leading_spaces(h1_trimmed) != indent {
         return None;
     }
@@ -1075,7 +1133,7 @@ fn parse_unicode_box(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
 
     // Optional DuckDB column type row before `├─┼─┤` header divider
     let mut col_types = None;
-    let next_trimmed = lines.get(idx)?.text.trim_end_matches(' ');
+    let next_trimmed = trim_horizontal_end(lines.get(idx)?.text);
     if leading_spaces(next_trimmed) != indent {
         return None;
     }
@@ -1097,7 +1155,7 @@ fn parse_unicode_box(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
         col_types = Some(maybe_types);
         idx += 1;
 
-        let div_trimmed = lines.get(idx)?.text.trim_end_matches(' ');
+        let div_trimmed = trim_horizontal_end(lines.get(idx)?.text);
         if leading_spaces(div_trimmed) != indent {
             return None;
         }
@@ -1114,15 +1172,15 @@ fn parse_unicode_box(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
     }
 
     // Data rows + optional per-row dividers + bottom border (or DuckDB merged footer band)
-    let mut rows: Vec<ParsedRow> = Vec::new();
-    let mut box_footers: Vec<String> = Vec::new();
+    let mut rows: Vec<ParsedRow<'a>> = Vec::with_capacity(lines.len().saturating_sub(idx));
+    let mut box_footers: Vec<Cow<'a, str>> = Vec::new();
     let mut used_row_dividers = false;
     let mut rows_since_divider = 0usize;
     let mut closed = false;
 
     while idx < lines.len() {
         let raw = lines[idx].text;
-        let trimmed = raw.trim_end_matches(' ');
+        let trimmed = trim_horizontal_end(raw);
         if leading_spaces(trimmed) != indent {
             return None;
         }
@@ -1151,7 +1209,7 @@ fn parse_unicode_box(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
             idx += 1;
             let mut inner_closed = false;
             while idx < lines.len() {
-                let ft = lines[idx].text.trim_end_matches(' ');
+                let ft = trim_horizontal_end(lines[idx].text);
                 if leading_spaces(ft) != indent {
                     return None;
                 }
@@ -1172,7 +1230,7 @@ fn parse_unicode_box(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
                 if !is_valid_footer_line(text) {
                     return None;
                 }
-                box_footers.push(text.to_owned());
+                box_footers.push(Cow::Borrowed(text));
                 idx += 1;
             }
             if !inner_closed || box_footers.is_empty() {
@@ -1235,17 +1293,12 @@ fn parse_aligned_separator(
     dash_ok: fn(char) -> bool,
     joint_ok: fn(char) -> bool,
 ) -> Option<Vec<usize>> {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() < 3 {
-        return None;
-    }
-    if joint_ok(chars[0]) || joint_ok(*chars.last()?) {
-        return None;
-    }
     let mut joints = Vec::new();
     let mut seg_dashes = 0usize;
     let mut total_dashes = 0usize;
-    for (i, &c) in chars.iter().enumerate() {
+    let mut count = 0usize;
+    for (i, c) in s.chars().enumerate() {
+        count = i + 1;
         if joint_ok(c) {
             if seg_dashes == 0 {
                 return None;
@@ -1259,7 +1312,7 @@ fn parse_aligned_separator(
             return None;
         }
     }
-    if seg_dashes == 0 {
+    if count < 3 || seg_dashes == 0 {
         return None;
     }
     let ncols = joints.len() + 1;
@@ -1269,19 +1322,19 @@ fn parse_aligned_separator(
     Some(joints)
 }
 
-fn parse_aligned_table(
-    lines: &[SourceLine<'_>],
+fn parse_aligned_table<'a>(
+    lines: &[SourceLine<'a>],
     kind: TableKind,
     delim: char,
     dash_ok: fn(char) -> bool,
     joint_ok: fn(char) -> bool,
-) -> Option<ParsedTable> {
+) -> Option<ParsedTable<'a>> {
     // Locate separator line within the first few lines (allowing 0..=2 title lines
     // and optional blank line before header).
     let max_sep_idx = (MAX_META_LINES + 3).min(lines.len().saturating_sub(MIN_ROWS));
     let mut found = None;
     for (sep_idx, line) in lines.iter().enumerate().take(max_sep_idx + 1).skip(1) {
-        let trimmed = line.text.trim_end_matches(' ');
+        let trimmed = trim_horizontal_end(line.text);
         let indent = leading_spaces(trimmed);
         if let Some(joints) = parse_aligned_separator(&trimmed[indent..], dash_ok, joint_ok) {
             found = Some((sep_idx, indent, joints));
@@ -1311,7 +1364,7 @@ fn parse_aligned_table(
 
     // Any leading non-blank lines before header must be clean title lines
     // without column delimiters (rejects multi-line headers or stray tables).
-    let mut titles = Vec::new();
+    let mut titles: Vec<Cow<'a, str>> = Vec::new();
     for line in &lines[..header_idx] {
         if is_blank(line.text) {
             continue;
@@ -1319,12 +1372,13 @@ fn parse_aligned_table(
         if titles.len() >= MAX_META_LINES || !is_valid_title_line(line.text, false) {
             return None;
         }
-        titles.push(line.text.trim().to_owned());
+        titles.push(Cow::Borrowed(line.text.trim()));
     }
 
     // Parse data rows until blank line or footer.
-    let mut rows: Vec<ParsedRow> = Vec::new();
-    let mut raw_rows: Vec<Vec<String>> = Vec::new();
+    let est_rows = lines.len().saturating_sub(sep_idx + 1);
+    let mut rows: Vec<ParsedRow<'a>> = Vec::with_capacity(est_rows);
+    let mut raw_rows: Vec<Vec<&'a str>> = Vec::with_capacity(est_rows);
     let mut idx = sep_idx + 1;
 
     while idx < lines.len() {
@@ -1377,7 +1431,7 @@ fn parse_aligned_table(
     })
 }
 
-fn has_psql_continuation(raw_rows: &[Vec<String>], rows: &[ParsedRow]) -> bool {
+fn has_psql_continuation(raw_rows: &[Vec<&str>], rows: &[ParsedRow<'_>]) -> bool {
     let ncols = rows[0].cells.len();
     for col in 0..ncols.saturating_sub(1) {
         let any_space_pad = raw_rows.iter().any(|r| r[col].ends_with(' '));
@@ -1399,7 +1453,7 @@ fn has_psql_continuation(raw_rows: &[Vec<String>], rows: &[ParsedRow]) -> bool {
     }
     let last_col = ncols - 1;
     for (i, r) in raw_rows.iter().enumerate() {
-        let last = &r[last_col];
+        let last = r[last_col];
         if (last.ends_with(" +") || last.ends_with('↵'))
             && i + 1 < rows.len()
             && rows[i + 1].cells[..last_col].iter().all(|v| v.is_empty())
@@ -1410,7 +1464,7 @@ fn has_psql_continuation(raw_rows: &[Vec<String>], rows: &[ParsedRow]) -> bool {
     false
 }
 
-fn parse_psql_aligned(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
+fn parse_psql_aligned<'a>(lines: &[SourceLine<'a>]) -> Option<ParsedTable<'a>> {
     parse_aligned_table(
         lines,
         TableKind::PsqlAligned,
@@ -1420,7 +1474,7 @@ fn parse_psql_aligned(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
     )
 }
 
-fn parse_unicode_aligned(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
+fn parse_unicode_aligned<'a>(lines: &[SourceLine<'a>]) -> Option<ParsedTable<'a>> {
     parse_aligned_table(
         lines,
         TableKind::UnicodeAligned,
@@ -1442,44 +1496,46 @@ fn parse_markdown_separator(trimmed: &str) -> Option<(usize, Vec<usize>)> {
             joints.push(ci);
         }
     }
-    let inner = &trimmed[1..trimmed.len() - 1];
-    let parts: Vec<&str> = inner.split('|').collect();
-    if parts.len() < MIN_COLS {
+    let ncols = joints.len().saturating_sub(1);
+    if ncols < MIN_COLS {
         return None;
     }
+    let inner = &trimmed[1..trimmed.len() - 1];
     let mut total_dashes = 0usize;
-    for seg in &parts {
-        let t = seg.trim_matches(' ');
+    for seg in inner.split('|') {
+        let t = seg.trim_matches([' ', '\t']);
         if t.is_empty() {
             return None;
         }
-        let core = t
-            .strip_prefix(':')
-            .unwrap_or(t)
-            .strip_suffix(':')
-            .unwrap_or_else(|| t.strip_prefix(':').unwrap_or(t));
+        let no_lead = t.strip_prefix(':').unwrap_or(t);
+        let core = no_lead.strip_suffix(':').unwrap_or(no_lead);
         if core.is_empty() || !core.bytes().all(|b| b == b'-') {
             return None;
         }
         total_dashes += core.len();
     }
-    if total_dashes < parts.len() * 2 {
+    if total_dashes < ncols * 2 {
         return None;
     }
-    Some((parts.len(), joints))
+    Some((ncols, joints))
 }
 
 /// Split a Markdown pipe row on unescaped `|`, falling back to column-aligned
 /// `|` offsets when a cell contains an unescaped literal `|`.
-fn split_markdown_row(trimmed: &str, sep_joints: &[usize], ncols: usize) -> Option<Vec<String>> {
-    if !trimmed.starts_with('|') || !trimmed.ends_with('|') || trimmed.len() < 3 {
+fn split_markdown_row<'a>(
+    trimmed: &'a str,
+    sep_joints: &[usize],
+    ncols: usize,
+) -> Option<Vec<Cow<'a, str>>> {
+    if !has_unescaped_closing_pipe(trimmed) {
         return None;
     }
     let inner = &trimmed[1..trimmed.len() - 1];
-    let mut pieces: Vec<&str> = Vec::with_capacity(ncols);
+    let mut cells: Vec<Cow<'a, str>> = Vec::with_capacity(ncols);
     let mut start = 0usize;
     let bytes = inner.as_bytes();
     let mut i = 0usize;
+    let mut overflow = false;
     while i < bytes.len() {
         if bytes[i] == b'|' {
             // Count consecutive preceding backslashes to distinguish `\|` from `\\|`.
@@ -1490,30 +1546,35 @@ fn split_markdown_row(trimmed: &str, sep_joints: &[usize], ncols: usize) -> Opti
                 j -= 1;
             }
             if bs.is_multiple_of(2) {
-                pieces.push(&inner[start..i]);
+                if cells.len() == ncols {
+                    overflow = true;
+                    break;
+                }
+                cells.push(Cow::Borrowed(inner[start..i].trim_matches(' ')));
                 start = i + 1;
             }
         }
         i += 1;
     }
-    pieces.push(&inner[start..]);
-
-    if pieces.len() == ncols {
-        return Some(
-            pieces
-                .into_iter()
-                .map(|p| p.trim_matches(' ').to_owned())
-                .collect(),
-        );
+    if !overflow {
+        if cells.len() == ncols {
+            overflow = true;
+        } else {
+            cells.push(Cow::Borrowed(inner[start..].trim_matches(' ')));
+        }
     }
-    if pieces.len() > ncols {
+
+    if !overflow && cells.len() == ncols {
+        return Some(cells);
+    }
+    if overflow {
         return slice_by_char_joints(trimmed, '|', sep_joints, true).map(|(_, trimmed)| trimmed);
     }
     None
 }
 
-fn parse_markdown_pipe(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
-    let mut titles = Vec::new();
+fn parse_markdown_pipe<'a>(lines: &[SourceLine<'a>]) -> Option<ParsedTable<'a>> {
+    let mut titles: Vec<Cow<'a, str>> = Vec::new();
     let mut idx = 0usize;
 
     // Allow at most 1 short heading/title line before a standalone Markdown table.
@@ -1523,14 +1584,14 @@ fn parse_markdown_pipe(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
             idx += 1;
             continue;
         }
-        let trimmed = raw.trim_matches(' ');
-        if trimmed.starts_with('|') && trimmed.ends_with('|') {
+        let trimmed = trim_markdown_line(raw);
+        if has_unescaped_closing_pipe(trimmed) {
             break;
         }
         if !titles.is_empty() || !is_valid_title_line(raw, true) {
             return None;
         }
-        titles.push(raw.trim().to_owned());
+        titles.push(Cow::Borrowed(raw.trim()));
         idx += 1;
     }
 
@@ -1538,23 +1599,23 @@ fn parse_markdown_pipe(lines: &[SourceLine<'_>]) -> Option<ParsedTable> {
         return None;
     }
 
-    let sep_trimmed = lines[idx + 1].text.trim_matches(' ');
+    let sep_trimmed = trim_markdown_line(lines[idx + 1].text);
     let (ncols, sep_joints) = parse_markdown_separator(sep_trimmed)?;
-    let header_trimmed = lines[idx].text.trim_matches(' ');
+    let header_trimmed = trim_markdown_line(lines[idx].text);
     let headers = split_markdown_row(header_trimmed, &sep_joints, ncols)?;
     if headers.iter().all(|h| h.is_empty()) {
         return None;
     }
 
-    let mut rows: Vec<ParsedRow> = Vec::new();
+    let mut rows: Vec<ParsedRow<'a>> = Vec::with_capacity(lines.len().saturating_sub(idx + 2));
     let mut cur = idx + 2;
     while cur < lines.len() {
         let raw = lines[cur].text;
         if is_blank(raw) {
             break;
         }
-        let trimmed = raw.trim_matches(' ');
-        if !trimmed.starts_with('|') || !trimmed.ends_with('|') {
+        let trimmed = trim_markdown_line(raw);
+        if !has_unescaped_closing_pipe(trimmed) {
             if is_valid_footer_line(raw) {
                 break;
             }
@@ -1611,7 +1672,13 @@ fn escape_cell(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn unescape_cell(s: &str) -> Option<String> {
+fn unescape_cell(s: &str) -> Option<Cow<'_, str>> {
+    if !s
+        .bytes()
+        .any(|b| matches!(b, b'\\' | b'\t' | b'\n' | b'\r'))
+    {
+        return Some(Cow::Borrowed(s));
+    }
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -1629,7 +1696,7 @@ fn unescape_cell(s: &str) -> Option<String> {
             out.push(c);
         }
     }
-    Some(out)
+    Some(Cow::Owned(out))
 }
 
 fn escape_col_name(s: &str) -> Cow<'_, str> {
@@ -1654,16 +1721,28 @@ fn escape_col_name(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn encode_col_spec(name: &str, mode: &ColMode) -> String {
-    let ename = escape_col_name(name);
+fn write_col_spec(name: &str, mode: &ColMode<'_>, out: &mut String) {
+    out.push_str(&escape_col_name(name));
     match mode {
-        ColMode::Plain => ename.into_owned(),
-        ColMode::Constant(val) => format!("{ename}={}", escape_cell(val)),
-        ColMode::Default(val) => format!("{ename}?={}", escape_cell(val)),
+        ColMode::Plain => {}
+        ColMode::Constant(val) => {
+            out.push('=');
+            out.push_str(&escape_cell(val));
+        }
+        ColMode::Default(val) => {
+            out.push_str("?=");
+            out.push_str(&escape_cell(val));
+        }
     }
 }
 
-fn decode_col_spec(spec: &str) -> Option<(String, ColMode)> {
+fn decode_col_spec(spec: &str) -> Option<(Cow<'_, str>, ColMode<'_>)> {
+    if !spec
+        .bytes()
+        .any(|b| matches!(b, b'\\' | b'\t' | b'\n' | b'\r' | b'=' | b'?'))
+    {
+        return Some((Cow::Borrowed(spec), ColMode::Plain));
+    }
     let mut name = String::with_capacity(spec.len());
     let mut chars = spec.char_indices();
     while let Some((idx, c)) = chars.next() {
@@ -1679,25 +1758,25 @@ fn decode_col_spec(spec: &str) -> Option<(String, ColMode)> {
             },
             '=' => {
                 let val = unescape_cell(&spec[idx + 1..])?;
-                return Some((name, ColMode::Constant(val)));
+                return Some((Cow::Owned(name), ColMode::Constant(val)));
             }
             '?' => {
                 let rest = spec[idx + 1..].strip_prefix('=')?;
                 let val = unescape_cell(rest)?;
-                return Some((name, ColMode::Default(val)));
+                return Some((Cow::Owned(name), ColMode::Default(val)));
             }
             '\t' | '\n' | '\r' => return None,
             other => name.push(other),
         }
     }
-    Some((name, ColMode::Plain))
+    Some((Cow::Owned(name), ColMode::Plain))
 }
 
-fn encode_varying_cell<'a>(cell: &'a str, mode: &ColMode) -> Cow<'a, str> {
+fn encode_varying_cell<'a>(cell: &'a str, mode: &ColMode<'_>) -> Cow<'a, str> {
     match mode {
         ColMode::Plain => escape_cell(cell),
         ColMode::Default(default_val) => {
-            if cell == default_val {
+            if cell == default_val.as_ref() {
                 Cow::Borrowed(".")
             } else if cell == "." {
                 Cow::Borrowed("\\.")
@@ -1709,14 +1788,14 @@ fn encode_varying_cell<'a>(cell: &'a str, mode: &ColMode) -> Cow<'a, str> {
     }
 }
 
-fn decode_varying_cell(encoded: &str, mode: &ColMode) -> Option<String> {
+fn decode_varying_cell<'a>(encoded: &'a str, mode: &ColMode<'a>) -> Option<Cow<'a, str>> {
     match mode {
         ColMode::Plain => unescape_cell(encoded),
         ColMode::Default(default_val) => {
             if encoded == "." {
                 Some(default_val.clone())
             } else if encoded == "\\." {
-                Some(String::from("."))
+                Some(Cow::Borrowed("."))
             } else {
                 unescape_cell(encoded)
             }
@@ -1725,16 +1804,19 @@ fn decode_varying_cell(encoded: &str, mode: &ColMode) -> Option<String> {
     }
 }
 
-fn plan_column_mode(rows: &[ParsedRow], col: usize) -> ColMode {
+fn plan_column_mode<'a>(rows: &[ParsedRow<'a>], col: usize) -> ColMode<'a> {
     let n = rows.len();
     let first = &rows[0].cells[col];
-    if rows.iter().all(|r| &r.cells[col] == first) {
+    if rows[1..]
+        .iter()
+        .all(|r| r.cells[col].as_ref() == first.as_ref())
+    {
         return ColMode::Constant(first.clone());
     }
 
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut counts: HashMap<&str, usize> = HashMap::with_capacity(n.min(64));
     for r in rows {
-        *counts.entry(r.cells[col].as_str()).or_insert(0) += 1;
+        *counts.entry(r.cells[col].as_ref()).or_insert(0) += 1;
     }
     let Some((&best_val, &best_count)) = counts
         .iter()
@@ -1754,36 +1836,50 @@ fn plan_column_mode(rows: &[ParsedRow], col: usize) -> ColMode {
         return ColMode::Plain;
     }
 
-    let dot_outliers = rows.iter().filter(|r| r.cells[col] == ".").count();
+    let dot_outliers = counts.get(".").copied().unwrap_or(0);
     let header_cost = 2 + escaped_len; // `?=VAL`
     let row_savings = best_count * (escaped_len - 1);
     if row_savings > header_cost + dot_outliers {
-        ColMode::Default(best_val.to_owned())
+        let best_cow = rows
+            .iter()
+            .find(|r| r.cells[col].as_ref() == best_val)
+            .map(|r| r.cells[col].clone())
+            .unwrap_or_else(|| Cow::Owned(best_val.to_owned()));
+        ColMode::Default(best_cow)
     } else {
         ColMode::Plain
     }
 }
 
-fn legend_suffix(has_tsv: bool, has_types: bool, has_const: bool, has_default: bool) -> String {
-    let mut s = String::new();
-    if has_tsv {
-        s.push_str(", TSV");
+fn legend_suffix(
+    has_tsv: bool,
+    has_types: bool,
+    has_const: bool,
+    has_default: bool,
+) -> &'static str {
+    match (has_tsv, has_types, has_const, has_default) {
+        (false, false, false, false) => "",
+        (false, false, false, true) => "; col?=V default (.=V)",
+        (false, false, true, false) => "; col=V const",
+        (false, false, true, true) => "; col=V const, col?=V default (.=V)",
+        (false, true, false, false) => ", typed",
+        (false, true, false, true) => ", typed; col?=V default (.=V)",
+        (false, true, true, false) => ", typed; col=V const",
+        (false, true, true, true) => ", typed; col=V const, col?=V default (.=V)",
+        (true, false, false, false) => ", TSV",
+        (true, false, false, true) => ", TSV; col?=V default (.=V)",
+        (true, false, true, false) => ", TSV; col=V const",
+        (true, false, true, true) => ", TSV; col=V const, col?=V default (.=V)",
+        (true, true, false, false) => ", TSV, typed",
+        (true, true, false, true) => ", TSV, typed; col?=V default (.=V)",
+        (true, true, true, false) => ", TSV, typed; col=V const",
+        (true, true, true, true) => ", TSV, typed; col=V const, col?=V default (.=V)",
     }
-    if has_types {
-        s.push_str(", typed");
-    }
-    match (has_const, has_default) {
-        (true, true) => s.push_str("; col=V const, col?=V default (.=V)"),
-        (true, false) => s.push_str("; col=V const"),
-        (false, true) => s.push_str("; col?=V default (.=V)"),
-        (false, false) => {}
-    }
-    s
 }
 
-fn compile_table(table: &ParsedTable) -> CompiledTable {
+fn compile_table(table: &ParsedTable<'_>) -> CompiledTable {
     let ncols = table.headers.len();
-    let modes: Vec<ColMode> = (0..ncols)
+    let modes: Vec<ColMode<'_>> = (0..ncols)
         .map(|c| plan_column_mode(&table.rows, c))
         .collect();
     let varying: Vec<usize> = (0..ncols)
@@ -1793,7 +1889,22 @@ fn compile_table(table: &ParsedTable) -> CompiledTable {
     let has_default = modes.iter().any(|m| matches!(m, ColMode::Default(_)));
     let has_types = table.col_types.is_some();
 
-    let mut prefix_block = String::new();
+    let est_prefix = table.titles.iter().map(|t| t.len() + 8).sum::<usize>()
+        + 7
+        + table.headers.iter().map(|h| h.len() + 1).sum::<usize>()
+        + modes
+            .iter()
+            .map(|m| match m {
+                ColMode::Plain => 0,
+                ColMode::Constant(v) => v.len() + 1,
+                ColMode::Default(v) => v.len() + 2,
+            })
+            .sum::<usize>()
+        + table
+            .col_types
+            .as_ref()
+            .map_or(0, |ts| 8 + ts.iter().map(|t| t.len() + 1).sum::<usize>());
+    let mut prefix_block = String::with_capacity(est_prefix);
     for title in &table.titles {
         prefix_block.push_str("title: ");
         prefix_block.push_str(&escape_cell(title));
@@ -1804,7 +1915,7 @@ fn compile_table(table: &ParsedTable) -> CompiledTable {
         if c > 0 {
             prefix_block.push('\t');
         }
-        prefix_block.push_str(&encode_col_spec(name, &modes[c]));
+        write_col_spec(name, &modes[c], &mut prefix_block);
     }
     prefix_block.push('\n');
     if let Some(types) = &table.col_types {
@@ -1825,7 +1936,8 @@ fn compile_table(table: &ParsedTable) -> CompiledTable {
             .rows
             .iter()
             .map(|row| {
-                let mut line = String::new();
+                let est: usize = varying.iter().map(|&c| row.cells[c].len() + 1).sum();
+                let mut line = String::with_capacity(est);
                 for (i, &c) in varying.iter().enumerate() {
                     if i > 0 {
                         line.push('\t');
@@ -1837,7 +1949,8 @@ fn compile_table(table: &ParsedTable) -> CompiledTable {
             .collect()
     };
 
-    let mut footer_block = String::new();
+    let footer_cap: usize = table.footers.iter().map(|f| f.len() + 1).sum();
+    let mut footer_block = String::with_capacity(footer_cap);
     for footer in &table.footers {
         footer_block.push_str(footer);
         footer_block.push('\n');
@@ -1854,7 +1967,7 @@ fn compile_table(table: &ParsedTable) -> CompiledTable {
     }
 }
 
-fn render_tier1(table: &ParsedTable, compiled: &CompiledTable) -> String {
+fn render_tier1(table: &ParsedTable<'_>, compiled: &CompiledTable) -> String {
     let has_tsv = !compiled.varying.is_empty();
     let suffix = legend_suffix(
         has_tsv,
@@ -1862,7 +1975,12 @@ fn render_tier1(table: &ParsedTable, compiled: &CompiledTable) -> String {
         compiled.has_const,
         compiled.has_default,
     );
-    let mut out = format!("[table: {} rows{suffix}]\n", table.rows.len());
+    let rows_bytes: usize = compiled.encoded_rows.iter().map(|r| r.len() + 1).sum();
+    let legend_cap = "[table:  rows]\n".len() + digits(table.rows.len()) + suffix.len();
+    let mut out = String::with_capacity(
+        legend_cap + compiled.prefix_block.len() + rows_bytes + compiled.footer_block.len(),
+    );
+    let _ = writeln!(out, "[table: {} rows{suffix}]", table.rows.len());
     out.push_str(&compiled.prefix_block);
     for row in &compiled.encoded_rows {
         out.push_str(row);
@@ -1888,7 +2006,21 @@ fn elision_line(omitted: usize, first_line: usize, last_line: usize) -> String {
     )
 }
 
-fn render_tier2(table: &ParsedTable, compiled: &CompiledTable, budget: usize) -> Option<String> {
+fn elision_line_len(omitted: usize, first_line: usize, last_line: usize) -> usize {
+    let unit_len = if omitted == 1 { 3 } else { 4 };
+    let ref_len = if first_line == last_line {
+        "[stdout:]".len() + digits(first_line)
+    } else {
+        "[stdout:-]".len() + digits(first_line) + digits(last_line)
+    };
+    "...  ".len() + digits(omitted) + unit_len + " omitted ".len() + ref_len + " ...\n".len()
+}
+
+fn render_tier2(
+    table: &ParsedTable<'_>,
+    compiled: &CompiledTable,
+    budget: usize,
+) -> Option<String> {
     let n = table.rows.len();
     if compiled.varying.is_empty() || n < 2 {
         return None;
@@ -1909,7 +2041,7 @@ fn render_tier2(table: &ParsedTable, compiled: &CompiledTable, budget: usize) ->
         let last_line = table.rows[n - tail_m - 1].line_no;
         let legend_len =
             "[table preview:  of  rows]\n".len() + digits(shown) + digits(n) + suffix.len();
-        let elision_len = elision_line(omitted, first_line, last_line).len();
+        let elision_len = elision_line_len(omitted, first_line, last_line);
         legend_len + fixed_bytes + head_bytes + elision_len + tail_bytes
     };
 
@@ -1995,7 +2127,7 @@ fn digits(mut n: usize) -> usize {
 // Bijective Tier 1 decoder & round-trip verification
 // ---------------------------------------------------------------------------
 
-fn decode_table(view: &str) -> Option<DecodedTable> {
+fn decode_table(view: &str) -> Option<DecodedTable<'_>> {
     let mut lines = view.strip_suffix('\n')?.split('\n').peekable();
 
     // 1. Legend line
@@ -2043,8 +2175,8 @@ fn decode_table(view: &str) -> Option<DecodedTable> {
 
     // 3. Schema line (`cols: ...`)
     let cols_line = lines.next()?.strip_prefix("cols: ")?;
-    let mut headers = Vec::new();
-    let mut modes = Vec::new();
+    let mut headers = Vec::with_capacity(8);
+    let mut modes = Vec::with_capacity(8);
     for spec in cols_line.split('\t') {
         let (name, mode) = decode_col_spec(spec)?;
         headers.push(name);
@@ -2055,18 +2187,18 @@ fn decode_table(view: &str) -> Option<DecodedTable> {
         return None;
     }
 
-    let varying: Vec<usize> = (0..ncols)
-        .filter(|&c| !matches!(modes[c], ColMode::Constant(_)))
-        .collect();
-    if has_tsv != !varying.is_empty() {
+    let has_varying = modes.iter().any(|m| !matches!(m, ColMode::Constant(_)));
+    if has_tsv != has_varying {
         return None;
     }
 
     // 4. Optional `types: ` line (present iff legend declared `typed`)
     let col_types = if has_types {
         let types_line = lines.next()?.strip_prefix("types: ")?;
-        let parsed: Option<Vec<String>> = types_line.split('\t').map(unescape_cell).collect();
-        let parsed = parsed?;
+        let mut parsed = Vec::with_capacity(ncols);
+        for seg in types_line.split('\t') {
+            parsed.push(unescape_cell(seg)?);
+        }
         if parsed.len() != ncols {
             return None;
         }
@@ -2077,8 +2209,8 @@ fn decode_table(view: &str) -> Option<DecodedTable> {
 
     // 5. Exact `row_count` data rows
     let mut rows = Vec::with_capacity(row_count);
-    if varying.is_empty() {
-        let const_row: Vec<String> = modes
+    if !has_varying {
+        let const_row: Vec<Cow<'_, str>> = modes
             .iter()
             .map(|m| match m {
                 ColMode::Constant(v) => v.clone(),
@@ -2091,20 +2223,19 @@ fn decode_table(view: &str) -> Option<DecodedTable> {
     } else {
         for _ in 0..row_count {
             let line = lines.next()?;
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() != varying.len() {
-                return None;
-            }
+            let mut parts = line.split('\t');
             let mut full_row = Vec::with_capacity(ncols);
-            let mut v_cursor = 0usize;
             for mode in &modes {
                 match mode {
                     ColMode::Constant(val) => full_row.push(val.clone()),
                     ColMode::Plain | ColMode::Default(_) => {
-                        full_row.push(decode_varying_cell(parts[v_cursor], mode)?);
-                        v_cursor += 1;
+                        let part = parts.next()?;
+                        full_row.push(decode_varying_cell(part, mode)?);
                     }
                 }
+            }
+            if parts.next().is_some() {
+                return None;
             }
             rows.push(full_row);
         }
@@ -2116,7 +2247,7 @@ fn decode_table(view: &str) -> Option<DecodedTable> {
         if footers.len() >= MAX_META_LINES {
             return None;
         }
-        footers.push(line.to_owned());
+        footers.push(Cow::Borrowed(line));
     }
 
     Some(DecodedTable {
@@ -2128,7 +2259,7 @@ fn decode_table(view: &str) -> Option<DecodedTable> {
     })
 }
 
-fn verify_round_trip(table: &ParsedTable, rendered: &str) -> bool {
+fn verify_round_trip(table: &ParsedTable<'_>, rendered: &str) -> bool {
     let Some(decoded) = decode_table(rendered) else {
         return false;
     };
@@ -2759,5 +2890,50 @@ worker-1 | 2026-11-25T10:00:06Z INFO job 42 done
                 out.len()
             );
         }
+    }
+
+    #[test]
+    fn markdown_escaped_pipes_trailing_whitespace_and_truncated_row_fidelity() {
+        // Escaped pipes in headers & cells (including `\|` adjacent to closing `|`,
+        // consecutive `\|\|`, and even backslashes `\\|` before delimiter/closing pipe),
+        // mixed with trailing spaces, trailing tabs, and CRLF.
+        let md_valid = concat!(
+            "| id | expr \\| rule | region | path | status |   \t\r\n",
+            "| ---: | --- | --- | --- | :---: |  \t \r\n",
+            "| 1 | a \\| b | us-east-1 | C:\\\\| running |   \r\n",
+            "| 2 | tail \\| | us-east-1 | /var/log | running |\t\r\n",
+            "| 3 | x \\|\\| y | us-east-1 | D:\\\\| running | \t \r\n",
+            "| 4 | plain | us-east-1 | /tmp | running |  \r\n",
+            "| 5 | a \\\\\\| b | us-east-1 | /opt | running |\r\n",
+            "| 6 | last | us-east-1 | /etc | stopped |   \t\r\n",
+        );
+        let out = format(md_valid, 8192)
+            .expect("escaped-pipe markdown table with trailing whitespace should compact");
+        assert_bijective(md_valid, &out);
+        let dec = decode_table(&out).unwrap();
+        assert_eq!(
+            dec.headers,
+            vec!["id", "expr \\| rule", "region", "path", "status"]
+        );
+        assert_eq!(dec.rows[0][1], "a \\| b");
+        assert_eq!(dec.rows[0][3], "C:\\\\");
+        assert_eq!(dec.rows[1][1], "tail \\|");
+        assert_eq!(dec.rows[2][1], "x \\|\\| y");
+        assert_eq!(dec.rows[4][1], "a \\\\\\| b");
+
+        // Truncated Markdown row ending with an escaped pipe (`\|`) has no unescaped
+        // closing delimiter and must fail closed instead of stripping `|` and keeping `\`.
+        let md_truncated = "\
+| id | expr |
+| --- | --- |
+| 1 | ok |
+| 2 | broken \\|
+| 3 | ok |
+| 4 | ok |
+| 5 | ok |
+| 6 | ok |
+";
+        assert!(parse_table(md_truncated).is_none());
+        assert!(format(md_truncated, 8192).is_none());
     }
 }

@@ -81,34 +81,34 @@ struct SourceLine<'a> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ParsedRow {
+struct ParsedRow<'a> {
     line_no: usize,
-    cells: Vec<String>,
+    cells: Vec<Cow<'a, str>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ParsedCsv {
+struct ParsedCsv<'a> {
     delim: Delim,
-    headers: Vec<String>,
-    rows: Vec<ParsedRow>,
+    headers: Vec<Cow<'a, str>>,
+    rows: Vec<ParsedRow<'a>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct DecodedCsv {
+struct DecodedCsv<'a> {
     delim: Delim,
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    headers: Vec<Cow<'a, str>>,
+    rows: Vec<Vec<Cow<'a, str>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum ColMode {
+enum ColMode<'a> {
     Plain,
-    Constant(String),
-    Default(String),
+    Constant(Cow<'a, str>),
+    Default(Cow<'a, str>),
 }
 
-struct ColumnPlan {
-    modes: Vec<ColMode>,
+struct ColumnPlan<'a> {
+    modes: Vec<ColMode<'a>>,
     varying: Vec<usize>,
     has_const: bool,
     has_default: bool,
@@ -158,7 +158,7 @@ pub fn format(stdout: &str, budget: usize) -> Option<String> {
     let csv = parse_csv(stdout)?;
     let plan = build_column_plan(&csv);
 
-    if let Some(tier1) = try_render_tier1(&csv, &plan, budget) {
+    if let Some(tier1) = try_render_tier1(&csv, &plan, budget, stdout.len()) {
         if !verify_round_trip(&csv, &tier1) {
             return None;
         }
@@ -186,17 +186,28 @@ fn saves_enough(rendered_len: usize, raw_len: usize) -> bool {
 // Strict RFC 4180 CSV & TSV parser and validation
 // ---------------------------------------------------------------------------
 
-fn parse_csv(stdout: &str) -> Option<ParsedCsv> {
+fn parse_csv(stdout: &str) -> Option<ParsedCsv<'_>> {
+    // Strip a leading UTF-8 BOM (common in Excel/BI CSV exports) before
+    // parsing so the first column header is never corrupted and quoted headers
+    // like `\u{feff}"id",...` parse cleanly.
+    let input = stdout.strip_prefix('\u{feff}').unwrap_or(stdout);
+
     // Reject NUL, ANSI escape sequences, and unexpected control characters.
-    if stdout
-        .bytes()
-        .any(|b| b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r'))
+    // Fast-path ESC via SIMD `str::contains` before scanning remaining bytes.
+    if input.contains('\x1b')
+        || input
+            .bytes()
+            .any(|b| b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r'))
     {
         return None;
     }
 
-    let raw = stdout.strip_suffix('\n').unwrap_or(stdout);
-    let mut lines: Vec<SourceLine<'_>> = Vec::new();
+    let raw = input.strip_suffix('\n').unwrap_or(input);
+    let line_count = raw.bytes().filter(|&b| b == b'\n').count() + 1;
+    if line_count < MIN_ROWS + 1 {
+        return None;
+    }
+    let mut lines: Vec<SourceLine<'_>> = Vec::with_capacity(line_count);
     for (idx, piece) in raw.split('\n').enumerate() {
         let text = piece.strip_suffix('\r').unwrap_or(piece);
         if text.len() > MAX_LINE_BYTES {
@@ -240,9 +251,9 @@ fn parse_csv(stdout: &str) -> Option<ParsedCsv> {
     None
 }
 
-fn parse_with_delim(slice: &[SourceLine<'_>], delim: Delim) -> Option<ParsedCsv> {
+fn parse_with_delim<'a>(slice: &[SourceLine<'a>], delim: Delim) -> Option<ParsedCsv<'a>> {
     let delim_byte = delim.as_byte();
-    let headers = parse_rfc4180_line(slice[0].text, delim_byte)?;
+    let headers = parse_rfc4180_line(slice[0].text, delim_byte, 0)?;
     let ncols = headers.len();
     if !(MIN_COLS..=MAX_COLS).contains(&ncols) {
         return None;
@@ -253,7 +264,7 @@ fn parse_with_delim(slice: &[SourceLine<'_>], delim: Delim) -> Option<ParsedCsv>
 
     let mut rows = Vec::with_capacity(slice.len() - 1);
     for line in &slice[1..] {
-        let cells = parse_rfc4180_line(line.text, delim_byte)?;
+        let cells = parse_rfc4180_line(line.text, delim_byte, ncols)?;
         if cells.len() != ncols {
             return None;
         }
@@ -281,25 +292,51 @@ fn parse_with_delim(slice: &[SourceLine<'_>], delim: Delim) -> Option<ParsedCsv>
 /// Strict single-line RFC 4180 parser parameterized by `delim` (`b','` or `b'\t'`).
 ///
 /// Rejects unclosed quotes, trailing non-delimiter text after a closing quote,
-/// and unescaped double quotes inside unquoted fields.
-fn parse_rfc4180_line(line: &str, delim: u8) -> Option<Vec<String>> {
+/// and unescaped double quotes inside unquoted fields. Borrows unquoted and
+/// escape-free quoted fields directly from `line` without heap allocation.
+fn parse_rfc4180_line<'a>(
+    line: &'a str,
+    delim: u8,
+    expected_cols: usize,
+) -> Option<Vec<Cow<'a, str>>> {
     let bytes = line.as_bytes();
-    let mut fields = Vec::new();
+    let mut fields = Vec::with_capacity(if expected_cols > 0 { expected_cols } else { 8 });
     let mut i = 0usize;
     loop {
+        if expected_cols > 0 && fields.len() >= expected_cols {
+            return None;
+        }
         if i < bytes.len() && bytes[i] == b'"' {
             i += 1;
-            let mut field = String::new();
+            let mut owned: Option<String> = None;
             let mut closed = false;
             let mut chunk_start = i;
             while i < bytes.len() {
                 if bytes[i] == b'"' {
-                    field.push_str(&line[chunk_start..i]);
                     if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                        field.push('"');
+                        let buf = match &mut owned {
+                            Some(s) => {
+                                s.push_str(&line[chunk_start..i]);
+                                s
+                            }
+                            None => {
+                                let mut s = String::with_capacity((i - chunk_start) + 16);
+                                s.push_str(&line[chunk_start..i]);
+                                owned.insert(s)
+                            }
+                        };
+                        buf.push('"');
                         i += 2;
                         chunk_start = i;
                     } else {
+                        let cell = match owned {
+                            Some(mut s) => {
+                                s.push_str(&line[chunk_start..i]);
+                                Cow::Owned(s)
+                            }
+                            None => Cow::Borrowed(&line[chunk_start..i]),
+                        };
+                        fields.push(cell);
                         i += 1;
                         closed = true;
                         break;
@@ -311,7 +348,6 @@ fn parse_rfc4180_line(line: &str, delim: u8) -> Option<Vec<String>> {
             if !closed {
                 return None;
             }
-            fields.push(field);
             if i == bytes.len() {
                 break;
             }
@@ -327,7 +363,7 @@ fn parse_rfc4180_line(line: &str, delim: u8) -> Option<Vec<String>> {
                 }
                 i += 1;
             }
-            fields.push(line[start..i].to_owned());
+            fields.push(Cow::Borrowed(&line[start..i]));
             if i == bytes.len() {
                 break;
             }
@@ -410,7 +446,7 @@ fn is_prose_stopword(word: &str) -> bool {
     )
 }
 
-fn is_plausible_header(headers: &[String], delim: Delim) -> bool {
+fn is_plausible_header(headers: &[Cow<'_, str>], delim: Delim) -> bool {
     let mut seen: HashSet<&str> = HashSet::with_capacity(headers.len());
     let mut alpha_cols = 0usize;
     let mut year_cols = 0usize;
@@ -527,14 +563,21 @@ fn is_plausible_header(headers: &[String], delim: Delim) -> bool {
             return false;
         }
 
-        let words: Vec<&str> = t.split_whitespace().collect();
-        if words.len() > 5 || (headers.len() == 2 && words.len() > 4) {
+        let mut word_count = 0usize;
+        let mut has_stopword = false;
+        for w in t.split_whitespace() {
+            word_count += 1;
+            if is_prose_stopword(w) {
+                has_stopword = true;
+            }
+        }
+        if word_count > 5 || (headers.len() == 2 && word_count > 4) {
             return false;
         }
-        if words.len() >= 3 && words.iter().any(|w| is_prose_stopword(w)) {
+        if word_count >= 3 && has_stopword {
             return false;
         }
-        total_words += words.len();
+        total_words += word_count;
 
         // Reject header cells that look like data values (booleans, nulls, dates, floats,
         // or non-year integers).
@@ -582,14 +625,18 @@ fn looks_like_ipv4(s: &str) -> bool {
     count == 4
 }
 
-fn is_plausible_table(headers: &[String], rows: &[ParsedRow], delim: Delim) -> bool {
+fn is_plausible_table(headers: &[Cow<'_, str>], rows: &[ParsedRow<'_>], delim: Delim) -> bool {
     let n = rows.len();
     let ncols = headers.len();
 
     // If a header cell equals >= 50% of data cells in its own column, line 1 is almost
     // certainly a headerless data row (e.g., `alice,us-east,prod` followed by `bob,us-east,prod`).
     for (c, header) in headers.iter().enumerate() {
-        let matches = rows.iter().filter(|r| &r.cells[c] == header).count();
+        let header_str = header.as_ref();
+        let matches = rows
+            .iter()
+            .filter(|r| r.cells[c].as_ref() == header_str)
+            .count();
         if matches.saturating_mul(2) >= n {
             return false;
         }
@@ -613,7 +660,7 @@ fn is_plausible_table(headers: &[String], rows: &[ParsedRow], delim: Delim) -> b
             .iter()
             .filter(|r| {
                 let c0 = r.cells[0].trim();
-                let c1 = r.cells[1].as_str();
+                let c1 = r.cells[1].as_ref();
                 let c1_trimmed = c1.trim();
                 let space_after_comma = c1.starts_with(' ');
                 let punctuated = c1_trimmed.ends_with('.')
@@ -657,7 +704,13 @@ fn escape_cell(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn unescape_cell(s: &str) -> Option<String> {
+fn unescape_cell(s: &str) -> Option<Cow<'_, str>> {
+    if !s
+        .bytes()
+        .any(|b| matches!(b, b'\\' | b'\t' | b'\n' | b'\r'))
+    {
+        return Some(Cow::Borrowed(s));
+    }
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -675,7 +728,7 @@ fn unescape_cell(s: &str) -> Option<String> {
             out.push(c);
         }
     }
-    Some(out)
+    Some(Cow::Owned(out))
 }
 
 fn escape_col_name(s: &str) -> Cow<'_, str> {
@@ -700,16 +753,28 @@ fn escape_col_name(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn encode_col_spec(name: &str, mode: &ColMode) -> String {
-    let ename = escape_col_name(name);
+fn write_col_spec(name: &str, mode: &ColMode<'_>, out: &mut String) {
+    out.push_str(&escape_col_name(name));
     match mode {
-        ColMode::Plain => ename.into_owned(),
-        ColMode::Constant(val) => format!("{ename}={}", escape_cell(val)),
-        ColMode::Default(val) => format!("{ename}?={}", escape_cell(val)),
+        ColMode::Plain => {}
+        ColMode::Constant(val) => {
+            out.push('=');
+            out.push_str(&escape_cell(val));
+        }
+        ColMode::Default(val) => {
+            out.push_str("?=");
+            out.push_str(&escape_cell(val));
+        }
     }
 }
 
-fn decode_col_spec(spec: &str) -> Option<(String, ColMode)> {
+fn decode_col_spec(spec: &str) -> Option<(Cow<'_, str>, ColMode<'_>)> {
+    if !spec
+        .bytes()
+        .any(|b| matches!(b, b'\\' | b'\t' | b'\n' | b'\r' | b'=' | b'?'))
+    {
+        return Some((Cow::Borrowed(spec), ColMode::Plain));
+    }
     let mut name = String::with_capacity(spec.len());
     let mut chars = spec.char_indices();
     while let Some((idx, c)) = chars.next() {
@@ -725,25 +790,25 @@ fn decode_col_spec(spec: &str) -> Option<(String, ColMode)> {
             },
             '=' => {
                 let val = unescape_cell(&spec[idx + 1..])?;
-                return Some((name, ColMode::Constant(val)));
+                return Some((Cow::Owned(name), ColMode::Constant(val)));
             }
             '?' => {
                 let rest = spec[idx + 1..].strip_prefix('=')?;
                 let val = unescape_cell(rest)?;
-                return Some((name, ColMode::Default(val)));
+                return Some((Cow::Owned(name), ColMode::Default(val)));
             }
             '\t' | '\n' | '\r' => return None,
             other => name.push(other),
         }
     }
-    Some((name, ColMode::Plain))
+    Some((Cow::Owned(name), ColMode::Plain))
 }
 
-fn encode_varying_cell<'a>(cell: &'a str, mode: &ColMode) -> Cow<'a, str> {
+fn encode_varying_cell<'a>(cell: &'a str, mode: &ColMode<'_>) -> Cow<'a, str> {
     match mode {
         ColMode::Plain => escape_cell(cell),
         ColMode::Default(default_val) => {
-            if cell == default_val {
+            if cell == default_val.as_ref() {
                 Cow::Borrowed(".")
             } else if cell == "." {
                 Cow::Borrowed("\\.")
@@ -755,14 +820,14 @@ fn encode_varying_cell<'a>(cell: &'a str, mode: &ColMode) -> Cow<'a, str> {
     }
 }
 
-fn decode_varying_cell(encoded: &str, mode: &ColMode) -> Option<String> {
+fn decode_varying_cell<'a>(encoded: &'a str, mode: &ColMode<'a>) -> Option<Cow<'a, str>> {
     match mode {
         ColMode::Plain => unescape_cell(encoded),
         ColMode::Default(default_val) => {
             if encoded == "." {
                 Some(default_val.clone())
             } else if encoded == "\\." {
-                Some(String::from("."))
+                Some(Cow::Borrowed("."))
             } else {
                 unescape_cell(encoded)
             }
@@ -771,16 +836,19 @@ fn decode_varying_cell(encoded: &str, mode: &ColMode) -> Option<String> {
     }
 }
 
-fn plan_column_mode(rows: &[ParsedRow], col: usize) -> ColMode {
+fn plan_column_mode<'a>(rows: &[ParsedRow<'a>], col: usize) -> ColMode<'a> {
     let n = rows.len();
     let first = &rows[0].cells[col];
-    if rows.iter().all(|r| &r.cells[col] == first) {
+    if rows[1..]
+        .iter()
+        .all(|r| r.cells[col].as_ref() == first.as_ref())
+    {
         return ColMode::Constant(first.clone());
     }
 
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut counts: HashMap<&str, usize> = HashMap::with_capacity(n.min(64));
     for r in rows {
-        *counts.entry(r.cells[col].as_str()).or_insert(0) += 1;
+        *counts.entry(r.cells[col].as_ref()).or_insert(0) += 1;
     }
     let Some((&best_val, &best_count)) = counts
         .iter()
@@ -800,31 +868,47 @@ fn plan_column_mode(rows: &[ParsedRow], col: usize) -> ColMode {
         return ColMode::Plain;
     }
 
-    let dot_outliers = rows.iter().filter(|r| r.cells[col] == ".").count();
+    let dot_outliers = counts.get(".").copied().unwrap_or(0);
     let header_cost = 2 + escaped_len; // `?=VAL`
     let row_savings = best_count * (escaped_len - 1);
     if row_savings > header_cost + dot_outliers {
-        ColMode::Default(best_val.to_owned())
+        let best_cow = rows
+            .iter()
+            .find(|r| r.cells[col].as_ref() == best_val)
+            .map(|r| r.cells[col].clone())
+            .unwrap_or_else(|| Cow::Owned(best_val.to_owned()));
+        ColMode::Default(best_cow)
     } else {
         ColMode::Plain
     }
 }
 
-fn build_column_plan(csv: &ParsedCsv) -> ColumnPlan {
+fn build_column_plan<'a>(csv: &ParsedCsv<'a>) -> ColumnPlan<'a> {
     let ncols = csv.headers.len();
-    let modes: Vec<ColMode> = (0..ncols).map(|c| plan_column_mode(&csv.rows, c)).collect();
+    let modes: Vec<ColMode<'a>> = (0..ncols).map(|c| plan_column_mode(&csv.rows, c)).collect();
     let varying: Vec<usize> = (0..ncols)
         .filter(|&c| !matches!(modes[c], ColMode::Constant(_)))
         .collect();
     let has_const = modes.iter().any(|m| matches!(m, ColMode::Constant(_)));
     let has_default = modes.iter().any(|m| matches!(m, ColMode::Default(_)));
 
-    let mut cols_line = String::from("cols: ");
+    let est_cols_len: usize = 7
+        + csv.headers.iter().map(|h| h.len() + 1).sum::<usize>()
+        + modes
+            .iter()
+            .map(|m| match m {
+                ColMode::Plain => 0,
+                ColMode::Constant(v) => v.len() + 1,
+                ColMode::Default(v) => v.len() + 2,
+            })
+            .sum::<usize>();
+    let mut cols_line = String::with_capacity(est_cols_len);
+    cols_line.push_str("cols: ");
     for (c, name) in csv.headers.iter().enumerate() {
         if c > 0 {
             cols_line.push('\t');
         }
-        cols_line.push_str(&encode_col_spec(name, &modes[c]));
+        write_col_spec(name, &modes[c], &mut cols_line);
     }
     cols_line.push('\n');
 
@@ -837,8 +921,9 @@ fn build_column_plan(csv: &ParsedCsv) -> ColumnPlan {
     }
 }
 
-fn encode_row(row: &ParsedRow, plan: &ColumnPlan) -> String {
-    let mut line = String::new();
+fn encode_row(row: &ParsedRow<'_>, plan: &ColumnPlan<'_>) -> String {
+    let est: usize = plan.varying.iter().map(|&c| row.cells[c].len() + 1).sum();
+    let mut line = String::with_capacity(est);
     for (i, &c) in plan.varying.iter().enumerate() {
         if i > 0 {
             line.push('\t');
@@ -848,21 +933,20 @@ fn encode_row(row: &ParsedRow, plan: &ColumnPlan) -> String {
     line
 }
 
-fn decode_encoded_row(line: &str, plan: &ColumnPlan) -> Option<Vec<String>> {
-    let parts: Vec<&str> = line.split('\t').collect();
-    if parts.len() != plan.varying.len() {
-        return None;
-    }
+fn decode_encoded_row<'a>(line: &'a str, plan: &ColumnPlan<'a>) -> Option<Vec<Cow<'a, str>>> {
+    let mut parts = line.split('\t');
     let mut full_row = Vec::with_capacity(plan.modes.len());
-    let mut v_cursor = 0usize;
     for mode in &plan.modes {
         match mode {
             ColMode::Constant(val) => full_row.push(val.clone()),
             ColMode::Plain | ColMode::Default(_) => {
-                full_row.push(decode_varying_cell(parts[v_cursor], mode)?);
-                v_cursor += 1;
+                let part = parts.next()?;
+                full_row.push(decode_varying_cell(part, mode)?);
             }
         }
+    }
+    if parts.next().is_some() {
+        return None;
     }
     Some(full_row)
 }
@@ -872,27 +956,38 @@ fn tier1_legend_suffix(
     has_varying: bool,
     has_const: bool,
     has_default: bool,
-) -> String {
-    let mut s = String::new();
-    if delim == Delim::Comma && has_varying {
-        s.push_str(" · TSV");
+) -> &'static str {
+    match (delim == Delim::Comma && has_varying, has_const, has_default) {
+        (true, true, true) => " · TSV · col=V const, col?=V default (.=V)",
+        (true, true, false) => " · TSV · col=V const",
+        (true, false, true) => " · TSV · col?=V default (.=V)",
+        (true, false, false) => " · TSV",
+        (false, true, true) => " · col=V const, col?=V default (.=V)",
+        (false, true, false) => " · col=V const",
+        (false, false, true) => " · col?=V default (.=V)",
+        (false, false, false) => "",
     }
-    match (has_const, has_default) {
-        (true, true) => s.push_str(" · col=V const, col?=V default (.=V)"),
-        (true, false) => s.push_str(" · col=V const"),
-        (false, true) => s.push_str(" · col?=V default (.=V)"),
-        (false, false) => {}
-    }
-    s
 }
 
 /// Attempts to render the full Tier 1 bijective lossless view, bailing out early
 /// as soon as the output would exceed `budget`.
-fn try_render_tier1(csv: &ParsedCsv, plan: &ColumnPlan, budget: usize) -> Option<String> {
+fn try_render_tier1(
+    csv: &ParsedCsv<'_>,
+    plan: &ColumnPlan<'_>,
+    budget: usize,
+    raw_len: usize,
+) -> Option<String> {
     let has_varying = !plan.varying.is_empty();
     let suffix = tier1_legend_suffix(csv.delim, has_varying, plan.has_const, plan.has_default);
-    let mut out = format!(
-        "[{} {} rows × {} cols{suffix}]\n",
+    let est_cap = if has_varying {
+        raw_len.min(budget).max(plan.cols_line.len() + 96)
+    } else {
+        plan.cols_line.len() + 96
+    };
+    let mut out = String::with_capacity(est_cap);
+    let _ = writeln!(
+        out,
+        "[{} {} rows × {} cols{suffix}]",
         csv.delim.label(),
         csv.rows.len(),
         csv.headers.len()
@@ -918,7 +1013,7 @@ fn try_render_tier1(csv: &ParsedCsv, plan: &ColumnPlan, budget: usize) -> Option
     Some(out)
 }
 
-fn decode_csv(view: &str) -> Option<DecodedCsv> {
+fn decode_csv(view: &str) -> Option<DecodedCsv<'_>> {
     let mut lines = view.strip_suffix('\n')?.split('\n');
 
     // 1. Legend line: `[CSV 50 rows × 6 cols · TSV · col=V const, col?=V default (.=V)]`
@@ -979,18 +1074,16 @@ fn decode_csv(view: &str) -> Option<DecodedCsv> {
         return None;
     }
 
-    let varying: Vec<usize> = (0..col_count)
-        .filter(|&c| !matches!(modes[c], ColMode::Constant(_)))
-        .collect();
-    let expect_tsv_flag = delim == Delim::Comma && !varying.is_empty();
+    let has_varying = modes.iter().any(|m| !matches!(m, ColMode::Constant(_)));
+    let expect_tsv_flag = delim == Delim::Comma && has_varying;
     if has_tsv_flag != expect_tsv_flag {
         return None;
     }
 
     // 3. Exact `row_count` data rows
     let mut rows = Vec::with_capacity(row_count);
-    if varying.is_empty() {
-        let const_row: Vec<String> = modes
+    if !has_varying {
+        let const_row: Vec<Cow<'_, str>> = modes
             .iter()
             .map(|m| match m {
                 ColMode::Constant(v) => v.clone(),
@@ -1003,20 +1096,19 @@ fn decode_csv(view: &str) -> Option<DecodedCsv> {
     } else {
         for _ in 0..row_count {
             let line = lines.next()?;
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() != varying.len() {
-                return None;
-            }
+            let mut parts = line.split('\t');
             let mut full_row = Vec::with_capacity(col_count);
-            let mut v_cursor = 0usize;
             for mode in &modes {
                 match mode {
                     ColMode::Constant(val) => full_row.push(val.clone()),
                     ColMode::Plain | ColMode::Default(_) => {
-                        full_row.push(decode_varying_cell(parts[v_cursor], mode)?);
-                        v_cursor += 1;
+                        let part = parts.next()?;
+                        full_row.push(decode_varying_cell(part, mode)?);
                     }
                 }
+            }
+            if parts.next().is_some() {
+                return None;
             }
             rows.push(full_row);
         }
@@ -1034,7 +1126,7 @@ fn decode_csv(view: &str) -> Option<DecodedCsv> {
     })
 }
 
-fn verify_round_trip(csv: &ParsedCsv, rendered: &str) -> bool {
+fn verify_round_trip(csv: &ParsedCsv<'_>, rendered: &str) -> bool {
     let Some(decoded) = decode_csv(rendered) else {
         return false;
     };
@@ -1243,11 +1335,11 @@ fn sanitize_schema_val(s: &str) -> String {
     cleaned
 }
 
-fn format_column_summary(csv: &ParsedCsv, col: usize) -> String {
+fn format_column_summary(csv: &ParsedCsv<'_>, col: usize) -> String {
     let n = csv.rows.len();
-    let name = &csv.headers[col];
+    let name = csv.headers[col].as_ref();
 
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut counts: HashMap<&str, usize> = HashMap::with_capacity(n.min(64));
     let mut empty_count = 0usize;
     let mut null_token_count = 0usize;
     let mut non_missing = 0usize;
@@ -1268,7 +1360,7 @@ fn format_column_summary(csv: &ParsedCsv, col: usize) -> String {
     let mut date_same_sep = true;
 
     for r in &csv.rows {
-        let cell = r.cells[col].as_str();
+        let cell = r.cells[col].as_ref();
         *counts.entry(cell).or_insert(0) += 1;
         match classify_missing(cell) {
             MissingKind::Empty => {
@@ -1361,18 +1453,15 @@ fn format_column_summary(csv: &ParsedCsv, col: usize) -> String {
     let distinct = ranked.len();
     let (top_val, top_count) = ranked[0];
 
-    let mut line = format!("  {} ({}): ", sanitize_schema_val(name), col_type.label());
-    let mut parts: Vec<String> = Vec::new();
+    let safe_name = sanitize_schema_val(name);
+    let mut line = format!("  {safe_name} ({}): ", col_type.label());
+    let mut parts: Vec<String> = Vec::with_capacity(4);
 
     if distinct == 1 {
         if top_val.is_empty() {
-            parts.push(format!("{}= (all empty)", sanitize_schema_val(name)));
+            parts.push(format!("{safe_name}= (all empty)"));
         } else {
-            parts.push(format!(
-                "{}={}",
-                sanitize_schema_val(name),
-                sanitize_schema_val(top_val)
-            ));
+            parts.push(format!("{safe_name}={}", sanitize_schema_val(top_val)));
         }
     } else {
         let is_majority =
@@ -1380,10 +1469,8 @@ fn format_column_summary(csv: &ParsedCsv, col: usize) -> String {
         if is_majority {
             let pct = ((top_count * 100 + n / 2) / n).min(99);
             parts.push(format!(
-                "{}?={} {}%",
-                sanitize_schema_val(name),
-                sanitize_schema_val(top_val),
-                pct
+                "{safe_name}?={} {pct}%",
+                sanitize_schema_val(top_val)
             ));
         }
 
@@ -1451,7 +1538,7 @@ fn format_column_summary(csv: &ParsedCsv, col: usize) -> String {
 }
 
 fn format_top_values(ranked: &[(&str, usize)], limit: usize, skip_empty: bool) -> String {
-    let mut items: Vec<String> = Vec::new();
+    let mut items: Vec<String> = Vec::with_capacity(limit + 1);
     let mut shown = 0usize;
     let mut total_eligible = 0usize;
     for &(val, count) in ranked {
@@ -1475,6 +1562,15 @@ fn format_top_values(ranked: &[(&str, usize)], limit: usize, skip_empty: bool) -
     items.join(", ")
 }
 
+fn digits(mut n: usize) -> usize {
+    let mut d = 1;
+    while n >= 10 {
+        n /= 10;
+        d += 1;
+    }
+    d
+}
+
 fn stdout_ref(first: usize, last: usize) -> String {
     if first == last {
         format!("[stdout:{first}]")
@@ -1491,7 +1587,17 @@ fn elision_line(omitted: usize, first_line: usize, last_line: usize) -> String {
     )
 }
 
-fn render_tier2(csv: &ParsedCsv, plan: &ColumnPlan, budget: usize) -> Option<String> {
+fn elision_line_len(omitted: usize, first_line: usize, last_line: usize) -> usize {
+    let unit_len = if omitted == 1 { 3 } else { 4 };
+    let ref_len = if first_line == last_line {
+        "[stdout:]".len() + digits(first_line)
+    } else {
+        "[stdout:-]".len() + digits(first_line) + digits(last_line)
+    };
+    "...  ".len() + digits(omitted) + unit_len + " omitted ".len() + ref_len + " ...\n".len()
+}
+
+fn render_tier2(csv: &ParsedCsv<'_>, plan: &ColumnPlan<'_>, budget: usize) -> Option<String> {
     let n = csv.rows.len();
     if plan.varying.is_empty() || n < 2 {
         return None;
@@ -1539,11 +1645,11 @@ fn render_tier2(csv: &ParsedCsv, plan: &ColumnPlan, budget: usize) -> Option<Str
     let last_row_bytes = tail_rows[max_tail - 1].len() + 1;
 
     let min_elision_1_1 = if n >= 3 {
-        elision_line(n - 2, csv.rows[1].line_no, csv.rows[n - 2].line_no).len()
+        elision_line_len(n - 2, csv.rows[1].line_no, csv.rows[n - 2].line_no)
     } else {
         usize::MAX / 4
     };
-    let min_elision_1_0 = elision_line(n - 1, csv.rows[1].line_no, csv.rows[n - 1].line_no).len();
+    let min_elision_1_0 = elision_line_len(n - 1, csv.rows[1].line_no, csv.rows[n - 1].line_no);
 
     let min_sample_1_1 = sample_prefix_len + row0_bytes + min_elision_1_1 + last_row_bytes;
     let min_sample_1_0 = sample_prefix_len + row0_bytes + min_elision_1_0;
@@ -1560,37 +1666,42 @@ fn render_tier2(csv: &ParsedCsv, plan: &ColumnPlan, budget: usize) -> Option<Str
     let schema_lines: Vec<String> = (0..csv.headers.len())
         .map(|c| format_column_summary(csv, c))
         .collect();
-    let mut schema_block = String::new();
     let total_schema_bytes: usize =
         "schema:\n".len() + schema_lines.iter().map(String::len).sum::<usize>();
-    if total_schema_bytes <= schema_budget {
-        schema_block.push_str("schema:\n");
+    let schema_block = if total_schema_bytes <= schema_budget {
+        let mut s = String::with_capacity(total_schema_bytes);
+        s.push_str("schema:\n");
         for l in &schema_lines {
-            schema_block.push_str(l);
+            s.push_str(l);
         }
+        s
     } else if schema_budget > "schema:\n".len() + 32 {
-        schema_block.push_str("schema:\n");
+        let mut s = String::with_capacity(schema_budget);
+        s.push_str("schema:\n");
         let mut included = 0usize;
         for (idx, l) in schema_lines.iter().enumerate() {
             let remaining_cols = schema_lines.len() - idx - 1;
             let more_len = if remaining_cols > 0 {
-                format!("  ... +{remaining_cols} more columns\n").len()
+                "  ... + more columns\n".len() + digits(remaining_cols)
             } else {
                 0
             };
-            if schema_block.len() + l.len() + more_len <= schema_budget {
-                schema_block.push_str(l);
+            if s.len() + l.len() + more_len <= schema_budget {
+                s.push_str(l);
                 included += 1;
             } else {
                 let omitted_cols = schema_lines.len() - included;
-                let _ = writeln!(schema_block, "  ... +{omitted_cols} more columns");
+                let _ = writeln!(s, "  ... +{omitted_cols} more columns");
                 break;
             }
         }
         if included == 0 {
-            schema_block.clear();
+            s.clear();
         }
-    }
+        s
+    } else {
+        String::new()
+    };
 
     let fixed_bytes = header_line.len() + schema_block.len() + sample_prefix_len;
 
@@ -1598,7 +1709,7 @@ fn render_tier2(csv: &ParsedCsv, plan: &ColumnPlan, budget: usize) -> Option<Str
         let omitted = n - (head_k + tail_m);
         let first_line = csv.rows[head_k].line_no;
         let last_line = csv.rows[n - tail_m - 1].line_no;
-        let elision_len = elision_line(omitted, first_line, last_line).len();
+        let elision_len = elision_line_len(omitted, first_line, last_line);
         fixed_bytes + head_bytes + elision_len + tail_bytes
     };
 
@@ -2072,5 +2183,54 @@ Because the client retries, the request eventually succeeds
         assert!(format(&too_short, 4096).is_none());
         let single_col = "service\n".to_owned() + &"payments-service-long-name\n".repeat(20);
         assert!(format(&single_col, 4096).is_none());
+    }
+
+    #[test]
+    fn utf8_bom_csv_unquoted_and_quoted_headers_round_trip_cleanly() {
+        // 1. Unquoted Excel UTF-8 BOM CSV with CRLF
+        let mut unquoted = String::from("\u{feff}id,service,env,region,status\r\n");
+        for i in 1..=20 {
+            let status = if i == 10 { "timeout" } else { "ok" };
+            let _ = write!(
+                unquoted,
+                "{i},billing-api,production,us-east-1,{status}\r\n"
+            );
+        }
+        let parsed = parse_csv(&unquoted).expect("BOM-prefixed unquoted CSV should parse");
+        assert_eq!(parsed.headers[0], "id", "BOM must not corrupt first header");
+        assert!(!parsed.headers[0].contains('\u{feff}'));
+        let view = format(&unquoted, 8192).expect("BOM-prefixed unquoted CSV should compact");
+        assert!(view.contains("cols: id\tservice=billing-api"), "{view}");
+        let decoded = decode_csv(&view).expect("BOM CSV view must decode bijectively");
+        assert_eq!(decoded.headers, parsed.headers);
+        assert_eq!(decoded.rows.len(), 20);
+        for (dec, orig) in decoded.rows.iter().zip(&parsed.rows) {
+            assert_eq!(dec, &orig.cells);
+        }
+
+        // 2. RFC 4180 quoted Excel UTF-8 BOM CSV (previously failed to parse when BOM preceded `"`)
+        let mut quoted =
+            String::from("\u{feff}\"id\",\"service\",\"env\",\"customer\",\"status\"\r\n");
+        for i in 1..=20 {
+            let status = if i == 5 { "error" } else { "ok" };
+            let customer = if i % 4 == 0 {
+                format!("\"Doe, Jane \"\"#{i}\"\"\"")
+            } else {
+                format!("\"cust_{i:02}\"")
+            };
+            let _ = write!(
+                quoted,
+                "\"{i}\",\"orders-api\",\"production\",{customer},\"{status}\"\r\n"
+            );
+        }
+        let parsed_q = parse_csv(&quoted).expect("BOM-prefixed quoted CSV should parse");
+        assert_eq!(parsed_q.headers[0], "id");
+        let view_q = format(&quoted, 8192).expect("BOM-prefixed quoted CSV should compact");
+        assert!(view_q.contains("cols: id\tservice=orders-api"), "{view_q}");
+        let decoded_q = decode_csv(&view_q).expect("BOM quoted CSV must decode bijectively");
+        assert_eq!(decoded_q.headers, parsed_q.headers);
+        for (dec, orig) in decoded_q.rows.iter().zip(&parsed_q.rows) {
+            assert_eq!(dec, &orig.cells);
+        }
     }
 }
