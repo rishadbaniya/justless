@@ -70,6 +70,9 @@ impl Route {
         post_run: bool,
         routes: impl Fn(&str, &Exclusions) -> bool,
     ) -> Self {
+        if command_disables_justless(command) {
+            return Self::Excluded;
+        }
         let none = Exclusions::default();
         if routes(command, exclusions) {
             Self::SupportedNotRouted
@@ -86,6 +89,87 @@ impl Route {
             Self::PassedThrough
         }
     }
+}
+
+fn is_shell_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn disables_justless_assignment(word: &str) -> bool {
+    word.strip_prefix("JUSTLESS_DISABLE=")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+/// Whether `command` explicitly disables Justless via a leading
+/// `JUSTLESS_DISABLE=<non-empty, non-0>` assignment, `export`, or wrapper
+/// (`env`, `time`, `nohup`, `command`, `nice`, `timeout`) in any top-level
+/// shell stage. Commands that merely mention `JUSTLESS_DISABLE=1` as a data
+/// argument (such as `rg 'JUSTLESS_DISABLE=1' src`) or set `JUSTLESS_DISABLE=0`
+/// return `false`.
+pub(crate) fn command_disables_justless(command: &str) -> bool {
+    if !command.contains("JUSTLESS_DISABLE=") {
+        return false;
+    }
+    split_shell_stages(command).into_iter().any(|stage| {
+        let Some(words) = shlex::split(stage) else {
+            return false;
+        };
+        let mut rest: &[String] = &words;
+        loop {
+            let Some(first) = rest.first() else {
+                return false;
+            };
+            if disables_justless_assignment(first) {
+                return true;
+            }
+            rest = match first.as_str() {
+                word if is_shell_assignment(word) => &rest[1..],
+                "env" => {
+                    let mut i = 1;
+                    while let Some(arg) = rest.get(i) {
+                        if arg == "--" {
+                            i += 1;
+                            break;
+                        } else if matches!(arg.as_str(), "-u" | "--unset" | "-C" | "--chdir") {
+                            i += 2;
+                        } else if arg.starts_with('-') {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    rest.get(i..).unwrap_or(&[])
+                }
+                "export" | "time" | "nohup" => &rest[1..],
+                "command" if rest.get(1).is_some_and(|w| !w.starts_with('-')) => &rest[1..],
+                "nice" => match rest.get(1).map(String::as_str) {
+                    Some("-n") => rest.get(3..).unwrap_or(&[]),
+                    Some(w) if w.starts_with('-') => rest.get(2..).unwrap_or(&[]),
+                    _ => &rest[1..],
+                },
+                "timeout" => {
+                    let mut i = 1;
+                    while let Some(option) = rest.get(i).filter(|w| w.starts_with('-')) {
+                        i += if matches!(option.as_str(), "-s" | "--signal" | "-k" | "--kill-after")
+                        {
+                            2
+                        } else {
+                            1
+                        };
+                    }
+                    rest.get(i + 1..).unwrap_or(&[])
+                }
+                _ => return false,
+            };
+        }
+    })
 }
 
 /// Split `command` into trimmed top-level stages on `\n`, `;`, `&&`, `||`, `|&`,
@@ -354,18 +438,24 @@ pub(crate) fn transcript_dir(root: &Path) -> Option<PathBuf> {
     Some(base.join("projects").join(slug))
 }
 
+fn is_regular_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
 pub(crate) fn transcripts(dir: &Path, since: SystemTime, depth: usize, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Ok(meta) = entry.metadata() else {
+        // `symlink_metadata` never follows symlinks, skipping linked files and directories.
+        let Ok(meta) = fs::symlink_metadata(&path) else {
             continue;
         };
         if meta.is_dir() && depth > 0 && path.file_name().is_some_and(|n| n != "memory") {
             transcripts(&path, since, depth - 1, out);
         } else if meta.is_file()
+            && meta.len() <= MAX_TRANSCRIPT_BYTES
             && path.extension().is_some_and(|e| e == "jsonl")
             && meta.modified().is_ok_and(|m| m >= since)
         {
@@ -405,35 +495,78 @@ pub(crate) fn ids_may_match<'a>(
     ids.any(|id| !is_plain_json_id(id) || line.contains(id))
 }
 
+/// Read one `\n`-terminated line up to `max_line_bytes` without allocating past
+/// the cap. Returns `Ok(Some(true))` when the line fit within `max_line_bytes`,
+/// `Ok(Some(false))` when the line was oversized and discarded up to `\n`/EOF,
+/// and `Ok(None)` at EOF.
+fn read_bounded_line(
+    reader: &mut BufReader<File>,
+    buf: &mut Vec<u8>,
+    max_line_bytes: usize,
+) -> std::io::Result<Option<bool>> {
+    buf.clear();
+    let mut read_any = false;
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(read_any.then_some(!oversized));
+        }
+        read_any = true;
+        let (consume, done) = match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => (pos + 1, true),
+            None => (available.len(), false),
+        };
+        if !oversized {
+            if buf.len().saturating_add(consume) <= max_line_bytes {
+                buf.extend_from_slice(&available[..consume]);
+            } else {
+                oversized = true;
+                buf.clear();
+            }
+        }
+        reader.consume(consume);
+        if done {
+            return Ok(Some(!oversized));
+        }
+    }
+}
+
 /// Stream a JSONL file line-by-line into a reusable byte buffer (zero per-line
-/// heap allocation on steady-state lines), safely skipping non-UTF8 or oversized
-/// lines. Stops early when `f` returns `false`.
+/// heap allocation on steady-state lines), safely skipping symlinks, non-UTF8,
+/// or oversized files and lines. Stops early when `f` returns `false`.
 pub(crate) fn for_each_jsonl_line(
     path: &Path,
     max_file_bytes: Option<u64>,
     mut f: impl FnMut(usize, &str) -> bool,
 ) {
+    // Reject symlinks, special files and oversized files before opening.
+    let Ok(sym_meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if !sym_meta.is_file() || max_file_bytes.is_some_and(|limit| sym_meta.len() > limit) {
+        return;
+    }
     let Ok(file) = File::open(path) else {
         return;
     };
-    if let Some(limit) = max_file_bytes
-        && file
-            .metadata()
-            .is_ok_and(|m| !m.is_file() || m.len() > limit)
+    if file
+        .metadata()
+        .is_ok_and(|m| !m.is_file() || max_file_bytes.is_some_and(|limit| m.len() > limit))
     {
         return;
     }
+    let max_line_bytes = max_file_bytes
+        .unwrap_or(MAX_TRANSCRIPT_BYTES)
+        .min(MAX_TRANSCRIPT_BYTES) as usize;
     let mut reader = BufReader::with_capacity(READER_CAPACITY, file);
     let mut buf = Vec::with_capacity(4096);
     let mut index = 0usize;
     loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
-            Ok(0) => break,
-            Ok(_) => {
-                if buf.len() as u64 <= MAX_TRANSCRIPT_BYTES
-                    && let Ok(raw) = std::str::from_utf8(&buf)
-                {
+        match read_bounded_line(&mut reader, &mut buf, max_line_bytes) {
+            Ok(None) | Err(_) => break,
+            Ok(Some(fit)) => {
+                if fit && let Ok(raw) = std::str::from_utf8(&buf) {
                     let line = raw.trim_end_matches(['\r', '\n']);
                     if !f(index, line) {
                         break;
@@ -444,14 +577,17 @@ pub(crate) fn for_each_jsonl_line(
                 }
                 index += 1;
             }
-            Err(_) => break,
         }
     }
 }
 
-/// Read a UTF-8 file up to `max_bytes`, failing silently on missing, oversized,
-/// or non-UTF8 files.
+/// Read a UTF-8 regular file up to `max_bytes`, failing silently on symlinks,
+/// missing, oversized, or non-UTF8 files.
 fn read_bounded_utf8(path: &Path, max_bytes: u64) -> Option<String> {
+    let sym_meta = fs::symlink_metadata(path).ok()?;
+    if !sym_meta.is_file() || sym_meta.len() > max_bytes {
+        return None;
+    }
     let file = File::open(path).ok()?;
     let meta = file.metadata().ok()?;
     if !meta.is_file() || meta.len() > max_bytes {
@@ -480,7 +616,7 @@ fn collect_files_with_ext(
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Ok(meta) = entry.metadata() else {
+        let Ok(meta) = fs::symlink_metadata(&path) else {
             continue;
         };
         if meta.is_dir() && depth > 0 {
@@ -686,6 +822,44 @@ pub(crate) fn routed(command: &str, label: &str, content: &Value) -> bool {
     invokes_justless || shell_read && first.is_some_and(|text| OUTLINE.is_match(text))
 }
 
+/// Collapses any label that looks like a pasted token or oversized identifier
+/// to `"other"` so `discover` never emits secrets even when an agent invokes a
+/// malformed command starting with a credential token.
+fn sanitize_discover_label(label: String) -> String {
+    const SECRET_PREFIXES: &[&str] = &[
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "sk-",
+        "sk_live_",
+        "sk_test_",
+        "pk_live_",
+        "AKIA",
+        "ASIA",
+        "xoxb-",
+        "xoxp-",
+        "AIza",
+        "glpat-",
+        "npm_",
+        "pypi-",
+    ];
+    if label.is_empty()
+        || label.len() > 48
+        || label.chars().any(char::is_control)
+        || label.split(' ').any(|word| {
+            SECRET_PREFIXES
+                .iter()
+                .any(|prefix| word.starts_with(prefix))
+        })
+    {
+        return "other".into();
+    }
+    label
+}
+
 /// Command label for `discover`: delegates to `agents::command_label` +
 /// `history::label`, and preserves allowlisted 3-word labels (`python3 -m
 /// unittest`, `python -m unittest`, `kubectl get events|svc|pods|…`) without
@@ -694,7 +868,7 @@ fn discover_label(command: &str) -> String {
     let words = crate::agents::command_label(command);
     let base = crate::history::label(&words.split(' ').collect::<Vec<_>>());
     if !matches!(base.as_str(), "python" | "python3" | "kubectl get") {
-        return base;
+        return sanitize_discover_label(base);
     }
     for stage in split_shell_stages(command) {
         let text = crate::shell_form::parse(stage)
@@ -706,10 +880,10 @@ fn discover_label(command: &str) -> String {
         let refs: Vec<&str> = stage_words.iter().map(String::as_str).collect();
         let refined = crate::history::label(&refs);
         if refined != base && refined.starts_with(&base) {
-            return refined;
+            return sanitize_discover_label(refined);
         }
     }
-    base
+    sanitize_discover_label(base)
 }
 
 #[derive(Default)]
@@ -784,7 +958,7 @@ impl AgentCoverage {
         routes: impl Fn(&str, &Exclusions) -> bool,
     ) {
         let trimmed = command.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || command_disables_justless(trimmed) {
             return;
         }
         let label = discover_label(trimmed);
@@ -992,11 +1166,11 @@ fn scan_gemini_in(
 
     for entry in project_entries.flatten() {
         let proj_dir = entry.path();
-        if !proj_dir.is_dir() {
+        if !is_regular_dir(&proj_dir) {
             continue;
         }
         let chats_dir = proj_dir.join("chats");
-        if !chats_dir.is_dir() {
+        if !is_regular_dir(&chats_dir) {
             continue;
         }
         let dir_name = entry.file_name().to_string_lossy().into_owned();
@@ -1031,7 +1205,7 @@ fn scan_gemini_in(
         };
         for chat in chat_entries.flatten() {
             let path = chat.path();
-            let Ok(meta) = chat.metadata() else {
+            let Ok(meta) = fs::symlink_metadata(&path) else {
                 continue;
             };
             let name = chat.file_name();
@@ -1332,7 +1506,7 @@ fn scan_opencode_in(
             scoped_by_message = true;
             for entry in entries.flatten() {
                 let path = entry.path();
-                let Ok(meta) = entry.metadata() else {
+                let Ok(meta) = fs::symlink_metadata(&path) else {
                     continue;
                 };
                 if !meta.is_file()
@@ -1522,7 +1696,7 @@ fn scan_cursor_in(
     if let Ok(entries) = fs::read_dir(&projects_dir) {
         for entry in entries.flatten() {
             let proj_dir = entry.path();
-            if !proj_dir.is_dir() {
+            if !is_regular_dir(&proj_dir) {
                 continue;
             }
             let dir_name = entry.file_name().to_string_lossy().into_owned();
@@ -1530,7 +1704,7 @@ fn scan_cursor_in(
                 continue;
             }
             let transcripts_dir = proj_dir.join("agent-transcripts");
-            if transcripts_dir.is_dir() {
+            if is_regular_dir(&transcripts_dir) {
                 collect_files_with_ext(
                     &transcripts_dir,
                     since,
@@ -1954,11 +2128,11 @@ fn scan_cline_like_in(
         };
         for task_entry in task_entries.flatten() {
             let task_dir = task_entry.path();
-            if !task_dir.is_dir() {
+            if !is_regular_dir(&task_dir) {
                 continue;
             }
             let hist_path = task_dir.join("api_conversation_history.json");
-            let Ok(meta) = fs::metadata(&hist_path) else {
+            let Ok(meta) = fs::symlink_metadata(&hist_path) else {
                 continue;
             };
             if !meta.is_file()
@@ -2178,7 +2352,7 @@ fn scan_claude_file(
         .filter(|modes| modes.len() == 1)
         .and_then(|modes| modes.first().cloned());
     let mut calls: HashMap<String, Call> = HashMap::new();
-    for_each_jsonl_line(file, None, |_, line| {
+    for_each_jsonl_line(file, Some(MAX_TRANSCRIPT_BYTES), |_, line| {
         if use_prefilter && !claude_line_wanted(line, &calls) {
             return true;
         }
@@ -2232,7 +2406,9 @@ fn scan_claude_file(
                     else {
                         continue;
                     };
-                    if call.date.as_str() < ctx.first_date {
+                    if call.date.as_str() < ctx.first_date
+                        || command_disables_justless(&call.command)
+                    {
                         continue;
                     }
                     let content = &part["content"];
@@ -3934,5 +4110,219 @@ mod tests {
             unrouted.labels.get("git status"),
             Some(&(1, shell_payload.len() as u64))
         );
+    }
+
+    #[test]
+    fn justless_disable_commands_symlinks_and_oversized_files_skip_cleanly_with_zero_leaks() {
+        use std::collections::{BTreeSet, HashMap};
+        use std::time::{Duration, SystemTime};
+
+        let none = crate::rewrite::Exclusions::default();
+
+        // 1. Direct `Route::unrouted` classifies `JUSTLESS_DISABLE=<non-0>` as Excluded
+        //    (never SupportedNotRouted), while `JUSTLESS_DISABLE=0` and data arguments still route.
+        for disabled_cmd in [
+            "JUSTLESS_DISABLE=1 cargo test",
+            "FOO=1 JUSTLESS_DISABLE=true git status",
+            "env JUSTLESS_DISABLE=1 cargo clippy",
+            "env -i JUSTLESS_DISABLE=1 rg foo src",
+            "export JUSTLESS_DISABLE=1 && cargo test",
+            "timeout 30 JUSTLESS_DISABLE=1 cargo build",
+        ] {
+            assert!(
+                super::command_disables_justless(disabled_cmd),
+                "{disabled_cmd}"
+            );
+            assert_eq!(
+                Route::unrouted(
+                    disabled_cmd,
+                    "cargo test",
+                    &none,
+                    true,
+                    crate::agents::would_route,
+                ),
+                Route::Excluded,
+                "{disabled_cmd}"
+            );
+        }
+        for active_cmd in [
+            "JUSTLESS_DISABLE=0 cargo test",
+            "JUSTLESS_DISABLE= cargo test",
+            "rg 'JUSTLESS_DISABLE=1' src",
+            "cargo test",
+        ] {
+            assert!(
+                !super::command_disables_justless(active_cmd),
+                "{active_cmd}"
+            );
+        }
+
+        // 2. Claude & Cursor scanners skip `JUSTLESS_DISABLE=1` commands cleanly while keeping
+        //    `JUSTLESS_DISABLE=0` and never leaking secrets (even when pasted as a command token).
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("disable_repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = crate::workspace::Workspace::discover(Some(&root)).unwrap();
+        let root_str = ws.root.to_string_lossy().into_owned();
+        let since = SystemTime::now() - Duration::from_secs(3600);
+        let since_ms = crate::history::now_ms().saturating_sub(3_600_000);
+
+        let secret_token = "ghp_99887766554433221100aabbccddeeff00";
+        let secret_stdout = "TOKEN=SUPER_SECRET_DISABLE_STDOUT_VALUE\n";
+
+        let claude_file = temp.path().join("claude_disable.jsonl");
+        let claude_lines = [
+            serde_json::json!({"type":"assistant","cwd":&root_str,"timestamp":"2099-01-01T00:00:00Z","message":{"content":[
+                {"type":"tool_use","id":"d1","name":"Bash","input":{"command":format!("JUSTLESS_DISABLE=1 cargo test -- {secret_token}")}}
+            ]}}).to_string(),
+            serde_json::json!({"type":"user","cwd":&root_str,"timestamp":"2099-01-01T00:00:01Z","message":{"content":[
+                {"type":"tool_result","tool_use_id":"d1","content":secret_stdout}
+            ]}}).to_string(),
+            serde_json::json!({"type":"assistant","cwd":&root_str,"timestamp":"2099-01-01T00:00:02Z","message":{"content":[
+                {"type":"tool_use","id":"d2","name":"Bash","input":{"command":"env JUSTLESS_DISABLE=true git status"}}
+            ]}}).to_string(),
+            serde_json::json!({"type":"user","cwd":&root_str,"timestamp":"2099-01-01T00:00:03Z","message":{"content":[
+                {"type":"tool_result","tool_use_id":"d2","content":"M src/lib.rs\n"}
+            ]}}).to_string(),
+            serde_json::json!({"type":"assistant","cwd":&root_str,"timestamp":"2099-01-01T00:00:04Z","message":{"content":[
+                {"type":"tool_use","id":"a1","name":"Bash","input":{"command":format!("JUSTLESS_DISABLE=0 git status -- {secret_token}")}}
+            ]}}).to_string(),
+            serde_json::json!({"type":"user","cwd":&root_str,"timestamp":"2099-01-01T00:00:05Z","message":{"content":[
+                {"type":"tool_result","tool_use_id":"a1","content":secret_stdout}
+            ]}}).to_string(),
+            serde_json::json!({"type":"assistant","cwd":&root_str,"timestamp":"2099-01-01T00:00:06Z","message":{"content":[
+                {"type":"tool_use","id":"t1","name":"Bash","input":{"command":secret_token}}
+            ]}}).to_string(),
+            serde_json::json!({"type":"user","cwd":&root_str,"timestamp":"2099-01-01T00:00:07Z","message":{"content":[
+                {"type":"tool_result","tool_use_id":"t1","content":secret_stdout}
+            ]}}).to_string(),
+        ];
+        std::fs::write(&claude_file, claude_lines.join("\n")).unwrap();
+
+        let mut ctx = super::ClaudeScanContext {
+            workspace: &ws,
+            root: &root_str,
+            first_date: "2020-01-01",
+            plan: true,
+            exclusions: &none,
+            post_run: None,
+            rules: None,
+            session_modes: HashMap::new(),
+            groups: BTreeMap::new(),
+            unrouted: BTreeMap::new(),
+            sessions: BTreeSet::new(),
+        };
+        super::scan_claude_file(&mut ctx, &claude_file, "s1", true, true, None);
+        let total_claude: u64 = ctx.groups.values().map(|g| g.commands).sum();
+        assert_eq!(
+            total_claude, 2,
+            "only JUSTLESS_DISABLE=0 and token cmd counted"
+        );
+        assert!(
+            !ctx.groups
+                .values()
+                .any(|g| g.labels.contains_key("cargo test")),
+            "JUSTLESS_DISABLE=1 cargo test must be skipped"
+        );
+        assert_eq!(discover_label(secret_token), "other");
+
+        // 3. Cursor skips `JUSTLESS_DISABLE=1`, invalid UTF-8 lines, oversized files, and symlinks.
+        let cursor_home = temp.path().join("cursor");
+        let slug = super::normalize_slug_collapsed(&ws.root.to_string_lossy());
+        let cursor_dir = cursor_home
+            .join("projects")
+            .join(&slug)
+            .join("agent-transcripts");
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+        let mut cursor_bytes = Vec::new();
+        cursor_bytes.extend_from_slice(
+            serde_json::json!({"role":"assistant","timestamp":"2099-01-01T00:00:00Z","message":{"content":[
+                {"type":"tool_use","id":"c1","name":"Shell","input":{"command":"JUSTLESS_DISABLE=1 cargo test"}}
+            ]}}).to_string().as_bytes(),
+        );
+        cursor_bytes.push(b'\n');
+        // Invalid UTF-8 line must be skipped without aborting the file scan.
+        cursor_bytes.extend_from_slice(&[0xff, 0xfe, b'{', b'}', b'\n']);
+        cursor_bytes.extend_from_slice(
+            serde_json::json!({"role":"user","timestamp":"2099-01-01T00:00:01Z","message":{"content":[
+                {"type":"tool_result","tool_use_id":"c1","content":secret_stdout}
+            ]}}).to_string().as_bytes(),
+        );
+        cursor_bytes.push(b'\n');
+        cursor_bytes.extend_from_slice(
+            serde_json::json!({"role":"assistant","timestamp":"2099-01-01T00:00:02Z","message":{"content":[
+                {"type":"tool_use","id":"c2","name":"Shell","input":{"command":format!("cargo test -- {secret_token}")}}
+            ]}}).to_string().as_bytes(),
+        );
+        cursor_bytes.push(b'\n');
+        cursor_bytes.extend_from_slice(
+            serde_json::json!({"role":"user","timestamp":"2099-01-01T00:00:03Z","message":{"content":[
+                {"type":"tool_result","tool_use_id":"c2","content":secret_stdout}
+            ]}}).to_string().as_bytes(),
+        );
+        cursor_bytes.push(b'\n');
+        std::fs::write(cursor_dir.join("real.jsonl"), &cursor_bytes).unwrap();
+
+        // Symlinked transcript pointing outside must be ignored cleanly.
+        #[cfg(unix)]
+        {
+            let outside = temp.path().join("outside.jsonl");
+            std::fs::write(&outside, &cursor_bytes).unwrap();
+            std::os::unix::fs::symlink(&outside, cursor_dir.join("linked.jsonl")).unwrap();
+            assert!(
+                super::read_bounded_utf8(&cursor_dir.join("linked.jsonl"), 1024 * 1024).is_none()
+            );
+            let mut seen = 0usize;
+            super::for_each_jsonl_line(
+                &cursor_dir.join("linked.jsonl"),
+                Some(1024 * 1024),
+                |_, _| {
+                    seen += 1;
+                    true
+                },
+            );
+            assert_eq!(seen, 0, "symlinked jsonl must never be read");
+        }
+
+        // Oversized file limit enforced cleanly by `for_each_jsonl_line` and `read_bounded_utf8`.
+        let small = temp.path().join("capped.jsonl");
+        std::fs::write(&small, "1234567890\n").unwrap();
+        assert!(super::read_bounded_utf8(&small, 5).is_none());
+        let mut seen = 0usize;
+        super::for_each_jsonl_line(&small, Some(5), |_, _| {
+            seen += 1;
+            true
+        });
+        assert_eq!(seen, 0, "oversized file must be skipped");
+
+        let cursor = super::scan_cursor_in(&cursor_home, &ws, &none, since, since_ms);
+        assert_eq!(
+            cursor.commands(),
+            1,
+            "only non-disabled command in real.jsonl"
+        );
+
+        let report = super::DiscoverReport {
+            claude_dir: Some(temp.path().join("claude_empty")),
+            claude_sessions: ctx.sessions,
+            claude_groups: ctx.groups,
+            claude_unrouted: ctx.unrouted,
+            claude_unreadable_permissions: false,
+            codex: crate::rollouts::Coverage::default(),
+            agy: crate::agy_sessions::Coverage::default(),
+            agents: vec![cursor],
+        };
+        let json_out = serde_json::to_string_pretty(&report.to_json(30, true)).unwrap();
+        let text_out = report.to_text(&ws, 30, true);
+        for forbidden in [secret_token, "SUPER_SECRET_DISABLE_STDOUT_VALUE"] {
+            assert!(
+                !json_out.contains(forbidden),
+                "leaked `{forbidden}` in JSON:\n{json_out}"
+            );
+            assert!(
+                !text_out.contains(forbidden),
+                "leaked `{forbidden}` in text:\n{text_out}"
+            );
+        }
     }
 }

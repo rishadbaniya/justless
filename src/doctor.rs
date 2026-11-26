@@ -1741,19 +1741,45 @@ impl Doctor<'_> {
             Err(_) => None,
         };
         if exists {
-            checks.push(match (facts.index_bytes, facts.index_saved) {
-                (Some(bytes), Some(saved)) => Check::new(
-                    Status::Ok,
-                    format!("Index: {}, saved {}", human_bytes(bytes), ago(saved)),
-                ),
-                (Some(bytes), None) => {
-                    Check::new(Status::Ok, format!("Index: {}", human_bytes(bytes)))
-                }
-                _ => Check::new(
-                    Status::Info,
-                    "No index yet. The session-start hook or the first query builds it.",
-                ),
-            });
+            checks.push(
+                match (facts.index_bytes, facts.index_format, facts.index_saved) {
+                    (Some(bytes), Some("index.bin"), Some(saved)) => Check::new(
+                        Status::Ok,
+                        format!(
+                            "Index: {} (index.bin), saved {}",
+                            human_bytes(bytes),
+                            ago(saved)
+                        ),
+                    ),
+                    (Some(bytes), Some("index.bin"), None) => Check::new(
+                        Status::Ok,
+                        format!("Index: {} (index.bin)", human_bytes(bytes)),
+                    ),
+                    (Some(bytes), Some("index.json"), Some(saved)) => Check::new(
+                        Status::Ok,
+                        format!(
+                            "Index: {} (legacy index.json), saved {}",
+                            human_bytes(bytes),
+                            ago(saved)
+                        ),
+                    ),
+                    (Some(bytes), Some("index.json"), None) => Check::new(
+                        Status::Ok,
+                        format!("Index: {} (legacy index.json)", human_bytes(bytes)),
+                    ),
+                    (Some(bytes), _, Some(saved)) => Check::new(
+                        Status::Ok,
+                        format!("Index: {}, saved {}", human_bytes(bytes), ago(saved)),
+                    ),
+                    (Some(bytes), _, None) => {
+                        Check::new(Status::Ok, format!("Index: {}", human_bytes(bytes)))
+                    }
+                    _ => Check::new(
+                        Status::Info,
+                        "No index yet. The session-start hook or the first query builds it.",
+                    ),
+                },
+            );
             checks.push(facts.runs_check());
             let limits = match &settings {
                 Some(Ok(settings)) => retention(settings),
@@ -1763,8 +1789,31 @@ impl Doctor<'_> {
                 checks.push(facts.archive_check(limits));
             }
         }
+        if let Some(shared_dir) = self.workspace.shared_worktree_state_dir() {
+            let shared_bin = shared_dir.join("index.bin");
+            let message = match fs::symlink_metadata(&shared_bin) {
+                Ok(meta) if meta.is_file() => format!(
+                    "Worktree cache: warm worktree cache seeding available from {} ({})",
+                    shared_bin.display(),
+                    human_bytes(meta.len())
+                ),
+                _ => format!(
+                    "Worktree cache: linked worktree shares {} (warm worktree cache seeding available once primary builds index.bin)",
+                    shared_dir.display()
+                ),
+            };
+            checks.push(Check::new(Status::Info, message));
+        }
         match settings {
-            Some(Ok(_)) => checks.push(Check::new(Status::Ok, ".justless.toml is valid")),
+            Some(Ok(settings)) => {
+                checks.push(Check::new(Status::Ok, ".justless.toml is valid"));
+                if settings.lossless_only {
+                    checks.push(Check::new(
+                        Status::Info,
+                        "lossless_only = true (bijective views only; lossy previews & outlines disabled)",
+                    ));
+                }
+            }
             Some(Err(error)) => checks.push(
                 Check::new(
                     Status::Fail,
@@ -2490,6 +2539,7 @@ struct Facts {
     last_observation: Option<u64>,
     index_bytes: Option<u64>,
     index_saved: Option<u64>,
+    index_format: Option<&'static str>,
     /// Commands the hooks saw and passed through unchanged.
     passed_through: u64,
     /// Commands the Claude Code command hook left as written for the permission
@@ -2597,9 +2647,18 @@ impl Facts {
                 facts.last_observation = facts.last_observation.max(Some(modified));
             }
         }
-        if let Ok(metadata) = fs::metadata(state.join("index.json")) {
+        if let Ok(metadata) = fs::symlink_metadata(state.join("index.bin"))
+            && metadata.is_file()
+        {
             facts.index_bytes = Some(metadata.len());
             facts.index_saved = metadata.modified().ok().map(millis);
+            facts.index_format = Some("index.bin");
+        } else if let Ok(metadata) = fs::symlink_metadata(state.join("index.json"))
+            && metadata.is_file()
+        {
+            facts.index_bytes = Some(metadata.len());
+            facts.index_saved = metadata.modified().ok().map(millis);
+            facts.index_format = Some("index.json");
         }
         let activity = fs::read(state.join("activity.json"))
             .ok()
@@ -2712,6 +2771,7 @@ impl Facts {
             "last_observation_ms": self.last_observation,
             "index_bytes": self.index_bytes,
             "index_saved_ms": self.index_saved,
+            "index_format": self.index_format,
         })
     }
 }
@@ -3506,5 +3566,144 @@ mod tests {
             project_detected(&detect_root, &profs, &no_clis),
             vec!["kiro", "kilo"]
         );
+    }
+
+    #[test]
+    fn state_checks_report_index_bin_worktree_seed_and_lossless_only_read_only() {
+        // 1. `.justless/index.bin` size and format beat the small `index.json` stub;
+        //    legacy `index.json`-only workspaces are labeled explicitly.
+        let bin_dir = tempfile::tempdir().unwrap();
+        let bin_root = bin_dir.path().canonicalize().unwrap();
+        let bin_state = bin_root.join(".justless");
+        fs::create_dir_all(&bin_state).unwrap();
+        fs::write(bin_state.join(".gitignore"), "*\n").unwrap();
+        let bin_payload = vec![b'B'; 4096];
+        fs::write(bin_state.join("index.bin"), &bin_payload).unwrap();
+        fs::write(
+            bin_state.join("index.json"),
+            "{\"cache\":\"index.bin\",\"version\":1}\n",
+        )
+        .unwrap();
+        let bin_ws = Workspace::discover_from(&bin_root).unwrap();
+        let bin_doctor = Doctor {
+            workspace: &bin_ws,
+            explicit_root: true,
+            at_root: true,
+        };
+        let bin_facts = Facts::collect(&bin_ws.state);
+        assert_eq!(bin_facts.index_bytes, Some(4096));
+        assert_eq!(bin_facts.index_format, Some("index.bin"));
+        assert_eq!(bin_facts.json()["index_format"], json!("index.bin"));
+        let bin_checks = bin_doctor.state_checks(&bin_facts);
+        assert!(
+            bin_checks.iter().any(|c| {
+                c.status == Status::Ok && c.message.starts_with("Index: 4.0 KB (index.bin)")
+            }),
+            "{:?}",
+            bin_checks.iter().map(|c| &c.message).collect::<Vec<_>>()
+        );
+
+        let legacy_dir = tempfile::tempdir().unwrap();
+        let legacy_root = legacy_dir.path().canonicalize().unwrap();
+        let legacy_state = legacy_root.join(".justless");
+        fs::create_dir_all(&legacy_state).unwrap();
+        fs::write(legacy_state.join(".gitignore"), "*\n").unwrap();
+        fs::write(legacy_state.join("index.json"), vec![b' '; 2048]).unwrap();
+        let legacy_ws = Workspace::discover_from(&legacy_root).unwrap();
+        let legacy_doctor = Doctor {
+            workspace: &legacy_ws,
+            explicit_root: true,
+            at_root: true,
+        };
+        let legacy_facts = Facts::collect(&legacy_ws.state);
+        assert_eq!(legacy_facts.index_bytes, Some(2048));
+        assert_eq!(legacy_facts.index_format, Some("index.json"));
+        let legacy_checks = legacy_doctor.state_checks(&legacy_facts);
+        assert!(
+            legacy_checks.iter().any(|c| {
+                c.status == Status::Ok && c.message.starts_with("Index: 2.0 KB (legacy index.json)")
+            }),
+            "{:?}",
+            legacy_checks.iter().map(|c| &c.message).collect::<Vec<_>>()
+        );
+
+        // 2. Linked Git worktree + `lossless_only = true`: doctor notes warm worktree
+        //    cache seeding and `lossless_only` while remaining 100% read-only.
+        let wt_base = tempfile::tempdir().unwrap();
+        let base = wt_base.path().canonicalize().unwrap();
+        let primary = base.join("primary");
+        let worktree = base.join("linked-wt");
+        let git_common = primary.join(".git");
+        let wt_gitdir = git_common.join("worktrees/linked-wt");
+        fs::create_dir_all(&wt_gitdir).unwrap();
+        fs::create_dir_all(primary.join(".justless")).unwrap();
+        fs::write(primary.join(".justless/index.bin"), vec![b'W'; 8192]).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", wt_gitdir.display()),
+        )
+        .unwrap();
+        fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
+        fs::write(
+            wt_gitdir.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+        fs::write(worktree.join(".justless.toml"), "lossless_only = true\n").unwrap();
+
+        let entries_before: Vec<PathBuf> = fs::read_dir(&worktree)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        let wt_ws = Workspace::discover_from(&worktree).unwrap();
+        assert_eq!(
+            wt_ws.shared_worktree_state_dir(),
+            Some(primary.join(".justless"))
+        );
+        let wt_doctor = Doctor {
+            workspace: &wt_ws,
+            explicit_root: true,
+            at_root: true,
+        };
+        let report = wt_doctor.report(Some(&worktree));
+        let state_section = report
+            .sections
+            .iter()
+            .find(|s| s.id == "state")
+            .expect("state section");
+        assert!(
+            state_section.checks.iter().any(|c| {
+                c.status == Status::Info
+                    && c.message.contains("warm worktree cache seeding available")
+                    && c.message.contains("8.0 KB")
+            }),
+            "{:?}",
+            state_section
+                .checks
+                .iter()
+                .map(|c| &c.message)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            state_section.checks.iter().any(|c| {
+                c.status == Status::Info
+                    && c.message
+                        == "lossless_only = true (bijective views only; lossy previews & outlines disabled)"
+            }),
+            "{:?}",
+            state_section
+                .checks
+                .iter()
+                .map(|c| &c.message)
+                .collect::<Vec<_>>()
+        );
+        // Strictly read-only: zero files or `.justless/` directory created.
+        assert!(!worktree.join(".justless").exists());
+        let entries_after: Vec<PathBuf> = fs::read_dir(&worktree)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(entries_before, entries_after);
     }
 }

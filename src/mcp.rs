@@ -303,7 +303,11 @@ impl Server {
     }
 
     fn request(&mut self, method: &str, params: &Map<String, Value>) -> Result<Value, RpcError> {
-        let meta = params.get("_meta");
+        let meta = match params.get("_meta") {
+            None | Some(Value::Null) => None,
+            Some(meta @ Value::Object(_)) => Some(meta),
+            Some(_) => return Err(RpcError::params("_meta must be an object")),
+        };
         let modern = match meta.and_then(|meta| meta.get(VERSION_KEY)) {
             Some(version) => {
                 check_request_meta(meta.unwrap(), version)?;
@@ -361,7 +365,8 @@ impl Server {
         let requested = params
             .get("protocolVersion")
             .and_then(Value::as_str)
-            .ok_or_else(|| RpcError::params("initialize requires protocolVersion"))?;
+            .filter(|version| !version.is_empty())
+            .ok_or_else(|| RpcError::params("initialize requires a non-empty protocolVersion"))?;
         let version = LEGACY_VERSIONS
             .iter()
             .find(|version| **version == requested)
@@ -380,7 +385,8 @@ impl Server {
         let name = params
             .get("name")
             .and_then(Value::as_str)
-            .ok_or_else(|| RpcError::params("tools/call requires a tool name"))?;
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| RpcError::params("tools/call requires a non-empty tool name"))?;
         let tool = TOOLS
             .iter()
             .find(|tool| tool.name == name)
@@ -522,7 +528,7 @@ fn log_pages(
         let shown = match bytes[..left].iter().rposition(|&b| b == b'\n') {
             Some(newline) => newline + 1,
             // Cut inside a line only when that line alone exceeds a page.
-            None if left == LOG_PAGE => left,
+            None if left == LOG_PAGE => floor_utf8_boundary(bytes, left),
             None => 0,
         };
         let lines = bytes[..shown].iter().filter(|&&b| b == b'\n').count() as u64;
@@ -705,6 +711,7 @@ enum Kind {
     Location,
     RunId,
     RecallId,
+    GitRef,
     Count(u64, u64),
     Flag,
     Choice(&'static [&'static str]),
@@ -740,6 +747,7 @@ struct Tool {
 
 const MAX_TEXT: usize = 4096;
 const MAX_LINE: u64 = 100_000_000;
+const MAX_LIST_ITEMS: usize = 256;
 /// The largest `limit` a tool takes. A cut notice that a tool can return never
 /// suggests more.
 pub(crate) const MAX_LIMIT: usize = 1000;
@@ -769,7 +777,7 @@ const BUDGET: Param = option("budget", "budget", Kind::Count(128, 1_000_000), ""
 const FILE: Param = positional("file", Kind::File, "");
 const RUN_ID: Param = positional("run_id", Kind::RunId, "");
 const STREAM: Param = option("stream", "stream", Kind::Choice(STREAMS), "");
-const BASE: Param = option("base", "base", Kind::Text, "Base ref");
+const BASE: Param = option("base", "base", Kind::GitRef, "Base ref");
 
 const TOOLS: &[Tool] = &[
     Tool {
@@ -863,7 +871,7 @@ const TOOLS: &[Tool] = &[
             },
             BUDGET,
         ],
-        check: None,
+        check: Some(range_input),
     },
     Tool {
         name: "read",
@@ -957,7 +965,7 @@ const TOOLS: &[Tool] = &[
             option("from", "from", Kind::Count(1, MAX_LINE), ""),
             option("to", "to", Kind::Count(1, MAX_LINE), ""),
         ],
-        check: None,
+        check: Some(range_input),
     },
     Tool {
         name: "search",
@@ -1054,6 +1062,17 @@ fn read_input(arguments: &Map<String, Value>) -> Result<(), String> {
     Ok(())
 }
 
+fn range_input(arguments: &Map<String, Value>) -> Result<(), String> {
+    if let (Some(from), Some(to)) = (
+        arguments.get("from").and_then(Value::as_u64),
+        arguments.get("to").and_then(Value::as_u64),
+    ) && from > to
+    {
+        return Err("`from` must not be after `to`".into());
+    }
+    Ok(())
+}
+
 fn recall_input(arguments: &Map<String, Value>) -> Result<(), String> {
     let list = arguments.get("list") == Some(&Value::Bool(true));
     let id = arguments.get("id").is_some_and(|value| !value.is_null());
@@ -1066,12 +1085,7 @@ fn recall_input(arguments: &Map<String, Value>) -> Result<(), String> {
     if list && (from.is_some() || to.is_some() || grep) {
         return Err("`from`, `to` and `grep` apply to `id`, not `list: true`".into());
     }
-    if let (Some(from), Some(to)) = (from, to)
-        && from > to
-    {
-        return Err("`from` must not be after `to`".into());
-    }
-    Ok(())
+    range_input(arguments)
 }
 
 /// Whether `changes` is true, after checking that a `base` comes with it.
@@ -1102,7 +1116,12 @@ impl Tool {
             // types, choices and short help where the name/type is not self-evident.
             // Arguments are validated in full on call.
             let mut schema = match param.kind {
-                Kind::Text | Kind::File | Kind::Location | Kind::RunId | Kind::RecallId => {
+                Kind::Text
+                | Kind::File
+                | Kind::Location
+                | Kind::RunId
+                | Kind::RecallId
+                | Kind::GitRef => {
                     json!({"type": "string"})
                 }
                 Kind::Count(..) => json!({"type": "integer"}),
@@ -1179,6 +1198,12 @@ impl Tool {
                 if matches!(param.kind, Kind::Files) && items.is_empty() {
                     return Err(format!("`{}` must not be empty", param.name));
                 }
+                if items.len() > MAX_LIST_ITEMS {
+                    return Err(format!(
+                        "`{}` accepts at most {MAX_LIST_ITEMS} items",
+                        param.name
+                    ));
+                }
                 for item in items {
                     let text = validate(param, item)?;
                     match param.flag {
@@ -1231,11 +1256,25 @@ fn validate(param: &Param, value: &Value) -> Result<String, String> {
         Kind::File | Kind::Files => normalize_relative(text, false),
         Kind::Paths => normalize_relative(text, true),
         Kind::Location => text.rsplit_once(':').and_then(|(file, lines)| {
-            let mut bounds = lines.splitn(2, '-');
             let file = normalize_relative(file, false)?;
-            bounds
-                .all(|bound| !bound.is_empty() && bound.bytes().all(|b| b.is_ascii_digit()))
-                .then(|| format!("{file}:{lines}"))
+            let parse_line = |bound: &str| -> Option<u64> {
+                if bound.is_empty() || !bound.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                let line = bound.parse::<u64>().ok()?;
+                (1..=MAX_LINE).contains(&line).then_some(line)
+            };
+            match lines.split_once('-') {
+                Some((start, end)) => {
+                    let start = parse_line(start)?;
+                    let end = parse_line(end)?;
+                    (start <= end).then(|| format!("{file}:{start}-{end}"))
+                }
+                None => {
+                    let line = parse_line(lines)?;
+                    Some(format!("{file}:{line}"))
+                }
+            }
         }),
         Kind::RunId => text
             .strip_prefix("run-")
@@ -1245,10 +1284,14 @@ fn validate(param: &Param, value: &Value) -> Result<String, String> {
             .then(|| text.to_owned()),
         // A 64-character recall ID, or a tool_use ID the proxy archived.
         Kind::RecallId => (text.len() <= 200
+            && !text.starts_with('-')
             && text
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'))
         .then(|| text.to_owned()),
+        Kind::GitRef => {
+            (!text.starts_with('-') && !text.chars().any(char::is_control)).then(|| text.to_owned())
+        }
         Kind::Choice(values) => values.contains(&text).then(|| text.to_owned()),
         _ => Some(text.to_owned()),
     };
@@ -1266,6 +1309,7 @@ fn validate(param: &Param, value: &Value) -> Result<String, String> {
         Kind::Location => format!("`{name}` must look like src/lib.rs:40 or src/lib.rs:40-52"),
         Kind::RunId => format!("`{name}` must be a run ID such as run-1a2b3c"),
         Kind::RecallId => format!("`{name}` must be a recall ID or a tool_use ID"),
+        Kind::GitRef => format!("`{name}` must be a Git ref such as main or HEAD~1"),
         Kind::Choice(values) => format!("`{name}` must be one of {}", values.join(", ")),
         _ => format!("invalid `{name}`"),
     })
@@ -2218,5 +2262,187 @@ mod tests {
         assert!(desc("pack").contains("before raw reads"));
         assert!(desc("affected").contains("Blast radius"));
         assert!(desc("review").contains("Blast-radius") && desc("review").contains("untested"));
+    }
+
+    #[test]
+    fn option_injection_and_malformed_params_are_hardened_within_compact_schema() {
+        // 1. All 18 tools stay read-only and the schema stays < 6,200 bytes.
+        let defs: Vec<Value> = TOOLS.iter().map(Tool::definition).collect();
+        assert_eq!(defs.len(), 18);
+        let schema_bytes = serde_json::to_string(&defs).unwrap().len();
+        assert!(
+            schema_bytes < 6_200,
+            "tools/list schema must stay < 6,200 B, got {schema_bytes}"
+        );
+        for forbidden in ["edit", "rename", "run", "exec", "init", "mask"] {
+            assert!(
+                !TOOLS.iter().any(|t| t.name == forbidden),
+                "mutating tool {forbidden} must never be exposed"
+            );
+        }
+
+        // 2. Every positional tool places `--` before untrusted `-`-prefixed values,
+        //    and the real CLI parser treats them as positional data, never flags.
+        let cases: &[(&str, Value, &[&str])] = &[
+            (
+                "query",
+                json!({"symbol": "--html"}),
+                &["query", "--", "--html"],
+            ),
+            (
+                "query",
+                json!({"symbol": "--help"}),
+                &["query", "--", "--help"],
+            ),
+            (
+                "path",
+                json!({"from": "--help", "to": "-V"}),
+                &["path", "--", "--help", "-V"],
+            ),
+            ("find", json!({"text": "--json"}), &["find", "--", "--json"]),
+            (
+                "lookup",
+                json!({"question": "--help"}),
+                &["lookup", "--", "--help"],
+            ),
+            (
+                "read",
+                json!({"file": "-flag.rs"}),
+                &["read", "--", "-flag.rs"],
+            ),
+            (
+                "read",
+                json!({"files": ["./-flag.rs", "--outline"]}),
+                &["read", "--", "-flag.rs", "--outline"],
+            ),
+            (
+                "code",
+                json!({"file": "-flag.rs", "to": 5}),
+                &["code", "--to=5", "--", "-flag.rs"],
+            ),
+            (
+                "expand",
+                json!({"file": "-flag.rs", "selector": "--json"}),
+                &["expand", "--", "-flag.rs", "--json"],
+            ),
+            (
+                "pack",
+                json!({"question": "--fresh"}),
+                &["pack", "--", "--fresh"],
+            ),
+            (
+                "affected",
+                json!({"target": "--json"}),
+                &["affected", "--", "--json"],
+            ),
+            (
+                "search",
+                json!({"run_id": "run-abc", "text": "--unredacted"}),
+                &["search", "--", "run-abc", "--unredacted"],
+            ),
+            (
+                "history",
+                json!({"text": "--oldest"}),
+                &["history", "--", "--oldest"],
+            ),
+        ];
+        for (name, args, expected) in cases {
+            let argv = tool(name).argv(&map(args.clone())).unwrap();
+            assert_eq!(argv, *expected, "{name}");
+            let mut full = vec!["justless".to_owned()];
+            full.extend(argv);
+            let parsed = crate::cli()
+                .try_get_matches_from(&full)
+                .unwrap_or_else(|e| panic!("{name} failed clap parse for {full:?}: {e}"));
+            let (sub_name, sub) = parsed.subcommand().unwrap();
+            assert_eq!(sub_name, *name);
+            // Verify unintended flags were never activated by positional values.
+            for flag in ["json", "html", "outline", "fresh", "unredacted", "oldest"] {
+                assert!(
+                    !matches!(sub.try_contains_id(flag), Ok(true)),
+                    "{name} unexpectedly activated --{flag} for {full:?}"
+                );
+            }
+            match *name {
+                "query" => assert!(sub.value_of("symbol").unwrap().starts_with('-')),
+                "read" => assert!(sub.values_of("file").unwrap().any(|v| v == "-flag.rs")),
+                "code" => assert_eq!(sub.value_of("file"), Some("-flag.rs")),
+                "expand" => assert_eq!(
+                    sub.values_of("file").unwrap().collect::<Vec<_>>(),
+                    ["-flag.rs", "--json"]
+                ),
+                "search" => assert_eq!(sub.value_of("text"), Some("--unredacted")),
+                "find" => assert_eq!(sub.value_of("text"), Some("--json")),
+                "lookup" => assert_eq!(
+                    sub.values_of("question").unwrap().collect::<Vec<_>>(),
+                    ["--help"]
+                ),
+                "pack" => assert_eq!(sub.value_of("task"), Some("--fresh")),
+                "path" => {
+                    assert_eq!(sub.value_of("from"), Some("--help"));
+                    assert_eq!(sub.value_of("to"), Some("-V"));
+                }
+                "affected" => assert_eq!(sub.value_of("target"), Some("--json")),
+                "history" => assert_eq!(sub.value_of("text"), Some("--oldest")),
+                _ => {}
+            }
+        }
+        // Option values use `--flag=value`, so `map --explain=--html` never triggers `--html`.
+        let map_argv = tool("map")
+            .argv(&map(json!({"explain": "--html"})))
+            .unwrap();
+        assert_eq!(map_argv, ["map", "--explain=--html"]);
+        let map_parsed = crate::cli()
+            .try_get_matches_from(["justless", "map", "--explain=--html"])
+            .unwrap();
+        let (_, map_sub) = map_parsed.subcommand().unwrap();
+        assert_eq!(map_sub.value_of("explain"), Some("--html"));
+        assert!(!map_sub.is_present("html"));
+
+        // 3. Malformed ranges, locations, recall IDs, and Git refs are rejected cleanly.
+        for (name, bad) in [
+            ("code", json!({"file": "src/a.rs", "from": 20, "to": 10})),
+            ("log", json!({"run_id": "run-abc", "from": 20, "to": 10})),
+            ("context", json!({"at": "src/a.rs:0"})),
+            ("context", json!({"at": "src/a.rs:50-10"})),
+            ("context", json!({"at": "src/a.rs:999999999999999"})),
+            ("recall", json!({"id": "--json"})),
+            ("review", json!({"base": "--exec=id"})),
+            ("affected", json!({"changes": true, "base": "-c"})),
+            (
+                "context",
+                json!({"changes": true, "base": "main\n--upload-pack=x"}),
+            ),
+        ] {
+            assert!(
+                tool(name).argv(&map(bad.clone())).is_err(),
+                "{name} should reject {bad}"
+            );
+        }
+
+        // 4. Protocol-level malformed params return JSON-RPC -32602 (INVALID_PARAMS).
+        let temp = tempfile::tempdir().unwrap();
+        let ws = Workspace::discover_from(temp.path()).unwrap();
+        let mut server = Server {
+            root: ws.root.clone(),
+            workspace: ws,
+            exe: PathBuf::from("justless"),
+            session: new_session(),
+            initialized: true,
+            version: Some(LEGACY_VERSIONS[0]),
+        };
+        for req in [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":""}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":"bad"}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":""}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"edit","arguments":{}}}),
+            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"query","arguments":"not-obj"}}),
+            json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":"not-obj"}),
+        ] {
+            let reply = server
+                .handle(req.to_string().as_bytes())
+                .expect("JSON-RPC error reply");
+            assert_eq!(reply["error"]["code"], INVALID_PARAMS, "{req} -> {reply}");
+        }
     }
 }
