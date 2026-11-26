@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
-use std::path::Path;
+use std::path::{Component, Path};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -509,10 +509,153 @@ struct Activity {
     /// the full file, alongside follow-up `expand` bytes on those outlined files.
     #[serde(default)]
     outlines: Outlines,
+    /// Semantic code-graph invocations (`map`, `query`, `path`, `context`,
+    /// `pack`, `review`) and their measured bytes vs. referenced files.
+    #[serde(default, skip_serializing_if = "GraphUsage::is_empty")]
+    graph: GraphUsage,
     /// Commands the Claude Code command hook left as written for the permission
     /// rules, by the permission mode the session reported. See `left_by_permissions`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     permission_leaves: BTreeMap<String, u64>,
+}
+
+/// Measured semantic code-graph invocations (`map`, `query`, `path`, `context`,
+/// `pack`, `review`) and their printed bytes vs. the full on-disk sizes of the
+/// distinct workspace files they referenced.
+#[derive(Default, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GraphUsage {
+    pub calls: u64,
+    pub shown_bytes: u64,
+    pub referenced_file_bytes: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_command: BTreeMap<String, u64>,
+}
+
+impl GraphUsage {
+    pub fn is_empty(&self) -> bool {
+        self.calls == 0
+            && self.shown_bytes == 0
+            && self.referenced_file_bytes == 0
+            && self.by_command.is_empty()
+    }
+
+    pub fn net_saved_bytes(&self) -> i64 {
+        net_bytes(self.referenced_file_bytes, self.shown_bytes, 0)
+    }
+
+    pub fn json(&self) -> serde_json::Value {
+        let net = self.net_saved_bytes();
+        serde_json::json!({
+            "calls": self.calls,
+            "shown_bytes": self.shown_bytes,
+            "referenced_file_bytes": self.referenced_file_bytes,
+            "net_saved_bytes": net,
+            "estimated_tokens_net_saved": crate::tokens::Content::Code.tokens_signed(net),
+            "by_command": self.by_command,
+        })
+    }
+
+    pub fn line(&self) -> String {
+        let net = self.net_saved_bytes();
+        let breakdown = if self.by_command.is_empty() {
+            String::new()
+        } else {
+            let parts: Vec<String> = self
+                .by_command
+                .iter()
+                .map(|(cmd, n)| format!("{cmd} ×{n}"))
+                .collect();
+            format!(" ({})", parts.join(", "))
+        };
+        format!(
+            "Code graph: {} call(s){breakdown} printed {} instead of {} across referenced files, net {} kept out (≈{} tokens, estimated at {:.2} bytes per token for code)",
+            self.calls,
+            human_bytes(self.shown_bytes),
+            human_bytes(self.referenced_file_bytes),
+            signed_bytes(net),
+            crate::tokens::Content::Code.tokens_signed(net),
+            crate::tokens::Content::Code.bytes_per_token(),
+        )
+    }
+}
+
+/// Measured code-graph usage totals from a project's `activity.json`, quietly
+/// returning zeros when unreadable or absent.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn graph_usage(workspace: &Workspace) -> GraphUsage {
+    let activity: Activity = get(&workspace.state.join("activity.json")).unwrap_or_default();
+    activity.graph
+}
+
+/// Records one semantic code-graph command invocation (`map`, `query`, `path`,
+/// `context`, `pack`, `review`) with its printed bytes and the sum of distinct
+/// referenced workspace file sizes. Fail-silent and only writes when the
+/// workspace's `.justless/` state directory already exists.
+pub fn record_graph_use(
+    workspace: &Workspace,
+    command: &str,
+    shown_bytes: u64,
+    referenced_file_bytes: u64,
+) {
+    if !workspace.state.is_dir() || command.is_empty() {
+        return;
+    }
+    let _ = update(
+        &workspace.state.join("activity.json"),
+        |a: &mut Activity| {
+            a.graph.calls = a.graph.calls.saturating_add(1);
+            a.graph.shown_bytes = a.graph.shown_bytes.saturating_add(shown_bytes);
+            a.graph.referenced_file_bytes = a
+                .graph
+                .referenced_file_bytes
+                .saturating_add(referenced_file_bytes);
+            *a.graph.by_command.entry(command.to_owned()).or_default() += 1;
+        },
+    );
+}
+
+/// Sums on-disk byte lengths of distinct workspace-relative `files` using
+/// metadata only (never reading file bodies). Rejects non-normal path
+/// components and skips symlinks or missing files silently.
+pub(crate) fn referenced_file_bytes<'a>(
+    workspace: &Workspace,
+    files: impl IntoIterator<Item = &'a str>,
+) -> u64 {
+    let mut seen = HashSet::new();
+    let mut total = 0u64;
+    for file in files {
+        if file.is_empty() || !seen.insert(file) {
+            continue;
+        }
+        let rel = Path::new(file);
+        if !rel
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+        {
+            continue;
+        }
+        if let Ok(meta) = fs::symlink_metadata(workspace.root.join(rel))
+            && meta.is_file()
+        {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
+}
+
+/// Records one code-graph invocation by stat-ing distinct referenced files only
+/// when the workspace's `.justless/` state directory already exists.
+pub(crate) fn record_graph_files<'a>(
+    workspace: &Workspace,
+    command: &str,
+    shown_bytes: u64,
+    files: impl IntoIterator<Item = &'a str>,
+) {
+    if !workspace.state.is_dir() || command.is_empty() {
+        return;
+    }
+    let referenced = referenced_file_bytes(workspace, files);
+    record_graph_use(workspace, command, shown_bytes, referenced);
 }
 
 /// How many views printed changes since an earlier read instead of the whole
@@ -1758,6 +1901,93 @@ fn collect_stats(workspace: &Workspace, since: u64) -> Result<StatsData> {
     })
 }
 
+fn activity_summary_lines(
+    deltas: &DeltasSummary,
+    outlines: &OutlinesSummary,
+    graph: &GraphUsage,
+    observations: &ObservationsSummary,
+    recalls: &ArchiveRecalls,
+    has_proxy: bool,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if deltas.views > 0 {
+        lines.push(deltas.line());
+    }
+    if outlines.views > 0 {
+        lines.push(outlines.line());
+    }
+    if graph.calls > 0 {
+        lines.push(graph.line());
+    }
+    if observations.archived_results > 0 && !has_proxy {
+        lines.push(observations.line(recalls));
+    }
+    lines
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_stats_json(
+    workspace: &Workspace,
+    data: StatsData,
+    activity: &Activity,
+    recalls: &ArchiveRecalls,
+    proxy: Option<serde_json::Value>,
+    codex: Option<&serde_json::Value>,
+    agy: Option<&serde_json::Value>,
+    claude_code_sessions: Option<serde_json::Value>,
+    outlines: &OutlinesSummary,
+    deltas: &DeltasSummary,
+    observations: &ObservationsSummary,
+) -> serde_json::Value {
+    let count = data.count;
+    let (raw, preview, saved, net) = (
+        data.totals.raw_bytes,
+        data.totals.preview_bytes,
+        data.totals.initial(),
+        data.totals.net_saved_bytes,
+    );
+    // The keys from before retrievals were measured keep their meaning:
+    // `saved_*` and `estimated_tokens_saved` are savings at first preview.
+    let mut report = serde_json::json!({
+        "runs": count,
+        "skipped_runs": data.skipped_runs,
+        "raw_bytes": raw,
+        "preview_bytes": preview,
+        "saved_bytes": saved,
+        "saved_percent": rounded(percent(saved, raw)),
+        "estimated_tokens_saved": data.estimate.saved_tokens(),
+        "replayed_bytes": data.replayed.measured,
+        "estimated_replay_bytes": data.replayed.estimated,
+        "estimated_replays": data.replayed.estimated_replays,
+        "unmeasured_retrievals": data.replayed.unmeasured,
+        "net_saved_bytes": net,
+        "net_saved_percent": rounded(signed_percent(net, raw)),
+        "estimated_tokens_net_saved": data.estimate.net_tokens(),
+        "token_estimate": crate::tokens::method(),
+        "estimate_by_content": data.estimate.json(),
+        "days": data.timeline.into_values().collect::<Vec<_>>(),
+        "commands": data.commands,
+        "views": data.views,
+        "repeated_source_reads": activity.repeat_reads,
+        "changed_since_read": deltas.json(),
+        "source_outlines": outlines.json(),
+        "graph": activity.graph.json(),
+        "observations": observations.json(recalls),
+        "redacted_secrets": data.secrets,
+        "unredacted_replays": data.unredacted,
+        "hook_pass_through": activity.bypasses,
+        "proxy": proxy,
+        "archive_recalls": recalls.json(),
+        "preview_budgets": crate::adaptive::stats_json(workspace),
+        "codex": codex,
+        "agy": agy,
+    });
+    if let Some(sessions_json) = claude_code_sessions {
+        report["claude_code_sessions"] = sessions_json;
+    }
+    report
+}
+
 pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) -> Result<()> {
     let since = now_ms().saturating_sub(days.saturating_mul(86_400_000));
     let data = collect_stats(workspace, since)?;
@@ -1769,58 +1999,32 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
     let usage = sessions
         .then(|| crate::tokens::sessions(&workspace.root, since))
         .flatten();
-    let count = data.count;
-    let (raw, preview, saved, net) = (
-        data.totals.raw_bytes,
-        data.totals.preview_bytes,
-        data.totals.initial(),
-        data.totals.net_saved_bytes,
-    );
     let outlines = OutlinesSummary::from_activity(&activity.outlines);
     let deltas = DeltasSummary::from_activity(&activity.deltas);
     let observations = observations_summary(workspace);
     if as_json {
-        // The keys from before retrievals were measured keep their meaning:
-        // `saved_*` and `estimated_tokens_saved` are savings at first preview.
-        let mut report = serde_json::json!({
-            "runs": count,
-            "skipped_runs": data.skipped_runs,
-            "raw_bytes": raw,
-            "preview_bytes": preview,
-            "saved_bytes": saved,
-            "saved_percent": rounded(percent(saved, raw)),
-            "estimated_tokens_saved": data.estimate.saved_tokens(),
-            "replayed_bytes": data.replayed.measured,
-            "estimated_replay_bytes": data.replayed.estimated,
-            "estimated_replays": data.replayed.estimated_replays,
-            "unmeasured_retrievals": data.replayed.unmeasured,
-            "net_saved_bytes": net,
-            "net_saved_percent": rounded(signed_percent(net, raw)),
-            "estimated_tokens_net_saved": data.estimate.net_tokens(),
-            "token_estimate": crate::tokens::method(),
-            "estimate_by_content": data.estimate.json(),
-            "days": data.timeline.into_values().collect::<Vec<_>>(),
-            "commands": data.commands,
-            "views": data.views,
-            "repeated_source_reads": activity.repeat_reads,
-            "changed_since_read": deltas.json(),
-            "source_outlines": outlines.json(),
-            "observations": observations.json(&recalls),
-            "redacted_secrets": data.secrets,
-            "unredacted_replays": data.unredacted,
-            "hook_pass_through": activity.bypasses,
-            "proxy": proxy.as_ref().map(|p| p.json()),
-            "archive_recalls": recalls.json(),
-            "preview_budgets": crate::adaptive::stats_json(workspace),
-            "codex": codex.as_ref().map(|codex| &codex.json),
-            "agy": agy.as_ref().map(|agy| &agy.json),
-        });
-        if sessions {
-            report["claude_code_sessions"] = crate::tokens::sessions_json(usage.as_ref(), days);
-        }
+        let report = build_stats_json(
+            workspace,
+            data,
+            &activity,
+            &recalls,
+            proxy.as_ref().map(|p| p.json()),
+            codex.as_ref().map(|codex| &codex.json),
+            agy.as_ref().map(|agy| &agy.json),
+            sessions.then(|| crate::tokens::sessions_json(usage.as_ref(), days)),
+            &outlines,
+            &deltas,
+            &observations,
+        );
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
+    let count = data.count;
+    let (raw, saved, net) = (
+        data.totals.raw_bytes,
+        data.totals.initial(),
+        data.totals.net_saved_bytes,
+    );
     if count == 0 {
         let justless = workspace.justless();
         println!(
@@ -2007,14 +2211,15 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
             }
         );
     }
-    if deltas.views > 0 {
-        println!("{}", deltas.line());
-    }
-    if outlines.views > 0 {
-        println!("{}", outlines.line());
-    }
-    if observations.archived_results > 0 && proxy.is_none() {
-        println!("{}", observations.line(&recalls));
+    for line in activity_summary_lines(
+        &deltas,
+        &outlines,
+        &activity.graph,
+        &observations,
+        &recalls,
+        proxy.is_some(),
+    ) {
+        println!("{line}");
     }
     if !activity.bypasses.is_empty() {
         let passed: Vec<_> = activity
@@ -3211,5 +3416,137 @@ mod tests {
         assert_eq!(recalls.count, 2);
         assert_eq!(recalls.bytes, 4_600);
         assert_eq!(recalls.proxy_bytes, 3_400);
+    }
+
+    #[test]
+    fn graph_usage_records_and_renders_in_stats_and_json() {
+        let (_dir, ws) = temp_workspace();
+        let alpha = "fn alpha() -> u32 { 1 }\n".repeat(40);
+        let beta = "fn beta() -> u32 { 2 }\n".repeat(60);
+        fs::write(ws.root.join("alpha.rs"), &alpha).unwrap();
+        fs::write(ws.root.join("beta.rs"), &beta).unwrap();
+
+        // Without `.justless/`, recording must stay silent and never create state.
+        record_graph_use(&ws, "query", 200, 4_000);
+        assert!(!ws.state.exists());
+        assert_eq!(graph_usage(&ws), GraphUsage::default());
+
+        let render_json = |ws: &Workspace| -> serde_json::Value {
+            let since = now_ms().saturating_sub(14 * 86_400_000);
+            let data = collect_stats(ws, since).unwrap();
+            let activity: Activity = get(&ws.state.join("activity.json")).unwrap_or_default();
+            let recalls = archive_recalls(&ws.state, since);
+            let outlines = OutlinesSummary::from_activity(&activity.outlines);
+            let deltas = DeltasSummary::from_activity(&activity.deltas);
+            let observations = observations_summary(ws);
+            build_stats_json(
+                ws,
+                data,
+                &activity,
+                &recalls,
+                None,
+                None,
+                None,
+                None,
+                &outlines,
+                &deltas,
+                &observations,
+            )
+        };
+
+        // 0-call workspaces omit the `Code graph:` line in text stats and report zeros in JSON.
+        let zero_lines = activity_summary_lines(
+            &DeltasSummary::default(),
+            &OutlinesSummary::default(),
+            &graph_usage(&ws),
+            &ObservationsSummary::default(),
+            &ArchiveRecalls::default(),
+            false,
+        );
+        assert!(
+            zero_lines.iter().all(|l| !l.contains("Code graph:")),
+            "0-call workspace must omit Code graph line: {zero_lines:?}"
+        );
+        let zero_json = render_json(&ws);
+        assert_eq!(zero_json["graph"]["calls"], 0);
+        assert_eq!(zero_json["graph"]["shown_bytes"], 0);
+        assert_eq!(zero_json["graph"]["referenced_file_bytes"], 0);
+        assert_eq!(zero_json["graph"]["net_saved_bytes"], 0);
+        assert_eq!(zero_json["graph"]["estimated_tokens_net_saved"], 0);
+        assert_eq!(zero_json["graph"]["by_command"], serde_json::json!({}));
+
+        // Metadata sizing deduplicates paths and skips traversal/missing paths safely.
+        assert_eq!(
+            referenced_file_bytes(
+                &ws,
+                [
+                    "alpha.rs",
+                    "alpha.rs",
+                    "beta.rs",
+                    "../outside.rs",
+                    "missing.rs"
+                ]
+            ),
+            (alpha.len() + beta.len()) as u64
+        );
+
+        // Once `.justless/` exists, record invocations and verify stats JSON + text.
+        ws.prepare_state().unwrap();
+        record_graph_use(&ws, "map", 1_024, 10_240);
+        record_graph_use(&ws, "query", 512, 5_120);
+        record_graph_use(&ws, "query", 512, 5_120);
+        record_graph_use(&ws, "pack", 2_048, 20_480);
+        record_graph_use(&ws, "review", 1_024, 10_240);
+
+        let usage = graph_usage(&ws);
+        assert_eq!(usage.calls, 5);
+        assert_eq!(usage.shown_bytes, 5_120);
+        assert_eq!(usage.referenced_file_bytes, 51_200);
+        assert_eq!(usage.net_saved_bytes(), 46_080);
+        assert_eq!(usage.by_command.get("map"), Some(&1));
+        assert_eq!(usage.by_command.get("query"), Some(&2));
+        assert_eq!(usage.by_command.get("pack"), Some(&1));
+        assert_eq!(usage.by_command.get("review"), Some(&1));
+
+        let expected_tokens = crate::tokens::Content::Code.tokens_signed(46_080);
+        let json = render_json(&ws);
+        assert_eq!(json["runs"], 0);
+        assert_eq!(json["graph"]["calls"], 5);
+        assert_eq!(json["graph"]["shown_bytes"], 5_120);
+        assert_eq!(json["graph"]["referenced_file_bytes"], 51_200);
+        assert_eq!(json["graph"]["net_saved_bytes"], 46_080);
+        assert_eq!(json["graph"]["estimated_tokens_net_saved"], expected_tokens);
+        assert_eq!(
+            json["graph"]["by_command"],
+            serde_json::json!({"map": 1, "pack": 1, "query": 2, "review": 1})
+        );
+
+        let lines = activity_summary_lines(
+            &DeltasSummary::default(),
+            &OutlinesSummary::default(),
+            &usage,
+            &ObservationsSummary::default(),
+            &ArchiveRecalls::default(),
+            false,
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        let expected_ratio = format!("{:.2}", crate::tokens::Content::Code.bytes_per_token());
+        assert!(
+            line.contains("Code graph: 5 call(s) (map ×1, pack ×1, query ×2, review ×1)"),
+            "{line}"
+        );
+        assert!(
+            line.contains(
+                "printed 5.0 KB instead of 50.0 KB across referenced files, net 45.0 KB kept out"
+            ),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!(
+                "(≈{expected_tokens} tokens, estimated at {expected_ratio} bytes per token for code)"
+            )),
+            "{line}"
+        );
     }
 }

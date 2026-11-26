@@ -73,6 +73,15 @@ pub fn command() -> Command<'static> {
 pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
     let budget = crate::context_budget(workspace, matches)?;
     let index = Index::open(workspace)?;
+    run_with_index(workspace, &index, matches, budget)
+}
+
+pub(crate) fn run_with_index(
+    workspace: &Workspace,
+    index: &Index,
+    matches: &ArgMatches,
+    budget: usize,
+) -> Result<()> {
     if matches.is_present("html") {
         let focus = matches
             .value_of("explain")
@@ -84,8 +93,8 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
             .and_then(|name| name.to_str())
             .filter(|name| !name.is_empty())
             .unwrap_or("repository");
-        if let Some(out) = matches.value_of_os("out") {
-            let rendered = build_html(&index, title, &workspace.invocation().files, focus);
+        let rendered = build_html(index, title, &workspace.invocation().files, focus);
+        let shown_bytes = if let Some(out) = matches.value_of_os("out") {
             let path = Path::new(out);
             std::fs::write(path, &rendered.html)
                 .with_context(|| format!("could not write {}", path.display()))?;
@@ -94,32 +103,40 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
             } else {
                 format!("{} communities", rendered.communities)
             };
-            println!(
-                "Wrote {} · {} bytes · {} · {} · {comms}",
+            let status = format!(
+                "Wrote {} · {} bytes · {} · {} · {comms}\n",
                 path.display(),
                 rendered.html.len(),
                 plural(rendered.nodes, "node"),
                 plural(rendered.edges, "edge"),
             );
+            std::io::stdout().lock().write_all(status.as_bytes())?;
+            status.len() as u64
         } else {
-            let html = render_html(&index, title, &workspace.invocation().files, focus);
             let mut stdout = std::io::stdout().lock();
-            stdout.write_all(html.as_bytes())?;
+            stdout.write_all(rendered.html.as_bytes())?;
             stdout.flush()?;
-        }
+            rendered.html.len() as u64
+        };
+        crate::history::record_graph_files(
+            workspace,
+            "map",
+            shown_bytes,
+            rendered.referenced_files.iter().map(String::as_str),
+        );
         return Ok(());
     }
     let json = matches.is_present("json");
     if let Some(symbol) = matches.value_of("explain") {
-        return explain(workspace, &index, symbol, budget, json);
+        return explain(workspace, index, symbol, budget, json);
     }
-    let (header, sections, order, summary) = build(&index, budget);
+    let (header, sections, order, summary) = build(index, budget);
     // `--root` for `expand` also serves `query` and `affected`.
     let footer = [format!(
         "Next: {} expand FILE NAME, query NAME or affected NAME",
         workspace.invocation().files
     )];
-    emit(
+    let (shown_bytes, shown) = emit_measured(
         &header,
         &sections,
         &footer,
@@ -127,7 +144,10 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
         Fill::RoundRobin,
         budget,
         json.then_some(summary),
-    )
+    )?;
+    let files = collect_section_files(&sections, &shown);
+    crate::history::record_graph_files(workspace, "map", shown_bytes, files);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +302,19 @@ pub(crate) fn emit(
     budget: usize,
     json: Option<Map<String, Value>>,
 ) -> Result<()> {
+    emit_measured(header, sections, footer, order, fill, budget, json)?;
+    Ok(())
+}
+
+fn emit_measured(
+    header: &[String],
+    sections: &[Section],
+    footer: &[String],
+    order: &[usize],
+    fill: Fill,
+    budget: usize,
+    json: Option<Map<String, Value>>,
+) -> Result<(u64, Vec<usize>)> {
     let shown = fit(header, sections, footer, order, fill, budget);
     if let Some(mut object) = json {
         let mut omitted = Map::new();
@@ -301,14 +334,50 @@ pub(crate) fn emit(
         let capped = object.get("capped") == Some(&Value::Bool(true)) || !omitted.is_empty();
         object.insert("omitted".into(), Value::Object(omitted));
         object.insert("capped".into(), Value::Bool(capped));
-        println!("{}", serde_json::to_string(&object)?);
-        return Ok(());
+        let mut out = serde_json::to_string(&object)?;
+        out.push('\n');
+        std::io::stdout().lock().write_all(out.as_bytes())?;
+        return Ok((out.len() as u64, shown));
     }
     let mut report = Report::new(budget);
     render(header, sections, footer, &shown, &mut |line| {
         report.line(line)
     });
-    report.finish()
+    let text = report.into_string();
+    let bytes = text.len() as u64;
+    std::io::stdout().lock().write_all(text.as_bytes())?;
+    Ok((bytes, shown))
+}
+
+fn collect_value_files<'a>(value: &'a Value, out: &mut BTreeSet<&'a str>) {
+    match value {
+        Value::Object(map) => {
+            for key in ["file", "file_scope"] {
+                if let Some(Value::String(file)) = map.get(key) {
+                    out.insert(file.as_str());
+                }
+            }
+            for child in map.values() {
+                collect_value_files(child, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_value_files(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_section_files<'a>(sections: &'a [Section], shown: &[usize]) -> BTreeSet<&'a str> {
+    let mut files = BTreeSet::new();
+    for (section, &count) in sections.iter().zip(shown) {
+        for value in &section.values[..count] {
+            collect_value_files(value, &mut files);
+        }
+    }
+    files
 }
 
 // ---------------------------------------------------------------------------
@@ -3598,7 +3667,7 @@ fn explain(
         def.location.start,
         def.location.end,
     )];
-    emit(
+    let (shown_bytes, shown) = emit_measured(
         &header,
         &sections,
         &footer,
@@ -3606,7 +3675,11 @@ fn explain(
         Fill::RoundRobin,
         budget,
         json.then_some(summary),
-    )
+    )?;
+    let mut files = collect_section_files(&sections, &shown);
+    files.insert(def.location.file.as_str());
+    crate::history::record_graph_files(workspace, "map", shown_bytes, files);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3623,6 +3696,7 @@ struct HtmlOutput {
     nodes: usize,
     edges: usize,
     communities: usize,
+    referenced_files: Vec<String>,
 }
 
 /// Escapes text for safe insertion into HTML element content (such as `<title>`).
@@ -3662,6 +3736,7 @@ fn escape_script_json(raw: &str) -> String {
 }
 
 /// Renders a self-contained, zero-CDN, XSS-safe interactive HTML graph explorer.
+#[cfg(test)]
 pub(crate) fn render_html(
     index: &Index,
     title: &str,
@@ -4063,15 +4138,35 @@ fn build_html(index: &Index, title: &str, invocation: &str, focus: Option<usize>
         ),
         None => format!("Justless Map · {}", escape_html_text(title)),
     };
-    let html = HTML_TEMPLATE
-        .replace("__JUSTLESS_TITLE__", &page_title)
-        .replace("__JUSTLESS_JSON__", &safe_json);
+    let (before_title, rest) = HTML_TEMPLATE
+        .split_once("__JUSTLESS_TITLE__")
+        .expect("HTML template contains title placeholder");
+    let (between, after_json) = rest
+        .split_once("__JUSTLESS_JSON__")
+        .expect("HTML template contains JSON placeholder");
+    let mut html = String::with_capacity(
+        before_title.len() + page_title.len() + between.len() + safe_json.len() + after_json.len(),
+    );
+    html.push_str(before_title);
+    html.push_str(&page_title);
+    html.push_str(between);
+    html.push_str(&safe_json);
+    html.push_str(after_json);
+
+    let referenced_files: Vec<String> = selected
+        .iter()
+        .map(|&id| index.definitions[id].location.file.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
 
     HtmlOutput {
         html,
         nodes: selected.len(),
         edges: edge_list.len(),
         communities: communities_json.len(),
+        referenced_files,
     }
 }
 
@@ -4358,7 +4453,8 @@ aside{width:330px;max-width:42vw;background:var(--panel);border-left:1px solid v
       if (showLabel) {
         ctx.font = (sel || hov ? '600 ' : '') + (11.5 / Math.sqrt(Math.max(0.55, cam.k))) + 'px system-ui,sans-serif';
         ctx.textAlign = 'center'; ctx.textBaseline = 'top';
-        const label = n.name.length > 28 ? n.name.slice(0, 27) + '…' : n.name;
+        const chars = [...n.name];
+        const label = chars.length > 28 ? chars.slice(0, 27).join('') + '…' : n.name;
         ctx.lineWidth = 3 / cam.k; ctx.strokeStyle = bgCol; ctx.strokeText(label, n.x, n.y + n.r + 3 / cam.k);
         ctx.fillStyle = textCol; ctx.fillText(label, n.x, n.y + n.r + 3 / cam.k);
       }
@@ -4430,9 +4526,9 @@ aside{width:330px;max-width:42vw;background:var(--panel);border-left:1px solid v
       cmdSec.appendChild(el('div', 'section-title', 'Justless commands'));
       const inv = sum.invocation || 'justless';
       for (const cmd of [
-        inv + ' query ' + shQuote(n.name),
-        inv + ' map --explain ' + shQuote(n.name),
-        inv + ' expand ' + shQuote(n.file) + ' L' + n.start + '-' + n.end,
+        inv + ' query -- ' + shQuote(n.name),
+        inv + ' map --explain=' + shQuote(n.name),
+        inv + ' expand -- ' + shQuote(n.file) + ' L' + n.start + '-' + n.end,
       ]) {
         const row = el('div', 'cmd-row');
         const code = el('code', '', cmd);
@@ -5301,6 +5397,21 @@ mod tests {
                 .any(|n| n["name"].as_str().unwrap() == weird),
             "escaped JSON must round-trip original symbol string losslessly"
         );
+
+        // P1-1: literal `__JUSTLESS_JSON__` in title must never expand into JSON.
+        let placeholder_html = render_html(&index, "__JUSTLESS_JSON__", "justless", None);
+        assert!(
+            placeholder_html.contains("<title>Justless Map · __JUSTLESS_JSON__</title>"),
+            "title placeholder must stay literal and never interpolate JSON"
+        );
+        // P1-4 & P2-1: option-terminating commands and code-point slicing.
+        assert!(placeholder_html.contains("inv + ' query -- ' + shQuote(n.name)"));
+        assert!(placeholder_html.contains("inv + ' map --explain=' + shQuote(n.name)"));
+        assert!(
+            placeholder_html
+                .contains("inv + ' expand -- ' + shQuote(n.file) + ' L' + n.start + '-' + n.end")
+        );
+        assert!(placeholder_html.contains("const chars = [...n.name];"));
     }
 
     #[test]
@@ -5341,5 +5452,88 @@ mod tests {
         let focus = payload["focus"].as_u64().expect("focus node index set") as usize;
         assert_eq!(payload["nodes"][focus]["name"], "compute_total");
         assert_eq!(payload["summary"]["focus_symbol"], "compute_total");
+    }
+
+    #[test]
+    fn map_and_review_record_graph_telemetry_only_with_state() {
+        let core_src = concat!(
+            "def compute_total(x):\n",
+            "    \"\"\"Compute a padded total for billing.\"\"\"\n",
+            "    return x + 1\n",
+        );
+        let api_src = concat!(
+            "from src.core import compute_total\n\n",
+            "def handle_request(v):\n",
+            "    return compute_total(v)\n",
+        );
+        let test_src = concat!(
+            "from src.api import handle_request\n\n",
+            "def test_handle_request():\n",
+            "    assert handle_request(41) == 42\n",
+        );
+        let (dir, _index) = write_repo(&[
+            ("src/core.py", core_src),
+            ("src/api.py", api_src),
+            ("tests/test_api.py", test_src),
+        ]);
+        let ws = Workspace::discover(Some(dir.path())).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.name", "Test"][..],
+            &["config", "user.email", "test@example.com"][..],
+            &["add", "."][..],
+            &["commit", "-qm", "init"][..],
+        ] {
+            let out = ws.git(args).unwrap();
+            assert!(out.status.success(), "{args:?}: {:?}", out.stderr);
+        }
+        // Mutate `src/core.py` so `review` has real diff + blast radius + reachable test.
+        let modified_core = core_src.replace("return x + 1", "return x + 2");
+        fs::write(dir.path().join("src/core.py"), &modified_core).unwrap();
+        let index = Index::open(&ws).unwrap();
+
+        let map_plain = command().try_get_matches_from(["map"]).unwrap();
+        let map_explain = command()
+            .try_get_matches_from(["map", "--explain", "compute_total"])
+            .unwrap();
+        let out_html = dir.path().join("graph.html");
+        let map_html = command()
+            .try_get_matches_from(["map", "--html", "--out", out_html.to_str().unwrap()])
+            .unwrap();
+        run(&ws, &map_plain).unwrap();
+        run(&ws, &map_explain).unwrap();
+        run(&ws, &map_html).unwrap();
+
+        let review_plain = crate::review::command()
+            .try_get_matches_from(["review"])
+            .unwrap();
+        let review_json = crate::review::command()
+            .try_get_matches_from(["review", "--json"])
+            .unwrap();
+        crate::review::run(&ws, &review_plain).unwrap();
+        crate::review::run(&ws, &review_json).unwrap();
+
+        let usage = crate::history::graph_usage(&ws);
+        assert_eq!(usage.calls, 5, "{usage:?}");
+        assert_eq!(usage.by_command.get("map"), Some(&3), "{usage:?}");
+        assert_eq!(usage.by_command.get("review"), Some(&2), "{usage:?}");
+        assert!(usage.shown_bytes > 0, "{usage:?}");
+        let min_expected_ref = (modified_core.len() + api_src.len()) as u64;
+        assert!(
+            usage.referenced_file_bytes >= min_expected_ref,
+            "expected referenced_file_bytes >= {min_expected_ref}, got {usage:?}"
+        );
+
+        // Removing `.justless/` must keep both `map` and `review` silent with zero state created.
+        fs::remove_dir_all(&ws.state).unwrap();
+        assert!(!ws.state.exists());
+        run_with_index(&ws, &index, &map_plain, 4096).unwrap();
+        explain(&ws, &index, "compute_total", 4096, false).unwrap();
+        let since = crate::context::Since::resolve(&ws, false, None).unwrap();
+        crate::review::run_with_index(&ws, &index, &since, 2, 4096, false).unwrap();
+        assert!(
+            !ws.state.exists(),
+            "map and review must stay silent and not create .justless/ when absent"
+        );
     }
 }

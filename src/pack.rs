@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::{Result, ensure};
@@ -895,14 +896,22 @@ pub fn pack(
     cap: usize,
     memory: Option<&mut Memory>,
 ) -> Result<()> {
-    let (report, failure) = pack_report(workspace, index, task, cap, memory)?;
-    report.finish()?;
+    let (report, failure, files) = pack_report_with_files(workspace, index, task, cap, memory)?;
+    let text = report.into_string();
+    io::stdout().lock().write_all(text.as_bytes())?;
     if let Some((id, bytes)) = failure.filter(|(_, bytes)| *bytes > 0) {
         history::excerpts(workspace, &BTreeMap::from([(id, bytes)]));
     }
+    history::record_graph_files(
+        workspace,
+        "pack",
+        text.len() as u64,
+        files.iter().map(String::as_str),
+    );
     Ok(())
 }
 
+#[cfg(test)]
 fn pack_report(
     workspace: &Workspace,
     index: &Index,
@@ -910,6 +919,19 @@ fn pack_report(
     cap: usize,
     memory: Option<&mut Memory>,
 ) -> Result<(Report, Option<(String, u64)>)> {
+    let (report, failure, _) = pack_report_with_files(workspace, index, task, cap, memory)?;
+    Ok((report, failure))
+}
+
+type PackOutput = (Report, Option<(String, u64)>, BTreeSet<String>);
+
+fn pack_report_with_files(
+    workspace: &Workspace,
+    index: &Index,
+    task: &str,
+    cap: usize,
+    memory: Option<&mut Memory>,
+) -> Result<PackOutput> {
     let mut cache = SourceCache::default();
     pack_report_with_cache(workspace, &mut cache, index, task, cap, memory)
 }
@@ -921,7 +943,7 @@ fn pack_report_with_cache(
     task: &str,
     cap: usize,
     mut memory: Option<&mut Memory>,
-) -> Result<(Report, Option<(String, u64)>)> {
+) -> Result<PackOutput> {
     ensure!(!task.trim().is_empty(), "provide a task or symbol");
     let (words, explicit_words) = task_terms(task);
     let question = task.to_lowercase();
@@ -1204,6 +1226,7 @@ fn pack_report_with_cache(
         }
     }
 
+    let mut referenced_files: BTreeSet<String> = BTreeSet::new();
     let mut seed_neighbors: HashSet<usize> = HashSet::new();
     let mut seeds_shown = 0usize;
     for (sup, score, id) in ranked {
@@ -1222,6 +1245,7 @@ fn pack_report_with_cache(
             continue;
         }
         let def = &index.definitions[id];
+        referenced_files.insert(def.location.file.clone());
         report.line(format!(
             "{} [{}] {}{}",
             def.qualified,
@@ -1439,6 +1463,10 @@ fn pack_report_with_cache(
                 break;
             }
             let target = &index.definitions[link.other];
+            referenced_files.insert(target.location.file.clone());
+            for label in &link.labels {
+                referenced_files.insert(label.file.to_owned());
+            }
             let target_kind = if target.test { "test" } else { &target.kind };
             let target_loc = format_pack_location(target, cone_base.as_deref());
             let format_link_span = |label: &PlannedEdgeLabel<'_>| {
@@ -1525,6 +1553,7 @@ fn pack_report_with_cache(
         );
         shown_text.insert(at);
     }
+    referenced_files.extend(shown_files.iter().cloned());
     let inspected: BTreeMap<_, _> = shown_files
         .iter()
         .filter_map(|file| {
@@ -1538,7 +1567,7 @@ fn pack_report_with_cache(
         report.line("No matching source or recorded failure. Try a symbol, file name, or an error from the log.");
     }
     history::saw_pack(workspace, inspected);
-    Ok((report, failure))
+    Ok((report, failure, referenced_files))
 }
 
 #[cfg(test)]

@@ -81,15 +81,33 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
         matches.value_of("base"),
     )?;
     let index = Index::open(workspace)?;
-    let output = render_review(
+    run_with_index(
         workspace,
         &index,
         &since,
         depth,
         budget,
         matches.is_present("json"),
-    )?;
+    )
+}
+
+pub(crate) fn run_with_index(
+    workspace: &Workspace,
+    index: &Index,
+    since: &Since,
+    depth: usize,
+    budget: usize,
+    as_json: bool,
+) -> Result<()> {
+    let (output, files) =
+        render_review_with_files(workspace, index, since, depth, budget, as_json)?;
     io::stdout().lock().write_all(output.as_bytes())?;
+    crate::history::record_graph_files(
+        workspace,
+        "review",
+        output.len() as u64,
+        files.iter().map(String::as_str),
+    );
     Ok(())
 }
 
@@ -1821,6 +1839,7 @@ fn detect_deleted_symbols(
     (deleted_specs, deletion_only)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn render_review(
     workspace: &Workspace,
     index: &Index,
@@ -1829,6 +1848,46 @@ pub(crate) fn render_review(
     budget: usize,
     as_json: bool,
 ) -> Result<String> {
+    render_review_with_files(workspace, index, since, depth, budget, as_json).map(|(out, _)| out)
+}
+
+fn collect_value_files(value: &Value, out: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(file)) = map.get("file") {
+                out.insert(file.clone());
+            }
+            for child in map.values() {
+                collect_value_files(child, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_value_files(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_section_files(sections: &[Section], shown: &[usize]) -> BTreeSet<String> {
+    let mut files = BTreeSet::new();
+    for (section, &count) in sections.iter().zip(shown) {
+        for value in &section.values[..count] {
+            collect_value_files(value, &mut files);
+        }
+    }
+    files
+}
+
+fn render_review_with_files(
+    workspace: &Workspace,
+    index: &Index,
+    since: &Since,
+    depth: usize,
+    budget: usize,
+    as_json: bool,
+) -> Result<(String, BTreeSet<String>)> {
     let file_diffs = collect_diff(workspace, since)?;
 
     if file_diffs.is_empty() {
@@ -1865,9 +1924,12 @@ pub(crate) fn render_review(
             obj.insert("message".into(), json!(msg));
             obj.insert("omitted".into(), json!({}));
             obj.insert("capped".into(), json!(false));
-            return Ok(format!("{}\n", serde_json::to_string(&obj)?));
+            return Ok((
+                format!("{}\n", serde_json::to_string(&obj)?),
+                BTreeSet::new(),
+            ));
         }
-        return Ok(format!("{msg}\n"));
+        return Ok((format!("{msg}\n"), BTreeSet::new()));
     }
 
     let diffs_by_path: BTreeMap<&str, &FileDiff> =
@@ -2818,6 +2880,7 @@ pub(crate) fn render_review(
     footer.push(next_line.clone());
 
     let shown = fit_sections(&header, &sections, &footer, &order, budget);
+    let referenced_files = collect_section_files(&sections, &shown);
 
     if as_json {
         let (scope, base) = scope_json(since);
@@ -2888,14 +2951,17 @@ pub(crate) fn render_review(
         object.insert("next".into(), json!(next_line));
         object.insert("omitted".into(), Value::Object(omitted));
         object.insert("capped".into(), Value::Bool(capped));
-        return Ok(format!("{}\n", serde_json::to_string(&object)?));
+        return Ok((
+            format!("{}\n", serde_json::to_string(&object)?),
+            referenced_files,
+        ));
     }
 
     let mut report = Report::new(budget);
     render_sections(&header, &sections, &footer, &shown, &mut |line| {
         report.line(line);
     });
-    Ok(report.into_string())
+    Ok((report.into_string(), referenced_files))
 }
 
 // ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
+use std::path::Path;
 use std::sync::LazyLock;
 
 use anyhow::{Context, Result, ensure};
@@ -470,17 +471,54 @@ fn fit_query_sections(header_bytes: usize, sections: &[QuerySection], cap: usize
     shown
 }
 
-pub fn query(index: &Index, name: &str, view: &str, cap: usize) -> Result<()> {
-    query_report(index, name, view, cap)?.finish()
+/// Resolves the [`Workspace`] behind an [`Index`] via its recorded invocation
+/// prefix (`index.justless`) so `query` and `path` can record code-graph
+/// telemetry without changing their public signatures.
+fn workspace_for_index(index: &Index) -> Option<Workspace> {
+    let words = shlex::split(&index.justless)?;
+    match words.as_slice() {
+        [cmd] if cmd == "justless" => Workspace::discover(None).ok(),
+        [cmd, flag, root] if cmd == "justless" && flag == "--root" => {
+            Workspace::discover(Some(Path::new(root))).ok()
+        }
+        _ => None,
+    }
 }
 
+pub fn query(index: &Index, name: &str, view: &str, cap: usize) -> Result<()> {
+    let (report, files) = query_report_with_files(index, name, view, cap)?;
+    let text = report.into_string();
+    io::stdout().lock().write_all(text.as_bytes())?;
+    if let Some(workspace) = workspace_for_index(index) {
+        crate::history::record_graph_files(
+            &workspace,
+            "query",
+            text.len() as u64,
+            files.iter().map(String::as_str),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn query_report(index: &Index, name: &str, view: &str, cap: usize) -> Result<Report> {
+    query_report_with_files(index, name, view, cap).map(|(report, _)| report)
+}
+
+fn query_report_with_files(
+    index: &Index,
+    name: &str,
+    view: &str,
+    cap: usize,
+) -> Result<(Report, BTreeSet<String>)> {
     let id = index.select(name)?;
     let mut report = Report::new(cap);
+    let mut files = BTreeSet::new();
+    files.insert(index.definitions[id].location.file.clone());
     let header = describe(&index.definitions[id]);
     if view == "definition" {
         report.line(&header);
-        return Ok(report);
+        return Ok((report, files));
     }
     type IncomingKey<'a> = (Option<usize>, &'static str, bool, &'a str);
     type OutgoingKey<'a> = (usize, &'static str, bool, &'a str);
@@ -663,29 +701,60 @@ fn query_report(index: &Index, name: &str, view: &str, cap: usize) -> Result<Rep
     if let Some(line) = &base_line {
         report.line(line);
     }
+    let mut rendered_counts = Vec::with_capacity(sections.len());
     for (section, &count) in sections.iter().zip(&shown) {
         if report.clipped {
+            rendered_counts.push(0);
             break;
         }
         if section.lines.is_empty() {
             if let Some(empty) = section.empty {
                 report.line(empty);
             }
+            rendered_counts.push(0);
             continue;
         }
+        let mut emitted = 0usize;
         for line in &section.lines[..count] {
             report.line(line);
+            emitted += 1;
             if report.clipped {
                 break;
             }
         }
+        rendered_counts.push(emitted);
         if !report.clipped
             && let Some(note) = section.clip_note(count)
         {
             report.line(note);
         }
     }
-    Ok(report)
+    let mut sec_idx = 0usize;
+    if let Some(groups) = &incoming_groups {
+        let emitted = rendered_counts.get(sec_idx).copied().unwrap_or(0);
+        for &((from, _, _, file), _) in &groups[..emitted] {
+            files.insert(file.to_owned());
+            if let Some(owner_id) = from {
+                files.insert(index.definitions[owner_id].location.file.clone());
+            }
+        }
+        sec_idx += 1;
+    }
+    if let Some(groups) = &outgoing_groups {
+        let emitted = rendered_counts.get(sec_idx).copied().unwrap_or(0);
+        for &((to, _, _, file), _) in &groups[..emitted] {
+            files.insert(index.definitions[to].location.file.clone());
+            files.insert(file.to_owned());
+        }
+        sec_idx += 1;
+    }
+    if let Some(tests) = &related_tests {
+        let emitted = rendered_counts.get(sec_idx).copied().unwrap_or(0);
+        for &(test_id, _, _) in &tests[..emitted] {
+            files.insert(index.definitions[test_id].location.file.clone());
+        }
+    }
+    Ok((report, files))
 }
 
 pub(crate) fn relationship(kind: Kind) -> &'static str {
@@ -699,10 +768,31 @@ pub(crate) fn relationship(kind: Kind) -> &'static str {
 }
 
 pub fn path(index: &Index, from: &str, to: &str, cap: usize) -> Result<()> {
-    path_report(index, from, to, cap)?.finish()
+    let (report, files) = path_report_with_files(index, from, to, cap)?;
+    let text = report.into_string();
+    io::stdout().lock().write_all(text.as_bytes())?;
+    if let Some(workspace) = workspace_for_index(index) {
+        crate::history::record_graph_files(
+            &workspace,
+            "path",
+            text.len() as u64,
+            files.iter().map(String::as_str),
+        );
+    }
+    Ok(())
 }
 
+#[cfg(test)]
 fn path_report(index: &Index, from: &str, to: &str, cap: usize) -> Result<Report> {
+    path_report_with_files(index, from, to, cap).map(|(report, _)| report)
+}
+
+fn path_report_with_files(
+    index: &Index,
+    from: &str,
+    to: &str,
+    cap: usize,
+) -> Result<(Report, BTreeSet<String>)> {
     let from = index.select(from)?;
     let to = index.select(to)?;
     let hops = index
@@ -716,6 +806,8 @@ fn path_report(index: &Index, from: &str, to: &str, cap: usize) -> Result<Report
     }
     let base = hoistable_dir_prefix(&hop_paths, "  base: ");
     let mut report = Report::new(cap);
+    let mut files = BTreeSet::new();
+    files.insert(index.definitions[from].location.file.clone());
     report.line(describe(&index.definitions[from]));
     if let Some(prefix) = &base {
         report.line(format!("  base: {prefix}"));
@@ -724,6 +816,8 @@ fn path_report(index: &Index, from: &str, to: &str, cap: usize) -> Result<Report
         let direction = if reverse { "←" } else { "→" };
         let other = if reverse { edge.from.unwrap() } else { edge.to };
         let confidence = if edge.inferred { "possible " } else { "" };
+        files.insert(edge.location.file.clone());
+        files.insert(index.definitions[other].location.file.clone());
         report.line(format!(
             "  {direction} {confidence}{} at {} → {}",
             relationship(edge.kind),
@@ -734,7 +828,7 @@ fn path_report(index: &Index, from: &str, to: &str, cap: usize) -> Result<Report
             break;
         }
     }
-    Ok(report)
+    Ok((report, files))
 }
 
 pub fn code(workspace: &Workspace, file: &str, from: usize, to: usize, cap: usize) -> Result<()> {
@@ -959,9 +1053,28 @@ pub fn at(
     memory: Option<&mut Memory>,
 ) -> Result<()> {
     let mut cache = SourceCache::default();
-    at_report_cached(workspace, &mut cache, index, input, cap, memory)?.finish()
+    let mut referenced = BTreeSet::new();
+    let text = at_report_cached_with_files(
+        workspace,
+        &mut cache,
+        index,
+        input,
+        cap,
+        memory,
+        &mut referenced,
+    )?
+    .into_string();
+    io::stdout().lock().write_all(text.as_bytes())?;
+    crate::history::record_graph_files(
+        workspace,
+        "context",
+        text.len() as u64,
+        referenced.iter().map(String::as_str),
+    );
+    Ok(())
 }
 
+#[cfg(test)]
 fn at_report_cached(
     workspace: &Workspace,
     cache: &mut SourceCache,
@@ -969,6 +1082,19 @@ fn at_report_cached(
     input: &str,
     cap: usize,
     memory: Option<&mut Memory>,
+) -> Result<Report> {
+    let mut referenced = BTreeSet::new();
+    at_report_cached_with_files(workspace, cache, index, input, cap, memory, &mut referenced)
+}
+
+fn at_report_cached_with_files(
+    workspace: &Workspace,
+    cache: &mut SourceCache,
+    index: &Index,
+    input: &str,
+    cap: usize,
+    memory: Option<&mut Memory>,
+    referenced: &mut BTreeSet<String>,
 ) -> Result<Report> {
     let (file, range) = input
         .rsplit_once(':')
@@ -994,6 +1120,7 @@ fn at_report_cached(
         None,
         &mut report,
         memory,
+        referenced,
     )?;
     Ok(report)
 }
@@ -1011,8 +1138,8 @@ pub fn symbol(
     let definition = &index.definitions[id];
     let location = &definition.location;
     let mut cache = SourceCache::default();
-    let Some(memory) = memory else {
-        return code_with_indent_cached(
+    let report = match memory {
+        None => code_with_indent_cached(
             workspace,
             &mut cache,
             &location.file,
@@ -1020,39 +1147,49 @@ pub fn symbol(
             location.end,
             cap,
             SESSION_MIN_TRIM_INDENT,
-        )?
-        .finish();
+        )?,
+        Some(memory) => {
+            let line_count = cache.get_or_read(workspace, &location.file)?.line_count();
+            if location.start == 0 || location.start > line_count {
+                code_with_indent_cached(
+                    workspace,
+                    &mut cache,
+                    &location.file,
+                    location.start,
+                    location.end,
+                    cap,
+                    SESSION_MIN_TRIM_INDENT,
+                )?
+            } else {
+                let text = &cache.get_or_read(workspace, &location.file)?.text;
+                let mut report = Report::new(cap);
+                memory.show(
+                    workspace,
+                    text,
+                    &Symbol {
+                        file: &location.file,
+                        name: &seen_name(index, id),
+                        start: location.start,
+                        end: location.end,
+                    },
+                    &overlapping_names(index, id),
+                    (location.start, location.end),
+                    true,
+                    &mut report,
+                );
+                report
+            }
+        }
     };
-    let line_count = cache.get_or_read(workspace, &location.file)?.line_count();
-    if location.start == 0 || location.start > line_count {
-        return code_with_indent_cached(
-            workspace,
-            &mut cache,
-            &location.file,
-            location.start,
-            location.end,
-            cap,
-            SESSION_MIN_TRIM_INDENT,
-        )?
-        .finish();
-    }
-    let text = &cache.get_or_read(workspace, &location.file)?.text;
-    let mut report = Report::new(cap);
-    memory.show(
+    let text = report.into_string();
+    io::stdout().lock().write_all(text.as_bytes())?;
+    crate::history::record_graph_files(
         workspace,
-        text,
-        &Symbol {
-            file: &location.file,
-            name: &seen_name(index, id),
-            start: location.start,
-            end: location.end,
-        },
-        &overlapping_names(index, id),
-        (location.start, location.end),
-        true,
-        &mut report,
+        "context",
+        text.len() as u64,
+        [location.file.as_str()],
     );
-    report.finish()
+    Ok(())
 }
 
 /// The name a session remembers a definition by: its qualified name, numbered
@@ -1248,7 +1385,7 @@ fn emit_diagnostics(
 }
 
 pub fn from_run(workspace: &Workspace, index: &Index, id: &str, cap: usize) -> Result<()> {
-    let (directory, text, source) = from_run_report(workspace, index, id, cap)?;
+    let (directory, text, source, referenced) = from_run_report(workspace, index, id, cap)?;
     io::stdout().lock().write_all(text.as_bytes())?;
     // The log lines and notes retrieve the run's output again. The source shown
     // beside them does not.
@@ -1256,6 +1393,12 @@ pub fn from_run(workspace: &Workspace, index: &Index, id: &str, cap: usize) -> R
         &directory,
         crate::history::Retrieval::Context,
         Some(text.len().saturating_sub(source) as u64),
+    );
+    crate::history::record_graph_files(
+        workspace,
+        "context",
+        text.len() as u64,
+        referenced.iter().map(String::as_str),
     );
     Ok(())
 }
@@ -1265,10 +1408,11 @@ fn from_run_report(
     index: &Index,
     id: &str,
     cap: usize,
-) -> Result<(std::path::PathBuf, String, usize)> {
+) -> Result<(std::path::PathBuf, String, usize, BTreeSet<String>)> {
     let (directory, run) = capture::load(workspace, id)?;
     let mut report = Report::new(cap);
     let mut cache = SourceCache::default();
+    let mut referenced = BTreeSet::new();
     let justless = workspace.justless();
     // Bytes of source shown around the locations.
     let mut source = 0;
@@ -1431,6 +1575,7 @@ fn from_run_report(
                         base.as_deref(),
                         &mut report,
                         SnippetView::Report,
+                        &mut referenced,
                     )?;
                     source += room.saturating_sub(report.left());
                 }
@@ -1453,6 +1598,7 @@ fn from_run_report(
                     break;
                 }
                 if stale {
+                    referenced.insert(location.file.clone());
                     report.line("  Source changed or disappeared after this run. Re-run the command for current locations.");
                 } else {
                     let room = report.left();
@@ -1464,13 +1610,14 @@ fn from_run_report(
                         base.as_deref(),
                         &mut report,
                         None,
+                        &mut referenced,
                     )?;
                     source += room.saturating_sub(report.left());
                 }
             }
         }
     }
-    Ok((directory, report.into_string(), source))
+    Ok((directory, report.into_string(), source, referenced))
 }
 
 #[cfg(test)]
@@ -1482,9 +1629,20 @@ fn at_location(
     memory: Option<&mut Memory>,
 ) -> Result<()> {
     let mut cache = SourceCache::default();
-    at_location_cached(workspace, &mut cache, index, location, None, report, memory)
+    let mut referenced = BTreeSet::new();
+    at_location_cached(
+        workspace,
+        &mut cache,
+        index,
+        location,
+        None,
+        report,
+        memory,
+        &mut referenced,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn at_location_cached(
     workspace: &Workspace,
     cache: &mut SourceCache,
@@ -1493,7 +1651,9 @@ fn at_location_cached(
     base: Option<&str>,
     report: &mut Report,
     mut memory: Option<&mut Memory>,
+    referenced: &mut BTreeSet<String>,
 ) -> Result<()> {
+    referenced.insert(location.file.clone());
     match resolve_location(index, location) {
         Resolution::Single { best, overlapping } => detail_cached(
             workspace,
@@ -1505,6 +1665,7 @@ fn at_location_cached(
             base,
             report,
             memory,
+            referenced,
         ),
         Resolution::Multiple { members } => {
             // Find outermost spans in O(M log M) while keeping identical-span twins.
@@ -1580,6 +1741,7 @@ fn at_location_cached(
                     base,
                     report,
                     memory.as_deref_mut(),
+                    referenced,
                 )?;
             }
             Ok(())
@@ -1627,6 +1789,7 @@ fn detail_cached(
     base: Option<&str>,
     report: &mut Report,
     memory: Option<&mut Memory>,
+    referenced: &mut BTreeSet<String>,
 ) -> Result<()> {
     let keep = if location.end > location.start {
         overlapping
@@ -1639,7 +1802,7 @@ fn detail_cached(
     };
     let locations = [location];
     detail_multi_cached(
-        workspace, cache, index, best, &locations, keep, base, report, view,
+        workspace, cache, index, best, &locations, keep, base, report, view, referenced,
     )
 }
 
@@ -1656,8 +1819,10 @@ fn detail_multi_cached(
     base: Option<&str>,
     report: &mut Report,
     view: SnippetView<'_>,
+    referenced: &mut BTreeSet<String>,
 ) -> Result<()> {
     let definition = &index.definitions[best];
+    referenced.insert(definition.location.file.clone());
     report.line(describe_with_base(definition, base));
     // Sort outgoing call/bridge/import edges once by (inferred, nearest distance, line),
     // then group repeated call sites to the same target into one line so all line
@@ -1722,6 +1887,8 @@ fn detail_multi_cached(
         } else {
             format_line_spans_with_base(origin_file, &spans, base)
         };
+        referenced.insert(index.definitions[to].location.file.clone());
+        referenced.insert(origin_file.to_owned());
         report.line(format!(
             "  {confidence}{description} {} (from {origin})",
             describe_with_base(&index.definitions[to], base),
@@ -1734,6 +1901,7 @@ fn detail_multi_cached(
             } else {
                 "related test"
             };
+            referenced.insert(index.definitions[id].location.file.clone());
             report.line(format!(
                 "  {confidence}: {}",
                 describe_with_base(&index.definitions[id], base)
@@ -2055,9 +2223,28 @@ fn deleted_symbols(workspace: &Workspace, file: &str, rev: &str, deletions: &mut
 }
 
 pub fn changed(workspace: &Workspace, index: &Index, since: &Since, cap: usize) -> Result<()> {
-    changed_report(workspace, index, since, cap)?.finish()
+    let mut cache = SourceCache::default();
+    let mut referenced = BTreeSet::new();
+    let text = changed_report_cached_with_files(
+        workspace,
+        &mut cache,
+        index,
+        since,
+        cap,
+        &mut referenced,
+    )?
+    .into_string();
+    io::stdout().lock().write_all(text.as_bytes())?;
+    crate::history::record_graph_files(
+        workspace,
+        "context",
+        text.len() as u64,
+        referenced.iter().map(String::as_str),
+    );
+    Ok(())
 }
 
+#[cfg(test)]
 fn changed_report(
     workspace: &Workspace,
     index: &Index,
@@ -2065,15 +2252,17 @@ fn changed_report(
     cap: usize,
 ) -> Result<Report> {
     let mut cache = SourceCache::default();
-    changed_report_cached(workspace, &mut cache, index, since, cap)
+    let mut referenced = BTreeSet::new();
+    changed_report_cached_with_files(workspace, &mut cache, index, since, cap, &mut referenced)
 }
 
-fn changed_report_cached(
+fn changed_report_cached_with_files(
     workspace: &Workspace,
     cache: &mut SourceCache,
     index: &Index,
     since: &Since,
     cap: usize,
+    referenced: &mut BTreeSet<String>,
 ) -> Result<Report> {
     let mut report = Report::new(cap);
     let changes = changes_with_cache(workspace, index, since, cache)?;
@@ -2090,6 +2279,7 @@ fn changed_report_cached(
     }
     let mut deferred: HashMap<(String, usize), Vec<Location>> = HashMap::new();
     for (pos, (file, change)) in changes.iter().enumerate() {
+        referenced.insert(file.clone());
         let name = display_with_base(file, base.as_deref());
         match change {
             Change::Unindexed if fs::symlink_metadata(workspace.root.join(file)).is_err() => {
@@ -2139,6 +2329,7 @@ fn changed_report_cached(
                     &mut deferred,
                     base.as_deref(),
                     &mut report,
+                    referenced,
                 )?;
             }
             Change::Ranges(locations) => {
@@ -2152,6 +2343,7 @@ fn changed_report_cached(
                     &mut deferred,
                     base.as_deref(),
                     &mut report,
+                    referenced,
                 )?;
             }
         }
@@ -2252,6 +2444,7 @@ fn emit_deletions(
     deferred: &mut HashMap<(String, usize), Vec<Location>>,
     base: Option<&str>,
     report: &mut Report,
+    referenced: &mut BTreeSet<String>,
 ) -> Result<()> {
     enum Entry<'a> {
         HeaderOnly(&'a Deletion),
@@ -2313,6 +2506,7 @@ fn emit_deletions(
                         base,
                         report,
                         SnippetView::Report,
+                        referenced,
                     )?;
                 }
             }
@@ -2333,6 +2527,7 @@ fn emit_changed_ranges(
     deferred: &mut HashMap<(String, usize), Vec<Location>>,
     base: Option<&str>,
     report: &mut Report,
+    referenced: &mut BTreeSet<String>,
 ) -> Result<()> {
     enum RangeEntry {
         Symbol {
@@ -2426,6 +2621,7 @@ fn emit_changed_ranges(
                         base,
                         report,
                         SnippetView::Report,
+                        referenced,
                     )?;
                 }
             }
@@ -2435,7 +2631,9 @@ fn emit_changed_ranges(
                     location.start, location.end
                 ));
                 if !report.clipped {
-                    at_location_cached(workspace, cache, index, &location, base, report, None)?;
+                    at_location_cached(
+                        workspace, cache, index, &location, base, report, None, referenced,
+                    )?;
                 }
             }
         }
@@ -3221,7 +3419,7 @@ mod tests {
         });
         fs::write(run_dir.join("record.json"), record.to_string()).unwrap();
 
-        let (_, out, source_bytes) =
+        let (_, out, source_bytes, _) =
             from_run_report(&workspace, &index, "run-multi01", 12_000).unwrap();
         // Every diagnostic header & Replay command is preserved.
         assert!(out.contains("src/lib.rs:14 · log stderr:1"), "{out}");
@@ -3500,6 +3698,70 @@ mod tests {
         assert!(
             out.contains("(from :4,5,6)\n"),
             "all repeated call-site line numbers must survive on one line:\n{out}"
+        );
+    }
+
+    #[test]
+    fn query_path_context_and_pack_record_graph_telemetry_only_with_state() {
+        let manifest = "[package]\nname = \"gstat\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        let lib =
+            "pub mod caller;\npub mod entry;\n\npub fn core_fn(x: u32) -> u32 {\n    x + 1\n}\n";
+        let caller =
+            "use crate::core_fn;\n\npub fn middle_fn(v: u32) -> u32 {\n    core_fn(v) * 2\n}\n";
+        let entry = "use crate::caller::middle_fn;\n\npub fn entry_fn(n: u32) -> u32 {\n    middle_fn(n)\n}\n";
+        let (_dir, workspace) = temp_workspace(&[
+            ("Cargo.toml", manifest),
+            ("src/lib.rs", lib),
+            ("src/caller.rs", caller),
+            ("src/entry.rs", entry),
+        ]);
+        init_git(&workspace);
+        let index = Index::open(&workspace).unwrap();
+
+        query(&index, "core_fn", "references", 4096).unwrap();
+        let after_query = crate::history::graph_usage(&workspace);
+        assert_eq!(after_query.calls, 1, "{after_query:?}");
+        assert_eq!(after_query.by_command.get("query"), Some(&1));
+        assert_eq!(
+            after_query.referenced_file_bytes,
+            (lib.len() + caller.len()) as u64,
+            "{after_query:?}"
+        );
+        assert!(after_query.shown_bytes > 0);
+
+        path(&index, "entry_fn", "core_fn", 4096).unwrap();
+        let after_path = crate::history::graph_usage(&workspace);
+        assert_eq!(after_path.calls, 2, "{after_path:?}");
+        assert_eq!(after_path.by_command.get("path"), Some(&1));
+        assert_eq!(
+            after_path.referenced_file_bytes - after_query.referenced_file_bytes,
+            (entry.len() + caller.len() + lib.len()) as u64,
+            "{after_path:?}"
+        );
+
+        at(&workspace, &index, "src/caller.rs:4", 4096, None).unwrap();
+        symbol(&workspace, &index, "core_fn", 4096, None).unwrap();
+        changed(&workspace, &index, &Since::Head, 4096).unwrap();
+        crate::pack::pack(&workspace, &index, "core_fn", 4096, None).unwrap();
+
+        let total = crate::history::graph_usage(&workspace);
+        assert_eq!(total.calls, 6, "{total:?}");
+        assert_eq!(total.by_command.get("query"), Some(&1));
+        assert_eq!(total.by_command.get("path"), Some(&1));
+        assert_eq!(total.by_command.get("context"), Some(&3));
+        assert_eq!(total.by_command.get("pack"), Some(&1));
+        assert!(total.shown_bytes > after_path.shown_bytes);
+        assert!(total.referenced_file_bytes > after_path.referenced_file_bytes);
+
+        // Removing `.justless/` keeps `query`, `path`, and `pack` fail-silent with no state created.
+        fs::remove_dir_all(&workspace.state).unwrap();
+        assert!(!workspace.state.exists());
+        query(&index, "core_fn", "references", 4096).unwrap();
+        path(&index, "entry_fn", "core_fn", 4096).unwrap();
+        crate::pack::pack(&workspace, &index, "core_fn", 4096, None).unwrap();
+        assert!(
+            !workspace.state.exists(),
+            "query, path, and pack must stay silent and not create .justless/ when absent"
         );
     }
 }
