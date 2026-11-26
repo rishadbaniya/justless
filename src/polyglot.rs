@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -1724,15 +1724,21 @@ fn hcl_reference(node: Node<'_>, source: &str) -> Option<String> {
     let root = text(node, source);
     let width = match root {
         "count" | "each" | "self" | "path" | "terraform" => return None,
-        "data" => 3,
+        "data" | "ephemeral" => 3,
         _ => 2,
     };
     let mut parts = [root, "", ""];
     let mut count = 1usize;
     let mut next = node.next_named_sibling();
-    while count < width
-        && let Some(attribute) = next.filter(|next| next.kind() == "get_attr")
-    {
+    while count < width {
+        while let Some(candidate) = next
+            && candidate.kind() == "comment"
+        {
+            next = candidate.next_named_sibling();
+        }
+        let Some(attribute) = next.filter(|next| next.kind() == "get_attr") else {
+            break;
+        };
         parts[count] = text(attribute.named_child(0)?, source);
         count += 1;
         next = attribute.next_named_sibling();
@@ -1749,6 +1755,36 @@ fn hcl_reference(node: Node<'_>, source: &str) -> Option<String> {
         out.push_str(part);
     }
     Some(out)
+}
+
+fn hcl_module_source<'a>(node: Node<'_>, source: &'a str) -> Option<(&'a str, usize)> {
+    let mut cursor = node.walk();
+    let mut children = node.named_children(&mut cursor);
+    let kind_node = children.next()?;
+    if kind_node.kind() != "identifier" || text(kind_node, source) != "module" {
+        return None;
+    }
+    let body = children.find(|child| child.kind() == "body")?;
+    let mut body_cursor = body.walk();
+    for attr in body
+        .named_children(&mut body_cursor)
+        .filter(|child| child.kind() == "attribute")
+    {
+        let key = attr.named_child(0)?;
+        if key.kind() != "identifier" || text(key, source) != "source" {
+            continue;
+        }
+        let expr = attr.named_child(1)?;
+        let raw = text(expr, source).trim();
+        let inner = raw.strip_prefix('"')?.strip_suffix('"')?;
+        if (inner.starts_with("./") || inner.starts_with("../"))
+            && !inner.contains("${")
+            && !inner.contains("%{")
+        {
+            return Some((inner, attr.start_position().row + 1));
+        }
+    }
+    None
 }
 
 fn zig_container(node: Node<'_>) -> &'static str {
@@ -2263,6 +2299,13 @@ fn module_import(grammar: Grammar, kind: &str, node: Node<'_>, source: &str) -> 
         Cow::Borrowed(
             (argument.kind() == "string_literal").then(|| literal(text(argument, source)))??,
         )
+    } else if grammar == Grammar::Hcl && kind == "block" {
+        let (path, line) = hcl_module_source(node, source)?;
+        return Some(Import {
+            path: path.to_owned(),
+            bindings,
+            line,
+        });
     } else {
         return None;
     };
@@ -3351,6 +3394,721 @@ fn extract_sql_body_table_refs(body: &str, body_start_line: usize) -> Vec<(Strin
         idx += 1;
     }
     refs
+}
+
+// ---------------------------------------------------------------------------
+// Helm chart `values.yaml` & Go-template extraction (zero regex, UTF-8 safe)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HelmRole {
+    Values,
+    Template,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HelmFacts {
+    pub chart_root: String,
+    pub lines: usize,
+    pub definitions: Vec<Definition>,
+    pub references: Vec<Reference>,
+}
+
+fn normalized_rel_path(file: &str) -> Cow<'_, str> {
+    if file.contains('\\') {
+        Cow::Owned(file.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(file)
+    }
+}
+
+/// Identifies every Helm chart root directory in `files` by locating `Chart.yaml`
+/// (or `Chart.yml`) manifests outside `templates/` directories.
+pub fn helm_chart_roots(files: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut roots = BTreeSet::new();
+    for file in files {
+        let norm = normalized_rel_path(file);
+        let (dir, name) = norm.rsplit_once('/').unwrap_or(("", norm.as_ref()));
+        if (name == "Chart.yaml" || name == "Chart.yml")
+            && dir != "templates"
+            && !dir.ends_with("/templates")
+        {
+            roots.insert(dir.to_owned());
+        }
+    }
+    roots
+}
+
+fn is_helm_values_file(name: &str) -> bool {
+    let Some((stem, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    if !ext.eq_ignore_ascii_case("yaml") && !ext.eq_ignore_ascii_case("yml") {
+        return false;
+    }
+    stem.eq_ignore_ascii_case("values")
+        || stem.get(..7).is_some_and(|prefix| {
+            prefix.eq_ignore_ascii_case("values.") || prefix.eq_ignore_ascii_case("values-")
+        })
+}
+
+fn is_helm_template_file(rel: &str) -> bool {
+    let Some(under_templates) = rel.strip_prefix("templates/") else {
+        return false;
+    };
+    let name = under_templates
+        .rsplit_once('/')
+        .map_or(under_templates, |(_, file)| file);
+    let Some((_, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    ext.eq_ignore_ascii_case("yaml")
+        || ext.eq_ignore_ascii_case("yml")
+        || ext.eq_ignore_ascii_case("tpl")
+}
+
+/// Classifies `file` when it belongs to one of `chart_roots`: either a chart
+/// `values*.yaml` file alongside `Chart.yaml`, or a template under `templates/`.
+/// Plain non-Helm YAML files return `None`.
+pub fn helm_file_role(file: &str, chart_roots: &BTreeSet<String>) -> Option<(String, HelmRole)> {
+    if chart_roots.is_empty() {
+        return None;
+    }
+    let norm = normalized_rel_path(file);
+    let mut best: Option<(&str, &str)> = None;
+    for root in chart_roots {
+        let rel = if root.is_empty() {
+            Some(norm.as_ref())
+        } else {
+            norm.strip_prefix(root.as_str())
+                .and_then(|rest| rest.strip_prefix('/'))
+        };
+        if let Some(rel) = rel
+            && best.is_none_or(|(prev_root, _)| root.len() >= prev_root.len())
+        {
+            best = Some((root.as_str(), rel));
+        }
+    }
+    let (chart_root, rel) = best?;
+    if !rel.contains('/') && is_helm_values_file(rel) {
+        Some((chart_root.to_owned(), HelmRole::Values))
+    } else if is_helm_template_file(rel) {
+        Some((chart_root.to_owned(), HelmRole::Template))
+    } else {
+        None
+    }
+}
+
+pub fn parse_helm(chart_root: String, role: HelmRole, source: &str) -> HelmFacts {
+    match role {
+        HelmRole::Values => parse_helm_values(chart_root, source),
+        HelmRole::Template => parse_helm_template(chart_root, source),
+    }
+}
+
+fn parse_yaml_mapping_key(rest: &str) -> Option<(&str, &str)> {
+    let first = rest.chars().next()?;
+    if first == '"' {
+        let mut escaped = false;
+        for (idx, ch) in rest.char_indices().skip(1) {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                let key = &rest[1..idx];
+                let after_quote = rest[idx + 1..].trim_start_matches([' ', '\t']);
+                let after_colon = after_quote.strip_prefix(':')?;
+                if after_colon.is_empty() || after_colon.starts_with([' ', '\t']) {
+                    return (!key.is_empty()).then_some((key, after_colon));
+                }
+                return None;
+            }
+        }
+        return None;
+    }
+    if first == '\'' {
+        let mut iter = rest.char_indices().skip(1).peekable();
+        while let Some((idx, ch)) = iter.next() {
+            if ch == '\'' {
+                if iter.peek().is_some_and(|&(_, next)| next == '\'') {
+                    iter.next();
+                    continue;
+                }
+                let key = &rest[1..idx];
+                let after_quote = rest[idx + 1..].trim_start_matches([' ', '\t']);
+                let after_colon = after_quote.strip_prefix(':')?;
+                if after_colon.is_empty() || after_colon.starts_with([' ', '\t']) {
+                    return (!key.is_empty()).then_some((key, after_colon));
+                }
+                return None;
+            }
+        }
+        return None;
+    }
+    if matches!(
+        first,
+        '#' | '-' | '{' | '}' | '[' | ']' | '&' | '*' | '!' | '?' | '%' | '@' | '`'
+    ) || rest.starts_with("{{")
+    {
+        return None;
+    }
+    for (idx, ch) in rest.char_indices() {
+        if ch == ':' {
+            let after_colon = &rest[idx + 1..];
+            if after_colon.is_empty() || after_colon.starts_with([' ', '\t']) {
+                let key = rest[..idx].trim_end_matches([' ', '\t']);
+                if key.is_empty()
+                    || key.contains(['{', '}', '[', ']', ',', '#'])
+                    || key.contains("{{")
+                {
+                    return None;
+                }
+                return Some((key, after_colon));
+            }
+        }
+    }
+    None
+}
+
+fn is_yaml_block_scalar(after_colon: &str) -> bool {
+    let val = after_colon.trim_start_matches([' ', '\t']);
+    let Some(rest) = val.strip_prefix('|').or_else(|| val.strip_prefix('>')) else {
+        return false;
+    };
+    let header = rest.split([' ', '\t', '#']).next().unwrap_or("");
+    header.chars().all(|ch| matches!(ch, '-' | '+' | '1'..='9'))
+}
+
+fn parse_helm_values(chart_root: String, source: &str) -> HelmFacts {
+    let lines = source.lines().count().max(1);
+    let mut definitions: Vec<Definition> = Vec::new();
+    let mut active_l0: Option<(usize, String)> = None;
+    let mut active_l1: Option<(usize, usize)> = None;
+    let mut section_child_indent: Option<usize> = None;
+    let mut block_scalar_indent: Option<usize> = None;
+    let mut sequence_indent: Option<usize> = None;
+
+    let mut byte_offset = 0usize;
+    for (idx, raw_line) in source.split_inclusive('\n').enumerate() {
+        let line_no = idx + 1;
+        let line_start = byte_offset;
+        byte_offset += raw_line.len();
+        let line = raw_line.trim_end_matches(['\r', '\n']);
+        let line_end = line_start + line.len();
+        let rest = line.trim_start_matches([' ', '\t']);
+        if rest.is_empty() {
+            continue;
+        }
+        let indent = line.len() - rest.len();
+
+        if let Some(parent_indent) = block_scalar_indent {
+            if indent > parent_indent {
+                if let Some((l0_idx, _)) = active_l0 {
+                    definitions[l0_idx].end = line_no;
+                    definitions[l0_idx].bytes.end = line_end;
+                }
+                if let Some((l1_idx, l1_indent)) = active_l1
+                    && parent_indent >= l1_indent
+                {
+                    definitions[l1_idx].end = line_no;
+                    definitions[l1_idx].bytes.end = line_end;
+                }
+                continue;
+            }
+            block_scalar_indent = None;
+        }
+
+        if rest.starts_with('#') {
+            continue;
+        }
+        if rest == "---" || rest == "..." || rest.starts_with("--- ") || rest.starts_with("... ") {
+            active_l0 = None;
+            active_l1 = None;
+            section_child_indent = None;
+            sequence_indent = None;
+            continue;
+        }
+
+        let is_seq_item = rest == "-" || rest.starts_with("- ") || rest.starts_with("-\t");
+        if let Some(seq_indent) = sequence_indent {
+            if indent > seq_indent || (indent == seq_indent && is_seq_item) {
+                if indent > 0 {
+                    if let Some((l0_idx, _)) = active_l0 {
+                        definitions[l0_idx].end = line_no;
+                        definitions[l0_idx].bytes.end = line_end;
+                    }
+                    if let Some((l1_idx, l1_indent)) = active_l1
+                        && seq_indent > l1_indent
+                    {
+                        definitions[l1_idx].end = line_no;
+                        definitions[l1_idx].bytes.end = line_end;
+                    }
+                }
+                continue;
+            }
+            sequence_indent = None;
+        }
+        if is_seq_item {
+            if indent > 0 {
+                if let Some((l0_idx, _)) = active_l0 {
+                    definitions[l0_idx].end = line_no;
+                    definitions[l0_idx].bytes.end = line_end;
+                }
+                if let Some((l1_idx, l1_indent)) = active_l1
+                    && indent > l1_indent
+                {
+                    definitions[l1_idx].end = line_no;
+                    definitions[l1_idx].bytes.end = line_end;
+                }
+                sequence_indent = Some(indent);
+            } else {
+                active_l0 = None;
+                active_l1 = None;
+                section_child_indent = None;
+            }
+            continue;
+        }
+
+        if indent == 0 {
+            active_l0 = None;
+            active_l1 = None;
+            section_child_indent = None;
+            if let Some((key, after_colon)) = parse_yaml_mapping_key(rest) {
+                let full = format!("values.{key}");
+                let def_idx = definitions.len();
+                definitions.push(Definition {
+                    bytes: line_start..line_end,
+                    signature_start: line_start,
+                    header_end: line_end,
+                    name: full.clone(),
+                    path: full,
+                    kind: "value".to_owned(),
+                    start: line_no,
+                    end: line_no,
+                    declaration: line_no,
+                    test: false,
+                });
+                active_l0 = Some((def_idx, key.to_owned()));
+                if is_yaml_block_scalar(after_colon) {
+                    block_scalar_indent = Some(0);
+                }
+            }
+            continue;
+        }
+
+        if let Some((l0_idx, ref l0_key)) = active_l0 {
+            definitions[l0_idx].end = line_no;
+            definitions[l0_idx].bytes.end = line_end;
+            match section_child_indent {
+                None => {
+                    if let Some((key, after_colon)) = parse_yaml_mapping_key(rest) {
+                        section_child_indent = Some(indent);
+                        let full = format!("values.{l0_key}.{key}");
+                        let def_idx = definitions.len();
+                        definitions.push(Definition {
+                            bytes: line_start..line_end,
+                            signature_start: line_start,
+                            header_end: line_end,
+                            name: full.clone(),
+                            path: full,
+                            kind: "value".to_owned(),
+                            start: line_no,
+                            end: line_no,
+                            declaration: line_no,
+                            test: false,
+                        });
+                        active_l1 = Some((def_idx, indent));
+                        if is_yaml_block_scalar(after_colon) {
+                            block_scalar_indent = Some(indent);
+                        }
+                    }
+                }
+                Some(child_indent) if indent == child_indent => {
+                    if let Some((key, after_colon)) = parse_yaml_mapping_key(rest) {
+                        let full = format!("values.{l0_key}.{key}");
+                        let def_idx = definitions.len();
+                        definitions.push(Definition {
+                            bytes: line_start..line_end,
+                            signature_start: line_start,
+                            header_end: line_end,
+                            name: full.clone(),
+                            path: full,
+                            kind: "value".to_owned(),
+                            start: line_no,
+                            end: line_no,
+                            declaration: line_no,
+                            test: false,
+                        });
+                        active_l1 = Some((def_idx, indent));
+                        if is_yaml_block_scalar(after_colon) {
+                            block_scalar_indent = Some(indent);
+                        }
+                    } else if let Some((l1_idx, _)) = active_l1 {
+                        definitions[l1_idx].end = line_no;
+                        definitions[l1_idx].bytes.end = line_end;
+                    }
+                }
+                Some(child_indent) if indent > child_indent => {
+                    if let Some((l1_idx, _)) = active_l1 {
+                        definitions[l1_idx].end = line_no;
+                        definitions[l1_idx].bytes.end = line_end;
+                    }
+                    if let Some((_, after_colon)) = parse_yaml_mapping_key(rest)
+                        && is_yaml_block_scalar(after_colon)
+                    {
+                        block_scalar_indent = Some(indent);
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    HelmFacts {
+        chart_root,
+        lines,
+        definitions,
+        references: Vec::new(),
+    }
+}
+
+enum HelmToken<'a> {
+    Word(&'a str, usize),
+    Str(String, usize),
+    Punct,
+}
+
+fn tokenize_helm_action(body: &str, start_line: usize) -> Vec<HelmToken<'_>> {
+    let mut tokens = Vec::new();
+    let mut line = start_line;
+    let mut chars = body.char_indices().peekable();
+    while let Some(&(idx, ch)) = chars.peek() {
+        if ch.is_whitespace() {
+            if ch == '\n' {
+                line += 1;
+            }
+            chars.next();
+            continue;
+        }
+        if ch == '/' && body[idx..].starts_with("/*") {
+            chars.next();
+            chars.next();
+            while let Some((c_idx, c)) = chars.next() {
+                if c == '\n' {
+                    line += 1;
+                }
+                if c == '*' && body[c_idx + 1..].starts_with('/') {
+                    chars.next();
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '"' {
+            let tok_line = line;
+            chars.next();
+            let mut decoded = String::new();
+            let mut escaped = false;
+            for (_, c) in chars.by_ref() {
+                if c == '\n' {
+                    line += 1;
+                }
+                if escaped {
+                    match c {
+                        'n' => decoded.push('\n'),
+                        'r' => decoded.push('\r'),
+                        't' => decoded.push('\t'),
+                        other => decoded.push(other),
+                    }
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    break;
+                } else {
+                    decoded.push(c);
+                }
+            }
+            tokens.push(HelmToken::Str(decoded, tok_line));
+            continue;
+        }
+        if ch == '`' {
+            let tok_line = line;
+            chars.next();
+            let content_start = idx + 1;
+            let mut content_end = body.len();
+            for (c_idx, c) in chars.by_ref() {
+                if c == '\n' {
+                    line += 1;
+                }
+                if c == '`' {
+                    content_end = c_idx;
+                    break;
+                }
+            }
+            tokens.push(HelmToken::Str(
+                body[content_start..content_end].to_owned(),
+                tok_line,
+            ));
+            continue;
+        }
+        if matches!(ch, '(' | ')' | '|' | ',' | ';') {
+            chars.next();
+            tokens.push(HelmToken::Punct);
+            continue;
+        }
+        let tok_line = line;
+        let word_start = idx;
+        let mut word_end = body.len();
+        while let Some(&(c_idx, c)) = chars.peek() {
+            if c.is_whitespace()
+                || matches!(c, '(' | ')' | '|' | ',' | ';' | '"' | '`')
+                || (c == '/' && body[c_idx..].starts_with("/*"))
+            {
+                word_end = c_idx;
+                break;
+            }
+            chars.next();
+        }
+        if word_end > word_start {
+            tokens.push(HelmToken::Word(&body[word_start..word_end], tok_line));
+        }
+    }
+    tokens
+}
+
+fn helm_values_ref_target(word: &str) -> Option<String> {
+    let rest = word
+        .strip_prefix(".Values.")
+        .or_else(|| word.strip_prefix("$.Values."))?;
+    let mut end = rest.len();
+    for (idx, ch) in rest.char_indices() {
+        if !(ch == '.' || ch == '_' || ch.is_alphanumeric()) {
+            end = idx;
+            break;
+        }
+    }
+    let clean = rest[..end].trim_end_matches('.');
+    if clean.is_empty() || clean.split('.').any(str::is_empty) {
+        return None;
+    }
+    Some(format!("values.{clean}"))
+}
+
+fn parse_helm_template(chart_root: String, source: &str) -> HelmFacts {
+    let lines = source.lines().count().max(1);
+    let mut definitions: Vec<Definition> = Vec::new();
+    let mut references: Vec<Reference> = Vec::new();
+    let mut seen: HashSet<(u8, usize, Option<usize>, String)> = HashSet::new();
+    let mut define_stack: Vec<(usize, usize)> = Vec::new();
+
+    let bytes = source.as_bytes();
+    let mut i = 0usize;
+    let mut line = 1usize;
+
+    while i < bytes.len() {
+        if bytes[i] == b'\n' {
+            line += 1;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'{' && bytes.get(i + 1) == Some(&b'{') {
+            let action_start_byte = i;
+            let action_start_line = line;
+            let inner_start = i + 2;
+            let mut j = inner_start;
+            let mut end_line = line;
+            let mut in_quote = false;
+            let mut in_raw = false;
+            let mut in_comment = false;
+            let mut closed_at = None;
+
+            while j < bytes.len() {
+                let b = bytes[j];
+                if b == b'\n' {
+                    end_line += 1;
+                }
+                if in_comment {
+                    if b == b'*' && bytes.get(j + 1) == Some(&b'/') {
+                        in_comment = false;
+                        j += 2;
+                        continue;
+                    }
+                    j += 1;
+                    continue;
+                }
+                if in_raw {
+                    if b == b'`' {
+                        in_raw = false;
+                    }
+                    j += 1;
+                    continue;
+                }
+                if in_quote {
+                    if b == b'\\' {
+                        j += 1;
+                        if j < bytes.len() {
+                            if bytes[j] == b'\n' {
+                                end_line += 1;
+                            }
+                            j += source[j..].chars().next().map_or(1, char::len_utf8);
+                        }
+                        continue;
+                    }
+                    if b == b'"' {
+                        in_quote = false;
+                    }
+                    j += 1;
+                    continue;
+                }
+                if b == b'/' && bytes.get(j + 1) == Some(&b'*') {
+                    in_comment = true;
+                    j += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    in_quote = true;
+                    j += 1;
+                    continue;
+                }
+                if b == b'`' {
+                    in_raw = true;
+                    j += 1;
+                    continue;
+                }
+                if b == b'}' && bytes.get(j + 1) == Some(&b'}') {
+                    closed_at = Some(j);
+                    break;
+                }
+                j += 1;
+            }
+
+            let Some(inner_end) = closed_at else {
+                break;
+            };
+            let action_end_byte = inner_end + 2;
+            let action_end_line = end_line;
+
+            let mut body = &source[inner_start..inner_end];
+            if body.starts_with('-')
+                && body[1..].starts_with(|ch: char| ch.is_whitespace() || ch == '/')
+            {
+                body = &body[1..];
+            }
+            if body.ends_with('-')
+                && (body.len() == 1
+                    || body[..body.len() - 1].ends_with(|ch: char| ch.is_whitespace() || ch == '*'))
+            {
+                body = &body[..body.len() - 1];
+            }
+
+            let tokens = tokenize_helm_action(body, action_start_line);
+            if !tokens.is_empty() {
+                match tokens.first() {
+                    Some(HelmToken::Word("define", def_line)) => {
+                        if let Some(HelmToken::Str(name, _)) = tokens.get(1)
+                            && !name.is_empty()
+                        {
+                            let def_idx = definitions.len();
+                            definitions.push(Definition {
+                                bytes: action_start_byte..action_end_byte,
+                                signature_start: action_start_byte,
+                                header_end: action_end_byte,
+                                name: name.clone(),
+                                path: name.clone(),
+                                kind: "template".to_owned(),
+                                start: action_start_line,
+                                end: action_end_line,
+                                declaration: *def_line,
+                                test: false,
+                            });
+                            define_stack.push((def_idx, 1));
+                        }
+                    }
+                    Some(HelmToken::Word("if" | "range" | "with" | "block", _)) => {
+                        if let Some((_, depth)) = define_stack.last_mut() {
+                            *depth += 1;
+                        }
+                    }
+                    Some(HelmToken::Word("end", _)) => {
+                        if let Some((def_idx, depth)) = define_stack.last_mut() {
+                            *depth -= 1;
+                            if *depth == 0 {
+                                let idx = *def_idx;
+                                definitions[idx].end = action_end_line;
+                                definitions[idx].bytes.end = action_end_byte;
+                                define_stack.pop();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+
+                let from = define_stack.last().map(|&(def_idx, _)| def_idx);
+                let mut push_ref = |name: String, ref_line: usize, kind: Kind| {
+                    if seen.insert((kind as u8, ref_line, from, name.clone())) {
+                        references.push(Reference {
+                            name,
+                            from,
+                            line: ref_line,
+                            kind,
+                        });
+                    }
+                };
+
+                for (tok_idx, tok) in tokens.iter().enumerate() {
+                    let HelmToken::Word(word, tok_line) = tok else {
+                        continue;
+                    };
+                    if (*word == "include" || *word == "template")
+                        && let Some(HelmToken::Str(target, str_line)) = tokens.get(tok_idx + 1)
+                        && !target.is_empty()
+                    {
+                        push_ref(target.clone(), *str_line, Kind::Call);
+                        continue;
+                    }
+                    if *word == "index"
+                        && let Some(HelmToken::Word(".Values" | "$.Values", _)) =
+                            tokens.get(tok_idx + 1)
+                        && let Some(HelmToken::Str(k1, str_line)) = tokens.get(tok_idx + 2)
+                        && !k1.is_empty()
+                    {
+                        let target = match tokens.get(tok_idx + 3) {
+                            Some(HelmToken::Str(k2, _)) if !k2.is_empty() => {
+                                format!("values.{k1}.{k2}")
+                            }
+                            _ => format!("values.{k1}"),
+                        };
+                        push_ref(target, *str_line, Kind::Reference);
+                        continue;
+                    }
+                    if let Some(target) = helm_values_ref_target(word) {
+                        push_ref(target, *tok_line, Kind::Reference);
+                    }
+                }
+            }
+
+            line = action_end_line;
+            i = action_end_byte;
+            continue;
+        }
+        i += 1;
+    }
+
+    for (def_idx, _) in define_stack {
+        definitions[def_idx].end = lines;
+        definitions[def_idx].bytes.end = source.len();
+    }
+
+    HelmFacts {
+        chart_root,
+        lines,
+        definitions,
+        references,
+    }
 }
 
 #[cfg(test)]

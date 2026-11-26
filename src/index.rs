@@ -13,7 +13,7 @@ use crate::polyglot::{self, Grammar, Parsers};
 use crate::rust_syntax::{self, Import, Kind, Reference, Syntax};
 use crate::workspace::{Location, Workspace, display_path, lock_state};
 
-pub(crate) const VERSION: u32 = 11;
+pub(crate) const VERSION: u32 = 12;
 
 #[derive(Default, Serialize, Deserialize)]
 struct Cache {
@@ -27,6 +27,8 @@ struct Parsed {
     syntax: Syntax,
     error: Option<String>,
     foreign: Option<polyglot::Facts>,
+    #[serde(default)]
+    helm: Option<polyglot::HelmFacts>,
     fingerprint: Fingerprint,
     stamp: Option<FileStamp>,
 }
@@ -34,7 +36,7 @@ struct Parsed {
 impl Parsed {
     /// Whether a non-Rust file was parsed as source, successfully or not.
     fn structured(&self) -> bool {
-        self.foreign.is_some() || self.error.is_some()
+        self.foreign.is_some() || self.helm.is_some() || self.error.is_some()
     }
 }
 
@@ -252,6 +254,7 @@ impl Index {
         let mut found = BTreeSet::new();
         let mut changed = rebuild || migrated;
         let mut parsers = Parsers::default();
+        let helm_charts = polyglot::helm_chart_roots(&candidates);
         for file in candidates {
             let Ok(path) = workspace.source_path(&file) else {
                 continue;
@@ -282,12 +285,14 @@ impl Index {
             let manifest = Path::new(&file)
                 .file_name()
                 .is_some_and(|name| name == "Cargo.toml");
+            let helm_role = polyglot::helm_file_role(&file, &helm_charts);
+            let expected_chart = helm_role.as_ref().map(|(root, _)| root.as_str());
             if !manifest
                 && stamp.is_some()
-                && cache
-                    .files
-                    .get(&file)
-                    .is_some_and(|parsed| parsed.stamp == stamp)
+                && cache.files.get(&file).is_some_and(|parsed| {
+                    parsed.stamp == stamp
+                        && parsed.helm.as_ref().map(|h| h.chart_root.as_str()) == expected_chart
+                })
             {
                 refresh.reused += usize::from(is_rust(&file) || cache.files[&file].structured());
                 found.insert(file);
@@ -314,10 +319,11 @@ impl Index {
             let digest = source_digest(&bytes);
             // Extensionless scripts and `.m` files need their text to pick a grammar.
             let grammar = Grammar::detect(&file, text);
-            let structured = is_rust(&file) || grammar.is_some();
+            let structured = is_rust(&file) || grammar.is_some() || helm_role.is_some();
             found.insert(file.clone());
             if let Some(parsed) = cache.files.get_mut(&file)
                 && parsed.digest == digest
+                && parsed.helm.as_ref().map(|h| h.chart_root.as_str()) == expected_chart
             {
                 refresh.reused += usize::from(structured);
                 if parsed.stamp != stamp {
@@ -326,22 +332,30 @@ impl Index {
                 }
                 continue;
             }
-            let (syntax, foreign, error) = if is_rust(&file) {
+            let (syntax, foreign, helm, error) = if is_rust(&file) {
                 match rust_syntax::parse(text) {
-                    Ok(syntax) => (syntax, None, None),
+                    Ok(syntax) => (syntax, None, None, None),
                     Err(error) => (
                         Syntax::default(),
+                        None,
                         None,
                         Some(format!("line {}: {error}", error.span().start().line)),
                     ),
                 }
             } else if let Some(grammar) = grammar {
                 match parsers.parse(grammar, text) {
-                    Ok(facts) => (Syntax::default(), Some(facts), None),
-                    Err(error) => (Syntax::default(), None, Some(error.to_string())),
+                    Ok(facts) => (Syntax::default(), Some(facts), None, None),
+                    Err(error) => (Syntax::default(), None, None, Some(error.to_string())),
                 }
+            } else if let Some((chart_root, role)) = helm_role {
+                (
+                    Syntax::default(),
+                    None,
+                    Some(polyglot::parse_helm(chart_root, role, text)),
+                    None,
+                )
             } else {
-                (Syntax::default(), None, None)
+                (Syntax::default(), None, None, None)
             };
             cache.files.insert(
                 file,
@@ -350,6 +364,7 @@ impl Index {
                     syntax,
                     error,
                     foreign,
+                    helm,
                     fingerprint: Fingerprint::new(text),
                     stamp,
                 },
@@ -410,15 +425,17 @@ impl Index {
                 .files
                 .entry(file.to_owned())
                 .or_insert_with(|| cached.clone());
-            let own = match &parsed.foreign {
-                Some(facts) => facts.definitions.len(),
-                None => parsed.syntax.symbols.len(),
+            let own = match (&parsed.foreign, &parsed.helm) {
+                (Some(facts), _) => facts.definitions.len(),
+                (None, Some(facts)) => facts.definitions.len(),
+                (None, None) => parsed.syntax.symbols.len(),
             };
-            match (definition, &mut parsed.foreign) {
-                (Removed::Rust(symbol), None) if is_rust(file) => {
+            match (definition, &mut parsed.foreign, &mut parsed.helm) {
+                (Removed::Rust(symbol), None, None) if is_rust(file) => {
                     parsed.syntax.symbols.push(symbol.clone())
                 }
-                (Removed::Foreign(tag), Some(facts)) => facts.definitions.push(tag.clone()),
+                (Removed::Foreign(tag), Some(facts), _) => facts.definitions.push(tag.clone()),
+                (Removed::Foreign(tag), None, Some(facts)) => facts.definitions.push(tag.clone()),
                 _ => continue,
             }
             overlay
@@ -626,6 +643,7 @@ impl Index {
             }
         }
         index.add_foreign(cache, overlay, &mut restored);
+        index.add_helm(cache, overlay, &mut restored);
         index.incoming = vec![Vec::new(); index.definitions.len()];
         index.outgoing = vec![Vec::new(); index.definitions.len()];
         for (id, edge) in index.edges.iter().enumerate() {
@@ -647,6 +665,7 @@ impl Index {
         let mut routes = BTreeMap::<&str, Vec<usize>>::new();
         let mut tables = BTreeMap::<&str, Vec<usize>>::new();
         let mut families = BTreeMap::<(Grammar, &str), Vec<usize>>::new();
+        let mut hcl_by_dir = BTreeMap::<(&str, &str), Vec<usize>>::new();
         let mut units_by_family = BTreeMap::<Grammar, Vec<&str>>::new();
         for file in cache.files.keys() {
             let Some(facts) = &overlay.parsed(cache, file).foreign else {
@@ -668,6 +687,7 @@ impl Index {
             );
             let origin = self.definitions.len();
             let family = facts.grammar.family();
+            let hcl_dir = (family == Grammar::Hcl).then(|| parent_dir_key(file));
             units.insert(file.as_str(), (module, origin, facts));
             units_by_family.entry(family).or_default().push(file);
             for (position, tag) in facts.definitions.iter().enumerate() {
@@ -689,6 +709,9 @@ impl Index {
                     },
                 );
                 families.entry((family, &tag.name)).or_default().push(id);
+                if let Some(dir) = hcl_dir {
+                    hcl_by_dir.entry((dir, &tag.name)).or_default().push(id);
+                }
                 if matches!(tag.kind.as_str(), "table" | "view") {
                     tables.entry(&tag.name).or_default().push(id);
                     if let Some((_, short)) = tag.name.rsplit_once('.') {
@@ -758,12 +781,19 @@ impl Index {
                     }
                 }
             }
+            let hcl_dir = (family == Grammar::Hcl).then(|| parent_dir_key(file));
             for reference in &facts.references {
                 let from = reference.from.map_or(module, |id| origin + id);
                 let name = reference.name.as_str();
                 let resolution = match reference.kind {
                     Kind::Route => only(routes.get(name)).map(|id| (id, true)),
                     Kind::Data => only(tables.get(name)).map(|id| (id, true)),
+                    _ if family == Grammar::Hcl => locals
+                        .get(name)
+                        .copied()
+                        .flatten()
+                        .map(|id| (id, false))
+                        .or_else(|| only(hcl_by_dir.get(&(hcl_dir?, name))).map(|id| (id, true))),
                     _ => locals
                         .get(name)
                         .copied()
@@ -774,6 +804,123 @@ impl Index {
                 };
                 if let Some((to, inferred)) = resolution {
                     attach(from, to, reference.kind, reference.line, inferred);
+                }
+            }
+        }
+    }
+
+    fn add_helm(&mut self, cache: &Cache, overlay: &Overlay, restored: &mut Vec<(usize, usize)>) {
+        let mut units = BTreeMap::new();
+        let mut chart_values = BTreeMap::<(&str, &str), Vec<usize>>::new();
+        let mut chart_helpers = BTreeMap::<(&str, &str), Vec<usize>>::new();
+        let mut all_helpers = BTreeMap::<&str, Vec<usize>>::new();
+        for file in cache.files.keys() {
+            let Some(facts) = &overlay.parsed(cache, file).helm else {
+                continue;
+            };
+            let module = self.add_definition(
+                file,
+                Definition {
+                    qualified: display_path(file).into_owned(),
+                    kind: "file".into(),
+                    location: Location {
+                        file: file.clone(),
+                        start: 1,
+                        end: facts.lines,
+                    },
+                    declaration: 1,
+                    test: false,
+                },
+            );
+            let origin = self.definitions.len();
+            units.insert(file.as_str(), (module, origin, facts));
+            for (position, tag) in facts.definitions.iter().enumerate() {
+                if let Some(entry) = overlay.restores(file, position) {
+                    restored.push((entry, self.definitions.len()));
+                }
+                let id = self.add_definition(
+                    &tag.name,
+                    Definition {
+                        qualified: display_path(&format!("{file}::{}", tag.path)).into_owned(),
+                        kind: tag.kind.clone(),
+                        location: Location {
+                            file: file.clone(),
+                            start: tag.start,
+                            end: tag.end,
+                        },
+                        declaration: tag.declaration,
+                        test: tag.test,
+                    },
+                );
+                match tag.kind.as_str() {
+                    "value" => {
+                        chart_values
+                            .entry((facts.chart_root.as_str(), tag.name.as_str()))
+                            .or_default()
+                            .push(id);
+                    }
+                    "template" => {
+                        chart_helpers
+                            .entry((facts.chart_root.as_str(), tag.name.as_str()))
+                            .or_default()
+                            .push(id);
+                        all_helpers.entry(tag.name.as_str()).or_default().push(id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut seen = HashSet::new();
+        for (&file, &(module, origin, facts)) in &units {
+            let chart = facts.chart_root.as_str();
+            let mut attach = |from, to, kind, line, inferred| {
+                if seen.insert((from, to, kind as u8, line)) {
+                    self.edges.push(Edge {
+                        from: Some(from),
+                        to,
+                        kind,
+                        inferred,
+                        location: Location {
+                            file: file.to_owned(),
+                            start: line,
+                            end: line,
+                        },
+                    });
+                }
+            };
+            for reference in &facts.references {
+                let from = reference.from.map_or(module, |id| origin + id);
+                let name = reference.name.as_str();
+                match reference.kind {
+                    Kind::Reference => {
+                        if let Some(ids) = chart_values.get(&(chart, name)) {
+                            for &to in ids {
+                                attach(from, to, Kind::Reference, reference.line, false);
+                            }
+                        } else {
+                            let mut candidate = name;
+                            while let Some((parent, _)) = candidate.rsplit_once('.') {
+                                if parent == "values" {
+                                    break;
+                                }
+                                if let Some(ids) = chart_values.get(&(chart, parent)) {
+                                    for &to in ids {
+                                        attach(from, to, Kind::Reference, reference.line, true);
+                                    }
+                                    break;
+                                }
+                                candidate = parent;
+                            }
+                        }
+                    }
+                    Kind::Call => {
+                        if let Some(to) = only(chart_helpers.get(&(chart, name))) {
+                            attach(from, to, Kind::Call, reference.line, false);
+                        } else if let Some(to) = only(all_helpers.get(name)) {
+                            attach(from, to, Kind::Call, reference.line, true);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1023,6 +1170,10 @@ pub fn is_call(kind: Kind) -> bool {
     matches!(kind, Kind::Call | Kind::Method)
 }
 
+fn parent_dir_key(file: &str) -> &str {
+    file.rsplit_once(['/', '\\']).map_or("", |(dir, _)| dir)
+}
+
 fn only(matches: Option<&Vec<usize>>) -> Option<usize> {
     unique(matches?.iter().copied())
 }
@@ -1082,6 +1233,28 @@ fn import_target<'a>(
         }
         // `#include "x.h"` and Julia's `include("x.jl")` name a path from the file.
         Grammar::C | Grammar::Julia => exact(&normalize(&parent.join(source))?),
+        Grammar::Hcl if source.starts_with('.') => {
+            let dir = normalize(&parent.join(source))?;
+            let prefix = if dir.is_empty() {
+                String::new()
+            } else {
+                format!("{dir}/")
+            };
+            for preferred in ["main.tf", "main.tofu"] {
+                if let Some(file) = exact(&format!("{prefix}{preferred}")) {
+                    return Some(file);
+                }
+            }
+            by_family.get(&family)?.iter().copied().find(|candidate| {
+                parent_dir_key(candidate) == dir
+                    && Path::new(candidate)
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| {
+                            ext.eq_ignore_ascii_case("tf") || ext.eq_ignore_ascii_case("tofu")
+                        })
+            })
+        }
         _ => None,
     }
 }
@@ -2411,6 +2584,7 @@ mod binary {
     const ENTRY_FOREIGN: u8 = 1 << 2;
     const ENTRY_STAMP: u8 = 1 << 3;
     const ENTRY_FINGERPRINT: u8 = 1 << 4;
+    const ENTRY_HELM: u8 = 1 << 5;
 
     const SYM_TEST: u8 = 1 << 0;
     const SYM_END_DELTA: u8 = 1 << 3;
@@ -2955,6 +3129,9 @@ mod binary {
         if has_fingerprint {
             flags |= ENTRY_FINGERPRINT;
         }
+        if parsed.helm.is_some() {
+            flags |= ENTRY_HELM;
+        }
         out.push(flags);
         write_raw_str(out, &parsed.digest);
         if let Some(error) = &parsed.error {
@@ -2979,6 +3156,9 @@ mod binary {
         }
         if let Some(facts) = &parsed.foreign {
             encode_foreign(out, interner, facts);
+        }
+        if let Some(facts) = &parsed.helm {
+            encode_helm(out, interner, facts);
         }
     }
 
@@ -3017,11 +3197,17 @@ mod binary {
         } else {
             None
         };
+        let helm = if flags & ENTRY_HELM != 0 {
+            Some(decode_helm(reader, strings)?)
+        } else {
+            None
+        };
         Ok(Parsed {
             digest,
             syntax,
             error,
             foreign,
+            helm,
             fingerprint: Fingerprint(words),
             stamp,
         })
@@ -3378,6 +3564,96 @@ mod binary {
             references,
             imports,
             routes,
+        })
+    }
+
+    fn encode_helm<'a>(
+        out: &mut Vec<u8>,
+        interner: &mut Interner<'a>,
+        facts: &'a polyglot::HelmFacts,
+    ) {
+        write_varint(out, u64::from(interner.intern(&facts.chart_root)));
+        write_varint(out, facts.lines as u64);
+
+        write_varint(out, facts.definitions.len() as u64);
+        for def in &facts.definitions {
+            write_varint(out, u64::from(interner.intern(&def.name)));
+            write_varint(out, u64::from(interner.intern(&def.kind)));
+            write_varint(out, u64::from(interner.intern(&def.path)));
+            write_varint(out, def.start as u64);
+            write_varint(out, def.end as u64);
+            write_varint(out, def.declaration as u64);
+            out.push(u8::from(def.test));
+        }
+
+        write_varint(out, facts.references.len() as u64);
+        let mut prev_line: u64 = 0;
+        for reference in &facts.references {
+            out.push(encode_kind(reference.kind));
+            write_varint(out, u64::from(interner.intern(&reference.name)));
+            write_opt_usize(out, reference.from);
+            let line = reference.line as u64;
+            write_zigzag(out, line.wrapping_sub(prev_line) as i64);
+            prev_line = line;
+        }
+    }
+
+    fn decode_helm(reader: &mut Reader<'_>, strings: &[String]) -> Result<polyglot::HelmFacts> {
+        let chart_root = reader.read_interned(strings)?;
+        let lines = reader.read_usize()?;
+
+        let def_count = reader.read_usize()?;
+        let mut definitions = Vec::with_capacity(def_count.min(reader.remaining()));
+        for _ in 0..def_count {
+            let name = reader.read_interned(strings)?;
+            let kind = reader.read_interned(strings)?;
+            let path = reader.read_interned(strings)?;
+            let start = reader.read_usize()?;
+            let end = reader.read_usize()?;
+            let declaration = reader.read_usize()?;
+            let test = match reader.read_u8()? {
+                0 => false,
+                1 => true,
+                other => bail!("invalid bool byte {other}"),
+            };
+            definitions.push(polyglot::Definition {
+                bytes: 0..0,
+                signature_start: 0,
+                header_end: 0,
+                name,
+                kind,
+                path,
+                start,
+                end,
+                declaration,
+                test,
+            });
+        }
+
+        let ref_count = reader.read_usize()?;
+        let mut references = Vec::with_capacity(ref_count.min(reader.remaining()));
+        let mut prev_line: u64 = 0;
+        for _ in 0..ref_count {
+            let kind = decode_kind(reader.read_u8()?)?;
+            let name = reader.read_interned(strings)?;
+            let from = reader.read_opt_usize()?;
+            let delta = reader.read_zigzag()?;
+            let line_u64 = prev_line.wrapping_add(delta as u64);
+            prev_line = line_u64;
+            let line = usize::try_from(line_u64)?;
+            references.push(polyglot::Reference {
+                name,
+                from,
+                line,
+                kind,
+            });
+        }
+
+        Ok(polyglot::HelmFacts {
+            chart_root,
+            lines,
+            definitions,
+            references,
         })
     }
 
@@ -3740,6 +4016,7 @@ mod tests {
                 },
                 error: None,
                 foreign: None,
+                helm: None,
                 fingerprint: Fingerprint::new("pub fn alpha() { test_alpha(); }"),
                 stamp: Some(FileStamp {
                     device: 42,
@@ -3793,6 +4070,7 @@ mod tests {
                     }],
                     routes: vec![("/orders".into(), 0)],
                 }),
+                helm: None,
                 fingerprint: Fingerprint::default(),
                 stamp: None,
             },
@@ -4090,5 +4368,370 @@ mod tests {
         let wt_warm = Index::open(&wt_ws).unwrap();
         assert_eq!(wt_warm.refresh.parsed, 0);
         assert_eq!(wt_warm.refresh.reused, 2);
+    }
+
+    #[test]
+    fn helm_chart_links_values_and_helpers_while_ignoring_plain_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("charts/app/templates")).unwrap();
+        fs::create_dir_all(root.join("config")).unwrap();
+
+        fs::write(
+            root.join("charts/app/Chart.yaml"),
+            "apiVersion: v2\nname: mychart\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("charts/app/values.yaml"),
+            concat!(
+                "# Café defaults — 日本語\n",
+                "replicaCount: 2\n",
+                "\n",
+                "image:\n",
+                "  repository: ghcr.io/acme/web\n",
+                "  tag: \"1.4.2\"\n",
+                "\n",
+                "fullnameOverride: \"\"\n",
+                "notes: |\n",
+                "  fakeKey: should-not-be-indexed\n",
+                "env:\n",
+                "  - name: APP_ENV\n",
+                "    value: prod\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("charts/app/templates/_helpers.tpl"),
+            concat!(
+                "{{- define \"mychart.fullname\" -}}\n",
+                "{{- if .Values.fullnameOverride }}\n",
+                "{{- .Values.fullnameOverride | trunc 63 }}\n",
+                "{{- else }}\n",
+                "{{- .Release.Name }}\n",
+                "{{- end }}\n",
+                "{{- end }}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("charts/app/templates/deployment.yaml"),
+            concat!(
+                "apiVersion: apps/v1\n",
+                "kind: Deployment\n",
+                "metadata:\n",
+                "  name: {{ include \"mychart.fullname\" . }}\n",
+                "spec:\n",
+                "  replicas: {{ .Values.replicaCount }}\n",
+                "  template:\n",
+                "    spec:\n",
+                "      containers:\n",
+                "        - name: café\n",
+                "          image: \"{{ .Values.image.repository }}:{{ $.Values.image.tag }}\"\n",
+                "          pullPolicy: {{ .Values.image.pullPolicy }}\n",
+                "          {{- /* {{ .Values.replicaCount }} */}}\n",
+            ),
+        )
+        .unwrap();
+        // Plain non-Helm YAML outside any chart must NOT enter the symbol graph.
+        fs::write(
+            root.join("config/plain.yaml"),
+            "image:\n  repository: plain-should-not-index\nreplicaCount: 99\n",
+        )
+        .unwrap();
+
+        let ws = test_workspace(root);
+        let index = Index::open(&ws).unwrap();
+
+        // Plain YAML has zero definitions in the index.
+        assert!(
+            !index.by_file.contains_key("config/plain.yaml"),
+            "plain non-Helm YAML must not bloat the symbol index"
+        );
+        // Block scalar interior and list items must not produce fake value definitions.
+        assert!(index.select("values.fakeKey").is_err());
+        assert!(index.select("values.env.name").is_err());
+
+        // Exact line spans in values.yaml and _helpers.tpl.
+        let img_id = index.select("values.image").unwrap();
+        assert_eq!(index.definitions[img_id].location.start, 4);
+        assert_eq!(index.definitions[img_id].location.end, 6);
+        let repo_id = index.select("values.image.repository").unwrap();
+        assert_eq!(index.definitions[repo_id].location.start, 5);
+        assert_eq!(index.definitions[repo_id].location.end, 5);
+        let helper_id = index.select("mychart.fullname").unwrap();
+        assert_eq!(index.definitions[helper_id].location.start, 1);
+        assert_eq!(index.definitions[helper_id].location.end, 7);
+        let override_id = index.select("values.fullnameOverride").unwrap();
+        let deploy_id = index
+            .select("charts/app/templates/deployment.yaml")
+            .unwrap();
+
+        // Direct edges: deployment.yaml -> values.image.repository (exact),
+        // values.image (fallback for .Values.image.pullPolicy), and mychart.fullname (Call).
+        assert!(index.incoming(repo_id).any(|e| {
+            e.from == Some(deploy_id)
+                && e.kind == Kind::Reference
+                && e.location.file == "charts/app/templates/deployment.yaml"
+                && e.location.start == 11
+                && !e.inferred
+        }));
+        assert!(index.incoming(img_id).any(|e| {
+            e.from == Some(deploy_id)
+                && e.kind == Kind::Reference
+                && e.location.start == 12
+                && e.inferred
+        }));
+        assert!(index.incoming(helper_id).any(|e| {
+            e.from == Some(deploy_id)
+                && e.kind == Kind::Call
+                && e.location.start == 4
+                && !e.inferred
+        }));
+        // Helper links transitively to values.fullnameOverride; comment on L13 is ignored.
+        assert!(index.incoming(override_id).any(|e| {
+            e.from == Some(helper_id) && e.kind == Kind::Reference && e.location.start == 2
+        }));
+        let replicas_id = index.select("values.replicaCount").unwrap();
+        let replica_lines: Vec<usize> = index
+            .incoming(replicas_id)
+            .map(|e| e.location.start)
+            .collect();
+        assert_eq!(replica_lines, vec![6]);
+        // Transitive graph path connects values.fullnameOverride -> deployment.yaml via helper.
+        assert!(index.path(override_id, deploy_id).is_some());
+    }
+
+    #[test]
+    fn terraform_cross_file_refs_resolve_per_module_with_interpolations_and_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("envs/prod")).unwrap();
+        fs::create_dir_all(root.join("envs/dev")).unwrap();
+
+        // Two independent modules sharing identical symbol names (`var.region`, etc.)
+        // verify module-directory scoping prevents cross-module ambiguity.
+        for env in ["prod", "dev"] {
+            let base = root.join(format!("envs/{env}"));
+            fs::write(
+                base.join("variables.tf"),
+                concat!(
+                    "variable \"region\" {\n",
+                    "  type    = string\n",
+                    "  default = \"eu-west-1\"\n",
+                    "}\n",
+                    "variable \"prefix\" {\n",
+                    "  type    = string\n",
+                    "  default = \"café\"\n",
+                    "}\n",
+                ),
+            )
+            .unwrap();
+            fs::write(
+                base.join("main.tf"),
+                concat!(
+                    "locals {\n",
+                    "  bucket_name = \"café-${var.prefix}-${var.region}-日本語\"\n",
+                    "}\n",
+                    "data \"aws_ami\" \"ubuntu\" {\n",
+                    "  most_recent = true\n",
+                    "}\n",
+                    "module \"vpc\" {\n",
+                    "  source = \"terraform-aws-modules/vpc/aws\"\n",
+                    "  region = var.region\n",
+                    "}\n",
+                    "resource \"aws_s3_bucket\" \"logs\" {\n",
+                    "  bucket = local.bucket_name\n",
+                    "  tags   = { note = \"über-${data.aws_ami.ubuntu.id}\" }\n",
+                    "}\n",
+                    "resource \"aws_s3_bucket_versioning\" \"logs\" {\n",
+                    "  bucket     = aws_s3_bucket.logs.id\n",
+                    "  depends_on = [aws_s3_bucket.logs, module.vpc]\n",
+                    "}\n",
+                ),
+            )
+            .unwrap();
+            fs::write(
+                base.join("outputs.tf"),
+                concat!(
+                    "output \"summary\" {\n",
+                    "  value      = \"${aws_s3_bucket.logs.arn}:${data.aws_ami.ubuntu.id}:${var.region}\"\n",
+                    "  depends_on = [aws_s3_bucket.logs]\n",
+                    "}\n",
+                    "output \"subnets\" {\n",
+                    "  value = module.vpc.subnet_ids\n",
+                    "}\n",
+                    "output \"bucket_label\" {\n",
+                    "  value = local.bucket_name\n",
+                    "}\n",
+                ),
+            )
+            .unwrap();
+        }
+
+        let ws = test_workspace(root);
+        let index = Index::open(&ws).unwrap();
+
+        for env in ["prod", "dev"] {
+            let var_region = index
+                .select(&format!("envs/{env}/variables.tf::var.region"))
+                .unwrap();
+            let var_prefix = index
+                .select(&format!("envs/{env}/variables.tf::var.prefix"))
+                .unwrap();
+            let local_bucket = index
+                .select(&format!("envs/{env}/main.tf::local.bucket_name"))
+                .unwrap();
+            let mod_vpc = index
+                .select(&format!("envs/{env}/main.tf::module.vpc"))
+                .unwrap();
+            let data_ami = index
+                .select(&format!("envs/{env}/main.tf::data.aws_ami.ubuntu"))
+                .unwrap();
+            let res_logs = index
+                .select(&format!("envs/{env}/main.tf::aws_s3_bucket.logs"))
+                .unwrap();
+            let out_summary = index
+                .select(&format!("envs/{env}/outputs.tf::output.summary"))
+                .unwrap();
+            let out_subnets = index
+                .select(&format!("envs/{env}/outputs.tf::output.subnets"))
+                .unwrap();
+            let out_label = index
+                .select(&format!("envs/{env}/outputs.tf::output.bucket_label"))
+                .unwrap();
+
+            // Interpolations + UTF-8 strings + depends_on resolve strictly within this module.
+            assert!(
+                index
+                    .incoming(var_prefix)
+                    .any(|e| e.from == Some(local_bucket)),
+                "{env}: missing var.prefix -> local.bucket_name"
+            );
+            assert!(
+                index
+                    .incoming(var_region)
+                    .any(|e| e.from == Some(local_bucket))
+                    && index
+                        .incoming(var_region)
+                        .any(|e| e.from == Some(out_summary)),
+                "{env}: missing var.region cross-file edges"
+            );
+            assert!(
+                index
+                    .incoming(local_bucket)
+                    .any(|e| e.from == Some(out_label)),
+                "{env}: missing local.bucket_name -> outputs.tf"
+            );
+            assert!(
+                index.incoming(mod_vpc).any(|e| e.from == Some(out_subnets)),
+                "{env}: missing module.vpc -> outputs.tf"
+            );
+            assert!(
+                index
+                    .incoming(data_ami)
+                    .any(|e| e.from == Some(out_summary))
+                    && index.incoming(data_ami).any(|e| e.from == Some(res_logs)),
+                "{env}: missing data.aws_ami.ubuntu edges"
+            );
+            assert!(
+                index
+                    .incoming(res_logs)
+                    .any(|e| e.from == Some(out_summary) && e.location.start == 2)
+                    && index
+                        .incoming(res_logs)
+                        .any(|e| e.from == Some(out_summary) && e.location.start == 3),
+                "{env}: missing aws_s3_bucket.logs interpolation + depends_on edges"
+            );
+            // Zero cross-module leakage from the sibling environment.
+            let other = if env == "prod" { "dev" } else { "prod" };
+            assert!(
+                index
+                    .incoming(var_region)
+                    .all(|e| !e.location.file.starts_with(&format!("envs/{other}/"))),
+                "{env}: leaked reference from sibling module {other}"
+            );
+        }
+    }
+
+    #[test]
+    fn binary_cache_round_trips_helm_and_hcl_definitions_and_edges_losslessly() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("chart/templates")).unwrap();
+        fs::create_dir_all(root.join("infra")).unwrap();
+
+        fs::write(
+            root.join("chart/Chart.yaml"),
+            "apiVersion: v2\nname: web\nversion: 1.0.0\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("chart/values.yaml"),
+            "image:\n  repository: nginx\n  tag: \"1.27\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("chart/templates/_helpers.tpl"),
+            "{{- define \"web.name\" -}}web{{- end -}}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("chart/templates/deploy.yaml"),
+            "name: {{ include \"web.name\" . }}\nimage: {{ .Values.image.repository }}\n",
+        )
+        .unwrap();
+        fs::write(root.join("infra/variables.tf"), "variable \"region\" {}\n").unwrap();
+        fs::write(
+            root.join("infra/main.tf"),
+            "resource \"aws_s3_bucket\" \"logs\" {\n  bucket = \"${var.region}-logs\"\n}\n",
+        )
+        .unwrap();
+
+        let ws = test_workspace(root);
+        let fresh = Index::open(&ws).unwrap();
+        assert!(fresh.refresh.parsed >= 5);
+        let bin_path = ws.state.join("index.bin");
+        let saved_bytes = fs::read(&bin_path).unwrap();
+        let sections = binary::split_sections(&saved_bytes).unwrap();
+        assert_eq!(sections.version, VERSION);
+
+        // Warm fast-path open from `.justless/index.bin` matches fresh build losslessly.
+        let warm = Index::open(&ws).unwrap();
+        assert_eq!(warm.refresh.parsed, 0);
+        assert_eq!(warm.refresh.reused, fresh.refresh.parsed);
+
+        let snap_defs = |idx: &Index| -> Vec<_> {
+            idx.definitions
+                .iter()
+                .map(|d| {
+                    (
+                        d.qualified.clone(),
+                        d.kind.clone(),
+                        d.location.clone(),
+                        d.declaration,
+                        d.test,
+                    )
+                })
+                .collect()
+        };
+        let snap_edges = |idx: &Index| -> Vec<_> {
+            idx.edges
+                .iter()
+                .map(|e| (e.from, e.to, e.kind, e.location.clone(), e.inferred))
+                .collect()
+        };
+        assert_eq!(snap_defs(&warm), snap_defs(&fresh));
+        assert_eq!(snap_edges(&warm), snap_edges(&fresh));
+        assert_eq!(warm.by_name, fresh.by_name);
+
+        // Raw-section decode + re-assembly via `with_removed` also preserves all Helm & HCL facts.
+        let (rebuilt, _) = warm.with_removed(&[], &[]).unwrap();
+        assert_eq!(snap_defs(&rebuilt), snap_defs(&fresh));
+        assert_eq!(snap_edges(&rebuilt), snap_edges(&fresh));
+        assert!(rebuilt.select("values.image.repository").is_ok());
+        assert!(rebuilt.select("web.name").is_ok());
+        assert!(rebuilt.select("var.region").is_ok());
+        assert!(rebuilt.select("aws_s3_bucket.logs").is_ok());
     }
 }
