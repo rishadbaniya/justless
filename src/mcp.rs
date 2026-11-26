@@ -775,7 +775,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "query",
         command: "query",
-        description: "Symbol definition, refs, callers, tests or deps.",
+        description: "Trace a symbol before grepping: def, refs, callers, tests.",
         params: &[
             positional("symbol", Kind::Text, ""),
             option(
@@ -798,7 +798,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "path",
         command: "path",
-        description: "Shortest call/import/SQL path between symbols.",
+        description: "Shortest call, import, HTTP or SQL path between symbols.",
         params: &[
             positional("from", Kind::Text, ""),
             positional("to", Kind::Text, ""),
@@ -824,7 +824,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "lookup",
         command: "lookup",
-        description: "Rank symbols, docs and config for a question.",
+        description: "Start for how/where questions: rank symbols, docs, config.",
         params: &[
             positional("question", Kind::Text, ""),
             option("limit", "limit", Kind::Count(1, 50), ""),
@@ -837,7 +837,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "context",
         command: "context",
-        description: "Source for at, symbol, Git changes or run_id (deduped).",
+        description: "Targeted source for at, symbol, diff or run_id (deduped).",
         params: &[
             option("at", "at", Kind::Location, "PATH:LINE[-END]"),
             option("symbol", "symbol", Kind::Text, ""),
@@ -902,7 +902,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "pack",
         command: "pack",
-        description: "Budgeted task evidence: defs, links, diff, runs.",
+        description: "Task pack: ranked symbols, callers & excerpts before raw reads.",
         params: &[
             positional("question", Kind::Text, ""),
             option("fresh", "fresh", Kind::Flag, "Skip dedup"),
@@ -913,7 +913,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "map",
         command: "map",
-        description: "Repo map, or architectural explain for a symbol.",
+        description: "Start here to orient: PageRank hubs, communities, explain.",
         params: &[
             option("explain", "explain", Kind::Text, "Explain symbol"),
             BUDGET,
@@ -923,7 +923,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "affected",
         command: "affected",
-        description: "Dependents and tests for target or Git changes.",
+        description: "Blast radius: dependents & tests for target or Git diff.",
         params: &[
             Param {
                 required: false,
@@ -939,7 +939,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "review",
         command: "review",
-        description: "PR blast-radius review pack: risk, callers, test gaps.",
+        description: "Blast-radius PR review: risk, callers & untested gaps.",
         params: &[
             BASE,
             option("depth", "depth", Kind::Count(1, 5), ""),
@@ -2199,5 +2199,24 @@ mod tests {
 
         let entries = config_entries(&ws, &clients).unwrap();
         assert!(entries.iter().all(|file| file.contents.is_none()));
+    }
+
+    #[test]
+    fn graph_tools_highlight_when_to_use_them_within_slim_schema() {
+        let defs: Vec<Value> = TOOLS.iter().map(Tool::definition).collect();
+        let bytes = serde_json::to_string(&defs).unwrap().len();
+        assert!(
+            bytes <= 6_600,
+            "tools/list schema must stay <= 6.6 KB, got {bytes} bytes"
+        );
+        let desc = |name: &str| tool(name).description;
+        assert!(desc("map").contains("orient") && desc("map").contains("PageRank"));
+        assert!(desc("query").contains("before grepping"));
+        assert!(desc("path").contains("HTTP or SQL"));
+        assert!(desc("lookup").contains("how/where"));
+        assert!(desc("context").contains("Targeted source"));
+        assert!(desc("pack").contains("before raw reads"));
+        assert!(desc("affected").contains("Blast radius"));
+        assert!(desc("review").contains("Blast-radius") && desc("review").contains("untested"));
     }
 }
