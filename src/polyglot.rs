@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -125,6 +126,99 @@ const RUBY_TEST_TAGS: &str = r#"
   block: [(do_block) (block)]) @definition.test
   (#eq? @_rspec "RSpec")
   (#any-of? @_test "describe" "fdescribe" "xdescribe" "shared_examples" "shared_context"))
+"#;
+
+// C# declarations, base/interface inheritance, attributes, and direct, generic,
+// and namespace-qualified calls (capturing both final receiver and method name).
+const CSHARP_TAGS: &str = r#"
+(namespace_declaration name: (_) @name) @definition.module
+(class_declaration name: (identifier) @name) @definition.class
+(struct_declaration name: (identifier) @name) @definition.struct
+(interface_declaration name: (identifier) @name) @definition.interface
+(enum_declaration name: (identifier) @name) @definition.enum
+(record_declaration name: (identifier) @name) @definition.record
+(delegate_declaration name: (identifier) @name) @definition.type
+(method_declaration name: (identifier) @name) @definition.method
+(constructor_declaration name: (identifier) @name) @definition.constructor
+(property_declaration name: (identifier) @name) @definition.property
+
+(base_list [
+  (identifier) @name
+  (generic_name (identifier) @name)
+  (qualified_name name: [(identifier) @name (generic_name (identifier) @name)])
+  (alias_qualified_name name: [(identifier) @name (generic_name (identifier) @name)])
+  (primary_constructor_base_type
+    type: [
+      (identifier) @name
+      (generic_name (identifier) @name)
+      (qualified_name name: [(identifier) @name (generic_name (identifier) @name)])
+      (alias_qualified_name name: [(identifier) @name (generic_name (identifier) @name)])
+    ])
+]) @reference.implementation
+
+(attribute
+  name: [
+    (identifier) @name
+    (generic_name (identifier) @name)
+    (qualified_name name: [(identifier) @name (generic_name (identifier) @name)])
+    (alias_qualified_name name: [(identifier) @name (generic_name (identifier) @name)])
+  ]) @reference.type
+
+(object_creation_expression
+  type: [
+    (identifier) @name
+    (generic_name (identifier) @name)
+    (qualified_name name: [(identifier) @name (generic_name (identifier) @name)])
+    (alias_qualified_name name: [(identifier) @name (generic_name (identifier) @name)])
+  ]) @reference.class
+
+(type_parameter_constraints_clause (identifier) @name) @reference.class
+(type_parameter_constraint
+  type: [
+    (identifier) @name
+    (generic_name (identifier) @name)
+    (qualified_name name: [(identifier) @name (generic_name (identifier) @name)])
+  ]) @reference.class
+(variable_declaration
+  type: [
+    (identifier) @name
+    (generic_name (identifier) @name)
+    (qualified_name name: [(identifier) @name (generic_name (identifier) @name)])
+  ]) @reference.class
+
+(invocation_expression
+  function: [
+    (identifier) @name
+    (generic_name (identifier) @name)
+  ]) @reference.call
+(invocation_expression
+  function: (member_access_expression
+    name: [
+      (identifier) @name
+      (generic_name (identifier) @name)
+    ])) @reference.send
+(invocation_expression
+  function: (conditional_access_expression
+    (member_binding_expression
+      name: [
+        (identifier) @name
+        (generic_name (identifier) @name)
+      ]))) @reference.send
+(invocation_expression
+  function: (member_access_expression
+    expression: [
+      (member_access_expression
+        name: [(identifier) @name (generic_name (identifier) @name)])
+      (qualified_name
+        name: [(identifier) @name (generic_name (identifier) @name)])
+      (alias_qualified_name
+        name: [(identifier) @name (generic_name (identifier) @name)])
+      (generic_name (identifier) @name)
+    ])) @reference.class
+((invocation_expression
+  function: (member_access_expression
+    expression: (identifier) @name)) @reference.class
+  (#match? @name "^[A-Z]"))
 "#;
 
 // Member patterns are anchored to a type body or the file so that locals
@@ -503,8 +597,16 @@ const GROOVY_TAGS: &str = r#"
 impl Grammar {
     pub fn for_file(file: &str) -> Option<Self> {
         let path = Path::new(file);
-        let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-        Some(match extension.as_str() {
+        let raw_ext = path.extension()?.to_str()?;
+        let mut buf = [0u8; 12];
+        if raw_ext.len() > buf.len() || !raw_ext.is_ascii() {
+            return None;
+        }
+        for (dst, src) in buf.iter_mut().zip(raw_ext.bytes()) {
+            *dst = src.to_ascii_lowercase();
+        }
+        let extension = std::str::from_utf8(&buf[..raw_ext.len()]).ok()?;
+        Some(match extension {
             "js" | "jsx" | "mjs" | "cjs" => Self::JavaScript,
             "ts" | "mts" | "cts" => Self::TypeScript,
             "tsx" => Self::Tsx,
@@ -679,7 +781,7 @@ impl Grammar {
             Self::Java => tree_sitter_java::TAGS_QUERY,
             Self::C => tree_sitter_c::TAGS_QUERY,
             Self::Cpp => tree_sitter_cpp::TAGS_QUERY,
-            Self::CSharp => tree_sitter_c_sharp::TAGS_QUERY,
+            Self::CSharp => CSHARP_TAGS,
             Self::Ruby => tree_sitter_ruby::TAGS_QUERY,
             Self::Php => tree_sitter_php::TAGS_QUERY,
             Self::Bash => {
@@ -806,6 +908,16 @@ pub struct Import {
     pub bindings: BTreeMap<String, String>,
 }
 
+impl Import {
+    /// Clean normalized module stem for display or alias/barrel matching:
+    /// strips leading `./`, path-alias prefixes (`@/`, `~/`, `#/`), trailing
+    /// `/index` barrel segments, and JS/TS file extensions.
+    #[allow(dead_code)]
+    pub fn module_stem(&self) -> String {
+        normalize_js_module_stem(&self.path)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Facts {
     #[serde(skip)]
@@ -818,17 +930,32 @@ pub struct Facts {
     pub routes: Vec<(String, usize)>,
 }
 
-struct RawTag<'a> {
+struct RawDef<'a> {
     name: &'a str,
     node: Node<'a>,
     name_node: Node<'a>,
-    label: &'static str,
+    kind: &'static str,
+}
+
+struct RawRef<'a> {
+    name: &'a str,
+    node: Node<'a>,
+    name_node: Node<'a>,
+    kind: Kind,
+}
+
+enum CaptureRole {
+    Ignore,
+    Name,
+    Definition(Box<str>),
+    Reference(Kind),
 }
 
 struct CompiledQuery {
     language: Language,
     query: Query,
     name_index: Option<u32>,
+    capture_roles: Vec<CaptureRole>,
 }
 
 impl CompiledQuery {
@@ -837,10 +964,31 @@ impl CompiledQuery {
         let tags = grammar.tags_source();
         let query = Query::new(&language, &tags).map_err(|error| error.to_string())?;
         let name_index = query.capture_index_for_name("name");
+        let capture_roles = query
+            .capture_names()
+            .iter()
+            .map(|&name| {
+                if name == "name" {
+                    CaptureRole::Name
+                } else if let Some(kind) = name.strip_prefix("definition.") {
+                    CaptureRole::Definition(kind.into())
+                } else if name.starts_with("reference.") {
+                    let kind = match name {
+                        "reference.call" | "reference.send" => Kind::Call,
+                        "reference.table" => Kind::Data,
+                        _ => Kind::Reference,
+                    };
+                    CaptureRole::Reference(kind)
+                } else {
+                    CaptureRole::Ignore
+                }
+            })
+            .collect();
         Ok(Self {
             language,
             query,
             name_index,
+            capture_roles,
         })
     }
 }
@@ -883,16 +1031,30 @@ impl Parsers {
             parser.set_language(&compiled.language)?;
             self.language = Some(canonical);
         }
+        // PostgreSQL dollar-quoted FUNCTION/PROCEDURE bodies often hold PL/pgSQL
+        // or multi-statement SQL that tree-sitter-sequel truncates or errors on.
+        // Scan them once (fast-path skipped when `$` is absent), mask their
+        // interior with equal-byte-length valid SQL for Tree-sitter so trailing
+        // DDL parses cleanly, then restore exact spans and body table refs.
+        let sql_routines = if grammar == Grammar::Sql && source.contains('$') {
+            scan_sql_dollar_routines(source)
+        } else {
+            Vec::new()
+        };
+        let masked_sql = (!sql_routines.is_empty())
+            .then(|| mask_sql_dollar_bodies(source, &sql_routines))
+            .flatten();
+        let parse_input = masked_sql.as_deref().unwrap_or(source);
         let tree = parser
-            .parse(source, None)
+            .parse(parse_input, None)
             .ok_or_else(|| anyhow::anyhow!("parse cancelled"))?;
         let query = &compiled.query;
-        let captures = query.capture_names();
+        let roles = &compiled.capture_roles;
         let mut definitions = Vec::new();
         let mut references = Vec::new();
         if let Some(name_index) = compiled.name_index {
             let cursor = self.cursor.get_or_insert_with(QueryCursor::new);
-            let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
+            let mut matches = cursor.matches(query, tree.root_node(), parse_input.as_bytes());
             while let Some(matched) = matches.next() {
                 let Some(name) = matched.captures.iter().find(|cap| cap.index == name_index) else {
                     continue;
@@ -902,21 +1064,24 @@ impl Parsers {
                     continue;
                 }
                 for capture in matched.captures {
-                    let label = captures[capture.index as usize];
-                    if label.starts_with("definition.") {
-                        definitions.push(RawTag {
-                            name: name_text,
-                            node: capture.node,
-                            name_node: name.node,
-                            label,
-                        });
-                    } else if label.starts_with("reference.") {
-                        references.push(RawTag {
-                            name: name_text,
-                            node: capture.node,
-                            name_node: name.node,
-                            label,
-                        });
+                    match &roles[capture.index as usize] {
+                        CaptureRole::Definition(kind) => {
+                            definitions.push(RawDef {
+                                name: name_text,
+                                node: capture.node,
+                                name_node: name.node,
+                                kind,
+                            });
+                        }
+                        CaptureRole::Reference(kind) => {
+                            references.push(RawRef {
+                                name: name_text,
+                                node: capture.node,
+                                name_node: name.node,
+                                kind: *kind,
+                            });
+                        }
+                        CaptureRole::Ignore | CaptureRole::Name => {}
                     }
                 }
             }
@@ -933,31 +1098,32 @@ impl Parsers {
             type_extension(grammar, tag.node, source).is_none()
                 // A Pester `It` names its test with a string, not a parameter.
                 && (grammar != Grammar::PowerShell
-                    || tag.label != "definition.test"
+                    || tag.kind != "test"
                     || literal(tag.name).is_some())
         });
         let mut facts = Facts {
             import_ranges: Vec::new(),
             grammar,
             lines: source.lines().count().max(1),
-            definitions: Vec::new(),
-            references: Vec::new(),
+            definitions: Vec::with_capacity(definitions.len() + sql_routines.len()),
+            references: Vec::with_capacity(references.len()),
             imports: Vec::new(),
             routes: Vec::new(),
         };
+        let mut def_spans = Vec::with_capacity(definitions.len() + sql_routines.len());
         for (id, definition) in definitions.iter().enumerate() {
-            let RawTag {
+            let RawDef {
                 node,
                 name_node,
                 name,
-                label,
+                kind: raw_kind,
             } = definition;
             // Declarators that share one statement are siblings, not owners.
             let parent = (0..id).rev().find(|&parent| {
                 let owner = definitions[parent].node;
                 owner.end_byte() >= node.end_byte() && owner.byte_range() != node.byte_range()
             });
-            let (name, kind) = match (grammar, label.strip_prefix("definition.").unwrap()) {
+            let (name, kind) = match (grammar, *raw_kind) {
                 (Grammar::Sql, kind) => (sql_name(name), kind),
                 (Grammar::Hcl, "block") => (hcl_block_name(*node, name, source), *name),
                 (Grammar::Hcl, kind) => (format!("local.{name}"), kind),
@@ -986,7 +1152,9 @@ impl Parsers {
                 (Grammar::Groovy, "task") => (literal(name).unwrap_or(name).to_owned(), "task"),
                 // `new Type(…)` names the class, so the constructor takes
                 // Dart's name for it rather than shadowing the class.
-                (Grammar::Groovy, "constructor") => ("new".to_owned(), "constructor"),
+                (Grammar::Groovy | Grammar::CSharp, "constructor") => {
+                    ("new".to_owned(), "constructor")
+                }
                 // Test calls and blocks are named by their quoted description,
                 // which cannot collide with the function under test.
                 (_, "test") => (format!("\"{}\"", literal(name).unwrap_or(name)), "test"),
@@ -1023,6 +1191,7 @@ impl Parsers {
                     Grammar::Java | Grammar::Kotlin | Grammar::Scala | Grammar::Groovy => {
                         callable && test_annotation(*node, source)
                     }
+                    Grammar::CSharp => callable && csharp_test_attribute(*node, source),
                     Grammar::ObjectiveC => kind == "method" && name.starts_with("test"),
                     // XCTest runs methods named test…; Swift Testing marks them @Test.
                     Grammar::Swift => {
@@ -1058,6 +1227,7 @@ impl Parsers {
             } else {
                 None
             };
+            def_spans.push((node.start_byte(), node.end_byte()));
             facts.definitions.push(Definition {
                 bytes: decorated_start(extent)..extent.end_byte(),
                 signature_start: extent.start_byte(),
@@ -1077,44 +1247,70 @@ impl Parsers {
                 test,
             });
         }
-        let mut seen = BTreeSet::new();
+        if !sql_routines.is_empty() {
+            merge_sql_dollar_routines(&mut facts.definitions, &mut def_spans, &sql_routines);
+        }
+        // Deduplicate references in O(1) without cloning owned strings per lookup.
+        let mut seen: HashSet<(u8, usize, Option<usize>, Cow<'_, str>)> =
+            HashSet::with_capacity(references.len());
         // Where a call names the function it defines, as Elixir and Julia
         // heads do, the name is the definition, not a call to it.
-        let declared: BTreeSet<_> = definitions
-            .iter()
-            .map(|tag| (tag.name_node.start_byte(), tag.name_node.end_byte()))
-            .collect();
+        let mut declared = HashSet::with_capacity(definitions.len());
+        for tag in &definitions {
+            declared.insert((tag.name_node.start_byte(), tag.name_node.end_byte()));
+        }
         for tag in references {
             if declared.contains(&(tag.name_node.start_byte(), tag.name_node.end_byte()))
                 || (grammar == Grammar::Elixir && module_attribute(tag.node))
             {
                 continue;
             }
-            let kind = match tag.label {
-                "reference.call" | "reference.send" => Kind::Call,
-                "reference.table" => Kind::Data,
-                _ => Kind::Reference,
-            };
+            let kind = tag.kind;
             let name = if kind == Kind::Data {
-                sql_name(tag.name)
+                sql_name_cow(tag.name)
             } else {
-                tag.name.to_owned()
+                Cow::Borrowed(tag.name)
             };
             let line = tag.name_node.start_position().row + 1;
-            let from = parent_symbol(&definitions, tag.node);
-            if seen.insert((kind, line, from, name.clone())) {
+            let from = parent_symbol(&def_spans, tag.node.byte_range());
+            let key = (kind as u8, line, from, name);
+            if !seen.contains(&key) {
+                let owned = key.3.as_ref().to_owned();
+                seen.insert(key);
                 facts.references.push(Reference {
-                    name,
+                    name: owned,
                     from,
                     line,
                     kind,
                 });
             }
         }
+        for routine in &sql_routines {
+            let from = parent_symbol(&def_spans, routine.full_range.clone());
+            let body = &source[routine.body_content_range.clone()];
+            for (table_name, line) in extract_sql_body_table_refs(body, routine.body_start_line) {
+                let key = (Kind::Data as u8, line, from, Cow::Owned(table_name));
+                if !seen.contains(&key) {
+                    let owned = key.3.as_ref().to_owned();
+                    seen.insert(key);
+                    facts.references.push(Reference {
+                        name: owned,
+                        from,
+                        line,
+                        kind: Kind::Data,
+                    });
+                }
+            }
+        }
         let mut embedded_queries = Vec::new();
+        let is_hcl = grammar == Grammar::Hcl;
+        let is_sql = grammar == Grammar::Sql;
+        let is_kotlin = grammar == Grammar::Kotlin;
+        let has_routes = grammar == Grammar::Python || grammar.family() == Grammar::JavaScript;
         walk(tree.root_node(), |node| {
+            let kind = node.kind();
             if matches!(
-                node.kind(),
+                kind,
                 "import_statement"
                     | "import_from_statement"
                     | "import_declaration"
@@ -1122,49 +1318,52 @@ impl Parsers {
                     | "using_directive"
                     | "namespace_use_declaration"
                     | "import_or_export"
-            ) || (grammar == Grammar::Kotlin && node.kind() == "import" && node.is_named())
-                || import_like(grammar, node, source)
+            ) || (is_kotlin && kind == "import" && node.is_named())
+                || import_like(grammar, kind, node, source)
             {
                 facts.import_ranges.push(node.byte_range());
             }
-            if grammar == Grammar::Hcl
-                && node.kind() == "variable_expr"
+            if is_hcl
+                && kind == "variable_expr"
                 && let Some(name) = hcl_reference(node, source)
             {
                 let line = node.start_position().row + 1;
-                let from = parent_symbol(&definitions, node);
-                if seen.insert((Kind::Reference, line, from, name.clone())) {
+                let from = parent_symbol(&def_spans, node.byte_range());
+                let key = (Kind::Reference as u8, line, from, Cow::Owned(name));
+                if !seen.contains(&key) {
+                    let owned = key.3.as_ref().to_owned();
+                    seen.insert(key);
                     facts.references.push(Reference {
-                        name,
+                        name: owned,
                         from,
                         line,
                         kind: Kind::Reference,
                     });
                 }
             }
-            if let Some(import) = module_import(grammar, node, source) {
+            if let Some(import) = module_import(grammar, kind, node, source) {
                 facts.imports.push(import);
             }
-            if let Some((route, handler, argument)) = route_use(grammar, node, source) {
+            if has_routes
+                && let Some((route, handler, argument)) = route_use(grammar, kind, node, source)
+            {
                 if let Some(handler) = handler {
-                    if let Some(id) = parent_symbol(&definitions, handler) {
+                    if let Some(id) = parent_symbol(&def_spans, handler.byte_range()) {
                         facts.routes.push((route.to_owned(), id));
                     }
                 } else {
                     facts.references.push(Reference {
                         name: route.to_owned(),
-                        from: parent_symbol(&definitions, node),
+                        from: parent_symbol(&def_spans, node.byte_range()),
                         line: argument.start_position().row + 1,
                         kind: Kind::Route,
                     });
                 }
             }
-            if grammar != Grammar::Sql
-                && let Some(sql) = embedded_sql(node, source)
-            {
+            if !is_sql && let Some(sql) = embedded_sql(kind, node, source) {
                 embedded_queries.push((
                     sql,
-                    parent_symbol(&definitions, node),
+                    parent_symbol(&def_spans, node.byte_range()),
                     node.start_position().row,
                 ));
             }
@@ -1194,14 +1393,18 @@ impl Parsers {
 fn declaration_extent<'a>(mut node: Node<'a>, name: Node<'a>) -> Node<'a> {
     if node.kind() == "property_declaration" {
         let mut cursor = node.walk();
-        let properties: Vec<_> = node
-            .named_children(&mut cursor)
-            .filter(|c| c.kind() == "property_element")
-            .collect();
-        if properties.len() > 1
-            && let Some(property) = properties
-                .into_iter()
-                .find(|p| p.start_byte() <= name.start_byte() && name.end_byte() <= p.end_byte())
+        let mut count = 0usize;
+        let mut matched = None;
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "property_element" {
+                count += 1;
+                if child.start_byte() <= name.start_byte() && name.end_byte() <= child.end_byte() {
+                    matched = Some(child);
+                }
+            }
+        }
+        if count > 1
+            && let Some(property) = matched
         {
             return property;
         }
@@ -1305,6 +1508,9 @@ fn header_boundary(grammar: Grammar, node: Node<'_>) -> Option<Node<'_>> {
         .then(|| node.named_child(1))
         .flatten(),
         Grammar::Groovy => node.child_by_field_name("closure"),
+        Grammar::CSharp if node.kind() == "property_declaration" => {
+            node.child_by_field_name("accessors")
+        }
         _ => header_block(grammar, node),
     }
 }
@@ -1411,55 +1617,107 @@ fn type_extension(grammar: Grammar, node: Node<'_>, source: &str) -> Option<Stri
 
 // JUnit, kotlin.test, ScalaTest's JUnit runner and Swift Testing mark tests
 // with an annotation or attribute named Test, ParameterizedTest and so on.
+fn is_test_annotation_node(annotation: Node<'_>, source: &str) -> bool {
+    matches!(
+        annotation.kind(),
+        "annotation" | "marker_annotation" | "attribute"
+    ) && text(annotation, source)
+        .trim_start_matches('@')
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()
+        .and_then(|name| name.rsplit('.').next())
+        .is_some_and(|name| name.ends_with("Test"))
+}
+
 fn test_annotation(node: Node<'_>, source: &str) -> bool {
     let mut cursor = node.walk();
-    let mut annotations = Vec::new();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "modifiers" {
-            let mut cursor = child.walk();
-            annotations.extend(child.named_children(&mut cursor));
-        } else {
-            annotations.push(child);
+            let mut mod_cursor = child.walk();
+            if child
+                .named_children(&mut mod_cursor)
+                .any(|annotation| is_test_annotation_node(annotation, source))
+            {
+                return true;
+            }
+        } else if is_test_annotation_node(child, source) {
+            return true;
         }
     }
-    annotations.into_iter().any(|annotation| {
-        matches!(
-            annotation.kind(),
-            "annotation" | "marker_annotation" | "attribute"
-        ) && text(annotation, source)
-            .trim_start_matches('@')
-            .split(|c: char| c == '(' || c.is_whitespace())
-            .next()
-            .and_then(|name| name.rsplit('.').next())
-            .is_some_and(|name| name.ends_with("Test"))
-    })
+    false
+}
+
+// xUnit (`[Fact]`, `[Theory]`), NUnit (`[Test]`, `[TestCase]`) and MSTest
+// (`[TestMethod]`, `[DataTestMethod]`) attributes on C# methods.
+fn csharp_test_attribute(node: Node<'_>, source: &str) -> bool {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "attribute_list" {
+            continue;
+        }
+        let mut attr_cursor = child.walk();
+        for attr in child.named_children(&mut attr_cursor) {
+            if attr.kind() != "attribute" {
+                continue;
+            }
+            let Some(name_node) = attr.child_by_field_name("name") else {
+                continue;
+            };
+            let raw = text(name_node, source);
+            let short = raw
+                .rsplit(['.', ':'])
+                .next()
+                .unwrap_or(raw)
+                .split('<')
+                .next()
+                .unwrap_or(raw);
+            let short = short.strip_suffix("Attribute").unwrap_or(short);
+            if matches!(
+                short,
+                "Fact"
+                    | "Theory"
+                    | "Test"
+                    | "TestMethod"
+                    | "TestCase"
+                    | "TestCaseSource"
+                    | "DataTestMethod"
+            ) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // Terraform addresses: `aws_s3_bucket.logs`, `data.T.N`, `var.x`, `module.y`.
 // Other top-level blocks join their type and labels the same way.
 fn hcl_block_name(node: Node<'_>, kind: &str, source: &str) -> String {
+    let mut out = String::new();
+    match kind {
+        "resource" => {}
+        "variable" => out.push_str("var"),
+        other => out.push_str(other),
+    }
     let mut cursor = node.walk();
-    let labels = node
+    for child in node
         .named_children(&mut cursor)
         .skip(1)
         .take_while(|child| matches!(child.kind(), "string_lit" | "identifier"))
-        .map(|label| {
-            let label = text(label, source);
-            label
-                .strip_prefix('"')
-                .and_then(|label| label.strip_suffix('"'))
-                .unwrap_or(label)
-        });
-    let mut parts = match kind {
-        "resource" => Vec::new(),
-        "variable" => vec!["var"],
-        other => vec![other],
-    };
-    parts.extend(labels);
-    if parts.is_empty() {
-        parts.push(kind);
+    {
+        let label = text(child, source);
+        let label = label
+            .strip_prefix('"')
+            .and_then(|label| label.strip_suffix('"'))
+            .unwrap_or(label);
+        if !out.is_empty() {
+            out.push('.');
+        }
+        out.push_str(label);
     }
-    parts.join(".")
+    if out.is_empty() {
+        out.push_str(kind);
+    }
+    out
 }
 
 fn hcl_reference(node: Node<'_>, source: &str) -> Option<String> {
@@ -1469,15 +1727,28 @@ fn hcl_reference(node: Node<'_>, source: &str) -> Option<String> {
         "data" => 3,
         _ => 2,
     };
-    let mut parts = vec![root];
+    let mut parts = [root, "", ""];
+    let mut count = 1usize;
     let mut next = node.next_named_sibling();
-    while parts.len() < width
+    while count < width
         && let Some(attribute) = next.filter(|next| next.kind() == "get_attr")
     {
-        parts.push(text(attribute.named_child(0)?, source));
+        parts[count] = text(attribute.named_child(0)?, source);
+        count += 1;
         next = attribute.next_named_sibling();
     }
-    (parts.len() == width).then(|| parts.join("."))
+    if count != width {
+        return None;
+    }
+    let total_len: usize = parts[..count].iter().map(|p| p.len()).sum::<usize>() + (count - 1);
+    let mut out = String::with_capacity(total_len);
+    for (idx, part) in parts[..count].iter().enumerate() {
+        if idx > 0 {
+            out.push('.');
+        }
+        out.push_str(part);
+    }
+    Some(out)
 }
 
 fn zig_container(node: Node<'_>) -> &'static str {
@@ -1507,8 +1778,17 @@ fn module_attribute(node: Node<'_>) -> bool {
 
 /// Import statements that a grammar spells as ordinary calls or commands, so
 /// outlines can show them as imports.
-fn import_like(grammar: Grammar, node: Node<'_>, source: &str) -> bool {
-    match (grammar, node.kind()) {
+fn import_like(grammar: Grammar, kind: &str, node: Node<'_>, source: &str) -> bool {
+    match (grammar, kind) {
+        (
+            Grammar::JavaScript
+            | Grammar::TypeScript
+            | Grammar::Tsx
+            | Grammar::Vue
+            | Grammar::Svelte
+            | Grammar::Astro,
+            "export_statement",
+        ) => node.child_by_field_name("source").is_some(),
         (Grammar::Elixir, "call") => node.child_by_field_name("target").is_some_and(|target| {
             matches!(text(target, source), "alias" | "import" | "require" | "use")
         }),
@@ -1572,11 +1852,9 @@ fn last_line(node: Node<'_>) -> usize {
     (end.row + usize::from(end.column != 0)).max(node.start_position().row + 1)
 }
 
-fn parent_symbol(tags: &[RawTag<'_>], node: Node<'_>) -> Option<usize> {
-    let end = tags.partition_point(|tag| tag.node.start_byte() <= node.start_byte());
-    (0..end)
-        .rev()
-        .find(|&id| tags[id].node.end_byte() >= node.end_byte())
+fn parent_symbol(spans: &[(usize, usize)], range: std::ops::Range<usize>) -> Option<usize> {
+    let end = spans.partition_point(|&(start, _)| start <= range.start);
+    (0..end).rev().find(|&id| spans[id].1 >= range.end)
 }
 
 fn walk(root: Node<'_>, mut visit: impl FnMut(Node<'_>)) {
@@ -1610,21 +1888,33 @@ fn literal(value: &str) -> Option<&str> {
     None
 }
 
-fn sql_name(value: &str) -> String {
-    value
-        .split('.')
-        .map(|part| {
-            part.trim()
-                .trim_matches(['"', '\u{60}'])
-                .to_ascii_lowercase()
-        })
-        .collect::<Vec<_>>()
-        .join(".")
+fn sql_name_cow(value: &str) -> Cow<'_, str> {
+    if value
+        .bytes()
+        .all(|b| !b.is_ascii_uppercase() && !b.is_ascii_whitespace() && b != b'"' && b != b'`')
+    {
+        return Cow::Borrowed(value);
+    }
+    let mut out = String::with_capacity(value.len());
+    for (idx, part) in value.split('.').enumerate() {
+        if idx > 0 {
+            out.push('.');
+        }
+        let cleaned = part.trim().trim_matches(['"', '\u{60}']);
+        for ch in cleaned.chars() {
+            out.push(ch.to_ascii_lowercase());
+        }
+    }
+    Cow::Owned(out)
 }
 
-fn embedded_sql<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+fn sql_name(value: &str) -> String {
+    sql_name_cow(value).into_owned()
+}
+
+fn embedded_sql<'a>(kind: &str, node: Node<'_>, source: &'a str) -> Option<&'a str> {
     if !matches!(
-        node.kind(),
+        kind,
         "string"
             | "template_string"
             | "string_literal"
@@ -1646,11 +1936,12 @@ fn embedded_sql<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
 
 fn route_use<'a, 'tree>(
     grammar: Grammar,
+    kind: &str,
     node: Node<'tree>,
     source: &'a str,
 ) -> Option<(&'a str, Option<Node<'tree>>, Node<'tree>)> {
-    let python = grammar == Grammar::Python && node.kind() == "decorator";
-    let javascript = grammar.family() == Grammar::JavaScript && node.kind() == "call_expression";
+    let python = grammar == Grammar::Python && kind == "decorator";
+    let javascript = grammar.family() == Grammar::JavaScript && kind == "call_expression";
     if !python && !javascript {
         return None;
     }
@@ -1681,23 +1972,274 @@ fn route_use<'a, 'tree>(
     }
 }
 
-fn module_import(grammar: Grammar, node: Node<'_>, source: &str) -> Option<Import> {
-    let mut bindings = BTreeMap::new();
-    let path = if grammar.family() == Grammar::JavaScript && node.kind() == "import_statement" {
-        let path = literal(text(node.child_by_field_name("source")?, source))?;
-        walk(node, |child| {
-            if child.kind() == "import_specifier"
-                && let Some(name) = child.child_by_field_name("name")
-            {
-                let alias = child.child_by_field_name("alias").unwrap_or(name);
-                bindings.insert(
-                    text(alias, source).to_owned(),
-                    text(name, source).to_owned(),
-                );
+const JS_TS_EXTENSIONS: &[&str] = &[".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"];
+
+fn strip_js_ts_extension(path: &str) -> &str {
+    for &ext in JS_TS_EXTENSIONS {
+        if let Some(stem) = path.strip_suffix(ext) {
+            return stem;
+        }
+    }
+    path
+}
+
+fn strip_js_query_and_hash(spec: &str) -> &str {
+    let spec = spec.split_once('?').map_or(spec, |(head, _)| head);
+    // Preserve leading `#` for Node subpath imports (`#utils/foo`).
+    match spec.find('#') {
+        Some(pos) if pos > 0 => &spec[..pos],
+        _ => spec,
+    }
+}
+
+fn collapse_js_slashes(spec: &str) -> String {
+    let mut out = String::with_capacity(spec.len());
+    let mut prev_slash = false;
+    for ch in spec.chars() {
+        let ch = if ch == '\\' { '/' } else { ch };
+        if ch == '/' {
+            if !prev_slash {
+                out.push('/');
+                prev_slash = true;
             }
-        });
-        path
-    } else if grammar == Grammar::Python && node.kind() == "import_from_statement" {
+        } else {
+            out.push(ch);
+            prev_slash = false;
+        }
+    }
+    out
+}
+
+/// Normalizes a JS/TS/TSX module specifier into a clean target path for
+/// `Import.path`: strips query/hash fragments, collapses redundant `./` and
+/// duplicate slashes, trims trailing slashes, and collapses barrel `/index`
+/// (or `/index.<js/ts ext>`) suffixes while keeping leading `./` or `../` on
+/// relative specifiers so `index.rs::import_target` resolves them directly.
+fn normalize_js_import_path(raw: &str) -> Option<String> {
+    let trimmed = strip_js_query_and_hash(raw.trim()).trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let collapsed = collapse_js_slashes(trimmed);
+    let mut normalized = collapsed.as_str();
+    if normalized.len() > 1 {
+        normalized = normalized.trim_end_matches('/');
+    }
+    if normalized.is_empty() {
+        return None;
+    }
+    // Collapse redundant `./` segments: `././foo` -> `./foo`, `./foo/./bar` -> `./foo/bar`.
+    let relative_dot = normalized.starts_with("./");
+    let mut segments = Vec::new();
+    for seg in normalized.split('/') {
+        if seg == "." && !segments.is_empty() {
+            continue;
+        }
+        segments.push(seg);
+    }
+    let mut cleaned = if relative_dot {
+        let mut s = String::with_capacity(normalized.len());
+        s.push('.');
+        for seg in segments.into_iter().skip_while(|&seg| seg == ".") {
+            s.push('/');
+            s.push_str(seg);
+        }
+        s
+    } else {
+        segments.join("/")
+    };
+    // Normalize barrel `foo/index` and `foo/index.<ext>` to `foo` when the
+    // parent stem has no dot (so `Path::extension` in `import_target` is not
+    // fooled by a dotted directory name like `foo.v2`).
+    if let Some((parent, tail)) = cleaned.rsplit_once('/')
+        && strip_js_ts_extension(tail) == "index"
+        && !matches!(parent, "" | "." | ".." | "@" | "~" | "#")
+    {
+        let last_dir = parent.rsplit('/').next().unwrap_or(parent);
+        if !last_dir.contains('.') {
+            cleaned.truncate(parent.len());
+        }
+    }
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// Produces a normalized module stem from a JS/TS/TSX specifier: strips
+/// leading `./` or path-alias prefixes (`@/`, `~/`, `#/`), collapses barrel
+/// `/index` segments, and drops JS/TS file extensions.
+pub fn normalize_js_module_stem(specifier: &str) -> String {
+    let base = normalize_js_import_path(specifier).unwrap_or_else(|| specifier.trim().to_owned());
+    let mut stem = base.as_str();
+    while let Some(rest) = stem.strip_prefix("./") {
+        stem = rest;
+    }
+    for alias_prefix in ["@/", "~/", "#/"] {
+        if let Some(rest) = stem.strip_prefix(alias_prefix) {
+            stem = rest;
+            break;
+        }
+    }
+    stem = strip_js_ts_extension(stem);
+    if let Some(parent) = stem.strip_suffix("/index")
+        && !parent.is_empty()
+        && parent != ".."
+    {
+        stem = parent;
+    }
+    stem.to_owned()
+}
+
+fn static_js_specifier<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let raw = text(node, source);
+    match node.kind() {
+        "string" => literal(raw),
+        "template_string" if !raw.contains("${") => literal(raw),
+        _ => None,
+    }
+}
+
+fn collect_js_import_bindings(
+    node: Node<'_>,
+    source: &str,
+    bindings: &mut BTreeMap<String, String>,
+) {
+    walk(node, |child| match child.kind() {
+        "import_specifier" => {
+            if let Some(name_node) = child.child_by_field_name("name") {
+                let alias_node = child.child_by_field_name("alias").unwrap_or(name_node);
+                let name_raw = text(name_node, source);
+                let alias_raw = text(alias_node, source);
+                let name = literal(name_raw).unwrap_or(name_raw);
+                let alias = literal(alias_raw).unwrap_or(alias_raw);
+                if !name.is_empty() && !alias.is_empty() {
+                    bindings.insert(alias.to_owned(), name.to_owned());
+                }
+            }
+        }
+        "import_clause" => {
+            let mut cursor = child.walk();
+            for clause_child in child.named_children(&mut cursor) {
+                if clause_child.kind() == "identifier" {
+                    let default_name = text(clause_child, source);
+                    if !default_name.is_empty() {
+                        bindings
+                            .entry(default_name.to_owned())
+                            .or_insert_with(|| default_name.to_owned());
+                    }
+                }
+            }
+        }
+        _ => {}
+    });
+}
+
+fn collect_js_export_bindings(
+    node: Node<'_>,
+    source: &str,
+    bindings: &mut BTreeMap<String, String>,
+) {
+    walk(node, |child| {
+        if child.kind() == "export_specifier"
+            && let Some(name_node) = child.child_by_field_name("name")
+        {
+            let alias_node = child.child_by_field_name("alias").unwrap_or(name_node);
+            let name_raw = text(name_node, source);
+            let alias_raw = text(alias_node, source);
+            let name = literal(name_raw).unwrap_or(name_raw);
+            let alias = literal(alias_raw).unwrap_or(alias_raw);
+            if !name.is_empty() && !alias.is_empty() {
+                bindings.insert(alias.to_owned(), name.to_owned());
+            }
+        }
+    });
+}
+
+fn collect_cjs_require_bindings(
+    call_node: Node<'_>,
+    source: &str,
+    bindings: &mut BTreeMap<String, String>,
+) {
+    let Some(parent) = call_node.parent() else {
+        return;
+    };
+    if parent.kind() != "variable_declarator"
+        || parent.child_by_field_name("value") != Some(call_node)
+    {
+        return;
+    }
+    let Some(lhs) = parent.child_by_field_name("name") else {
+        return;
+    };
+    if lhs.kind() != "object_pattern" {
+        return;
+    }
+    let mut cursor = lhs.walk();
+    for item in lhs.named_children(&mut cursor) {
+        match item.kind() {
+            "shorthand_property_identifier_pattern" => {
+                let name = text(item, source);
+                if !name.is_empty() {
+                    bindings.insert(name.to_owned(), name.to_owned());
+                }
+            }
+            "pair_pattern" => {
+                if let Some(key) = item.child_by_field_name("key")
+                    && let Some(value) = item.child_by_field_name("value")
+                    && value.kind() == "identifier"
+                {
+                    let key_raw = text(key, source);
+                    let key_name = literal(key_raw).unwrap_or(key_raw);
+                    let alias = text(value, source);
+                    if !key_name.is_empty() && !alias.is_empty() {
+                        bindings.insert(alias.to_owned(), key_name.to_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn module_import(grammar: Grammar, kind: &str, node: Node<'_>, source: &str) -> Option<Import> {
+    let mut bindings = BTreeMap::new();
+    let path: Cow<'_, str> = if grammar.family() == Grammar::JavaScript {
+        match kind {
+            "import_statement" => {
+                let source_node = node.child_by_field_name("source").or_else(|| {
+                    // TypeScript `import foo = require('./foo')`.
+                    let mut cursor = node.walk();
+                    node.named_children(&mut cursor)
+                        .find(|child| child.kind() == "import_require_clause")
+                        .and_then(|clause| clause.child_by_field_name("source"))
+                })?;
+                let raw = static_js_specifier(source_node, source)?;
+                collect_js_import_bindings(node, source, &mut bindings);
+                Cow::Owned(normalize_js_import_path(raw)?)
+            }
+            "export_statement" => {
+                let source_node = node.child_by_field_name("source")?;
+                let raw = static_js_specifier(source_node, source)?;
+                collect_js_export_bindings(node, source, &mut bindings);
+                Cow::Owned(normalize_js_import_path(raw)?)
+            }
+            "call_expression" => {
+                let func = node.child_by_field_name("function")?;
+                let is_dynamic_import = func.kind() == "import";
+                let is_require = !is_dynamic_import
+                    && func.kind() == "identifier"
+                    && text(func, source) == "require";
+                if !is_dynamic_import && !is_require {
+                    return None;
+                }
+                let arg = node.child_by_field_name("arguments")?.named_child(0)?;
+                let raw = static_js_specifier(arg, source)?;
+                if is_require {
+                    collect_cjs_require_bindings(node, source, &mut bindings);
+                }
+                Cow::Owned(normalize_js_import_path(raw)?)
+            }
+            _ => return None,
+        }
+    } else if grammar == Grammar::Python && kind == "import_from_statement" {
         let module = node.child_by_field_name("module_name")?;
         let mut cursor = node.walk();
         for child in node.children_by_field_name("name", &mut cursor) {
@@ -1708,25 +2250,1102 @@ fn module_import(grammar: Grammar, node: Node<'_>, source: &str) -> Option<Impor
                 text(name, source).to_owned(),
             );
         }
-        text(module, source)
+        Cow::Borrowed(text(module, source))
     } else if matches!(grammar, Grammar::C | Grammar::Cpp | Grammar::ObjectiveC)
-        && node.kind() == "preproc_include"
+        && kind == "preproc_include"
     {
-        literal(text(node.child_by_field_name("path")?, source))?
+        Cow::Borrowed(literal(text(node.child_by_field_name("path")?, source))?)
     } else if grammar == Grammar::Julia
-        && node.kind() == "call_expression"
+        && kind == "call_expression"
         && text(node.named_child(0)?, source) == "include"
     {
         let argument = node.named_child(1)?.named_child(0)?;
-        (argument.kind() == "string_literal").then(|| literal(text(argument, source)))??
+        Cow::Borrowed(
+            (argument.kind() == "string_literal").then(|| literal(text(argument, source)))??,
+        )
     } else {
         return None;
     };
     Some(Import {
-        path: path.to_owned(),
+        path: path.into_owned(),
         bindings,
         line: node.start_position().row + 1,
     })
+}
+
+// ---------------------------------------------------------------------------
+// PostgreSQL dollar-quoted FUNCTION / PROCEDURE support
+// ---------------------------------------------------------------------------
+
+struct SqlDollarRoutine {
+    kind: &'static str,
+    name: String,
+    full_range: std::ops::Range<usize>,
+    name_range: std::ops::Range<usize>,
+    header_end: usize,
+    body_content_range: std::ops::Range<usize>,
+    start_line: usize,
+    end_line: usize,
+    decl_line: usize,
+    body_start_line: usize,
+}
+
+fn line_at_offset(source: &str, offset: usize) -> usize {
+    source
+        .as_bytes()
+        .get(..offset)
+        .unwrap_or(source.as_bytes())
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        + 1
+}
+
+/// Parses a PostgreSQL dollar-quote delimiter starting at `pos` (`$$` or
+/// `$tag$` where `tag` matches `[A-Za-z_][A-Za-z0-9_]*`). Positional params
+/// like `$1` are rejected because tags cannot begin with an ASCII digit.
+fn parse_dollar_tag(bytes: &[u8], pos: usize) -> Option<&[u8]> {
+    if bytes.get(pos) != Some(&b'$') {
+        return None;
+    }
+    let mut i = pos + 1;
+    if bytes.get(i) == Some(&b'$') {
+        return Some(&bytes[pos..=i]);
+    }
+    let first = *bytes.get(i)?;
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return None;
+    }
+    i += 1;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'$' {
+            return Some(&bytes[pos..=i]);
+        }
+        if !(b.is_ascii_alphanumeric() || b == b'_') {
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn skip_sql_ws_and_comments(bytes: &[u8], mut i: usize) -> usize {
+    let len = bytes.len();
+    while i < len {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            i += 1;
+        } else if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            let mut depth = 1usize;
+            while i < len && depth > 0 {
+                if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+fn skip_sql_single_quoted(bytes: &[u8], start: usize, escape_backslash: bool) -> usize {
+    let len = bytes.len();
+    let mut i = start + 1;
+    while i < len {
+        let b = bytes[i];
+        if escape_backslash && b == b'\\' {
+            i = (i + 2).min(len);
+        } else if b == b'\'' {
+            if bytes.get(i + 1) == Some(&b'\'') {
+                i += 2;
+            } else {
+                return i + 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    len
+}
+
+fn skip_sql_quoted_ident(bytes: &[u8], start: usize, quote: u8) -> usize {
+    let len = bytes.len();
+    let mut i = start + 1;
+    while i < len {
+        if bytes[i] == quote {
+            if bytes.get(i + 1) == Some(&quote) {
+                i += 2;
+            } else {
+                return i + 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    len
+}
+
+fn read_sql_word(source: &str, pos: usize) -> Option<(&str, usize)> {
+    let bytes = source.as_bytes();
+    let first = *bytes.get(pos)?;
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return None;
+    }
+    let mut end = pos + 1;
+    while let Some(&b) = bytes.get(end) {
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    Some((&source[pos..end], end))
+}
+
+fn read_sql_ident_part(source: &str, pos: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    match *bytes.get(pos)? {
+        b'"' => Some(skip_sql_quoted_ident(bytes, pos, b'"')),
+        b'`' => Some(skip_sql_quoted_ident(bytes, pos, b'`')),
+        b if b.is_ascii_alphabetic() || b == b'_' => read_sql_word(source, pos).map(|(_, end)| end),
+        _ => None,
+    }
+}
+
+fn read_sql_object_reference(
+    source: &str,
+    start: usize,
+) -> Option<(std::ops::Range<usize>, usize)> {
+    let bytes = source.as_bytes();
+    let mut end = read_sql_ident_part(source, start)?;
+    loop {
+        let dot = skip_sql_ws_and_comments(bytes, end);
+        if bytes.get(dot) != Some(&b'.') {
+            break;
+        }
+        let next = skip_sql_ws_and_comments(bytes, dot + 1);
+        let Some(next_end) = read_sql_ident_part(source, next) else {
+            break;
+        };
+        end = next_end;
+    }
+    Some((start..end, end))
+}
+
+fn is_sql_top_level_starter(word: &str) -> bool {
+    word.eq_ignore_ascii_case("CREATE")
+        || word.eq_ignore_ascii_case("ALTER")
+        || word.eq_ignore_ascii_case("DROP")
+        || word.eq_ignore_ascii_case("GRANT")
+        || word.eq_ignore_ascii_case("REVOKE")
+        || word.eq_ignore_ascii_case("SELECT")
+        || word.eq_ignore_ascii_case("INSERT")
+        || word.eq_ignore_ascii_case("UPDATE")
+        || word.eq_ignore_ascii_case("DELETE")
+        || word.eq_ignore_ascii_case("BEGIN")
+        || word.eq_ignore_ascii_case("COMMIT")
+        || word.eq_ignore_ascii_case("COMMENT")
+}
+
+/// Scans PostgreSQL `CREATE [OR REPLACE] FUNCTION/PROCEDURE ... AS $tag$ ... $tag$`
+/// routines so their symbol spans cover the complete dollar-quoted body and
+/// trailing clauses (never cutting off at internal semicolons).
+fn scan_sql_dollar_routines(source: &str) -> Vec<SqlDollarRoutine> {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut routines = Vec::new();
+    let mut i = 0usize;
+    while i < len {
+        i = skip_sql_ws_and_comments(bytes, i);
+        if i >= len {
+            break;
+        }
+        let b = bytes[i];
+        if b == b'\'' {
+            i = skip_sql_single_quoted(bytes, i, false);
+            continue;
+        }
+        if matches!(b, b'e' | b'E') && bytes.get(i + 1) == Some(&b'\'') {
+            i = skip_sql_single_quoted(bytes, i + 1, true);
+            continue;
+        }
+        if b == b'"' || b == b'`' {
+            i = skip_sql_quoted_ident(bytes, i, b);
+            continue;
+        }
+        if b == b'$'
+            && let Some(tag_bytes) = parse_dollar_tag(bytes, i)
+            && let Ok(tag) = std::str::from_utf8(tag_bytes)
+        {
+            let body_start = i + tag.len();
+            i = source[body_start..]
+                .find(tag)
+                .map_or(len, |rel| body_start + rel + tag.len());
+            continue;
+        }
+        let Some((word, next)) = read_sql_word(source, i) else {
+            i += 1;
+            continue;
+        };
+        if !word.eq_ignore_ascii_case("CREATE") {
+            i = next;
+            continue;
+        }
+        let create_start = i;
+        let mut cur = skip_sql_ws_and_comments(bytes, next);
+        if let Some((w, after_or)) = read_sql_word(source, cur)
+            && w.eq_ignore_ascii_case("OR")
+        {
+            let after_ws = skip_sql_ws_and_comments(bytes, after_or);
+            if let Some((w2, after_replace)) = read_sql_word(source, after_ws)
+                && w2.eq_ignore_ascii_case("REPLACE")
+            {
+                cur = skip_sql_ws_and_comments(bytes, after_replace);
+            }
+        }
+        let Some((kind_word, after_kind)) = read_sql_word(source, cur) else {
+            i = next;
+            continue;
+        };
+        let kind = if kind_word.eq_ignore_ascii_case("FUNCTION") {
+            "function"
+        } else if kind_word.eq_ignore_ascii_case("PROCEDURE") {
+            "procedure"
+        } else {
+            i = after_kind;
+            continue;
+        };
+        cur = skip_sql_ws_and_comments(bytes, after_kind);
+        // Optional `IF NOT EXISTS`.
+        if let Some((w, after_if)) = read_sql_word(source, cur)
+            && w.eq_ignore_ascii_case("IF")
+        {
+            let p1 = skip_sql_ws_and_comments(bytes, after_if);
+            if let Some((w2, after_not)) = read_sql_word(source, p1)
+                && w2.eq_ignore_ascii_case("NOT")
+            {
+                let p2 = skip_sql_ws_and_comments(bytes, after_not);
+                if let Some((w3, after_exists)) = read_sql_word(source, p2)
+                    && w3.eq_ignore_ascii_case("EXISTS")
+                {
+                    cur = skip_sql_ws_and_comments(bytes, after_exists);
+                }
+            }
+        }
+        let Some((name_range, after_name)) = read_sql_object_reference(source, cur) else {
+            i = after_kind;
+            continue;
+        };
+        // Scan header until a top-level dollar-quoted body or statement end.
+        let mut scan = after_name;
+        let mut paren_depth = 0usize;
+        let mut found_body = None;
+        while scan < len {
+            scan = skip_sql_ws_and_comments(bytes, scan);
+            if scan >= len {
+                break;
+            }
+            let ch = bytes[scan];
+            match ch {
+                b'(' => {
+                    paren_depth += 1;
+                    scan += 1;
+                }
+                b')' => {
+                    paren_depth = paren_depth.saturating_sub(1);
+                    scan += 1;
+                }
+                b';' if paren_depth == 0 => break,
+                b'\'' => {
+                    scan = skip_sql_single_quoted(bytes, scan, false);
+                }
+                b'e' | b'E' if bytes.get(scan + 1) == Some(&b'\'') => {
+                    scan = skip_sql_single_quoted(bytes, scan + 1, true);
+                }
+                b'"' | b'`' => {
+                    scan = skip_sql_quoted_ident(bytes, scan, ch);
+                }
+                b'$' if paren_depth == 0 => {
+                    if let Some(tag_bytes) = parse_dollar_tag(bytes, scan)
+                        && let Ok(tag) = std::str::from_utf8(tag_bytes)
+                    {
+                        let body_start = scan + tag.len();
+                        if let Some(rel_close) = source[body_start..].find(tag) {
+                            let body_end = body_start + rel_close;
+                            let close_end = body_end + tag.len();
+                            found_body = Some((scan, body_start, body_end, close_end));
+                        }
+                        break;
+                    }
+                    scan += 1;
+                }
+                _ => {
+                    if let Some((_, w_end)) = read_sql_word(source, scan) {
+                        scan = w_end;
+                    } else {
+                        scan += 1;
+                    }
+                }
+            }
+        }
+        let Some((open_tag_start, body_start, body_end, close_end)) = found_body else {
+            i = after_name;
+            continue;
+        };
+        // Scan trailing routine attributes (e.g. `LANGUAGE plpgsql`, `STABLE`,
+        // `SECURITY DEFINER`, `SET search_path = ...`) up to `;`.
+        let mut tail = close_end;
+        let mut last_end = close_end;
+        let mut tail_parens = 0usize;
+        while tail < len {
+            tail = skip_sql_ws_and_comments(bytes, tail);
+            if tail >= len {
+                break;
+            }
+            let ch = bytes[tail];
+            if ch == b';' && tail_parens == 0 {
+                last_end = tail + 1;
+                break;
+            }
+            if ch == b'(' {
+                tail_parens += 1;
+                tail += 1;
+                last_end = tail;
+            } else if ch == b')' {
+                tail_parens = tail_parens.saturating_sub(1);
+                tail += 1;
+                last_end = tail;
+            } else if ch == b'\'' {
+                tail = skip_sql_single_quoted(bytes, tail, false);
+                last_end = tail;
+            } else if ch == b'"' || ch == b'`' {
+                tail = skip_sql_quoted_ident(bytes, tail, ch);
+                last_end = tail;
+            } else if let Some((w, w_end)) = read_sql_word(source, tail) {
+                if tail_parens == 0 && is_sql_top_level_starter(w) {
+                    break;
+                }
+                tail = w_end;
+                last_end = w_end;
+            } else {
+                tail += 1;
+                last_end = tail;
+            }
+        }
+        let header_end = create_start + source[create_start..open_tag_start].trim_end().len();
+        let name = sql_name(&source[name_range.clone()]);
+        let start_line = line_at_offset(source, create_start);
+        let end_line = line_at_offset(source, last_end.saturating_sub(1));
+        let decl_line = line_at_offset(source, name_range.start);
+        let body_start_line = line_at_offset(source, body_start);
+        routines.push(SqlDollarRoutine {
+            kind,
+            name,
+            full_range: create_start..last_end,
+            name_range,
+            header_end,
+            body_content_range: body_start..body_end,
+            start_line,
+            end_line,
+            decl_line,
+            body_start_line,
+        });
+        i = last_end;
+    }
+    routines
+}
+
+/// Replaces each dollar-quoted routine's interior with equal-byte-length
+/// `SELECT 1` + spaces (preserving every `\n` and `\r`) so `tree-sitter-sequel`
+/// parses surrounding DDL without getting stuck on PL/pgSQL syntax.
+fn mask_sql_dollar_bodies(source: &str, routines: &[SqlDollarRoutine]) -> Option<String> {
+    let mut buf = source.as_bytes().to_vec();
+    let mut modified = false;
+    for routine in routines {
+        let range = routine.body_content_range.clone();
+        if range.len() < 8 {
+            continue;
+        }
+        let slice = &mut buf[range];
+        // Find a contiguous non-newline span of >= 8 bytes for `SELECT 1`.
+        let mut placed = false;
+        let mut run_start = 0usize;
+        for idx in 0..=slice.len() {
+            let is_nl = idx == slice.len() || matches!(slice[idx], b'\n' | b'\r');
+            if is_nl {
+                if !placed && idx - run_start >= 8 {
+                    slice[run_start..run_start + 8].copy_from_slice(b"SELECT 1");
+                    for b in &mut slice[run_start + 8..idx] {
+                        *b = b' ';
+                    }
+                    placed = true;
+                } else {
+                    for b in &mut slice[run_start..idx] {
+                        *b = b' ';
+                    }
+                }
+                run_start = idx + 1;
+            }
+        }
+        if !placed {
+            // Fallback: place `SELECT` and `1` across separate short lines.
+            let mut s_placed = false;
+            let mut one_placed = false;
+            let mut r_start = 0usize;
+            for idx in 0..=slice.len() {
+                let is_nl = idx == slice.len() || matches!(slice[idx], b'\n' | b'\r');
+                if is_nl {
+                    let span = idx - r_start;
+                    if !s_placed && span >= 6 {
+                        slice[r_start..r_start + 6].copy_from_slice(b"SELECT");
+                        s_placed = true;
+                    } else if s_placed && !one_placed && span >= 1 {
+                        slice[r_start] = b'1';
+                        one_placed = true;
+                    }
+                    r_start = idx + 1;
+                }
+            }
+            if !(s_placed && one_placed) {
+                // Restore original bytes for this routine if too narrow.
+                buf[routine.body_content_range.clone()]
+                    .copy_from_slice(&source.as_bytes()[routine.body_content_range.clone()]);
+                continue;
+            }
+        }
+        modified = true;
+    }
+    modified.then(|| String::from_utf8(buf).expect("ASCII masking preserves UTF-8"))
+}
+
+fn merge_sql_dollar_routines(
+    definitions: &mut Vec<Definition>,
+    spans: &mut Vec<(usize, usize)>,
+    routines: &[SqlDollarRoutine],
+) {
+    // Drop any broken/partial Tree-sitter definitions strictly nested inside a
+    // dollar-quoted routine body.
+    let mut keep = vec![true; definitions.len()];
+    for (idx, span) in spans.iter().enumerate() {
+        for routine in routines {
+            if span.0 > routine.full_range.start && span.1 <= routine.full_range.end {
+                keep[idx] = false;
+                break;
+            }
+        }
+    }
+    if keep.iter().any(|&k| !k) {
+        let mut idx = 0;
+        definitions.retain(|_| {
+            let k = keep[idx];
+            idx += 1;
+            k
+        });
+        let mut idx = 0;
+        spans.retain(|_| {
+            let k = keep[idx];
+            idx += 1;
+            k
+        });
+    }
+    let mut inserted = false;
+    for routine in routines {
+        let existing = spans.iter().position(|&(start, end)| {
+            start == routine.full_range.start
+                || (start <= routine.name_range.start && end >= routine.name_range.end)
+        });
+        if let Some(idx) = existing {
+            let def = &mut definitions[idx];
+            def.bytes = routine.full_range.clone();
+            def.signature_start = routine.full_range.start;
+            def.header_end = routine.header_end;
+            def.start = routine.start_line;
+            def.end = routine.end_line;
+            def.declaration = routine.decl_line;
+            spans[idx] = (routine.full_range.start, routine.full_range.end);
+        } else {
+            definitions.push(Definition {
+                bytes: routine.full_range.clone(),
+                signature_start: routine.full_range.start,
+                header_end: routine.header_end,
+                name: routine.name.clone(),
+                path: routine.name.clone(),
+                kind: routine.kind.to_owned(),
+                start: routine.start_line,
+                end: routine.end_line,
+                declaration: routine.decl_line,
+                test: false,
+            });
+            spans.push((routine.full_range.start, routine.full_range.end));
+            inserted = true;
+        }
+    }
+    if inserted {
+        let mut order: Vec<usize> = (0..definitions.len()).collect();
+        order.sort_by_key(|&i| (spans[i].0, std::cmp::Reverse(spans[i].1)));
+        let old_defs = std::mem::take(definitions);
+        let old_spans = std::mem::take(spans);
+        let mut slots: Vec<Option<Definition>> = old_defs.into_iter().map(Some).collect();
+        for i in order {
+            definitions.push(slots[i].take().unwrap());
+            spans.push(old_spans[i]);
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SqlTokKind {
+    Word,
+    Quoted,
+    Dot,
+    LParen,
+    RParen,
+    Comma,
+    Semi,
+    Other,
+}
+
+struct SqlTok<'a> {
+    kind: SqlTokKind,
+    text: &'a str,
+    line_offset: usize,
+}
+
+fn tokenize_sql_body(body: &str) -> Vec<SqlTok<'_>> {
+    let bytes = body.as_bytes();
+    let len = bytes.len();
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+    let mut line_offset = 0usize;
+    let count_newlines = |slice: &[u8]| slice.iter().filter(|&&b| b == b'\n').count();
+    while i < len {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            if b == b'\n' {
+                line_offset += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let start = i;
+            i = skip_sql_ws_and_comments(bytes, i);
+            line_offset += count_newlines(&bytes[start..i]);
+            continue;
+        }
+        if b == b'\'' {
+            let start = i;
+            i = skip_sql_single_quoted(bytes, i, false);
+            line_offset += count_newlines(&bytes[start..i]);
+            tokens.push(SqlTok {
+                kind: SqlTokKind::Other,
+                text: &body[start..i],
+                line_offset,
+            });
+            continue;
+        }
+        if matches!(b, b'e' | b'E') && bytes.get(i + 1) == Some(&b'\'') {
+            let start = i;
+            i = skip_sql_single_quoted(bytes, i + 1, true);
+            line_offset += count_newlines(&bytes[start..i]);
+            tokens.push(SqlTok {
+                kind: SqlTokKind::Other,
+                text: &body[start..i],
+                line_offset,
+            });
+            continue;
+        }
+        if b == b'$'
+            && let Some(tag_bytes) = parse_dollar_tag(bytes, i)
+            && let Ok(tag) = std::str::from_utf8(tag_bytes)
+        {
+            let start = i;
+            let inner = i + tag.len();
+            i = body[inner..]
+                .find(tag)
+                .map_or(len, |rel| inner + rel + tag.len());
+            line_offset += count_newlines(&bytes[start..i]);
+            tokens.push(SqlTok {
+                kind: SqlTokKind::Other,
+                text: &body[start..i],
+                line_offset,
+            });
+            continue;
+        }
+        if b == b'"' || b == b'`' {
+            let start = i;
+            let tok_line = line_offset;
+            i = skip_sql_quoted_ident(bytes, i, b);
+            line_offset += count_newlines(&bytes[start..i]);
+            tokens.push(SqlTok {
+                kind: SqlTokKind::Quoted,
+                text: &body[start..i],
+                line_offset: tok_line,
+            });
+            continue;
+        }
+        if let Some((word, end)) = read_sql_word(body, i) {
+            tokens.push(SqlTok {
+                kind: SqlTokKind::Word,
+                text: word,
+                line_offset,
+            });
+            i = end;
+            continue;
+        }
+        let kind = match b {
+            b'.' => SqlTokKind::Dot,
+            b'(' => SqlTokKind::LParen,
+            b')' => SqlTokKind::RParen,
+            b',' => SqlTokKind::Comma,
+            b';' => SqlTokKind::Semi,
+            _ => SqlTokKind::Other,
+        };
+        tokens.push(SqlTok {
+            kind,
+            text: &body[i..i + 1],
+            line_offset,
+        });
+        i += 1;
+    }
+    tokens
+}
+
+fn upper_ascii_word<'a>(word: &str, buf: &'a mut [u8; 16]) -> Option<&'a str> {
+    if word.len() > buf.len() || !word.is_ascii() {
+        return None;
+    }
+    for (dst, src) in buf.iter_mut().zip(word.bytes()) {
+        *dst = src.to_ascii_uppercase();
+    }
+    std::str::from_utf8(&buf[..word.len()]).ok()
+}
+
+fn is_non_table_sql_keyword(word: &str) -> bool {
+    let mut buf = [0u8; 16];
+    let Some(upper) = upper_ascii_word(word, &mut buf) else {
+        return false;
+    };
+    matches!(
+        upper,
+        "SELECT"
+            | "VALUES"
+            | "LATERAL"
+            | "ONLY"
+            | "UNNEST"
+            | "ROWS"
+            | "TABLE"
+            | "WHERE"
+            | "SET"
+            | "INTO"
+            | "ON"
+            | "USING"
+            | "JOIN"
+            | "INNER"
+            | "LEFT"
+            | "RIGHT"
+            | "FULL"
+            | "OUTER"
+            | "CROSS"
+            | "NATURAL"
+            | "GROUP"
+            | "ORDER"
+            | "HAVING"
+            | "LIMIT"
+            | "OFFSET"
+            | "FETCH"
+            | "FOR"
+            | "UNION"
+            | "INTERSECT"
+            | "EXCEPT"
+            | "RETURNING"
+            | "WINDOW"
+            | "STDIN"
+            | "STDOUT"
+            | "PROGRAM"
+            | "CURRENT"
+            | "DEFAULT"
+            | "NULL"
+            | "TRUE"
+            | "FALSE"
+            | "END"
+            | "THEN"
+            | "ELSE"
+            | "LOOP"
+            | "BEGIN"
+            | "RETURN"
+            | "IF"
+    )
+}
+
+fn is_from_clause_ender(word: &str) -> bool {
+    let mut buf = [0u8; 16];
+    let Some(upper) = upper_ascii_word(word, &mut buf) else {
+        return false;
+    };
+    matches!(
+        upper,
+        "WHERE"
+            | "JOIN"
+            | "INNER"
+            | "LEFT"
+            | "RIGHT"
+            | "FULL"
+            | "OUTER"
+            | "CROSS"
+            | "NATURAL"
+            | "GROUP"
+            | "ORDER"
+            | "HAVING"
+            | "LIMIT"
+            | "OFFSET"
+            | "FETCH"
+            | "FOR"
+            | "UNION"
+            | "INTERSECT"
+            | "EXCEPT"
+            | "WINDOW"
+            | "SET"
+            | "INTO"
+            | "RETURNING"
+            | "ON"
+            | "USING"
+            | "VALUES"
+            | "END"
+            | "THEN"
+            | "ELSE"
+            | "LOOP"
+    )
+}
+
+fn read_tok_object_ref(tokens: &[SqlTok<'_>], start: usize) -> Option<(String, usize, usize)> {
+    let first = tokens.get(start)?;
+    if !matches!(first.kind, SqlTokKind::Word | SqlTokKind::Quoted) {
+        return None;
+    }
+    if first.kind == SqlTokKind::Word && is_non_table_sql_keyword(first.text) {
+        return None;
+    }
+    let line_offset = first.line_offset;
+    let mut name = sql_name(first.text);
+    let mut idx = start + 1;
+    while tokens.get(idx).is_some_and(|t| t.kind == SqlTokKind::Dot) {
+        let Some(next) = tokens.get(idx + 1) else {
+            break;
+        };
+        if !matches!(next.kind, SqlTokKind::Word | SqlTokKind::Quoted) {
+            break;
+        }
+        name.push('.');
+        name.push_str(&sql_name_cow(next.text));
+        idx += 2;
+    }
+    Some((name, line_offset, idx))
+}
+
+/// Extracts table references inside a PostgreSQL dollar-quoted function or
+/// procedure body, skipping comments, string literals, CTEs, `FOR/DO UPDATE`,
+/// `IS DISTINCT FROM`, `EXTRACT(... FROM ...)`, and table-valued functions.
+fn extract_sql_body_table_refs(body: &str, body_start_line: usize) -> Vec<(String, usize)> {
+    let tokens = tokenize_sql_body(body);
+    let mut ctes: HashSet<String> = HashSet::new();
+    // Pre-scan CTE names (`WITH [RECURSIVE] name [(cols)] AS (`).
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if tokens[i].kind == SqlTokKind::Word && tokens[i].text.eq_ignore_ascii_case("WITH") {
+            let mut j = i + 1;
+            if tokens.get(j).is_some_and(|t| {
+                t.kind == SqlTokKind::Word && t.text.eq_ignore_ascii_case("RECURSIVE")
+            }) {
+                j += 1;
+            }
+            while let Some(cte) = tokens.get(j) {
+                if !matches!(cte.kind, SqlTokKind::Word | SqlTokKind::Quoted) {
+                    break;
+                }
+                let cte_name = sql_name(cte.text);
+                j += 1;
+                // Optional column list `(col1, col2)`
+                if tokens.get(j).is_some_and(|t| t.kind == SqlTokKind::LParen) {
+                    let mut depth = 1usize;
+                    j += 1;
+                    while j < tokens.len() && depth > 0 {
+                        match tokens[j].kind {
+                            SqlTokKind::LParen => depth += 1,
+                            SqlTokKind::RParen => depth -= 1,
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                }
+                if tokens.get(j).is_some_and(|t| {
+                    t.kind == SqlTokKind::Word && t.text.eq_ignore_ascii_case("AS")
+                }) {
+                    j += 1;
+                    // Optional `[NOT] MATERIALIZED`
+                    if tokens.get(j).is_some_and(|t| {
+                        t.kind == SqlTokKind::Word && t.text.eq_ignore_ascii_case("NOT")
+                    }) {
+                        j += 1;
+                    }
+                    if tokens.get(j).is_some_and(|t| {
+                        t.kind == SqlTokKind::Word && t.text.eq_ignore_ascii_case("MATERIALIZED")
+                    }) {
+                        j += 1;
+                    }
+                    if tokens.get(j).is_some_and(|t| t.kind == SqlTokKind::LParen) {
+                        ctes.insert(cte_name);
+                        let mut depth = 1usize;
+                        j += 1;
+                        while j < tokens.len() && depth > 0 {
+                            match tokens[j].kind {
+                                SqlTokKind::LParen => depth += 1,
+                                SqlTokKind::RParen => depth -= 1,
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                        if tokens.get(j).is_some_and(|t| t.kind == SqlTokKind::Comma) {
+                            j += 1;
+                            continue;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        i += 1;
+    }
+
+    let mut refs = Vec::new();
+    let mut non_table_from_depths: Vec<usize> = Vec::new();
+    let mut paren_depth = 0usize;
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        let tok = &tokens[idx];
+        match tok.kind {
+            SqlTokKind::LParen => {
+                paren_depth += 1;
+                if idx > 0 && tokens[idx - 1].kind == SqlTokKind::Word {
+                    let prev = tokens[idx - 1].text;
+                    if prev.eq_ignore_ascii_case("EXTRACT")
+                        || prev.eq_ignore_ascii_case("TRIM")
+                        || prev.eq_ignore_ascii_case("SUBSTRING")
+                        || prev.eq_ignore_ascii_case("OVERLAY")
+                    {
+                        non_table_from_depths.push(paren_depth);
+                    }
+                }
+                idx += 1;
+                continue;
+            }
+            SqlTokKind::RParen => {
+                if non_table_from_depths.last() == Some(&paren_depth) {
+                    non_table_from_depths.pop();
+                }
+                paren_depth = paren_depth.saturating_sub(1);
+                idx += 1;
+                continue;
+            }
+            SqlTokKind::Word => {}
+            _ => {
+                idx += 1;
+                continue;
+            }
+        }
+
+        let word = tok.text;
+        let prev_word =
+            (idx > 0 && tokens[idx - 1].kind == SqlTokKind::Word).then(|| tokens[idx - 1].text);
+
+        if word.eq_ignore_ascii_case("FROM") {
+            let in_non_table_expr = non_table_from_depths.last() == Some(&paren_depth);
+            let is_distinct_from = prev_word.is_some_and(|w| w.eq_ignore_ascii_case("DISTINCT"));
+            if !in_non_table_expr && !is_distinct_from {
+                let mut cur = idx + 1;
+                loop {
+                    while tokens.get(cur).is_some_and(|t| {
+                        t.kind == SqlTokKind::Word
+                            && (t.text.eq_ignore_ascii_case("ONLY")
+                                || t.text.eq_ignore_ascii_case("LATERAL"))
+                    }) {
+                        cur += 1;
+                    }
+                    if let Some((name, line_off, after)) = read_tok_object_ref(&tokens, cur) {
+                        let is_call = tokens
+                            .get(after)
+                            .is_some_and(|t| t.kind == SqlTokKind::LParen);
+                        if !is_call && !ctes.contains(&name) {
+                            refs.push((name, body_start_line + line_off));
+                        }
+                        cur = after;
+                        // Skip optional `[AS] alias` and check for comma-join `, table2`.
+                        if tokens.get(cur).is_some_and(|t| {
+                            t.kind == SqlTokKind::Word && t.text.eq_ignore_ascii_case("AS")
+                        }) {
+                            cur += 1;
+                        }
+                        if tokens.get(cur).is_some_and(|t| {
+                            matches!(t.kind, SqlTokKind::Word | SqlTokKind::Quoted)
+                                && (t.kind == SqlTokKind::Quoted || !is_from_clause_ender(t.text))
+                        }) {
+                            cur += 1;
+                        }
+                        if tokens.get(cur).is_some_and(|t| t.kind == SqlTokKind::Comma) {
+                            cur += 1;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                idx = cur;
+                continue;
+            }
+        } else if word.eq_ignore_ascii_case("JOIN") {
+            let mut cur = idx + 1;
+            while tokens.get(cur).is_some_and(|t| {
+                t.kind == SqlTokKind::Word
+                    && (t.text.eq_ignore_ascii_case("ONLY")
+                        || t.text.eq_ignore_ascii_case("LATERAL"))
+            }) {
+                cur += 1;
+            }
+            if let Some((name, line_off, after)) = read_tok_object_ref(&tokens, cur) {
+                let is_call = tokens
+                    .get(after)
+                    .is_some_and(|t| t.kind == SqlTokKind::LParen);
+                if !is_call && !ctes.contains(&name) {
+                    refs.push((name, body_start_line + line_off));
+                }
+                idx = after;
+                continue;
+            }
+        } else if (word.eq_ignore_ascii_case("INSERT") || word.eq_ignore_ascii_case("MERGE"))
+            && tokens
+                .get(idx + 1)
+                .is_some_and(|t| t.kind == SqlTokKind::Word && t.text.eq_ignore_ascii_case("INTO"))
+        {
+            let mut cur = idx + 2;
+            if tokens
+                .get(cur)
+                .is_some_and(|t| t.kind == SqlTokKind::Word && t.text.eq_ignore_ascii_case("ONLY"))
+            {
+                cur += 1;
+            }
+            if let Some((name, line_off, after)) = read_tok_object_ref(&tokens, cur) {
+                if !ctes.contains(&name) {
+                    refs.push((name, body_start_line + line_off));
+                }
+                idx = after;
+                continue;
+            }
+        } else if word.eq_ignore_ascii_case("UPDATE") {
+            let skip = prev_word.is_some_and(|w| {
+                w.eq_ignore_ascii_case("FOR")
+                    || w.eq_ignore_ascii_case("DO")
+                    || w.eq_ignore_ascii_case("ON")
+                    || w.eq_ignore_ascii_case("BEFORE")
+                    || w.eq_ignore_ascii_case("AFTER")
+                    || w.eq_ignore_ascii_case("OF")
+                    || w.eq_ignore_ascii_case("OR")
+            });
+            if !skip {
+                let mut cur = idx + 1;
+                if tokens.get(cur).is_some_and(|t| {
+                    t.kind == SqlTokKind::Word && t.text.eq_ignore_ascii_case("ONLY")
+                }) {
+                    cur += 1;
+                }
+                if let Some((name, line_off, after)) = read_tok_object_ref(&tokens, cur) {
+                    if !ctes.contains(&name) {
+                        refs.push((name, body_start_line + line_off));
+                    }
+                    idx = after;
+                    continue;
+                }
+            }
+        } else if word.eq_ignore_ascii_case("TRUNCATE") {
+            let mut cur = idx + 1;
+            if tokens
+                .get(cur)
+                .is_some_and(|t| t.kind == SqlTokKind::Word && t.text.eq_ignore_ascii_case("TABLE"))
+            {
+                cur += 1;
+            }
+            if tokens
+                .get(cur)
+                .is_some_and(|t| t.kind == SqlTokKind::Word && t.text.eq_ignore_ascii_case("ONLY"))
+            {
+                cur += 1;
+            }
+            if let Some((name, line_off, after)) = read_tok_object_ref(&tokens, cur) {
+                if !ctes.contains(&name) {
+                    refs.push((name, body_start_line + line_off));
+                }
+                idx = after;
+                continue;
+            }
+        } else if (word.eq_ignore_ascii_case("ALTER") || word.eq_ignore_ascii_case("DROP"))
+            && tokens
+                .get(idx + 1)
+                .is_some_and(|t| t.kind == SqlTokKind::Word && t.text.eq_ignore_ascii_case("TABLE"))
+        {
+            let mut cur = idx + 2;
+            if tokens
+                .get(cur)
+                .is_some_and(|t| t.kind == SqlTokKind::Word && t.text.eq_ignore_ascii_case("IF"))
+                && tokens.get(cur + 1).is_some_and(|t| {
+                    t.kind == SqlTokKind::Word && t.text.eq_ignore_ascii_case("EXISTS")
+                })
+            {
+                cur += 2;
+            }
+            if tokens
+                .get(cur)
+                .is_some_and(|t| t.kind == SqlTokKind::Word && t.text.eq_ignore_ascii_case("ONLY"))
+            {
+                cur += 1;
+            }
+            if let Some((name, line_off, after)) = read_tok_object_ref(&tokens, cur) {
+                if !ctes.contains(&name) {
+                    refs.push((name, body_start_line + line_off));
+                }
+                idx = after;
+                continue;
+            }
+        } else if (word.eq_ignore_ascii_case("REFERENCES") || word.eq_ignore_ascii_case("COPY"))
+            && let Some((name, line_off, after)) = read_tok_object_ref(&tokens, idx + 1)
+        {
+            if !ctes.contains(&name) {
+                refs.push((name, body_start_line + line_off));
+            }
+            idx = after;
+            continue;
+        }
+
+        idx += 1;
+    }
+    refs
 }
 
 #[cfg(test)]
@@ -2117,6 +3736,356 @@ mod tests {
                 .references
                 .iter()
                 .any(|r| r.kind == Kind::Data && r.name == "app.orders")
+        );
+    }
+
+    #[test]
+    fn js_ts_barrel_reexports_dynamic_imports_require_and_alias_stems() {
+        let mut parsers = Parsers::default();
+        let src = concat!(
+            "import DefaultAuth, { verify as checkAuth } from './auth/index.ts';\n",
+            "export { foo } from './orders';\n",
+            "export { bar as baz } from './billing/index';\n",
+            "export * from './users';\n",
+            "export * as shared from '../shared/index.js';\n",
+            "import { helper } from '@/foo/bar/index.ts';\n",
+            "const { qux, legacy: oldQux } = require('./qux');\n",
+            "export async function load() {\n",
+            "  const mod = await import('./lazy');\n",
+            "  return [DefaultAuth, checkAuth, helper, qux, oldQux, mod];\n",
+            "}\n",
+        );
+        for grammar in [Grammar::TypeScript, Grammar::Tsx] {
+            let facts = parsers.parse(grammar, src).unwrap();
+            let paths: Vec<_> = facts.imports.iter().map(|i| i.path.as_str()).collect();
+            assert_eq!(
+                paths,
+                [
+                    "./auth",
+                    "./orders",
+                    "./billing",
+                    "./users",
+                    "../shared",
+                    "@/foo/bar",
+                    "./qux",
+                    "./lazy",
+                ],
+                "{grammar:?}"
+            );
+            let stems: Vec<_> = facts.imports.iter().map(Import::module_stem).collect();
+            assert_eq!(
+                stems,
+                [
+                    "auth",
+                    "orders",
+                    "billing",
+                    "users",
+                    "../shared",
+                    "foo/bar",
+                    "qux",
+                    "lazy",
+                ],
+                "{grammar:?}"
+            );
+            assert_eq!(
+                facts.imports[0]
+                    .bindings
+                    .get("DefaultAuth")
+                    .map(String::as_str),
+                Some("DefaultAuth")
+            );
+            assert_eq!(
+                facts.imports[0]
+                    .bindings
+                    .get("checkAuth")
+                    .map(String::as_str),
+                Some("verify")
+            );
+            assert_eq!(
+                facts.imports[1].bindings.get("foo").map(String::as_str),
+                Some("foo")
+            );
+            assert_eq!(
+                facts.imports[2].bindings.get("baz").map(String::as_str),
+                Some("bar")
+            );
+            assert!(facts.imports[3].bindings.is_empty());
+            assert_eq!(
+                facts.imports[6].bindings.get("qux").map(String::as_str),
+                Some("qux")
+            );
+            assert_eq!(
+                facts.imports[6].bindings.get("oldQux").map(String::as_str),
+                Some("legacy")
+            );
+        }
+
+        // Plain JS also extracts barrel re-exports, dynamic import, and require.
+        let js_src = concat!(
+            "export { foo } from './orders';\n",
+            "export * from './users/index.js';\n",
+            "const lazy = () => import('./lazy');\n",
+            "const qux = require('./qux/index');\n",
+        );
+        let js_facts = parsers.parse(Grammar::JavaScript, js_src).unwrap();
+        let js_paths: Vec<_> = js_facts.imports.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(js_paths, ["./orders", "./users", "./lazy", "./qux"]);
+    }
+
+    #[test]
+    fn csharp_records_inheritance_attributes_and_qualified_receiver_calls() {
+        let mut parsers = Parsers::default();
+        let cs = concat!(
+            "namespace App.Billing\n",
+            "{\n",
+            "    public interface IBillable {}\n",
+            "    public record BaseEntity(int Id);\n",
+            "    public record Invoice(int Id, decimal Total) : BaseEntity(Id), App.Billing.IBillable;\n",
+            "    public record struct Money(decimal Amount) : System.IComparable<Money>;\n",
+            "    [App.Security.Authorize]\n",
+            "    public class CheckoutHandler : BaseHandler, IHandler<Invoice>\n",
+            "    {\n",
+            "        public CheckoutHandler() {}\n",
+            "        [Xunit.Fact]\n",
+            "        public void Handle(string payload)\n",
+            "        {\n",
+            "            var inv = System.Text.Json.JsonSerializer.Deserialize<Invoice>(payload);\n",
+            "            App.Billing.InvoiceService.Charge(inv);\n",
+            "            var svc = new App.Billing.AuditLogger();\n",
+            "            svc?.Record(inv);\n",
+            "        }\n",
+            "    }\n",
+            "}\n",
+        );
+        let facts = parsers.parse(Grammar::CSharp, cs).unwrap();
+        let defs: Vec<_> = facts
+            .definitions
+            .iter()
+            .map(|d| (d.kind.as_str(), d.name.as_str(), d.test))
+            .collect();
+        assert!(defs.contains(&("module", "App.Billing", false)), "{defs:?}");
+        assert!(
+            defs.contains(&("interface", "IBillable", false)),
+            "{defs:?}"
+        );
+        assert!(defs.contains(&("record", "BaseEntity", false)), "{defs:?}");
+        assert!(defs.contains(&("record", "Invoice", false)), "{defs:?}");
+        assert!(defs.contains(&("record", "Money", false)), "{defs:?}");
+        assert!(
+            defs.contains(&("class", "CheckoutHandler", false)),
+            "{defs:?}"
+        );
+        assert!(defs.contains(&("constructor", "new", false)), "{defs:?}");
+        assert!(defs.contains(&("method", "Handle", true)), "{defs:?}");
+
+        let refs: Vec<_> = facts
+            .references
+            .iter()
+            .map(|r| (r.kind, r.name.as_str()))
+            .collect();
+        // Qualified receiver + method tokens preserved without losing either.
+        assert!(
+            refs.contains(&(Kind::Reference, "JsonSerializer")),
+            "{refs:?}"
+        );
+        assert!(refs.contains(&(Kind::Call, "Deserialize")), "{refs:?}");
+        assert!(
+            refs.contains(&(Kind::Reference, "InvoiceService")),
+            "{refs:?}"
+        );
+        assert!(refs.contains(&(Kind::Call, "Charge")), "{refs:?}");
+        assert!(refs.contains(&(Kind::Call, "Record")), "{refs:?}");
+        // Qualified object creation and attributes.
+        assert!(refs.contains(&(Kind::Reference, "AuditLogger")), "{refs:?}");
+        assert!(refs.contains(&(Kind::Reference, "Authorize")), "{refs:?}");
+        // Clean base-class and interface inheritance without `<T>` or namespace noise.
+        assert!(refs.contains(&(Kind::Reference, "BaseEntity")), "{refs:?}");
+        assert!(refs.contains(&(Kind::Reference, "IBillable")), "{refs:?}");
+        assert!(refs.contains(&(Kind::Reference, "IComparable")), "{refs:?}");
+        assert!(refs.contains(&(Kind::Reference, "BaseHandler")), "{refs:?}");
+        assert!(refs.contains(&(Kind::Reference, "IHandler")), "{refs:?}");
+        assert!(
+            !refs
+                .iter()
+                .any(|(_, name)| name.contains('<') || name.contains('.')),
+            "inheritance/qualified refs should emit clean identifiers: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn sql_dollar_quoted_functions_and_procedures_keep_full_span_and_body_tables() {
+        let mut parsers = Parsers::default();
+        let sql = concat!(
+            "CREATE OR REPLACE FUNCTION app.reconcile_orders(p_since TIMESTAMPTZ)\n",
+            "RETURNS INT\n",
+            "AS $$\n",
+            "DECLARE\n",
+            "  v_count INT := 0;\n",
+            "BEGIN\n",
+            "  -- FROM ignored_comment_table\n",
+            "  WITH active_ids AS (SELECT id FROM app.orders WHERE status = 'open')\n",
+            "  SELECT COUNT(*) INTO v_count FROM active_ids;\n",
+            "  IF v_count > 0 THEN\n",
+            "    UPDATE app.orders SET status = 'reconciled' WHERE created_at >= p_since;\n",
+            "    INSERT INTO app.audit_log(order_id, note)\n",
+            "      SELECT o.id, 'SELECT * FROM ignored_string_table'\n",
+            "      FROM app.orders o\n",
+            "      JOIN app.customers c ON c.id = o.customer_id;\n",
+            "  END IF;\n",
+            "  DELETE FROM app.pending_queue WHERE processed = TRUE;\n",
+            "  PERFORM EXTRACT(EPOCH FROM NOW());\n",
+            "  RETURN v_count;\n",
+            "END;\n",
+            "$$ LANGUAGE plpgsql;\n\n",
+            "CREATE OR REPLACE PROCEDURE app.archive_batch(p_id INT)\n",
+            "AS $body$\n",
+            "BEGIN\n",
+            "  INSERT INTO app.order_archive SELECT * FROM app.orders WHERE id = p_id FOR UPDATE;\n",
+            "  DELETE FROM app.orders WHERE id = p_id;\n",
+            "END;\n",
+            "$body$ LANGUAGE plpgsql;\n\n",
+            "CREATE TABLE app.after_routines (\n",
+            "  id INT PRIMARY KEY\n",
+            ");\n",
+        );
+        let facts = parsers.parse(Grammar::Sql, sql).unwrap();
+        let fn_idx = facts
+            .definitions
+            .iter()
+            .position(|d| d.kind == "function" && d.name == "app.reconcile_orders")
+            .expect("missing app.reconcile_orders");
+        let fn_def = &facts.definitions[fn_idx];
+        assert_eq!(fn_def.start, 1);
+        assert_eq!(fn_def.end, 21);
+        let fn_slice = &sql[fn_def.bytes.clone()];
+        assert!(
+            fn_slice.starts_with("CREATE OR REPLACE FUNCTION app.reconcile_orders")
+                && fn_slice.ends_with("$$ LANGUAGE plpgsql;"),
+            "function span cut off prematurely: {fn_slice:?}"
+        );
+
+        let proc_idx = facts
+            .definitions
+            .iter()
+            .position(|d| d.kind == "procedure" && d.name == "app.archive_batch")
+            .expect("missing app.archive_batch");
+        let proc_def = &facts.definitions[proc_idx];
+        assert_eq!(proc_def.start, 23);
+        assert_eq!(proc_def.end, 29);
+        assert!(sql[proc_def.bytes.clone()].ends_with("$body$ LANGUAGE plpgsql;"));
+
+        // Trailing DDL after PL/pgSQL dollar-quoted routines must still parse cleanly.
+        assert!(
+            facts
+                .definitions
+                .iter()
+                .any(|d| d.kind == "table" && d.name == "app.after_routines"),
+            "trailing CREATE TABLE lost after PL/pgSQL routine: {:?}",
+            facts.definitions
+        );
+
+        let fn_tables: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.kind == Kind::Data && r.from == Some(fn_idx))
+            .map(|r| r.name.as_str())
+            .collect();
+        for expected in [
+            "app.orders",
+            "app.audit_log",
+            "app.customers",
+            "app.pending_queue",
+        ] {
+            assert!(
+                fn_tables.contains(&expected),
+                "missing {expected} in {fn_tables:?}"
+            );
+        }
+        for forbidden in [
+            "ignored_comment_table",
+            "ignored_string_table",
+            "active_ids",
+            "now",
+        ] {
+            assert!(
+                !fn_tables.contains(&forbidden),
+                "unexpected false-positive table {forbidden} in {fn_tables:?}"
+            );
+        }
+
+        let proc_tables: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.kind == Kind::Data && r.from == Some(proc_idx))
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            proc_tables.contains(&"app.order_archive"),
+            "{proc_tables:?}"
+        );
+        assert!(proc_tables.contains(&"app.orders"), "{proc_tables:?}");
+    }
+
+    #[test]
+    fn fixtures_mixed_polyglot_extraction_remains_intact() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/mixed");
+        let mut parsers = Parsers::default();
+
+        let orders_ts = std::fs::read_to_string(root.join("frontend/orders.ts")).unwrap();
+        let ts_facts = parsers.parse(Grammar::TypeScript, &orders_ts).unwrap();
+        assert!(ts_facts.definitions.iter().any(|d| d.name == "fetchOrders"));
+        assert_eq!(ts_facts.imports.len(), 1);
+        assert_eq!(ts_facts.imports[0].path, "./format.js");
+        assert_eq!(ts_facts.imports[0].module_stem(), "format");
+        assert_eq!(
+            ts_facts.imports[0]
+                .bindings
+                .get("formatOrder")
+                .map(String::as_str),
+            Some("formatOrder")
+        );
+        assert!(
+            ts_facts
+                .references
+                .iter()
+                .any(|r| r.kind == Kind::Route && r.name == "/api/orders")
+        );
+
+        let orders_py = std::fs::read_to_string(root.join("backend/orders.py")).unwrap();
+        let py_facts = parsers.parse(Grammar::Python, &orders_py).unwrap();
+        assert!(py_facts.routes.iter().any(|(r, _)| r == "/api/orders"));
+        assert!(
+            py_facts
+                .references
+                .iter()
+                .any(|r| r.kind == Kind::Data && r.name == "purchase_orders")
+        );
+
+        let schema_sql = std::fs::read_to_string(root.join("db/schema.sql")).unwrap();
+        let sql_facts = parsers.parse(Grammar::Sql, &schema_sql).unwrap();
+        assert!(
+            sql_facts
+                .definitions
+                .iter()
+                .any(|d| d.kind == "table" && d.name == "purchase_orders")
+        );
+    }
+
+    #[test]
+    fn fast_path_normalizers_handle_case_insensitive_extensions_and_sql_names() {
+        assert_eq!(Grammar::for_file("App.TSX"), Some(Grammar::Tsx));
+        assert_eq!(Grammar::for_file("Program.CS"), Some(Grammar::CSharp));
+        assert_eq!(Grammar::for_file("schema.SQL"), Some(Grammar::Sql));
+        assert_eq!(Grammar::for_file("archive.UNKNOWNEXTLONG"), None);
+        assert!(matches!(
+            sql_name_cow("app.orders"),
+            Cow::Borrowed("app.orders")
+        ));
+        assert_eq!(sql_name_cow("\"App\".\"Orders\"").as_ref(), "app.orders");
+        assert_eq!(normalize_js_module_stem("./foo/index.tsx"), "foo");
+        assert_eq!(
+            normalize_js_module_stem("@/billing/orders/index"),
+            "billing/orders"
         );
     }
 }
