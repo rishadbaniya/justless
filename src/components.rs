@@ -25,7 +25,8 @@ pub(crate) fn scripts(source: &str, frontmatter: bool) -> (String, bool) {
         }
         if opens_tag(source, start, b"<style") {
             let Some(tag_end) = tag_end(source, start) else {
-                break;
+                at = start + 1;
+                continue;
             };
             let tag = &source[start + "<style".len()..tag_end - 1];
             at = if tag.trim_end().ends_with('/') {
@@ -44,7 +45,8 @@ pub(crate) fn scripts(source: &str, frontmatter: bool) -> (String, bool) {
             continue;
         }
         let Some(tag_end) = tag_end(source, start) else {
-            break;
+            at = start + 1;
+            continue;
         };
         let tag = &source[start + "<script".len()..tag_end - 1];
         if tag.trim_end().ends_with('/') {
@@ -153,16 +155,25 @@ fn fence(source: &str) -> Option<Range<usize>> {
 }
 
 /// The offset just past the `>` that ends the tag starting at `start`,
-/// skipping quoted attribute values.
+/// skipping quoted attribute values (only when preceded by `=`) and aborting
+/// on an unquoted `<` so unclosed text comparisons like `x<y don't` never
+/// swallow a following tag or `<script>` block.
 fn tag_end(source: &str, start: usize) -> Option<usize> {
     let mut quote = None;
+    let mut expect_attr_value = false;
     for (offset, byte) in source.bytes().enumerate().skip(start) {
         match (quote, byte) {
             (Some(open), _) if byte == open => quote = None,
             (Some(_), _) => {}
-            (None, b'"' | b'\'') => quote = Some(byte),
+            (None, b'=') => expect_attr_value = true,
+            (None, b'"' | b'\'') if expect_attr_value => {
+                quote = Some(byte);
+                expect_attr_value = false;
+            }
             (None, b'>') => return Some(offset + 1),
-            _ => {}
+            (None, b'<') if offset > start => return None,
+            (None, b) if b.is_ascii_whitespace() => {}
+            (None, _) => expect_attr_value = false,
         }
     }
     None
@@ -282,6 +293,24 @@ mod tests {
                 "<template><p>{a < b && \"don't\"}</p></template>\n<style>p::before { content: \"<!--\"; }</style>\n<script lang=\"ts\">\nconst afterStyle = 3\n</script>\n",
                 false,
                 vec!["\nconst afterStyle = 3\n"],
+                false,
+            ),
+            (
+                "<template>\n  <p>if x<y don't worry</p>\n</template>\n<script lang=\"ts\">\nconst msg = \"can't break\";\nexport const ok = 4\n</script>\n",
+                false,
+                vec!["\nconst msg = \"can't break\";\nexport const ok = 4\n"],
+                false,
+            ),
+            (
+                "<template><p>if x<y <span title = '<!-- not a comment'>hi</span></p></template>\n<script setup lang=\"ts\" generic=\"T extends Array<string>\">\nexport const ok = 5\n</script>\n",
+                false,
+                vec!["\nexport const ok = 5\n"],
+                false,
+            ),
+            (
+                "<template><p>if x<y <script lang=\"ts\">export const inlineOk = 6</script></p></template>\n",
+                false,
+                vec!["export const inlineOk = 6"],
                 false,
             ),
         ] {

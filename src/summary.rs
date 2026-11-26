@@ -2877,9 +2877,6 @@ impl XcodebuildScan {
             if self.in_failed_commands == Some(stream) && !self.details.failed_commands.is_empty() {
                 self.in_failed_commands = None;
             }
-            if self.in_testing_failed == Some(stream) && !self.details.testing_failed.is_empty() {
-                self.in_testing_failed = None;
-            }
             return;
         }
 
@@ -3193,18 +3190,23 @@ fn parse_xcodebuild_error<'a>(
     }
 
     // Multi-line linker blocks (classic ld64 and Xcode 15/16 ld_prime).
-    let is_ld_symbol_header = |prefix: &str| {
-        starts_with_ignore_ascii_case(trimmed, prefix) && {
-            let tail = &trimmed[prefix.len()..];
-            tail.is_empty()
-                || tail == ":"
-                || starts_with_ignore_ascii_case(tail, " for architecture ")
+    let is_ld_symbol_rest = |rest: &str| {
+        let rest = rest.trim();
+        for prefix in ["undefined symbols", "duplicate symbols"] {
+            if starts_with_ignore_ascii_case(rest, prefix) {
+                let tail = &rest[prefix.len()..];
+                if tail.is_empty()
+                    || tail == ":"
+                    || starts_with_ignore_ascii_case(tail, " for architecture ")
+                {
+                    return true;
+                }
+            }
         }
+        false
     };
     if line.starts_with("Undefined symbols for architecture ")
         || line.starts_with("Duplicate symbols for architecture ")
-        || is_ld_symbol_header("ld: undefined symbols")
-        || is_ld_symbol_header("ld: duplicate symbols")
         || (line.starts_with("duplicate symbol '") && line.ends_with(" in:"))
     {
         return Some((Some(ActiveXcodeKind::LinkerBlock), trimmed, ""));
@@ -3227,6 +3229,7 @@ fn parse_xcodebuild_error<'a>(
     // bundle or binary path rather than `codesign:`).
     if !is_xcodebuild_warning(line, trimmed)
         && !trimmed.starts_with("note: ")
+        && !is_xcodebuild_located_note(line)
         && let Some((target, rest)) = parse_xcodebuild_codesign_error(line)
     {
         return Some((None, target, rest));
@@ -3238,6 +3241,9 @@ fn parse_xcodebuild_error<'a>(
         if tool_base == "ld" {
             if rest.starts_with("warning:") {
                 return None;
+            }
+            if is_ld_symbol_rest(rest) {
+                return Some((Some(ActiveXcodeKind::LinkerBlock), "ld:", rest.trim()));
             }
             if starts_with_ignore_ascii_case(rest, "error:")
                 || rest.starts_with("symbol(s) not found")
@@ -6899,6 +6905,69 @@ Tests: 9, Assertions: 14, Failures: 1.
         assert!(
             crash_report.contains("Early unexpected exit"),
             "{crash_report}"
+        );
+    }
+
+    #[test]
+    fn xcodebuild_full_path_ld_blank_testing_failed_and_located_note_codesign() {
+        let log = concat!(
+            "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld: Undefined symbols:\n",
+            "  _missing_helper, referenced from:\n",
+            "      _main in App.o\n",
+            "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld: Duplicate symbols for architecture arm64:\n",
+            "  _dup_sym in Foo.o\n",
+            "  _dup_sym in Bar.o\n",
+            "/Users/dev/App/Foo.swift:12:5: note: see ': errSecInternalComponent' for details\n",
+            "/Users/dev/App/Foo.swift:14:5: error: signing check failed\n",
+            "/Users/dev/App/Foo.swift:15:5: note: expected ': code object is not signed' hint\n",
+            "Testing failed:\n",
+            "\tTargetA:\n",
+            "\t\tTargetA crashed\n",
+            "\n",
+            "\tTargetB:\n",
+            "\t\tTargetB crashed\n",
+            "\n",
+            "** TEST FAILED **\n",
+        );
+        let summary = parse("xcodebuild", log);
+        let report = summary.render(None, 65).expect("xcodebuild q11 report");
+
+        // Full-path `.../ld: Undefined symbols:` & `Duplicate symbols` preserve indented symbols.
+        assert!(
+            report.contains(
+                "ld: Undefined symbols: _missing_helper, referenced from: _main in App.o [stdout:1-3]"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "ld: Duplicate symbols for architecture arm64: _dup_sym in Foo.o _dup_sym in Bar.o [stdout:4-6]"
+            ),
+            "{report}"
+        );
+        // Located compiler `note:` mentioning codesign markers is NOT falsely promoted to an error.
+        assert_eq!(summary.items.len(), 3, "items: {:?}", summary.items);
+        assert!(
+            !report.contains("errSecInternalComponent"),
+            "located note should not be promoted:\n{report}"
+        );
+        assert!(
+            report
+                .contains("/Users/dev/App/Foo.swift:14:5 error: signing check failed [stdout:8-9]"),
+            "{report}"
+        );
+        // `Testing failed:` survives interior blank lines and omits trailing blank line before banner.
+        assert!(
+            report.contains("Testing failed: [stdout:10-15]"),
+            "{report}"
+        );
+        assert!(report.contains("  TargetA:"), "{report}");
+        assert!(report.contains("  TargetA crashed"), "{report}");
+        assert!(report.contains("  TargetB:"), "{report}");
+        assert!(report.contains("  TargetB crashed"), "{report}");
+        assert!(
+            report.contains("** TEST FAILED ** [stdout:17-17]"),
+            "{report}"
         );
     }
 }

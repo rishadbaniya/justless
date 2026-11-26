@@ -3673,8 +3673,11 @@ fn compare_json_map_hunks(
                         if meta_depth == 1 && !changed && trimmed == "\"hash\": {" {
                             in_meta_hash = true;
                         }
+                        if in_meta_hash && meta_depth >= 2 && delta > 0 {
+                            return None;
+                        }
                         if changed {
-                            if !in_meta_hash || delta != 0 {
+                            if !in_meta_hash || meta_depth != 2 || delta != 0 {
                                 return None;
                             }
                             let obj: serde_json::Map<String, serde_json::Value> =
@@ -6767,6 +6770,73 @@ SPEC CHECKSUMS:
                 .any(|f| f.contains("checksum changed on existing version Firebase/Core 10.24.0")),
             "genuine root checksum tamper must still be flagged: {:?}",
             real_tamper.flags
+        );
+    }
+
+    #[test]
+    fn q11_pipfile_meta_hash_nested_object_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let nested_meta_hash_patch = concat!(
+            "diff --git a/Pipfile.lock b/Pipfile.lock\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/Pipfile.lock\n",
+            "+++ b/Pipfile.lock\n",
+            "@@ -2,8 +2,8 @@\n",
+            "   \"_meta\": {\n",
+            "     \"hash\": {\n",
+            "       \"nested\": {\n",
+            "-        \"sha256\": \"aaa\"\n",
+            "+        \"sha256\": \"bbb\"\n",
+            "       }\n",
+            "     },\n",
+            "   },\n",
+            "@@ -20,8 +20,8 @@\n",
+            "   \"default\": {\n",
+            "     \"requests\": {\n",
+            "       \"hashes\": [\"sha256:111\"],\n",
+            "       \"index\": \"pypi\",\n",
+            "-      \"version\": \"==2.31.0\"\n",
+            "+      \"version\": \"==2.32.0\"\n",
+            "     }\n",
+            "   }\n",
+        );
+        assert!(
+            sections(nested_meta_hash_patch, dir.path()).is_empty(),
+            "nested object inside _meta.hash must fail closed"
+        );
+
+        // Benign control: direct `_meta.hash.sha256` update at depth 2 alongside a package bump still succeeds.
+        let valid_meta_hash_patch = concat!(
+            "diff --git a/Pipfile.lock b/Pipfile.lock\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/Pipfile.lock\n",
+            "+++ b/Pipfile.lock\n",
+            "@@ -2,6 +2,6 @@\n",
+            "   \"_meta\": {\n",
+            "     \"hash\": {\n",
+            "-      \"sha256\": \"aaa\"\n",
+            "+      \"sha256\": \"bbb\"\n",
+            "     },\n",
+            "   },\n",
+            "@@ -20,8 +20,8 @@\n",
+            "   \"default\": {\n",
+            "     \"requests\": {\n",
+            "       \"hashes\": [\"sha256:111\"],\n",
+            "       \"index\": \"pypi\",\n",
+            "-      \"version\": \"==2.31.0\"\n",
+            "+      \"version\": \"==2.32.0\"\n",
+            "     }\n",
+            "   }\n",
+        );
+        let valid_sections = sections(valid_meta_hash_patch, dir.path());
+        assert_eq!(valid_sections.len(), 1);
+        assert!(
+            valid_sections[0]
+                .text()
+                .contains("requests 2.31.0 -> 2.32.0"),
+            "{}",
+            valid_sections[0].text()
         );
     }
 }
