@@ -434,6 +434,7 @@ pub fn execute_shaped(workspace: &Workspace, args: &[OsString], shape: Shape<'_>
         origin: None,
         pieces: &[],
         json_grouping: settings.json_grouping,
+        lossless_only: settings.lossless_only,
         ends_early: false,
     };
     match capture.record(&mut archive, family, status, stdout_preview) {
@@ -618,6 +619,7 @@ pub(crate) fn record_cut(
         origin: Some(origin),
         pieces,
         json_grouping: settings.json_grouping,
+        lossless_only: settings.lossless_only,
         ends_early,
     };
     match capture.record(&mut archive, family, status, None) {
@@ -1468,6 +1470,9 @@ struct Capture<'a> {
     pieces: &'a [RunPiece],
     /// `json_grouping` from the settings.
     json_grouping: bool,
+    /// `lossless_only` from the settings: allow only bijective/lossless views
+    /// and never elide/truncate output lines.
+    lossless_only: bool,
     /// The output can stop in the middle of an item.
     ends_early: bool,
 }
@@ -1516,6 +1521,7 @@ impl Capture<'_> {
             origin,
             pieces,
             json_grouping,
+            lossless_only,
             ends_early,
         } = *self;
         let directory = archive.directory.clone();
@@ -1558,24 +1564,34 @@ impl Capture<'_> {
         if ends_early {
             parser.ends_early();
         }
-        let mut lint = if selection.profile == Some(crate::filters::Profile::Lint) {
+        let mut lint = if lossless_only {
+            None
+        } else if selection.profile == Some(crate::filters::Profile::Lint) {
             Some(crate::lint::Lint::new(&workspace.root))
         } else {
             known_lint_tool(words).map(|tool| crate::lint::Lint::for_tool(&workspace.root, tool))
         };
-        let mut grouping = match selection.profile {
-            Some(crate::filters::Profile::Search) => Some(Grouping::Search(
-                crate::search::Search::new(&workspace.cwd, words),
-            )),
-            Some(crate::filters::Profile::Listing) => {
-                Some(Grouping::Listing(crate::listing::Listing::new(words)))
+        let mut grouping = if lossless_only {
+            (!merged && origin.is_none() && !ends_early)
+                .then(|| crate::gitview::View::select(words, max_bytes))
+                .flatten()
+                .filter(|view| matches!(view, crate::gitview::View::Blame(_)))
+                .map(Grouping::Git)
+        } else {
+            match selection.profile {
+                Some(crate::filters::Profile::Search) => Some(Grouping::Search(
+                    crate::search::Search::new(&workspace.cwd, words),
+                )),
+                Some(crate::filters::Profile::Listing) => {
+                    Some(Grouping::Listing(crate::listing::Listing::new(words)))
+                }
+                // A joined stderr, output another program cut or recorded, or a
+                // stream cut short would make the counts of a log or status wrong.
+                None if !merged && origin.is_none() && !ends_early => {
+                    crate::gitview::View::select(words, max_bytes).map(Grouping::Git)
+                }
+                _ => None,
             }
-            // A joined stderr, output another program cut or recorded, or a
-            // stream cut short would make the counts of a log or status wrong.
-            None if !merged && origin.is_none() && !ends_early => {
-                crate::gitview::View::select(words, max_bytes).map(Grouping::Git)
-            }
-            _ => None,
         };
         let mut locations = Locations::default();
         let mut previews = Vec::new();
@@ -1600,6 +1616,7 @@ impl Capture<'_> {
                 lengths[index],
                 stream,
                 max_bytes,
+                lossless_only,
                 redactor,
                 &mut run,
                 &mut Observers {
@@ -1616,7 +1633,7 @@ impl Capture<'_> {
             // than the footer that then names the run.
             let preview = match std::str::from_utf8(&preview)
                 .ok()
-                .filter(|_| direct && fits && !(json && index == 0))
+                .filter(|_| !lossless_only && direct && fits && !(json && index == 0))
                 .and_then(|text| crate::floor::compact_stream(text, &workspace.root, stream.name()))
             {
                 Some(compact) if compact.len() + 64 < preview.len() => compact.into_bytes(),
@@ -1699,10 +1716,21 @@ impl Capture<'_> {
                     .finish(&run.family, max_bytes, previous, true)
                     .map(|(groups, summary)| (groups, Some(summary))),
                 // Output that fits takes the path it would take without one.
-                Grouping::Git(view) => (!stdout_fits)
-                    .then(|| view.finish(max_bytes.min(previews[0].1.len().saturating_sub(1))))
-                    .flatten()
-                    .map(|view| (view, None)),
+                // Under `lossless_only`, only `git blame` reaches this arm and
+                // passing `usize::MAX` forces the full lossless table with zero
+                // elided lines.
+                Grouping::Git(view) => {
+                    if lossless_only {
+                        view.finish(usize::MAX).map(|view| (view, None))
+                    } else {
+                        (!stdout_fits)
+                            .then(|| {
+                                view.finish(max_bytes.min(previews[0].1.len().saturating_sub(1)))
+                            })
+                            .flatten()
+                            .map(|view| (view, None))
+                    }
+                }
             }
         });
         if let Some((_, Some(summary))) = &grouped {
@@ -1736,14 +1764,17 @@ impl Capture<'_> {
                 }
         };
         // The Cargo.lock sections of a patch, described by their dependency changes.
-        let locks = (!merged && run.produced_bytes.is_empty() && crate::lockdiff::applies(words))
-            .then(|| read_text(&archive.readers[0], lengths[0], crate::lockdiff::LIMIT))
-            .flatten()
-            .map(|patch| {
-                let sections = crate::lockdiff::sections(&patch, &workspace.cwd);
-                (patch, sections)
-            })
-            .filter(|(_, sections)| !sections.is_empty());
+        let locks = (!lossless_only
+            && !merged
+            && run.produced_bytes.is_empty()
+            && crate::lockdiff::applies(words))
+        .then(|| read_text(&archive.readers[0], lengths[0], crate::lockdiff::LIMIT))
+        .flatten()
+        .map(|patch| {
+            let sections = crate::lockdiff::sections(&patch, &workspace.cwd);
+            (patch, sections)
+        })
+        .filter(|(_, sections)| !sections.is_empty());
         // The patch with those sections described instead, when it fits and is
         // smaller than the preview. A rerun keeps its comparison with the earlier run.
         let lock_view = locks
@@ -1766,7 +1797,8 @@ impl Capture<'_> {
                         .1
                         .windows("[output clipped.".len())
                         .any(|w| w == "[output clipped.".as_bytes())));
-        let polyglot_report = if run.produced_bytes.is_empty()
+        let polyglot_report = if !lossless_only
+            && run.produced_bytes.is_empty()
             && selection.profile.is_none()
             && let Some(runner) = crate::polyglot_tests::runner_for_words(words)
             && (!merged
@@ -1804,7 +1836,72 @@ impl Capture<'_> {
                 .map(crate::polyglot_tests::FailureItem::to_summary_item)
                 .collect();
         }
-        if let Some(prior) = &previous
+        if lossless_only {
+            let stdout_over_budget =
+                previews[0].1.len() > max_bytes || lengths[0] > max_bytes as u64;
+            if let Some((blame_view, None)) = grouped
+                && !blame_view.is_empty()
+                && (stdout_over_budget && blame_view.len() < previews[0].1.len()
+                    || blame_view.len() + 64 < previews[0].1.len())
+            {
+                previews[0].1 = blame_view.into_bytes();
+                report = true;
+                run.replaced = Some("stdout".to_owned());
+            } else if !merged
+                && selection.profile.is_none()
+                && run.produced_bytes.is_empty()
+                && origin.is_none_or(|o| o.outline.is_none())
+                && (direct || stdout_over_budget)
+                && let Some(view) = json_view(
+                    &archive.readers[0],
+                    lengths[0],
+                    redactor.filter(|_| secrets[0] > 0),
+                    None,
+                    json_grouping,
+                )
+                && (stdout_over_budget && view.len() < previews[0].1.len()
+                    || view.len() + 64 < previews[0].1.len())
+            {
+                previews[0].1 = view;
+                run.replaced = Some("stdout".to_owned());
+            } else if !merged
+                && selection.profile.is_none()
+                && run.produced_bytes.is_empty()
+                && origin.is_none_or(|o| o.outline.is_none())
+                && !prints_file
+                && (direct || stdout_over_budget)
+                && let Some(view) = table_view(
+                    &archive.readers[0],
+                    lengths[0],
+                    redactor,
+                    secrets[0] > 0,
+                    usize::MAX,
+                )
+                && (stdout_over_budget && view.len() < previews[0].1.len()
+                    || view.len() + 64 < previews[0].1.len())
+            {
+                previews[0].1 = view.into_bytes();
+                run.replaced = Some("stdout".to_owned());
+            } else if !merged
+                && selection.profile.is_none()
+                && run.produced_bytes.is_empty()
+                && origin.is_none_or(|o| o.outline.is_none())
+                && !prints_file
+                && (direct || stdout_over_budget)
+                && let Some(view) = csv_view(
+                    &archive.readers[0],
+                    lengths[0],
+                    redactor,
+                    secrets[0] > 0,
+                    usize::MAX,
+                )
+                && (stdout_over_budget && view.len() < previews[0].1.len()
+                    || view.len() + 64 < previews[0].1.len())
+            {
+                previews[0].1 = view.into_bytes();
+                run.replaced = Some("stdout".to_owned());
+            }
+        } else if let Some(prior) = &previous
             && run.unchanged
         {
             if shown > 64 {
@@ -1996,7 +2093,7 @@ impl Capture<'_> {
                 &archive.readers[0],
                 lengths[0],
                 redactor.filter(|_| secrets[0] > 0),
-                max_bytes,
+                Some(max_bytes),
                 json_grouping,
             )
             && (!stdout_fits || view.len() + 64 < previews[0].1.len())
@@ -2047,7 +2144,8 @@ impl Capture<'_> {
         }
         if let Some(shape_stdout) = stdout_preview
             && !run.unchanged
-            && !stdout_fits
+            && (!stdout_fits
+                || (lossless_only && run.replaced.is_none() && previews[0].1.len() > max_bytes))
         {
             // The shaper cuts lines and windows out of stdout, and a cut through a
             // secret can leave a part that no longer looks like one. When stdout held
@@ -2066,7 +2164,10 @@ impl Capture<'_> {
                 shape_stdout(&path, &run.id)
             });
             match shaped {
-                Ok(Some(shaped)) if shaped.len() <= max_bytes => {
+                Ok(Some(shaped))
+                    if shaped.len() <= max_bytes
+                        || (lossless_only && shaped.len() < previews[0].1.len()) =>
+                {
                     previews[0].1 = shaped;
                     if run.replaced.is_none() {
                         run.replaced = Some("stdout".to_owned());
@@ -2609,6 +2710,26 @@ fn table_view(
     crate::tableview::format(&text, max_bytes)
 }
 
+/// Format unambiguous RFC 4180 CSV or TSV output via `csvview`.
+fn csv_view(
+    reader: &File,
+    length: u64,
+    redactor: Option<&crate::redact::Redactor>,
+    has_secrets: bool,
+    max_bytes: usize,
+) -> Option<String> {
+    let limit = crate::csvview::LIMIT as u64;
+    if length == 0 || length > limit {
+        return None;
+    }
+    let text = read_text(reader, length, limit)?;
+    let text = match redactor.filter(|_| has_secrets) {
+        Some(redactor) => redactor.text(&text).into_owned(),
+        None => text,
+    };
+    crate::csvview::format(&text, max_bytes)
+}
+
 /// Match the 12 Wave-6 ecosystem linters routed via `known::ROUTED` (so they
 /// keep non-approvable hook behavior while still receiving grouped rule reports
 /// and clean summaries in `capture`).
@@ -2683,14 +2804,14 @@ fn known_lint_tool(words: &[&str]) -> Option<crate::lint::Tool> {
     }
 }
 
-/// Stdout shown as JSON tables or compact JSON, clipped at whole lines to
-/// `max_bytes`, when a view is smaller and decodes to the same data. See
-/// `jsonview`.
+/// Stdout shown as JSON tables or compact JSON, optionally clipped at whole
+/// lines to `max_bytes` (or unclipped bijective lossless when `max_bytes` is
+/// `None`), when a view is smaller and decodes to the same data. See `jsonview`.
 fn json_view(
     mut file: &File,
     length: u64,
     redactor: Option<&crate::redact::Redactor>,
-    max_bytes: usize,
+    max_bytes: Option<usize>,
     group: bool,
 ) -> Option<Vec<u8>> {
     if length > crate::jsonview::LIMIT as u64 {
@@ -2720,11 +2841,14 @@ fn json_view(
     if text.contains("\"compiler-message\"") {
         return None;
     }
-    // The smallest view that fits or can be cut: a compact document on one line
-    // longer than the budget cannot be, and the tables then still can.
-    crate::jsonview::views(&text, group)
-        .into_iter()
-        .find_map(|view| clip_view(view, max_bytes))
+    let views = crate::jsonview::views(&text, group);
+    match max_bytes {
+        // The smallest view that fits or can be cut: a compact document on one line
+        // longer than the budget cannot be, and the tables then still can.
+        Some(limit) => views.into_iter().find_map(|view| clip_view(view, limit)),
+        // Strict lossless mode: pick the smallest unclipped bijective view.
+        None => views.into_iter().next().map(String::into_bytes),
+    }
 }
 
 /// A view cut at a whole line to `max_bytes`, with a marker, unless that leaves
@@ -2825,6 +2949,7 @@ fn scan(
     length: u64,
     stream: Stream,
     max_bytes: usize,
+    lossless_only: bool,
     redactor: Option<&crate::redact::Redactor>,
     run: &mut Run,
     observers: &mut Observers,
@@ -2839,7 +2964,7 @@ fn scan(
     const DIAGNOSTICS: &[u8] = b"\n[diagnostics]\n";
     const CLIPPED: &[u8] = b"\n[output clipped. Full log retained.]\n";
     const PROGRESS_RESERVE: usize = 48;
-    let mut truncated = length > max_bytes as u64;
+    let mut truncated = !lossless_only && length > max_bytes as u64;
     // Redaction can bring output under the budget, as when a private key body
     // collapses to one marker, so keep the redacted stream while it still fits.
     let mut whole = (truncated && redactor.is_some()).then(Vec::new);
@@ -3110,7 +3235,8 @@ fn scan(
     // A tool's built-in progress lines only ever shorten a preview: when the
     // other lines still do not fit, the ordinary preview, which puts failures
     // before warnings (and now omits progress lines from head/tail too), is shown.
-    if let Some((filtered, whole)) = filter.finish()
+    if !lossless_only
+        && let Some((filtered, whole)) = filter.finish()
         && (filtered.len() < preview.len() || truncated && filtered.len() <= max_bytes)
         && (whole || !selection.built_in)
     {
@@ -4825,6 +4951,7 @@ done"#,
             origin: None,
             pieces: &[],
             json_grouping: settings.json_grouping,
+            lossless_only: settings.lossless_only,
             ends_early: false,
         };
         let ((previews, report), _footer, run) =
@@ -5051,5 +5178,102 @@ done"#,
         ] {
             assert_eq!(known_lint_tool(words), None, "expected None for {words:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lossless_only_preserves_raw_logs_while_compacting_bijective_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = test_workspace(dir.path());
+        fs::write(ws.root.join(".justless.toml"), "lossless_only = true\n").unwrap();
+        let settings = ws.settings().unwrap();
+        assert!(settings.lossless_only);
+
+        // 1. Oversized lossy logs (> max_bytes) stay 100% raw & untruncated while archiving cleanly.
+        let mut raw_logs = String::new();
+        for i in 0..120 {
+            raw_logs.push_str(&format!(
+                "2026-11-26T10:00:{:02}Z INFO worker=api req_id={i} status=200 ok\n",
+                i % 60
+            ));
+        }
+        assert!(raw_logs.len() > 2048);
+        let origin_logs = Origin {
+            command: "docker logs api".into(),
+            label: "docker logs".into(),
+            note: String::new(),
+            outline: None,
+        };
+        let log_args = vec![
+            OsString::from("docker"),
+            OsString::from("logs"),
+            OsString::from("api"),
+        ];
+        let rec_logs = record_cut(
+            &ws,
+            &log_args,
+            raw_logs.as_bytes(),
+            0,
+            1024,
+            "lossless-test",
+            (&origin_logs, &[], false),
+        )
+        .unwrap();
+        assert_eq!(rec_logs.previews[0].1, raw_logs.as_bytes());
+        assert_eq!(rec_logs.run.replaced, None);
+        assert!(
+            ws.state
+                .join("runs")
+                .join(&rec_logs.run.id)
+                .join("stdout")
+                .is_file()
+        );
+
+        // 2. Bijective JSON still compacts losslessly (even when the bijective view exceeds max_bytes).
+        let mut rows = String::from("[");
+        for i in 0..80 {
+            if i > 0 {
+                rows.push(',');
+            }
+            rows.push_str(&format!(
+                "{{\"id\":{i},\"service\":\"api-{i}\",\"status\":\"running\",\"region\":\"us-east-1\"}}"
+            ));
+        }
+        rows.push_str("]\n");
+        let origin_json = Origin {
+            command: "gh api /services".into(),
+            label: "gh api".into(),
+            note: String::new(),
+            outline: None,
+        };
+        let json_args = vec![
+            OsString::from("gh"),
+            OsString::from("api"),
+            OsString::from("/services"),
+        ];
+        let rec_json = record_cut(
+            &ws,
+            &json_args,
+            rows.as_bytes(),
+            0,
+            1024,
+            "lossless-test",
+            (&origin_json, &[], false),
+        )
+        .unwrap();
+        let shown = String::from_utf8(rec_json.previews[0].1.clone()).unwrap();
+        assert_eq!(rec_json.run.replaced.as_deref(), Some("stdout"));
+        assert!(
+            shown.len() < rows.len(),
+            "bijective JSON view must shrink output"
+        );
+        assert!(
+            !shown.contains("more lines of this view"),
+            "lossless_only must never clip bijective JSON:\n{shown}"
+        );
+        assert!(
+            shown.contains("api-0") && shown.contains("api-79"),
+            "{shown}"
+        );
     }
 }

@@ -385,7 +385,9 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
     let session = std::env::var("JUSTLESS_SESSION").unwrap_or_else(|_| "terminal".into());
     let justless = workspace.justless();
     let workspace_root = workspace.root.clone();
-    let json_grouping = workspace.settings()?.json_grouping;
+    let settings = workspace.settings()?;
+    let json_grouping = settings.json_grouping;
+    let lossless_only = settings.lossless_only;
     let intent_owned = intent.map(str::to_owned);
     let status = capture::execute_shaped(
         workspace,
@@ -408,7 +410,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
             // workspace-aware `stacktrace` collapsing, structured `logview` folding,
             // dedup-aware `--intent` ranking, or whole-line `focus::outline`.
             stdout_preview: Some(Box::new(move |stdout: &Path, id: &str| {
-                shape_stdout(
+                shape_stdout_with_mode(
                     stdout,
                     id,
                     max_bytes,
@@ -416,6 +418,7 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<i32> {
                     &workspace_root,
                     &justless,
                     json_grouping,
+                    lossless_only,
                 )
             })),
             spawn: Some(Box::new(spawn)),
@@ -863,6 +866,7 @@ enum ShapedText {
 /// deduplication. Without `--intent`, tries lossless deep-schema `jsonview` (routing
 /// NDJSON structured logs to `logview` first), structured `logview` folding, and
 /// workspace-aware `stacktrace` collapsing before falling back to `focus::outline`.
+#[cfg(test)]
 fn shape_stdout(
     stdout: &Path,
     run_id: &str,
@@ -872,7 +876,30 @@ fn shape_stdout(
     justless: &str,
     json_grouping: bool,
 ) -> Result<Option<Vec<u8>>> {
-    if let Some(intent) = intent {
+    shape_stdout_with_mode(
+        stdout,
+        run_id,
+        max_bytes,
+        intent,
+        workspace_root,
+        justless,
+        json_grouping,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shape_stdout_with_mode(
+    stdout: &Path,
+    run_id: &str,
+    max_bytes: usize,
+    intent: Option<&str>,
+    workspace_root: &Path,
+    justless: &str,
+    json_grouping: bool,
+    lossless_only: bool,
+) -> Result<Option<Vec<u8>>> {
+    if !lossless_only && let Some(intent) = intent {
         return intent_preview(stdout, intent, max_bytes, justless, run_id)
             .map(Some)
             .context("could not rank stdout for --intent");
@@ -885,29 +912,37 @@ fn shape_stdout(
         if can_read {
             let bytes = fs::read(stdout)?;
             if let Ok(text) = String::from_utf8(bytes) {
-                match shape_text_preview(
+                match shape_text_preview_with_mode(
                     &text,
                     max_bytes,
                     workspace_root,
                     "stdout",
                     json_grouping,
                     None,
+                    lossless_only,
                 ) {
-                    ShapedText::Ready(preview) if preview.len() <= max_bytes => {
+                    ShapedText::Ready(preview)
+                        if preview.len() <= max_bytes
+                            || (lossless_only && preview.len() < text.len()) =>
+                    {
                         return Ok(Some(preview));
                     }
-                    ShapedText::UseCaptureStacktrace => return Ok(None),
-                    ShapedText::OutlineCollapsed(collapsed) => {
+                    ShapedText::UseCaptureStacktrace if !lossless_only => return Ok(None),
+                    ShapedText::OutlineCollapsed(collapsed) if !lossless_only => {
                         if let Some(outlined) =
                             outline_collapsed_text(&collapsed, max_bytes, justless, run_id)
                         {
                             return Ok(Some(outlined));
                         }
                     }
-                    ShapedText::Ready(_) | ShapedText::Fallback => {}
+                    _ => {}
                 }
             }
         }
+    }
+
+    if lossless_only {
+        return Ok(None);
     }
 
     crate::focus::outline(stdout, max_bytes, justless, run_id).context("could not outline stdout")
@@ -916,6 +951,7 @@ fn shape_stdout(
 /// Shapes UTF-8 stream text using the Wave-1/Wave-2 engines (`jsonview`,
 /// `tableview`, `csvview`, `logview`, `stacktrace`), applying `redactor` first
 /// whenever one is provided.
+#[cfg(test)]
 fn shape_text_preview(
     raw: &str,
     max_bytes: usize,
@@ -923,6 +959,26 @@ fn shape_text_preview(
     stream: &str,
     json_grouping: bool,
     redactor: Option<&crate::redact::Redactor>,
+) -> ShapedText {
+    shape_text_preview_with_mode(
+        raw,
+        max_bytes,
+        workspace_root,
+        stream,
+        json_grouping,
+        redactor,
+        false,
+    )
+}
+
+fn shape_text_preview_with_mode(
+    raw: &str,
+    max_bytes: usize,
+    workspace_root: &Path,
+    stream: &str,
+    json_grouping: bool,
+    redactor: Option<&crate::redact::Redactor>,
+    lossless_only: bool,
 ) -> ShapedText {
     let text = match redactor {
         Some(redactor) => redactor.text(raw),
@@ -938,32 +994,42 @@ fn shape_text_preview(
     if json_candidate {
         // NDJSON structured logs fold routine lines into templates and keep 100% of
         // errors/warnings visible instead of clipping mid-table.
-        if text.len() <= TEXT_SHAPE_LIMIT as usize
+        if !lossless_only
+            && text.len() <= TEXT_SHAPE_LIMIT as usize
             && looks_like_json_logs(text)
             && let Some(folded) = format_logview(stream, text, max_bytes)
         {
             return ShapedText::Ready(folded.into_bytes());
         }
-        if let Some(view) = shape_json_view(text, max_bytes, json_grouping) {
+        let view = if lossless_only {
+            crate::jsonview::views(text, json_grouping)
+                .into_iter()
+                .next()
+                .map(String::into_bytes)
+        } else {
+            shape_json_view(text, max_bytes, json_grouping)
+        };
+        if let Some(view) = view {
             return ShapedText::Ready(view);
         }
     }
 
+    let view_budget = if lossless_only { usize::MAX } else { max_bytes };
     if stream == "stdout"
         && text.len() <= crate::tableview::LIMIT
-        && let Some(view) = crate::tableview::format(text, max_bytes)
+        && let Some(view) = crate::tableview::format(text, view_budget)
     {
         return ShapedText::Ready(view.into_bytes());
     }
 
     if stream == "stdout"
         && text.len() <= crate::csvview::LIMIT
-        && let Some(view) = crate::csvview::format(text, max_bytes)
+        && let Some(view) = crate::csvview::format(text, view_budget)
     {
         return ShapedText::Ready(view.into_bytes());
     }
 
-    if text.len() > TEXT_SHAPE_LIMIT as usize {
+    if lossless_only || text.len() > TEXT_SHAPE_LIMIT as usize {
         return ShapedText::Fallback;
     }
 
@@ -3636,5 +3702,53 @@ done
         let replayed_slice =
             crate::capture::log(&run_dir, &[crate::capture::Stream::Stdout], 10, 997).unwrap();
         assert_eq!(replayed_slice as usize, expected_omitted_bytes);
+    }
+
+    #[test]
+    fn lossless_only_mode_skips_lossy_logs_and_outline_while_keeping_bijective_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // 1. Structured logs are lossy -> Fallback in lossless_only mode, and shape_stdout returns None.
+        let mut logs = String::new();
+        for i in 0..80 {
+            logs.push_str(&format!(
+                "2026-11-26T10:00:{:02}Z INFO service=api req={i} ok\n",
+                i % 60
+            ));
+        }
+        assert!(matches!(
+            shape_text_preview_with_mode(&logs, 1024, root, "stdout", false, None, true),
+            ShapedText::Fallback
+        ));
+        let log_file = root.join("logs.out");
+        fs::write(&log_file, &logs).unwrap();
+        assert!(
+            shape_stdout_with_mode(
+                &log_file, "run-1", 1024, None, root, "justless", false, true
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        // 2. Bijective JSON compacts without clipping even when budget is tiny.
+        let mut rows = String::from("[");
+        for i in 0..60 {
+            if i > 0 {
+                rows.push(',');
+            }
+            rows.push_str(&format!(
+                "{{\"id\":{i},\"service\":\"svc-{i}\",\"env\":\"prod\",\"region\":\"us-east-1\"}}"
+            ));
+        }
+        rows.push(']');
+        let json_shaped =
+            match shape_text_preview_with_mode(&rows, 512, root, "stdout", false, None, true) {
+                ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+                _ => panic!("expected bijective jsonview in lossless_only mode"),
+            };
+        assert!(json_shaped.len() < rows.len());
+        assert!(!json_shaped.contains("more lines of this view"));
+        assert!(json_shaped.contains("svc-0") && json_shaped.contains("svc-59"));
     }
 }

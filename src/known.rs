@@ -158,6 +158,43 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     (&["bazel", "test"], &[]),
     (&["zig", "build"], &[]),
     (&["zig", "test"], &[]),
+    // Dart and Flutter
+    (
+        &["dart", "analyze"],
+        &["--format", "--write", "--machine", "--watch", "-w"],
+    ),
+    (
+        &["flutter", "analyze"],
+        &["--format", "--write", "--machine", "--watch", "-w"],
+    ),
+    (
+        &["dart", "test"],
+        &[
+            "--machine",
+            "--start-paused",
+            "--pause-after-load",
+            "-r",
+            "--reporter",
+        ],
+    ),
+    (
+        &["flutter", "test"],
+        &[
+            "--machine",
+            "--start-paused",
+            "--pause-after-load",
+            "-r",
+            "--reporter",
+        ],
+    ),
+    (
+        &["dart", "pub", "deps"],
+        &["--json", "--executables", "--style", "-s", "-h", "--help"],
+    ),
+    (
+        &["flutter", "pub", "deps"],
+        &["--json", "--executables", "--style", "-s", "-h", "--help"],
+    ),
     (&["xcodebuild"], &[]),
     (&["trunk", "build"], &[]),
     (&["pio", "run"], &["-t", "--target"]),
@@ -1068,6 +1105,66 @@ mod tests {
             assert!(
                 !omitted(cmd, "Plan: 1 to add, 0 to change, 0 to destroy."),
                 "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn dart_and_flutter_routing_allows_display_checks_and_rejects_mutating_or_machine_modes() {
+        for allowed in [
+            "dart analyze",
+            "dart analyze lib/",
+            "flutter analyze",
+            "flutter analyze --no-pub",
+            "dart test",
+            "dart test test/calc_test.dart",
+            "flutter test",
+            "flutter test test/widget_test.dart",
+            "dart pub deps",
+            "dart pub deps --no-dev",
+            "flutter pub deps",
+            "flutter pub deps --no-dev",
+        ] {
+            let words: Vec<&str> = allowed.split(' ').collect();
+            assert!(routes(&words), "expected routed: {allowed}");
+            assert!(
+                crate::agents::supported_words(&words),
+                "expected supported: {allowed}"
+            );
+            assert!(!approvable(&words), "must never auto-approve: {allowed}");
+        }
+
+        for rejected in [
+            "dart analyze --format json",
+            "dart analyze --format=machine",
+            "dart analyze --write report.txt",
+            "dart analyze --machine",
+            "dart analyze --watch",
+            "flutter analyze -w",
+            "flutter analyze --write=out.txt",
+            "dart test --machine",
+            "dart test --start-paused",
+            "dart test --pause-after-load",
+            "dart test -r json",
+            "flutter test --reporter expanded",
+            "dart pub deps --json",
+            "dart pub deps --executables",
+            "dart pub deps --style compact",
+            "dart pub deps -s list",
+            "dart pub deps --help",
+            "flutter pub deps --json",
+            "flutter pub deps -h",
+            "dart pub publish",
+            "dart pub add http",
+            "flutter pub add http",
+            "flutter build apk",
+            "flutter run",
+        ] {
+            let words: Vec<&str> = rejected.split(' ').collect();
+            assert!(!routes(&words), "must not route: {rejected}");
+            assert!(
+                !crate::agents::supported_words(&words),
+                "must stay as written: {rejected}"
             );
         }
     }

@@ -2497,7 +2497,7 @@ fn scan_sql_dollar_routines(source: &str) -> Vec<SqlDollarRoutine> {
             continue;
         }
         let Some((word, next)) = read_sql_word(source, i) else {
-            i += 1;
+            i += source[i..].chars().next().map_or(1, char::len_utf8);
             continue;
         };
         if !word.eq_ignore_ascii_case("CREATE") {
@@ -2596,7 +2596,7 @@ fn scan_sql_dollar_routines(source: &str) -> Vec<SqlDollarRoutine> {
                     if let Some((_, w_end)) = read_sql_word(source, scan) {
                         scan = w_end;
                     } else {
-                        scan += 1;
+                        scan += source[scan..].chars().next().map_or(1, char::len_utf8);
                     }
                 }
             }
@@ -2641,7 +2641,7 @@ fn scan_sql_dollar_routines(source: &str) -> Vec<SqlDollarRoutine> {
                 tail = w_end;
                 last_end = w_end;
             } else {
-                tail += 1;
+                tail += source[tail..].chars().next().map_or(1, char::len_utf8);
                 last_end = tail;
             }
         }
@@ -2913,20 +2913,25 @@ fn tokenize_sql_body(body: &str) -> Vec<SqlTok<'_>> {
             i = end;
             continue;
         }
-        let kind = match b {
-            b'.' => SqlTokKind::Dot,
-            b'(' => SqlTokKind::LParen,
-            b')' => SqlTokKind::RParen,
-            b',' => SqlTokKind::Comma,
-            b';' => SqlTokKind::Semi,
-            _ => SqlTokKind::Other,
+        let step = body[i..].chars().next().map_or(1, char::len_utf8);
+        let kind = if step == 1 {
+            match b {
+                b'.' => SqlTokKind::Dot,
+                b'(' => SqlTokKind::LParen,
+                b')' => SqlTokKind::RParen,
+                b',' => SqlTokKind::Comma,
+                b';' => SqlTokKind::Semi,
+                _ => SqlTokKind::Other,
+            }
+        } else {
+            SqlTokKind::Other
         };
         tokens.push(SqlTok {
             kind,
-            text: &body[i..i + 1],
+            text: &body[i..i + step],
             line_offset,
         });
-        i += 1;
+        i += step;
     }
     tokens
 }
@@ -4087,5 +4092,32 @@ mod tests {
             normalize_js_module_stem("@/billing/orders/index"),
             "billing/orders"
         );
+    }
+
+    #[test]
+    fn sql_dollar_quoted_body_handles_non_ascii_utf8_identifiers_and_punctuation() {
+        let mut parsers = Parsers::default();
+        let sql = concat!(
+            "CREATE OR REPLACE FUNCTION app.sync_café(p_note text) RETURNS void AS $$\n",
+            "BEGIN\n",
+            "  SELECT café\u{00a0}— «€» FROM app.orders;\n",
+            "  INSERT INTO app.audit_log(über_col) VALUES (café);\n",
+            "END;\n",
+            "$$ LANGUAGE plpgsql;\n",
+        );
+        let facts = parsers.parse(Grammar::Sql, sql).unwrap();
+        let fn_idx = facts
+            .definitions
+            .iter()
+            .position(|d| d.kind == "function" && d.name.starts_with("app.sync_caf"))
+            .expect("dollar-quoted routine should be extracted without panicking");
+        let tables: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.kind == Kind::Data && r.from == Some(fn_idx))
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(tables.contains(&"app.orders"), "{tables:?}");
+        assert!(tables.contains(&"app.audit_log"), "{tables:?}");
     }
 }

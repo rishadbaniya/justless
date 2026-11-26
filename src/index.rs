@@ -13,7 +13,7 @@ use crate::polyglot::{self, Grammar, Parsers};
 use crate::rust_syntax::{self, Import, Kind, Reference, Syntax};
 use crate::workspace::{Location, Workspace, display_path, lock_state};
 
-pub(crate) const VERSION: u32 = 10;
+pub(crate) const VERSION: u32 = 11;
 
 #[derive(Default, Serialize, Deserialize)]
 struct Cache {
@@ -228,7 +228,18 @@ impl Index {
             return Ok(index);
         }
 
-        let (mut cache, migrated) = load_raw_cache(bin_bytes.as_deref(), &json_path)?;
+        let (mut cache, migrated) = if bin_bytes.is_none()
+            && !bin_path.exists()
+            && !json_path.exists()
+            && let Some(shared_seed) = read_worktree_seed_cache(workspace)
+        {
+            // Seed from the primary checkout's `.justless/index.bin` read-only;
+            // every file is still checked against this worktree's own stamps/digests,
+            // and the refreshed cache is written only to this worktree's `state`.
+            (shared_seed, true)
+        } else {
+            load_raw_cache(bin_bytes.as_deref(), &json_path)?
+        };
         let rebuild = cache.version != VERSION;
         if rebuild {
             cache = Cache {
@@ -2299,6 +2310,25 @@ fn try_fast_open(
     })
 }
 
+/// Reads a valid raw parsed-file `Cache` from the primary checkout's
+/// `.justless/index.bin` when running in a linked worktree without a local
+/// cache yet. Fails open (`None`) on any missing, symlinked, incompatible, or
+/// corrupt shared cache, and never mutates the shared directory.
+fn read_worktree_seed_cache(workspace: &Workspace) -> Option<Cache> {
+    let shared_dir = workspace.shared_worktree_state_dir()?;
+    let shared_bin = shared_dir.join("index.bin");
+    if !fs::symlink_metadata(&shared_bin).is_ok_and(|meta| meta.is_file()) {
+        return None;
+    }
+    let bytes = fs::read(&shared_bin).ok()?;
+    let sections = binary::split_sections(&bytes).ok()?;
+    if sections.version != VERSION {
+        return None;
+    }
+    let cache = binary::decode_raw_cache(sections.raw).ok()?;
+    (cache.version == VERSION).then_some(cache)
+}
+
 /// Loads the raw parsed-file `Cache` from Section 2 of `.justless/index.bin`,
 /// falling back to a legacy `.justless/index.json` when present. Returns
 /// `(cache, migrated)` where `migrated` is true whenever `.justless/index.bin`
@@ -3966,5 +3996,99 @@ mod tests {
         assert!(
             fs::metadata(ws.state.join("index.json")).unwrap().len() < legacy_json.len() as u64
         );
+    }
+
+    #[test]
+    fn linked_worktree_seeds_warm_cache_read_only_and_writes_only_local_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let primary = base.join("primary");
+        let worktree = base.join("agent-wt");
+        fs::create_dir_all(primary.join("src")).unwrap();
+
+        let git = |cwd: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        let cargo_toml = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        let shared_rs = "pub fn stable() -> u32 { 42 }\n";
+        let primary_main = "mod shared;\npub fn run() -> u32 { shared::stable() }\n";
+        let worktree_main = "mod shared;\npub fn run() -> u32 { shared::stable() + 1 }\n";
+
+        fs::write(primary.join("Cargo.toml"), cargo_toml).unwrap();
+        fs::write(primary.join("src/shared.rs"), shared_rs).unwrap();
+        fs::write(primary.join("src/lib.rs"), primary_main).unwrap();
+
+        git(&primary, &["init", "-q"]);
+        git(&primary, &["add", "."]);
+        git(
+            &primary,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+        );
+        git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "wt-seed",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        fs::write(worktree.join("src/lib.rs"), worktree_main).unwrap();
+
+        let primary_ws = test_workspace(&primary);
+        let primary_idx = Index::open(&primary_ws).unwrap();
+        assert_eq!(primary_idx.refresh.parsed, 2);
+        let primary_bin_before = fs::read(primary_ws.state.join("index.bin")).unwrap();
+        let primary_json_before = fs::read(primary_ws.state.join("index.json")).unwrap();
+
+        // First open in linked worktree has no local index.bin yet: it seeds
+        // `src/shared.rs` from primary (reused via digest!) and parses only the
+        // modified `src/lib.rs`, writing only to `worktree/.justless/`.
+        let wt_ws = test_workspace(&worktree);
+        assert!(wt_ws.is_linked_worktree());
+        assert_eq!(
+            wt_ws.shared_worktree_state_dir(),
+            Some(primary_ws.state.clone())
+        );
+        assert!(!wt_ws.state.join("index.bin").exists());
+        let wt_idx = Index::open(&wt_ws).unwrap();
+        assert_eq!(wt_idx.refresh.reused, 1, "unchanged file should reuse seed");
+        assert_eq!(wt_idx.refresh.parsed, 1, "modified file should reparse");
+        assert!(wt_ws.state.join("index.bin").is_file());
+        assert!(wt_ws.state.join("index.json").is_file());
+        assert_eq!(
+            fs::read(primary_ws.state.join("index.bin")).unwrap(),
+            primary_bin_before,
+            "primary index.bin must never be mutated"
+        );
+        assert_eq!(
+            fs::read(primary_ws.state.join("index.json")).unwrap(),
+            primary_json_before,
+            "primary index.json must never be mutated"
+        );
+
+        // Subsequent open in the worktree uses its own local fast path.
+        let wt_warm = Index::open(&wt_ws).unwrap();
+        assert_eq!(wt_warm.refresh.parsed, 0);
+        assert_eq!(wt_warm.refresh.reused, 2);
     }
 }

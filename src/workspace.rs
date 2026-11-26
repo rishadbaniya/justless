@@ -158,7 +158,6 @@ pub struct Settings {
     pub global_hooks: bool,
     /// Restrict output replacement strictly to bijective/lossless views.
     #[serde(default)]
-    #[allow(dead_code)]
     pub lossless_only: bool,
     /// Reuse warm index/state from the primary checkout when running in a linked
     /// Git worktree.
@@ -246,11 +245,31 @@ fn parse_gitfile(root: &Path) -> Option<(PathBuf, Option<PathBuf>)> {
 }
 
 /// Returns the shared common Git directory only when `root` is a linked Git
-/// worktree (`.git` regular file with a distinct `<gitdir>/commondir`).
+/// worktree (`.git` regular file with a distinct `<gitdir>/commondir`, a
+/// canonicalized `gitdir` strictly under `<common>/worktrees`, and a regular
+/// `<gitdir>/gitdir` file resolving back to `<root>/.git`).
 fn linked_worktree_common_dir(root: &Path) -> Option<PathBuf> {
     let (gitdir, common) = parse_gitfile(root)?;
     let common = common?;
-    (common != gitdir).then_some(common)
+    if common == gitdir {
+        return None;
+    }
+    let worktrees_link = common.join("worktrees");
+    if !fs::symlink_metadata(&worktrees_link).is_ok_and(|meta| meta.is_dir()) {
+        return None;
+    }
+    let worktrees_dir = worktrees_link.canonicalize().ok()?;
+    if gitdir == worktrees_dir || !gitdir.starts_with(&worktrees_dir) {
+        return None;
+    }
+    let backptr_raw = read_git_pointer(&gitdir.join("gitdir"))?;
+    let backptr_raw = backptr_raw.trim();
+    if backptr_raw.is_empty() {
+        return None;
+    }
+    let backptr = gitdir.join(backptr_raw).canonicalize().ok()?;
+    let expected_gitfile = root.join(".git").canonicalize().ok()?;
+    (backptr == expected_gitfile).then_some(common)
 }
 
 /// Resolves the common Git directory for `root` using only filesystem reads
@@ -414,7 +433,6 @@ impl Workspace {
     /// Returns `<primary_root>/.justless` when this workspace is a linked Git
     /// worktree, the primary checkout has an existing `.justless` directory
     /// distinct from `self.state`, and `share_worktree_index` is enabled.
-    #[allow(dead_code)]
     pub fn shared_worktree_state_dir(&self) -> Option<PathBuf> {
         let common_dir = linked_worktree_common_dir(&self.root)?;
         if common_dir.file_name() != Some(std::ffi::OsStr::new(".git")) {
@@ -748,6 +766,11 @@ mod tests {
         fs::create_dir_all(&worktree).unwrap();
         fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
         fs::write(
+            wt_gitdir.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+        fs::write(
             worktree.join(".git"),
             "gitdir: ../primary/.git/worktrees/agent-1\r\n",
         )
@@ -880,5 +903,120 @@ mod tests {
         let custom = ws.settings().unwrap();
         assert!(custom.lossless_only);
         assert!(!custom.share_worktree_index);
+    }
+
+    #[test]
+    fn crafted_git_pointers_outside_worktrees_or_without_valid_backpointer_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        let victim = base.join("victim");
+        let victim_wt = victim.join(".git/worktrees/legit");
+        let legit_checkout = base.join("legit-checkout");
+        fs::create_dir_all(&victim_wt).unwrap();
+        fs::create_dir_all(victim.join(".justless")).unwrap();
+        fs::create_dir_all(&legit_checkout).unwrap();
+        fs::write(victim_wt.join("commondir"), "../..\n").unwrap();
+        fs::write(
+            victim_wt.join("gitdir"),
+            format!("{}\n", legit_checkout.join(".git").display()),
+        )
+        .unwrap();
+        fs::write(
+            legit_checkout.join(".git"),
+            format!("gitdir: {}\n", victim_wt.display()),
+        )
+        .unwrap();
+
+        // 1. Crafted repo pointing to a fake gitdir outside `<common>/worktrees`.
+        let evil_outside = base.join("evil-outside");
+        let fake_gitdir = evil_outside.join("fake-gitdir");
+        fs::create_dir_all(&fake_gitdir).unwrap();
+        fs::write(
+            fake_gitdir.join("commondir"),
+            format!("{}\n", victim.join(".git").display()),
+        )
+        .unwrap();
+        fs::write(
+            fake_gitdir.join("gitdir"),
+            format!("{}\n", evil_outside.join(".git").display()),
+        )
+        .unwrap();
+        fs::write(evil_outside.join(".git"), "gitdir: ./fake-gitdir\n").unwrap();
+        let ws_outside = workspace(&evil_outside, &evil_outside);
+        assert!(!ws_outside.is_linked_worktree());
+        assert_eq!(ws_outside.shared_worktree_state_dir(), None);
+
+        // 2. Crafted repo pointing at another checkout's real worktree admin dir
+        //    whose `gitdir` back-pointer points to `legit-checkout/.git`, not `evil-hijack/.git`.
+        let evil_hijack = base.join("evil-hijack");
+        fs::create_dir_all(&evil_hijack).unwrap();
+        fs::write(
+            evil_hijack.join(".git"),
+            format!("gitdir: {}\n", victim_wt.display()),
+        )
+        .unwrap();
+        let ws_hijack = workspace(&evil_hijack, &evil_hijack);
+        assert!(!ws_hijack.is_linked_worktree());
+        assert_eq!(ws_hijack.shared_worktree_state_dir(), None);
+
+        // 3. Worktree admin dir missing `<gitdir>/gitdir` back-pointer is rejected.
+        let missing_backptr_wt = victim.join(".git/worktrees/no-backptr");
+        let no_backptr_checkout = base.join("no-backptr");
+        fs::create_dir_all(&missing_backptr_wt).unwrap();
+        fs::create_dir_all(&no_backptr_checkout).unwrap();
+        fs::write(missing_backptr_wt.join("commondir"), "../..\n").unwrap();
+        fs::write(
+            no_backptr_checkout.join(".git"),
+            format!("gitdir: {}\n", missing_backptr_wt.display()),
+        )
+        .unwrap();
+        let ws_missing = workspace(&no_backptr_checkout, &no_backptr_checkout);
+        assert!(!ws_missing.is_linked_worktree());
+        assert_eq!(ws_missing.shared_worktree_state_dir(), None);
+
+        // 4. Relative `<gitdir>/gitdir` back-pointer resolving to `<root>/.git` is accepted.
+        let rel_wt = victim.join(".git/worktrees/rel-wt");
+        let rel_checkout = base.join("rel-checkout");
+        fs::create_dir_all(&rel_wt).unwrap();
+        fs::create_dir_all(&rel_checkout).unwrap();
+        fs::write(rel_wt.join("commondir"), "../..\n").unwrap();
+        fs::write(rel_wt.join("gitdir"), "../../../../rel-checkout/.git\n").unwrap();
+        fs::write(
+            rel_checkout.join(".git"),
+            "gitdir: ../victim/.git/worktrees/rel-wt\n",
+        )
+        .unwrap();
+        let ws_rel = workspace(&rel_checkout, &rel_checkout);
+        assert!(ws_rel.is_linked_worktree());
+        assert_eq!(
+            ws_rel.shared_worktree_state_dir(),
+            Some(victim.join(".justless"))
+        );
+
+        // 5. Symlinked `<gitdir>/gitdir` is rejected.
+        #[cfg(unix)]
+        {
+            let sym_wt = victim.join(".git/worktrees/sym-wt");
+            let sym_checkout = base.join("sym-checkout");
+            let sym_target = base.join("sym-target");
+            fs::create_dir_all(&sym_wt).unwrap();
+            fs::create_dir_all(&sym_checkout).unwrap();
+            fs::write(sym_wt.join("commondir"), "../..\n").unwrap();
+            fs::write(
+                &sym_target,
+                format!("{}\n", sym_checkout.join(".git").display()),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&sym_target, sym_wt.join("gitdir")).unwrap();
+            fs::write(
+                sym_checkout.join(".git"),
+                format!("gitdir: {}\n", sym_wt.display()),
+            )
+            .unwrap();
+            let ws_sym = workspace(&sym_checkout, &sym_checkout);
+            assert!(!ws_sym.is_linked_worktree());
+            assert_eq!(ws_sym.shared_worktree_state_dir(), None);
+        }
     }
 }

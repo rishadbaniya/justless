@@ -778,16 +778,23 @@ fn widening(runner: &RunnerPlan, step: &Step, outcome: &Outcome) -> Option<(usiz
     Some((count, selection::cargo_argv(&runner.base, &flags, &[])))
 }
 
-/// Whether a filtered JS/TS or RSpec step matched zero tests (and had no
-/// failures or suite load errors), requiring a conservative fallback to the
-/// full suite.
+/// Whether a filtered JS/TS, Deno, Dart/Flutter, or RSpec step matched zero
+/// tests (and had no failures or suite load errors), requiring a conservative
+/// fallback to the full suite.
 fn file_runner_ran_zero(runner: &RunnerPlan, step: &Step, outcome: &Outcome) -> bool {
     if step.kind != StepKind::Filtered || outcome.unavailable.is_some() {
         return false;
     }
     if !matches!(
         runner.runner,
-        Kind::Jest | Kind::Vitest | Kind::Bun | Kind::NodeTest | Kind::Playwright | Kind::Rspec
+        Kind::Jest
+            | Kind::Vitest
+            | Kind::Bun
+            | Kind::NodeTest
+            | Kind::Playwright
+            | Kind::Rspec
+            | Kind::DenoTest
+            | Kind::DartTest
     ) {
         return false;
     }
@@ -1678,6 +1685,118 @@ mod tests {
             0,
             "",
             "bun test v1.1.38\n 1 pass\nRan 1 test across 1 file. [1ms]\n"
+        ));
+    }
+
+    #[test]
+    fn deno_and_dart_zero_ran_widens_unless_failed_errored_or_skipped() {
+        let make = |kind: Kind, base: &[&str], argv: &[&str], status: i32, out: &str, err: &str| {
+            let step = filtered(&[], argv);
+            let plan = runner_plan(kind, base);
+            let outcome = Outcome {
+                status,
+                run: None,
+                tally: runners::tally(kind, out, err),
+                elapsed_ms: 0,
+                shown: 0,
+                raw: 0,
+                unavailable: None,
+            };
+            file_runner_ran_zero(&plan, &step, &outcome)
+        };
+
+        // Deno zero-matched subsets MUST widen.
+        assert!(make(
+            Kind::DenoTest,
+            &["deno", "test"],
+            &["deno", "test", "tests/a_test.ts"],
+            1,
+            "",
+            "error: No test modules found\n"
+        ));
+        assert!(make(
+            Kind::DenoTest,
+            &["deno", "test"],
+            &["deno", "test", "tests/a_test.ts"],
+            0,
+            "ok | 0 passed | 0 failed (2ms)\n",
+            ""
+        ));
+        // Deno load error, ignored tests, or passing tests MUST NOT widen.
+        assert!(!make(
+            Kind::DenoTest,
+            &["deno", "test"],
+            &["deno", "test", "tests/broken_test.ts"],
+            1,
+            "",
+            "error: Module not found \"file:///broken_test.ts\"\n"
+        ));
+        assert!(!make(
+            Kind::DenoTest,
+            &["deno", "test"],
+            &["deno", "test", "tests/a_test.ts"],
+            0,
+            "ok | 0 passed | 0 failed | 2 ignored (4ms)\n",
+            ""
+        ));
+        assert!(!make(
+            Kind::DenoTest,
+            &["deno", "test"],
+            &["deno", "test", "tests/a_test.ts"],
+            0,
+            "ok | 2 passed | 0 failed (8ms)\n",
+            ""
+        ));
+
+        // Dart / Flutter zero-matched subsets MUST widen.
+        assert!(make(
+            Kind::DartTest,
+            &["dart", "test"],
+            &["dart", "test", "test/calc_test.dart"],
+            79,
+            "00:00 +0: No tests ran.\n",
+            ""
+        ));
+        assert!(make(
+            Kind::DartTest,
+            &["flutter", "test"],
+            &["flutter", "test", "test/widget_test.dart"],
+            1,
+            "No tests match regular expression \"foo\".\n",
+            ""
+        ));
+        assert!(make(
+            Kind::DartTest,
+            &["dart", "test"],
+            &["dart", "test", "test/calc_test.dart"],
+            0,
+            "00:00 +0: No tests were found.\n",
+            ""
+        ));
+        // Dart load error, skipped tests, or passing tests MUST NOT widen.
+        assert!(!make(
+            Kind::DartTest,
+            &["dart", "test"],
+            &["dart", "test", "test/broken_test.dart"],
+            1,
+            "00:00 +0 -1: loading test/broken_test.dart [E]\nFailed to load \"test/broken_test.dart\": syntax error\n",
+            ""
+        ));
+        assert!(!make(
+            Kind::DartTest,
+            &["dart", "test"],
+            &["dart", "test", "test/calc_test.dart"],
+            0,
+            "00:01 +0 ~2: All tests skipped!\n",
+            ""
+        ));
+        assert!(!make(
+            Kind::DartTest,
+            &["flutter", "test"],
+            &["flutter", "test", "test/widget_test.dart"],
+            0,
+            "00:01 +3: All tests passed!\n",
+            ""
         ));
     }
 }

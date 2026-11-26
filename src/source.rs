@@ -321,6 +321,7 @@ impl Snapshot {
 
     pub fn index(&mut self, file: &str) -> Result<()> {
         let mut imports = Vec::new();
+        let mut tried_sections = false;
         self.is_rust = file.ends_with(".rs");
         if self.is_rust {
             // syn parses whole files, so one syntax error leaves no symbols.
@@ -348,6 +349,9 @@ impl Snapshot {
                     }
                 }
             }
+        } else if prefers_hcl_config_outline(file) {
+            self.sections(file);
+            tried_sections = true;
         } else if let Some(grammar) = Grammar::detect(file, &self.text) {
             self.grammar = Some(grammar);
             let facts = Parsers::default().parse(grammar, &self.text)?;
@@ -362,7 +366,7 @@ impl Snapshot {
                 });
             }
         }
-        if self.entries.is_empty() {
+        if self.entries.is_empty() && !tried_sections {
             self.sections(file);
         }
         let needs_pages = self.entries.is_empty();
@@ -2360,6 +2364,18 @@ fn resolve_read_target(ws: &Workspace, raw: &str, root_given: bool) -> Result<Re
         }
     }
     Ok(ReadTarget::File(workspace_file(ws, raw, root_given)?))
+}
+
+fn prefers_hcl_config_outline(file: &str) -> bool {
+    Path::new(file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "terragrunt.hcl" | ".terraform.lock.hcl" | "terraform.lock.hcl"
+            )
+        })
 }
 
 fn is_excluded_dir(name: &str) -> bool {
@@ -6187,5 +6203,85 @@ mod tests {
             .unwrap();
         let cell_json: serde_json::Value = serde_json::from_str(&snap.text[span]).unwrap();
         assert_eq!(cell_json["execution_count"], 1);
+    }
+
+    #[test]
+    fn terragrunt_and_terraform_lock_hcl_use_config_outline_while_tf_uses_grammar_hcl() {
+        let tg = concat!(
+            "include \"root\" {\n",
+            "  path = find_in_parent_folders()\n",
+            "}\n\n",
+            "dependency \"vpc\" {\n",
+            "  config_path = \"../vpc\"\n",
+            "}\n\n",
+            "inputs = {\n",
+            "  env = \"prod\"\n",
+            "  replicas = 3\n",
+            "}\n",
+        );
+        let mut tg_snap = Snapshot::from_text("envs/prod/app/terragrunt.hcl", tg.to_owned());
+        tg_snap.index("envs/prod/app/terragrunt.hcl").unwrap();
+        assert_eq!(tg_snap.grammar, None);
+        let tg_out = tg_snap.page("", None, 40, 4096).unwrap().display();
+        assert!(
+            tg_out.contains("include include.root")
+                && tg_out.contains("path = find_in_parent_folders()"),
+            "{tg_out}"
+        );
+        assert!(
+            tg_out.contains("dependency dependency.vpc")
+                && tg_out.contains("config_path = \"../vpc\""),
+            "{tg_out}"
+        );
+        assert!(tg_out.contains("attr inputs"), "{tg_out}");
+        let inputs_idx = tg_snap
+            .entries
+            .iter()
+            .position(|e| e.kind == "attr" && e.name == "inputs")
+            .expect("inputs attr entry");
+        let inputs_span = tg_snap
+            .resolve(
+                &format!("{}#{}", tg_snap.revision, inputs_idx + 1),
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            &tg_snap.text[inputs_span],
+            "inputs = {\n  env = \"prod\"\n  replicas = 3\n}\n"
+        );
+
+        let lock = concat!(
+            "provider \"registry.terraform.io/hashicorp/aws\" {\n",
+            "  version     = \"5.40.0\"\n",
+            "  constraints = \"~> 5.0\"\n",
+            "}\n\n",
+            "provider \"registry.terraform.io/hashicorp/random\" {\n",
+            "  version = \"3.6.0\"\n",
+            "}\n",
+        );
+        let mut lock_snap = Snapshot::from_text(".terraform.lock.hcl", lock.to_owned());
+        lock_snap.index(".terraform.lock.hcl").unwrap();
+        assert_eq!(lock_snap.grammar, None);
+        let lock_out = lock_snap.page("", None, 40, 4096).unwrap().display();
+        assert!(
+            lock_out.contains("provider provider.registry.terraform.io/hashicorp/aws")
+                || lock_out.contains("provider registry.terraform.io/hashicorp/aws"),
+            "{lock_out}"
+        );
+        assert!(lock_out.contains("5.40.0"), "{lock_out}");
+        assert!(lock_out.contains("3.6.0"), "{lock_out}");
+
+        // Plain Terraform `.tf` stays on tree-sitter `Grammar::Hcl`.
+        let tf = "resource \"aws_s3_bucket\" \"logs\" {\n  bucket = \"my-logs\"\n}\n";
+        let mut tf_snap = Snapshot::from_text("main.tf", tf.to_owned());
+        tf_snap.index("main.tf").unwrap();
+        assert_eq!(tf_snap.grammar, Some(Grammar::Hcl));
+        assert!(
+            tf_snap
+                .entries
+                .iter()
+                .any(|e| e.kind == "resource" && e.name == "aws_s3_bucket.logs")
+        );
     }
 }

@@ -456,13 +456,19 @@ fn anthropic_retrieval_ids(messages: &[&RawValue]) -> HashSet<String> {
             let Some(bm) = plan::parse_members(block.get()) else {
                 continue;
             };
-            let is_use = member_str(&bm, "type")
-                .is_some_and(|t| matches!(t.as_str(), "tool_use" | "mcp_tool_use"));
+            let block_type = member_str(&bm, "type");
+            let is_use = block_type
+                .as_deref()
+                .is_some_and(|t| matches!(t, "tool_use" | "mcp_tool_use"));
             if !is_use {
                 continue;
             }
             let name = member_str(&bm, "name").unwrap_or_default();
-            if is_retrieval_call(&name, member(&bm, "input"))
+            let is_mcp_justless_retrieval = block_type.as_deref() == Some("mcp_tool_use")
+                && member_str(&bm, "server_name")
+                    .is_some_and(|server| server.to_ascii_lowercase().contains("justless"))
+                && is_retrieval_op_name(&name);
+            if (is_mcp_justless_retrieval || is_retrieval_call(&name, member(&bm, "input")))
                 && let Some(id) = member_str(&bm, "id")
             {
                 ids.insert(id);
@@ -608,6 +614,17 @@ fn is_retrieval_call(name: &str, args_raw: Option<&RawValue>) -> bool {
     is_retrieval_tool_name(name) || args_have_retrieval_cmd(args_raw)
 }
 
+fn is_retrieval_op_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ["recall", "log", "expand", "search"].iter().any(|op| {
+        lower == *op
+            || lower.ends_with(&format!("_{op}"))
+            || lower.ends_with(&format!("-{op}"))
+            || lower.ends_with(&format!(":{op}"))
+            || lower.ends_with(&format!("/{op}"))
+    })
+}
+
 fn is_retrieval_tool_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.contains("justless")
@@ -644,12 +661,8 @@ fn value_has_retrieval_cmd(val: &Value) -> bool {
         }
         Value::Array(items) => {
             if items.iter().all(Value::is_string) {
-                let joined = items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if contains_justless_retrieval_cmd(&joined) {
+                let argv: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
+                if tokens_have_justless_retrieval(&argv) {
                     return true;
                 }
             }
@@ -660,21 +673,69 @@ fn value_has_retrieval_cmd(val: &Value) -> bool {
     }
 }
 
-fn contains_justless_retrieval_cmd(cmd: &str) -> bool {
-    const OPS: [&str; 4] = ["recall", "log", "expand", "search"];
-    if !cmd.contains("justless") {
-        return false;
+/// Splits a shell command string on unquoted chaining operators (`;`, `&&`,
+/// `||`, `|`, `&`, `\n`) so unspaced chains like `cd /repo&&justless recall id`
+/// isolate each simple command without breaking quoted paths containing
+/// metacharacters.
+fn split_shell_segments(cmd: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (idx, b) in cmd.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+            continue;
+        }
+        if in_double {
+            if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_double = false;
+            }
+            continue;
+        }
+        match b {
+            b'\\' => escaped = true,
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b';' | b'&' | b'|' | b'\n' => {
+                let seg = cmd[start..idx].trim();
+                if !seg.is_empty() {
+                    segments.push(seg);
+                }
+                start = idx + 1;
+            }
+            _ => {}
+        }
     }
-    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    let tail = cmd[start..].trim();
+    if !tail.is_empty() {
+        segments.push(tail);
+    }
+    segments
+}
+
+fn tokens_have_justless_retrieval<S: AsRef<str>>(tokens: &[S]) -> bool {
+    const OPS: [&str; 4] = ["recall", "log", "expand", "search"];
     for (i, token) in tokens.iter().enumerate() {
-        let bin = token.trim_matches(|c| matches!(c, '\'' | '"' | '(' | ')'));
+        let raw = token.as_ref();
+        let raw = raw.strip_prefix("$(").unwrap_or(raw);
+        let bin = raw.trim_matches(|c| matches!(c, '\'' | '"' | '(' | ')' | '`'));
         let name = bin.rsplit(['/', '\\']).next().unwrap_or(bin);
         if name != "justless" && name != "justless.exe" {
             continue;
         }
         let mut j = i + 1;
         while j < tokens.len() {
-            let arg = tokens[j].trim_matches(|c| matches!(c, '\'' | '"'));
+            let arg = tokens[j].as_ref().trim_matches(|c| matches!(c, '\'' | '"'));
             if arg == "--root" {
                 j += 2;
             } else if arg.starts_with("--root=") {
@@ -685,6 +746,47 @@ fn contains_justless_retrieval_cmd(cmd: &str) -> bool {
                 }
                 break;
             }
+        }
+    }
+    false
+}
+
+fn contains_justless_retrieval_cmd(cmd: &str) -> bool {
+    if !cmd.contains("justless") {
+        return false;
+    }
+    for segment in split_shell_segments(cmd) {
+        if !segment.contains("justless") {
+            continue;
+        }
+        if let Some(tokens) = shlex::split(segment) {
+            if tokens_have_justless_retrieval(&tokens) {
+                return true;
+            }
+            // Handle nested shell wrappers such as `bash -lc "justless recall ..."`.
+            let is_shell_wrapper = tokens.first().is_some_and(|first| {
+                let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+                matches!(
+                    base.to_ascii_lowercase().as_str(),
+                    "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" | "pwsh" | "cmd" | "cmd.exe"
+                )
+            });
+            if is_shell_wrapper
+                && tokens
+                    .iter()
+                    .skip(1)
+                    .any(|arg| arg != segment && contains_justless_retrieval_cmd(arg))
+            {
+                return true;
+            }
+            if !segment.contains('\\') {
+                continue;
+            }
+        }
+        // Fallback for unbalanced quotes or unescaped Windows backslashes.
+        let ws_tokens: Vec<&str> = segment.split_whitespace().collect();
+        if tokens_have_justless_retrieval(&ws_tokens) {
+            return true;
         }
     }
     false
@@ -1930,6 +2032,65 @@ mod tests {
         assert!(
             compact_openai_responses_live_zone(&ws, &Body::parse(&raw).unwrap(), &live_options())
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn skips_spaced_root_chained_commands_and_anthropic_mcp_tool_use_server_name() {
+        let (_dir, ws) = workspace();
+        let big = large_json_array();
+
+        assert!(contains_justless_retrieval_cmd(
+            "justless --root '/tmp/My Project' recall deadbeef"
+        ));
+        assert!(contains_justless_retrieval_cmd(
+            "justless --root \"/Users/alice/My Project\" search run-1 timeout"
+        ));
+        assert!(contains_justless_retrieval_cmd(
+            "justless --root='/tmp/My Project' expand src/lib.rs rev#1"
+        ));
+        assert!(contains_justless_retrieval_cmd(
+            "cd /repo&&justless log run-1"
+        ));
+        assert!(contains_justless_retrieval_cmd(
+            "cd /repo;justless --root '/tmp/a;b' recall deadbeef|head -n 20"
+        ));
+        assert!(!contains_justless_retrieval_cmd(
+            "echo \"justless recall deadbeef\""
+        ));
+
+        // Anthropic: spaced `--root`, unspaced `cd /repo&&justless log`, and
+        // `mcp_tool_use` with `name: "recall"` + `server_name: "justless"` all skip!
+        let req = json!({
+            "model": "claude-opus-5-5",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t_spaced", "name": "Bash", "input": {"command": "justless --root '/tmp/My Project' recall deadbeef"}},
+                    {"type": "tool_use", "id": "t_chain", "name": "Bash", "input": {"command": "cd /repo&&justless log run-1"}},
+                    {"type": "mcp_tool_use", "id": "t_mcp_srv", "name": "recall", "server_name": "justless", "input": {"id": "deadbeef"}},
+                    {"type": "mcp_tool_use", "id": "t_other_srv", "name": "recall", "server_name": "other-mcp", "input": {"id": "deadbeef"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t_spaced", "content": big},
+                    {"type": "tool_result", "tool_use_id": "t_chain", "content": big},
+                    {"type": "tool_result", "tool_use_id": "t_mcp_srv", "content": big},
+                    {"type": "tool_result", "tool_use_id": "t_other_srv", "content": big}
+                ]}
+            ]
+        });
+        let raw = serde_json::to_vec(&req).unwrap();
+        let res = compact_live_zone(&ws, &Body::parse(&raw).unwrap(), &live_options())
+            .expect("non-justless MCP server result should still compact");
+        assert_eq!(res.stats.results, 1);
+        let out: Value = serde_json::from_slice(&res.body).unwrap();
+        assert_eq!(out["messages"][1]["content"][0]["content"], big);
+        assert_eq!(out["messages"][1]["content"][1]["content"], big);
+        assert_eq!(out["messages"][1]["content"][2]["content"], big);
+        assert!(
+            out["messages"][1]["content"][3]["content"]
+                .as_str()
+                .unwrap()
+                .contains("[justless recall ")
         );
     }
 

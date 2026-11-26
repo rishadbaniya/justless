@@ -1618,10 +1618,10 @@ fn scan_cursor_in(
                             }
                         }
                         Some("tool_result") => {
-                            let matched = part["tool_use_id"]
-                                .as_str()
-                                .and_then(|id| pending.remove(id))
-                                .or_else(|| anonymous.pop_front());
+                            let matched = match part["tool_use_id"].as_str() {
+                                Some(id) => pending.remove(id),
+                                None => anonymous.pop_front(),
+                            };
                             if let Some((command, call_ts, in_ws)) = matched {
                                 let ts = line_ts.or(call_ts);
                                 if !in_ws || ts.is_some_and(|t| t < since_ms) {
@@ -1698,9 +1698,10 @@ fn scan_cursor_in(
                 let id = entry["tool_call_id"]
                     .as_str()
                     .or_else(|| entry["message"]["tool_call_id"].as_str());
-                let matched = id
-                    .and_then(|id| pending.remove(id))
-                    .or_else(|| anonymous.pop_front());
+                let matched = match id {
+                    Some(id) => pending.remove(id),
+                    None => anonymous.pop_front(),
+                };
                 if let Some((command, call_ts, in_ws)) = matched {
                     let ts = line_ts.or(call_ts);
                     if in_ws && !ts.is_some_and(|t| t < since_ms) {
@@ -1771,9 +1772,10 @@ fn scan_cursor_in(
                         .as_str()
                         .or_else(|| entry["call_id"].as_str())
                         .or_else(|| entry["id"].as_str());
-                    let matched = id
-                        .and_then(|id| pending.remove(id))
-                        .or_else(|| anonymous.pop_front());
+                    let matched = match id {
+                        Some(id) => pending.remove(id),
+                        None => anonymous.pop_front(),
+                    };
                     if let Some((command, call_ts, in_ws)) = matched {
                         let ts = line_ts.or(call_ts);
                         if in_ws && !ts.is_some_and(|t| t < since_ms) {
@@ -3880,6 +3882,57 @@ mod tests {
         assert!(
             ag_parsed_fast * 4 < ag_parsed_full,
             "expected Agy prefilter to skip noise: fast={ag_parsed_fast}, full={ag_parsed_full}"
+        );
+    }
+
+    #[test]
+    fn cursor_unmatched_tool_use_id_never_steals_anonymous_shell_call() {
+        use std::time::{Duration, SystemTime};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("cursor_anon_repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = crate::workspace::Workspace::discover(Some(&root)).unwrap();
+        let exclusions = crate::rewrite::Exclusions::default();
+        let since = SystemTime::now() - Duration::from_secs(3600);
+        let since_ms = crate::history::now_ms().saturating_sub(3_600_000);
+
+        let cursor_home = temp.path().join("cursor");
+        let slug = super::normalize_slug_collapsed(&ws.root.to_string_lossy());
+        let cursor_dir = cursor_home
+            .join("projects")
+            .join(&slug)
+            .join("agent-transcripts");
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+
+        let non_shell_payload = "FILE_CONTENTS_FROM_READ_TOOL\n".repeat(40);
+        let shell_payload = "real shell output\n".repeat(10);
+        std::fs::write(
+            cursor_dir.join("anon.jsonl"),
+            [
+                // Anonymous shell tool_use (no `id`) queued in `anonymous`.
+                serde_json::json!({"role":"assistant","timestamp":"2099-01-01T00:00:00Z","message":{"content":[
+                    {"type":"tool_use","name":"Shell","input":{"command":"git status"}}
+                ]}}).to_string(),
+                // Non-shell tool_result with an explicit unmatched `tool_use_id` MUST NOT pop `anonymous`.
+                serde_json::json!({"role":"user","timestamp":"2099-01-01T00:00:01Z","message":{"content":[
+                    {"type":"tool_result","tool_use_id":"read_file_42","content":non_shell_payload}
+                ]}}).to_string(),
+                // Anonymous tool_result (no `tool_use_id`) matches the queued anonymous shell call.
+                serde_json::json!({"role":"user","timestamp":"2099-01-01T00:00:02Z","message":{"content":[
+                    {"type":"tool_result","content":shell_payload}
+                ]}}).to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let cursor = super::scan_cursor_in(&cursor_home, &ws, &exclusions, since, since_ms);
+        assert_eq!(cursor.commands(), 1);
+        let unrouted = cursor.groups.get(&Route::SupportedNotRouted).unwrap();
+        assert_eq!(
+            unrouted.labels.get("git status"),
+            Some(&(1, shell_payload.len() as u64))
         );
     }
 }
