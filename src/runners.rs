@@ -26,6 +26,10 @@ pub(crate) enum Kind {
     #[serde(rename = "node-test")]
     NodeTest,
     Playwright,
+    #[serde(rename = "deno-test")]
+    DenoTest,
+    #[serde(rename = "dart-test")]
+    DartTest,
     Rspec,
     Go,
     Command,
@@ -42,6 +46,8 @@ impl Kind {
             Self::Bun => "bun test",
             Self::NodeTest => "node --test",
             Self::Playwright => "playwright",
+            Self::DenoTest => "deno test",
+            Self::DartTest => "dart test",
             Self::Rspec => "rspec",
             Self::Go => "go",
             Self::Command => "command",
@@ -59,6 +65,8 @@ impl Kind {
             Self::Bun => "bun test",
             Self::NodeTest => "node --test",
             Self::Playwright => "playwright test",
+            Self::DenoTest => "deno test",
+            Self::DartTest => "dart test",
             Self::Rspec => "rspec",
             Self::Go => "go test",
             Self::Command => "",
@@ -68,9 +76,13 @@ impl Kind {
     /// What one selected unit is for this runner.
     pub fn unit(self) -> &'static str {
         match self {
-            Self::Jest | Self::Vitest | Self::Bun | Self::NodeTest | Self::Playwright => {
-                "test file"
-            }
+            Self::Jest
+            | Self::Vitest
+            | Self::Bun
+            | Self::NodeTest
+            | Self::Playwright
+            | Self::DenoTest
+            | Self::DartTest => "test file",
             Self::Rspec => "spec file",
             _ => "test",
         }
@@ -83,7 +95,12 @@ impl Kind {
     pub fn is_js(self) -> bool {
         matches!(
             self,
-            Self::Jest | Self::Vitest | Self::Bun | Self::NodeTest | Self::Playwright
+            Self::Jest
+                | Self::Vitest
+                | Self::Bun
+                | Self::NodeTest
+                | Self::Playwright
+                | Self::DenoTest
         )
     }
 }
@@ -1017,6 +1034,48 @@ pub(crate) fn detect(
             runners.push(Runner::new(Kind::Bun, directory, words(&["bun", "test"])));
         }
     }
+    // Deno: `deno.json` or `deno.jsonc` alongside at least one Deno test file.
+    let mut deno_roots = BTreeSet::new();
+    for file in index.files.keys() {
+        let name = file.rsplit('/').next().unwrap_or(file);
+        if matches!(name, "deno.json" | "deno.jsonc") {
+            let directory = parent(file).to_owned();
+            if !js_roots.contains(&directory)
+                && index
+                    .files
+                    .keys()
+                    .any(|other| under(other, &directory) && is_deno_test_file(other))
+            {
+                deno_roots.insert(directory);
+            }
+        }
+    }
+    for root in deno_roots {
+        runners.push(Runner::new(Kind::DenoTest, root, words(&["deno", "test"])));
+    }
+    // Dart / Flutter: each `pubspec.yaml` package with at least one `test/*_test.dart`.
+    let mut dart_roots = BTreeSet::new();
+    for file in index.files.keys() {
+        if !(file == "pubspec.yaml" || file.ends_with("/pubspec.yaml")) {
+            continue;
+        }
+        let directory = parent(file).to_owned();
+        if index
+            .files
+            .keys()
+            .any(|other| is_dart_test_file(&directory, other))
+        {
+            dart_roots.insert((directory, file.as_str()));
+        }
+    }
+    for (root, pubspec) in dart_roots {
+        let base = if is_flutter_pubspec(workspace, pubspec) {
+            words(&["flutter", "test"])
+        } else {
+            words(&["dart", "test"])
+        };
+        runners.push(Runner::new(Kind::DartTest, root, base));
+    }
     // Ruby RSpec: `.rspec` or a Gemfile listing `rspec`, alongside at least one `*_spec.rb`.
     let mut rspec_roots = BTreeSet::new();
     for file in index.files.keys() {
@@ -1122,6 +1181,51 @@ pub(crate) fn is_dot_test_or_spec_file(file: &str) -> bool {
         return false;
     };
     stem.ends_with(".test") || stem.ends_with(".spec")
+}
+
+/// Whether `file` matches Deno's default `deno test` discovery conventions
+/// (`*_test.<ext>`, `*.test.<ext>`, or `test.<ext>`).
+pub(crate) fn is_deno_test_file(file: &str) -> bool {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    let Some(stem) = [".ts", ".tsx", ".mts", ".js", ".mjs", ".jsx", ".cjs", ".cts"]
+        .iter()
+        .find_map(|ext| name.strip_suffix(ext))
+    else {
+        return false;
+    };
+    stem == "test" || stem.ends_with("_test") || stem.ends_with(".test")
+}
+
+/// Whether `file` is a Dart/Flutter test file under `<root>/test/` (`*_test.dart`).
+pub(crate) fn is_dart_test_file(root: &str, file: &str) -> bool {
+    if !under(file, root) || !file.ends_with("_test.dart") {
+        return false;
+    }
+    let relative = if root.is_empty() {
+        file
+    } else {
+        file.strip_prefix(root)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .unwrap_or(file)
+    };
+    relative.starts_with("test/")
+}
+
+/// Whether `file` looks like a Dart/Flutter test file (`test/.../*_test.dart`).
+pub(crate) fn is_dart_test_path(file: &str) -> bool {
+    file.ends_with("_test.dart") && (file.starts_with("test/") || file.contains("/test/"))
+}
+
+/// Whether a `pubspec.yaml` declares a Flutter SDK dependency (`sdk: flutter`).
+pub(crate) fn is_flutter_pubspec(workspace: &Workspace, pubspec: &str) -> bool {
+    let Ok(text) = fs::read_to_string(workspace.root.join(pubspec)) else {
+        return false;
+    };
+    text.lines().any(|raw| {
+        let line = raw.split('#').next().unwrap_or(raw).trim();
+        line.strip_prefix("sdk:")
+            .is_some_and(|rest| rest.trim().trim_matches(['"', '\'']) == "flutter")
+    })
 }
 
 /// The runner behind a command the user gave after `--`.
@@ -1267,6 +1371,34 @@ fn classify(workspace: &Workspace, index: &Index, cwd: &str, command: &[String])
             runner.selects = playwright_selects(tail);
             runner
         }
+        ("deno", ["test", tail @ ..]) => {
+            if has_flag(tail, &["--watch", "--watch-hmr"]) {
+                let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                runner.unknown = Some("deno test in watch mode".into());
+                return runner;
+            }
+            if has_flag(tail, &["--doc", "--no-run", "--help", "-h"]) {
+                let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                runner.unknown = Some("deno test non-subsettable mode".into());
+                return runner;
+            }
+            let mut runner = Runner::new(Kind::DenoTest, cwd.to_owned(), base);
+            runner.selects = deno_selects(tail);
+            runner
+        }
+        ("dart" | "flutter", ["test", tail @ ..]) => {
+            if has_flag(
+                tail,
+                &["--help", "-h", "--pause-after-load", "--start-paused"],
+            ) {
+                let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                runner.unknown = Some(format!("{program} test interactive/help mode"));
+                return runner;
+            }
+            let mut runner = Runner::new(Kind::DartTest, cwd.to_owned(), base);
+            runner.selects = dart_selects(tail);
+            runner
+        }
         ("rspec", tail) => {
             if has_flag(tail, &["--dry-run", "--init"]) {
                 let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
@@ -1361,6 +1493,25 @@ fn detect_script_runner(_workspace: &Workspace, directory: &str, script: &str) -
             command.extend(tail.iter().map(|s| (*s).to_owned()));
             let mut runner = Runner::new(Kind::Playwright, directory.to_owned(), command);
             runner.selects = playwright_selects(tail);
+            Some(runner)
+        }
+        ["deno", "test", tail @ ..]
+            if !has_flag(
+                tail,
+                &[
+                    "--watch",
+                    "--watch-hmr",
+                    "--doc",
+                    "--no-run",
+                    "--help",
+                    "-h",
+                ],
+            ) =>
+        {
+            let mut command = words(&["deno", "test"]);
+            command.extend(tail.iter().map(|s| (*s).to_owned()));
+            let mut runner = Runner::new(Kind::DenoTest, directory.to_owned(), command);
+            runner.selects = deno_selects(tail);
             Some(runner)
         }
         _ => None,
@@ -1459,6 +1610,28 @@ fn script_runner(workspace: &Workspace, cwd: &str, program: &str, base: Vec<Stri
                 command.extend(tail.iter().map(|s| (*s).to_owned()));
                 let mut runner = Runner::new(Kind::Playwright, cwd.to_owned(), command);
                 runner.selects = playwright_selects(tail);
+                return runner;
+            }
+            ["deno", "test", tail @ ..] => {
+                if has_flag(
+                    tail,
+                    &[
+                        "--watch",
+                        "--watch-hmr",
+                        "--doc",
+                        "--no-run",
+                        "--help",
+                        "-h",
+                    ],
+                ) {
+                    let mut runner = Runner::new(Kind::Command, cwd.to_owned(), base);
+                    runner.unknown = Some(format!("{program} test (deno test)"));
+                    return runner;
+                }
+                let mut command = words(&["deno", "test"]);
+                command.extend(tail.iter().map(|s| (*s).to_owned()));
+                let mut runner = Runner::new(Kind::DenoTest, cwd.to_owned(), command);
+                runner.selects = deno_selects(tail);
                 return runner;
             }
             _ => {}
@@ -1824,6 +1997,106 @@ fn playwright_selects(tail: &[&str]) -> Option<String> {
     None
 }
 
+const DENO_VALUES: &[&str] = &[
+    "-c",
+    "--config",
+    "--import-map",
+    "--lock",
+    "--cert",
+    "--seed",
+    "--reporter",
+    "--junit-path",
+    "--location",
+    "--env-file",
+    "--v8-flags",
+    "--preload",
+    "--conditions",
+    "-L",
+    "--log-level",
+    "-j",
+    "--jobs",
+    "--ext",
+];
+
+fn deno_selects(tail: &[&str]) -> Option<String> {
+    let mut words = tail.iter();
+    while let Some(word) = words.next() {
+        // In `deno test [OPTIONS] [FILES...] [-- SCRIPT_ARGS...]`, anything
+        // after `--` is forwarded to `Deno.args`, not treated as test files.
+        if *word == "--" {
+            break;
+        }
+        let flag = word.split_once('=').map_or(*word, |(flag, _)| flag);
+        if matches!(flag, "--filter" | "--ignore") {
+            return Some((*word).to_owned());
+        }
+        if DENO_VALUES.contains(word) {
+            words.next();
+            continue;
+        }
+        if !word.starts_with('-') {
+            return Some((*word).to_owned());
+        }
+    }
+    None
+}
+
+const DART_VALUES: &[&str] = &[
+    "-r",
+    "--reporter",
+    "-p",
+    "--platform",
+    "-P",
+    "--preset",
+    "-j",
+    "--concurrency",
+    "--timeout",
+    "--file-reporter",
+    "--coverage-path",
+    "--dart-define",
+    "--dart-define-from-file",
+    "--flavor",
+    "--test-randomize-ordering-seed",
+    "-d",
+    "--device-id",
+    "--compiler",
+];
+
+fn dart_selects(tail: &[&str]) -> Option<String> {
+    let mut words = tail.iter();
+    while let Some(word) = words.next() {
+        if *word == "--" {
+            if let Some(next) = words.next() {
+                return Some((*next).to_owned());
+            }
+            break;
+        }
+        let flag = word.split_once('=').map_or(*word, |(flag, _)| flag);
+        if matches!(
+            flag,
+            "-n" | "--name"
+                | "-N"
+                | "--plain-name"
+                | "-t"
+                | "--tags"
+                | "-x"
+                | "--exclude-tags"
+                | "--total-shards"
+                | "--shard-index"
+        ) {
+            return Some((*word).to_owned());
+        }
+        if DART_VALUES.contains(word) {
+            words.next();
+            continue;
+        }
+        if !word.starts_with('-') {
+            return Some((*word).to_owned());
+        }
+    }
+    None
+}
+
 const RSPEC_VALUES: &[&str] = &[
     "-f",
     "--format",
@@ -2089,6 +2362,8 @@ pub(crate) fn tally(kind: Kind, stdout: &str, stderr: &str) -> Tally {
         Kind::Bun => bun_tally(&format!("{stdout}\n{stderr}")),
         Kind::NodeTest => node_test_tally(&format!("{stdout}\n{stderr}")),
         Kind::Playwright => playwright_tally(&format!("{stdout}\n{stderr}")),
+        Kind::DenoTest => deno_tally(&format!("{stdout}\n{stderr}")),
+        Kind::DartTest => dart_tally(&format!("{stdout}\n{stderr}")),
         Kind::Rspec => rspec_tally(&format!("{stdout}\n{stderr}")),
         Kind::Go => go_tally(stdout),
         Kind::Command => {
@@ -2111,6 +2386,12 @@ pub(crate) fn tally(kind: Kind, stdout: &str, stderr: &str) -> Tally {
             }
             if !tally.known {
                 tally = playwright_tally(&combined);
+            }
+            if !tally.known {
+                tally = deno_tally(&combined);
+            }
+            if !tally.known {
+                tally = dart_tally(&combined);
             }
             if !tally.known {
                 tally = rspec_tally(&combined);
@@ -2870,6 +3151,147 @@ fn playwright_tally(text: &str) -> Tally {
         && tally.errors == 0
         && tally.failed.is_empty()
     {
+        tally.no_tests_matched = true;
+    }
+    tally
+}
+
+fn deno_tally(text: &str) -> Tally {
+    let mut tally = Tally::default();
+    let mut in_errors_or_failures = false;
+    let mut saw_error_line = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.contains("No test modules found") {
+            tally.known = true;
+            tally.no_tests_matched = true;
+            continue;
+        }
+        if trimmed == "ERRORS" || trimmed == "FAILURES" {
+            in_errors_or_failures = true;
+            continue;
+        }
+        // Summary line: `ok | 4 passed (2 steps) | 0 failed | 1 ignored (45ms)`
+        // or `FAILED | 1 passed | 1 failed (12ms)`.
+        if (trimmed.starts_with("ok |") || trimmed.starts_with("FAILED |"))
+            && trimmed.contains("passed")
+            && trimmed.contains("failed")
+        {
+            in_errors_or_failures = false;
+            let passed = count_before(trimmed, "passed").unwrap_or(0);
+            let failed = count_before(trimmed, "failed").unwrap_or(0);
+            let ignored = count_before(trimmed, "ignored").unwrap_or(0);
+            tally.known = true;
+            tally.ran = passed + failed;
+            tally.ignored = ignored;
+            if passed == 0 && failed == 0 && ignored == 0 && tally.errors == 0 {
+                tally.no_tests_matched = true;
+            }
+            continue;
+        }
+        if in_errors_or_failures
+            && !line.starts_with([' ', '\t'])
+            && let Some((name, loc)) = trimmed.split_once(" => ")
+        {
+            let name = name.trim();
+            if !name.is_empty() && !loc.trim().is_empty() {
+                if !tally.failed.iter().any(|known| known == name) {
+                    tally.failed.push(name.to_owned());
+                }
+                continue;
+            }
+        }
+        if trimmed.starts_with("error:") {
+            saw_error_line = true;
+        }
+    }
+    if saw_error_line && tally.ran == 0 && tally.failed.is_empty() && !tally.no_tests_matched {
+        tally.errors += 1;
+    }
+    tally
+}
+
+fn dart_tally(text: &str) -> Tally {
+    let mut tally = Tally::default();
+    let mut passed = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+
+    for line in text.split(['\n', '\r']) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.contains("No tests were found.")
+            || trimmed.contains("No tests ran.")
+            || trimmed.contains("No tests match")
+        {
+            tally.known = true;
+            tally.no_tests_matched = true;
+        }
+        if trimmed.starts_with("Failed to load ") {
+            tally.errors += 1;
+            continue;
+        }
+        // Standard `dart test` / `flutter test` progress & summary lines:
+        // `00:02 +5 ~1 -1: Some tests failed.`
+        // `00:01 +1 -1: test/calc_test.dart: computes tax [E]`
+        let Some((header, body)) = trimmed.split_once(':') else {
+            continue;
+        };
+        // Expect `MM:SS ...` so `header` is digits and `body` starts with `SS `.
+        if header.is_empty() || !header.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Some((counts_part, message)) = body.split_once(':') else {
+            continue;
+        };
+        let mut tokens = counts_part.split_whitespace();
+        let Some(secs) = tokens.next() else {
+            continue;
+        };
+        if secs.is_empty() || !secs.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let mut saw_count = false;
+        for tok in tokens {
+            if let Some(n) = tok.strip_prefix('+').and_then(|s| s.parse::<usize>().ok()) {
+                passed = n;
+                saw_count = true;
+            } else if let Some(n) = tok.strip_prefix('~').and_then(|s| s.parse::<usize>().ok()) {
+                skipped = n;
+                saw_count = true;
+            } else if let Some(n) = tok.strip_prefix('-').and_then(|s| s.parse::<usize>().ok()) {
+                failed = n;
+                saw_count = true;
+            }
+        }
+        if !saw_count {
+            continue;
+        }
+        let msg = message.trim();
+        if msg == "All tests passed!" || msg == "Some tests failed." || msg == "No tests ran." {
+            tally.known = true;
+        }
+        if let Some(name) = msg.strip_suffix(" [E]") {
+            let name = name.trim();
+            if name.starts_with("loading ") {
+                tally.errors += 1;
+            } else if !name.is_empty() && !tally.failed.iter().any(|known| known == name) {
+                tally.failed.push(name.to_owned());
+            }
+        }
+    }
+    if passed > 0 || failed > 0 || skipped > 0 {
+        tally.known = true;
+    }
+    tally.ran = passed + failed;
+    tally.ignored = skipped;
+    if tally.known && tally.ran == 0 && tally.ignored == 0 && tally.errors == 0 && failed == 0 {
         tally.no_tests_matched = true;
     }
     tally

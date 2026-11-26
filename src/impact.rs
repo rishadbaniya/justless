@@ -1,7 +1,7 @@
 //! `justless affected`: a reverse walk from a symbol, a file or the current Git
 //! changes to the code that depends on it, followed by the tests that reach it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 
@@ -583,7 +583,7 @@ fn follow(
     };
 
     // Lines that link to the restored symbol: certain unless every link is ambiguous.
-    let mut found = BTreeMap::<(String, usize), Doubt>::new();
+    let mut found = BTreeMap::<(&str, usize), Doubt>::new();
     for edge in rebuilt
         .into_iter()
         .flat_map(|rebuilt| ids.iter().flat_map(|&id| rebuilt.incoming(id)))
@@ -594,7 +594,7 @@ fn follow(
             Doubt::Certain
         };
         let entry = found
-            .entry((edge.location.file.clone(), edge.location.start))
+            .entry((edge.location.file.as_str(), edge.location.start))
             .or_insert(doubt);
         if doubt == Doubt::Certain {
             *entry = doubt;
@@ -603,7 +603,7 @@ fn follow(
 
     // The remaining mentions of its name.
     let resolving = rebuilt.unwrap_or(index);
-    let lines: BTreeSet<(&str, usize)> = search
+    let lines: HashSet<(&str, usize)> = search
         .lines
         .iter()
         .map(|mention| (mention.file.as_str(), mention.line))
@@ -626,7 +626,7 @@ fn follow(
     // is to the trait item it implements, so for a removed member a link to or
     // declaration of one proves nothing when either belongs to a trait. A
     // removed member that could not be restored may belong to one.
-    let traits: BTreeSet<&str> = resolving
+    let traits: HashSet<&str> = resolving
         .definitions
         .iter()
         .filter(|definition| definition.kind == "trait")
@@ -648,7 +648,7 @@ fn follow(
     // A certain link from a mention line to another definition of that name.
     // The index can bind a bare name inside a method to that method, which Rust
     // does not, so a link to a method only counts for a removed member.
-    let mut other = BTreeMap::<(&str, usize), String>::new();
+    let mut other = HashMap::<(&str, usize), String>::new();
     for edge in &resolving.edges {
         let at = (edge.location.file.as_str(), edge.location.start);
         let target = &resolving.definitions[edge.to];
@@ -665,7 +665,7 @@ fn follow(
     let mut elsewhere = Vec::new();
     for mention in &search.lines {
         let at = (mention.file.as_str(), mention.line);
-        if found.contains_key(&(mention.file.clone(), mention.line)) {
+        if found.contains_key(&at) {
             continue;
         }
         let rust = mention.file.ends_with(".rs");
@@ -715,7 +715,7 @@ fn follow(
                 continue;
             }
         }
-        found.insert((mention.file.clone(), mention.line), Doubt::NameOnly);
+        found.insert(at, Doubt::NameOnly);
     }
 
     let mut referenced = false;
@@ -723,7 +723,7 @@ fn follow(
     for ((path, line), doubt) in found {
         let enclosing = index
             .at(&Location {
-                file: path.clone(),
+                file: path.to_owned(),
                 start: line,
                 end: line,
             })
@@ -1086,7 +1086,7 @@ fn seeded(workspace: &Workspace, index: &Index, changes: &[(String, Change)]) ->
     (seeds, section)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Dependent<'a> {
     Symbol(usize),
     /// A file-scope reference, such as a Rust `use` outside any item.
@@ -1140,22 +1140,36 @@ fn walk_from<'a>(
         Some(from) => Dependent::Symbol(from),
         None => Dependent::Scope(&edge.location.file),
     };
-    let mut seen: BTreeSet<Dependent> = seeds.iter().map(|&id| Dependent::Symbol(id)).collect();
-    let mut frontier: Vec<(usize, bool)> = seeds
-        .iter()
-        .map(|&id| (id, possible.contains(&id)))
-        .collect();
+    let mut seen_symbols = HashSet::<usize>::with_capacity(seeds.len().max(16));
+    let mut seen_scopes = HashSet::<&'a str>::new();
+    let has_possible = !possible.is_empty();
+    let mut frontier: Vec<(usize, bool)> = Vec::with_capacity(seeds.len());
+    for &id in seeds {
+        seen_symbols.insert(id);
+        frontier.push((id, has_possible && possible.contains(&id)));
+    }
+    let seed_count = seen_symbols.len();
     let mut levels = Vec::new();
     let mut fanned = Vec::new();
     let mut full = false;
+    // Reuse scratch buffers across frontier nodes and BFS levels to avoid
+    // repeated heap allocations on large graphs.
+    let mut links = HashMap::<Dependent<'a>, &'a Edge>::new();
+    let mut links_buf = Vec::<(Dependent<'a>, &'a Edge)>::new();
+    let mut next = HashMap::<Dependent<'a>, Reach<'a>>::new();
+
     for _ in 0..depth {
-        let mut next = BTreeMap::<Dependent, Reach>::new();
+        next.clear();
         for &(id, possible) in &frontier {
             // One link per new dependent, the most certain and then the first.
-            let mut links = BTreeMap::<Dependent, &Edge>::new();
+            links.clear();
             for edge in links_into(index, id) {
                 let key = dependent(edge);
-                if seen.contains(&key) {
+                let already_seen = match key {
+                    Dependent::Symbol(sym) => seen_symbols.contains(&sym),
+                    Dependent::Scope(scope) => seen_scopes.contains(scope),
+                };
+                if already_seen {
                     continue;
                 }
                 let link = links.entry(key).or_insert(edge);
@@ -1163,13 +1177,19 @@ fn walk_from<'a>(
                     *link = edge;
                 }
             }
-            let mut links: Vec<_> = links.into_iter().collect();
-            links.sort_by_key(|(key, edge)| (edge.inferred, &edge.location, *key));
-            if links.len() > FAN_OUT {
-                fanned.push((id, links.len()));
-                links.truncate(FAN_OUT);
+            if links.is_empty() {
+                continue;
             }
-            for (key, edge) in links {
+            links_buf.clear();
+            links_buf.extend(links.drain());
+            if links_buf.len() > FAN_OUT {
+                links_buf.sort_unstable_by(|(ka, ea), (kb, eb)| {
+                    (ea.inferred, &ea.location, *ka).cmp(&(eb.inferred, &eb.location, *kb))
+                });
+                fanned.push((id, links_buf.len()));
+                links_buf.truncate(FAN_OUT);
+            }
+            for &(key, edge) in &links_buf {
                 let reach = Reach {
                     dependent: key,
                     edge,
@@ -1184,42 +1204,51 @@ fn walk_from<'a>(
                 }
             }
         }
-        let mut level: Vec<Reach> = next.into_values().collect();
-        level.sort_by(|a, b| {
-            let place = |reach: &Reach| match reach.dependent {
-                Dependent::Symbol(id) => (false, definitions[id].location.clone()),
-                Dependent::Scope(_) => (true, reach.edge.location.clone()),
+        let mut level: Vec<Reach> = next.drain().map(|(_, reach)| reach).collect();
+        level.sort_unstable_by(|a, b| {
+            let place = |reach: &Reach<'a>| match reach.dependent {
+                Dependent::Symbol(id) => (false, &definitions[id].location),
+                Dependent::Scope(_) => (true, &reach.edge.location),
             };
-            (a.possible, place(a)).cmp(&(b.possible, place(b)))
+            (a.possible, place(a), a.dependent).cmp(&(b.possible, place(b), b.dependent))
         });
         if level.is_empty() {
             frontier.clear();
             break;
         }
-        let room = MAX_REACHED.saturating_sub(seen.len().saturating_sub(seeds.len()));
+        let seen_total = seen_symbols.len() + seen_scopes.len();
+        let room = MAX_REACHED.saturating_sub(seen_total.saturating_sub(seed_count));
         if level.len() > room {
             full = true;
             level.truncate(room);
         }
-        seen.extend(level.iter().map(|reach| reach.dependent));
-        frontier = level
-            .iter()
-            .filter_map(|reach| match reach.dependent {
-                Dependent::Symbol(id) => Some((id, reach.possible)),
-                Dependent::Scope(_) => None,
-            })
-            .collect();
+        frontier.clear();
+        for reach in &level {
+            match reach.dependent {
+                Dependent::Symbol(id) => {
+                    seen_symbols.insert(id);
+                    frontier.push((id, reach.possible));
+                }
+                Dependent::Scope(scope) => {
+                    seen_scopes.insert(scope);
+                }
+            }
+        }
         levels.push(level);
         if frontier.is_empty() || full {
             break;
         }
     }
-    let mut beyond = BTreeSet::new();
+    let mut beyond = HashSet::new();
     if !full {
         for &(id, _) in &frontier {
             for edge in links_into(index, id) {
                 let key = dependent(edge);
-                if !seen.contains(&key) {
+                let already_seen = match key {
+                    Dependent::Symbol(sym) => seen_symbols.contains(&sym),
+                    Dependent::Scope(scope) => seen_scopes.contains(scope),
+                };
+                if !already_seen {
                     beyond.insert(key);
                 }
             }
@@ -1285,10 +1314,10 @@ fn tests(
         }
     }
 
-    // Collect every reached symbol and file to drive JS/TS and Ruby augmentations.
+    // Collect every reached symbol and file to drive JS/TS, Dart, and Ruby augmentations.
     let mut all_ids =
         Vec::with_capacity(seeds.len() + walk.levels.iter().map(Vec::len).sum::<usize>());
-    let mut seen_ids = BTreeSet::new();
+    let mut seen_ids = HashSet::with_capacity(all_ids.capacity());
     for &seed in seeds {
         if seen_ids.insert(seed) {
             all_ids.push(seed);
@@ -1428,6 +1457,49 @@ fn tests(
         }
     }
 
+    // Dart / Flutter: follow `package:` / relative `import`, `export`, and `part` links.
+    let dart_files: Vec<String> = all_ids
+        .iter()
+        .map(|&id| definitions[id].location.file.clone())
+        .filter(|file| file.ends_with(".dart"))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if !dart_files.is_empty() {
+        let dart_graph = DartGraph::build(workspace, index);
+        let reach = dart_graph.reach_from(&dart_files);
+        for (test_file, (line, why)) in reach.test_files {
+            insert_file(
+                test_file.clone(),
+                TestFileHit {
+                    hops: 1,
+                    possible: false,
+                    at: Location {
+                        file: test_file,
+                        start: line,
+                        end: line,
+                    },
+                    note: Some(why),
+                },
+            );
+        }
+        if dart_files.iter().any(|file| is_shared_dart_helper(file)) {
+            extra_notes.push(
+                "Shared Dart/Flutter test helper or config touched; run the full test suite."
+                    .into(),
+            );
+        } else if !dart_graph.reflection_sites.is_empty()
+            && dart_files
+                .iter()
+                .any(|file| !crate::runners::is_dart_test_path(file))
+        {
+            let (site, line) = &dart_graph.reflection_sites[0];
+            extra_notes.push(format!(
+                "Dynamic Dart reflection (dart:mirrors at {site}:{line}); additional tests may be affected."
+            ));
+        }
+    }
+
     // When a JS/TS test file is conservatively widened (barrel re-export or
     // dynamic import), report the whole test file instead of a partial subset
     // of its `it`/`describe` blocks.
@@ -1438,7 +1510,7 @@ fn tests(
         .map(|(id, (possible, hops))| (id, hops, possible))
         .collect();
     tests.sort_by_key(|&(id, hops, possible)| (possible, hops, &definitions[id].location, id));
-    let covered: BTreeSet<&str> = tests
+    let covered: HashSet<&str> = tests
         .iter()
         .map(|&(id, _, _)| definitions[id].location.file.as_str())
         .collect();
@@ -1452,7 +1524,9 @@ fn tests(
     });
     for (location, hops, possible) in seed_files.chain(reached) {
         let file = location.file.as_str();
-        if is_test_file(file) && !covered.contains(file) {
+        if (is_test_file(file) || crate::runners::is_deno_test_file(file))
+            && !covered.contains(file)
+        {
             insert_file(
                 file.to_owned(),
                 TestFileHit {
@@ -1474,6 +1548,7 @@ enum Runner {
     Cargo,
     Pytest,
     Js,
+    Dart,
     Rspec,
     Go,
 }
@@ -1505,6 +1580,10 @@ fn commands(
                     .map(|(prefix, filter)| (Runner::Js, prefix, filter))
             })
             .or_else(|| {
+                dart_command(workspace, index, &definition.location.file)
+                    .map(|(prefix, filter)| (Runner::Dart, prefix, filter))
+            })
+            .or_else(|| {
                 rspec_command(index, &definition.location.file)
                     .map(|(prefix, filter)| (Runner::Rspec, prefix, filter))
             });
@@ -1515,6 +1594,8 @@ fn commands(
     for file in files.keys() {
         if let Some((prefix, filter)) = js_command(workspace, index, file) {
             push(Runner::Js, prefix, filter);
+        } else if let Some((prefix, filter)) = dart_command(workspace, index, file) {
+            push(Runner::Dart, prefix, filter);
         } else if let Some((prefix, filter)) = rspec_command(index, file) {
             push(Runner::Rspec, prefix, filter);
         }
@@ -1528,7 +1609,7 @@ fn commands(
             match runner {
                 Runner::Cargo if filters.len() == 1 => format!("{prefix} {}", filters[0]),
                 Runner::Cargo => format!("{prefix} -- {}", filters.join(" ")),
-                Runner::Pytest | Runner::Js | Runner::Rspec => {
+                Runner::Pytest | Runner::Js | Runner::Dart | Runner::Rspec => {
                     format!("{prefix} {}", filters.join(" "))
                 }
                 Runner::Go if filters.len() == 1 => format!("{prefix} -run '^{}$'", filters[0]),
@@ -1540,9 +1621,9 @@ fn commands(
 }
 
 /// Suggests the unambiguous JS/TS runner command for a test file by inspecting
-/// the nearest `package.json` or `bunfig.toml` above `file`.
+/// the nearest `package.json`, `bunfig.toml`, or `deno.json`/`deno.jsonc` above `file`.
 fn js_command(workspace: &Workspace, index: &Index, file: &str) -> Option<(String, String)> {
-    if !is_js_file(file) || !is_test_file(file) {
+    if !is_js_file(file) || !(is_test_file(file) || crate::runners::is_deno_test_file(file)) {
         return None;
     }
     let path = Path::new(file);
@@ -1589,8 +1670,14 @@ fn js_command(workspace: &Workspace, index: &Index, file: &str) -> Option<(Strin
                         "node --test"
                     } else if script.starts_with("playwright test") {
                         "npx playwright test"
+                    } else if script.starts_with("deno test") {
+                        "deno test"
                     } else if index.files.contains_key(&rel_path("bunfig.toml")) {
                         "bun test"
+                    } else if index.files.contains_key(&rel_path("deno.json"))
+                        || index.files.contains_key(&rel_path("deno.jsonc"))
+                    {
+                        "deno test"
                     } else {
                         return None;
                     }
@@ -1598,9 +1685,38 @@ fn js_command(workspace: &Workspace, index: &Index, file: &str) -> Option<(Strin
             };
             return Some((prefix.to_owned(), quote(file)));
         }
-        let bunfig_rel = rel_path("bunfig.toml");
-        if index.files.contains_key(&bunfig_rel) {
+        if index.files.contains_key(&rel_path("bunfig.toml")) {
             return Some(("bun test".to_owned(), quote(file)));
+        }
+        if index.files.contains_key(&rel_path("deno.json"))
+            || index.files.contains_key(&rel_path("deno.jsonc"))
+        {
+            return Some(("deno test".to_owned(), quote(file)));
+        }
+    }
+    None
+}
+
+/// Suggests `flutter test` or `dart test` for a Dart/Flutter test file (`test/.../*_test.dart`).
+fn dart_command(workspace: &Workspace, index: &Index, file: &str) -> Option<(String, String)> {
+    if !crate::runners::is_dart_test_path(file) {
+        return None;
+    }
+    let path = Path::new(file);
+    for directory in path.ancestors().skip(1) {
+        let dir = directory.to_str()?;
+        let pubspec = if dir.is_empty() {
+            "pubspec.yaml".to_owned()
+        } else {
+            format!("{dir}/pubspec.yaml")
+        };
+        if index.files.contains_key(&pubspec) {
+            let prefix = if crate::runners::is_flutter_pubspec(workspace, &pubspec) {
+                "flutter test"
+            } else {
+                "dart test"
+            };
+            return Some((prefix.to_owned(), quote(file)));
         }
     }
     None
@@ -1741,13 +1857,36 @@ pub(crate) fn is_shared_js_config_or_setup(file: &str) -> bool {
             stem,
             "setupTests"
                 | "setup-tests"
+                | "setup_tests"
                 | "test-setup"
+                | "test_setup"
                 | "testSetup"
                 | "global-setup"
                 | "globalSetup"
                 | "global-teardown"
                 | "globalTeardown"
         )
+}
+
+/// Whether a Dart/Flutter file is a shared test harness, helper, or config file.
+pub(crate) fn is_shared_dart_helper(file: &str) -> bool {
+    let base = file.rsplit('/').next().unwrap_or(file);
+    matches!(
+        base,
+        "pubspec.yaml"
+            | "pubspec.lock"
+            | "build.yaml"
+            | "analysis_options.yaml"
+            | "dart_test.yaml"
+            | "flutter_test_config.dart"
+            | "l10n.yaml"
+            | "test_helper.dart"
+            | "test_helpers.dart"
+            | "test_setup.dart"
+            | "setup_tests.dart"
+    ) || (base.starts_with("build.") && base.ends_with(".yaml"))
+        || (file.ends_with(".dart")
+            && (file.starts_with("test/support/") || file.contains("/test/support/")))
 }
 
 /// Whether a Ruby file is a shared RSpec/test helper or configuration file.
@@ -1813,6 +1952,9 @@ pub(crate) struct JsGraph {
     pub computed_dynamic: Vec<ComputedImport>,
     /// Non-relative path-alias imports (`@/...`, `~/...`, `#...`, `src/...`).
     pub alias_imports: Vec<(String, usize, String)>,
+    /// Cached `file_path -> file-node definition ID` built once per graph so
+    /// per-seed traversals avoid rescanning `index.definitions`.
+    file_nodes: HashMap<String, usize>,
 }
 
 #[derive(Default)]
@@ -1835,7 +1977,16 @@ pub(crate) struct JsReach {
 
 impl JsGraph {
     pub(crate) fn build(workspace: &Workspace, index: &Index) -> Self {
-        let mut graph = Self::default();
+        let mut graph = Self {
+            file_nodes: index
+                .definitions
+                .iter()
+                .enumerate()
+                .filter(|(_, def)| def.kind == "file" && is_js_file(&def.location.file))
+                .map(|(id, def)| (def.location.file.clone(), id))
+                .collect(),
+            ..Self::default()
+        };
         for file in index.files.keys() {
             if !is_js_file(file) {
                 continue;
@@ -2053,8 +2204,8 @@ impl JsGraph {
                 .trim_end_matches('/');
             if keys.iter().any(|key| {
                 normalized == key
-                    || normalized.ends_with(&format!("/{key}"))
-                    || key.ends_with(&format!("/{normalized}"))
+                    || ends_with_path_segment(normalized, key)
+                    || ends_with_path_segment(key, normalized)
             }) {
                 return Some((importer.clone(), *line, spec.clone()));
             }
@@ -2066,97 +2217,88 @@ impl JsGraph {
     /// edges, and static `index` file imports starting from `starts`.
     pub(crate) fn reach_from(&self, index: &Index, starts: &[String]) -> JsReach {
         let mut reach = JsReach::default();
-        // Map file path -> file-node definition ID for fast static import traversal.
-        let file_nodes: BTreeMap<&str, usize> = index
-            .definitions
-            .iter()
-            .enumerate()
-            .filter(|(_, def)| def.kind == "file" && is_js_file(&def.location.file))
-            .map(|(id, def)| (def.location.file.as_str(), id))
-            .collect();
-
         // Queue entries: (file, via_barrel_or_dynamic, first_line, why_chain).
-        let mut visited = BTreeSet::<String>::new();
-        let mut queue = std::collections::VecDeque::<(String, bool, usize, String)>::new();
+        let mut visited = HashSet::<&str>::with_capacity(starts.len().max(8));
+        let mut queue = VecDeque::<(&str, bool, usize, String)>::new();
         for start in starts {
-            if visited.insert(start.clone()) {
+            if visited.insert(start.as_str()) {
                 let is_barrel = self.barrels.contains(start);
                 if is_barrel {
                     reach.touched_barrels.insert(start.clone());
                 }
-                queue.push_back((start.clone(), is_barrel, 1, String::new()));
+                queue.push_back((start.as_str(), is_barrel, 1, String::new()));
             }
         }
 
         while let Some((current, widened, _, prefix_why)) = queue.pop_front() {
             for computed in &self.computed_dynamic {
-                if computed.file != current && computed.matches(&current, "") {
+                if computed.file != current && computed.matches(current, "") {
                     reach.computed_hits.push((
                         computed.file.clone(),
                         computed.line,
                         computed.kind,
-                        current.clone(),
+                        current.to_owned(),
                     ));
                 }
             }
             // 1. Barrel re-exports of `current`.
-            if let Some(edges) = self.reexports.get(&current) {
+            if let Some(edges) = self.reexports.get(current) {
                 for edge in edges {
                     reach.touched_barrels.insert(edge.from.clone());
                     let step_why =
                         format!("{} at {}:{} → {current}", edge.kind, edge.from, edge.line);
                     let why = join_why(&prefix_why, &step_why);
-                    if is_test_file(&edge.from) {
+                    if is_test_file(&edge.from) || crate::runners::is_deno_test_file(&edge.from) {
                         reach
                             .test_files
                             .entry(edge.from.clone())
                             .or_insert((edge.line, why, true));
-                    } else if visited.insert(edge.from.clone()) {
+                    } else if visited.insert(edge.from.as_str()) {
                         reach.reached_files.insert(edge.from.clone());
-                        queue.push_back((edge.from.clone(), true, edge.line, why));
+                        queue.push_back((edge.from.as_str(), true, edge.line, why));
                     }
                 }
             }
             // 2. Static `import('./...')`, `require('./...')`, `vi.mock('./...')`.
-            if let Some(edges) = self.dynamic_imports.get(&current) {
+            if let Some(edges) = self.dynamic_imports.get(current) {
                 for edge in edges {
                     let step_why =
                         format!("{} at {}:{} → {current}", edge.kind, edge.from, edge.line);
                     let why = join_why(&prefix_why, &step_why);
-                    if is_test_file(&edge.from) {
+                    if is_test_file(&edge.from) || crate::runners::is_deno_test_file(&edge.from) {
                         reach
                             .test_files
                             .entry(edge.from.clone())
                             .or_insert((edge.line, why, true));
-                    } else if visited.insert(edge.from.clone()) {
+                    } else if visited.insert(edge.from.as_str()) {
                         reach.reached_files.insert(edge.from.clone());
-                        queue.push_back((edge.from.clone(), true, edge.line, why));
+                        queue.push_back((edge.from.as_str(), true, edge.line, why));
                     }
                 }
             }
             // 3. Static `import` edges already indexed in `index` (needed once
             //    we have stepped through a barrel or dynamic import!).
-            if widened && let Some(&node_id) = file_nodes.get(current.as_str()) {
+            if widened && let Some(&node_id) = self.file_nodes.get(current) {
                 for edge in index.incoming(node_id) {
                     if edge.kind != Kind::Import {
                         continue;
                     }
-                    let importer = &edge.location.file;
-                    if importer == &current || !is_js_file(importer) {
+                    let importer = edge.location.file.as_str();
+                    if importer == current || !is_js_file(importer) {
                         continue;
                     }
                     let step_why =
                         format!("import at {}:{} → {current}", importer, edge.location.start);
                     let why = join_why(&prefix_why, &step_why);
-                    if is_test_file(importer) {
-                        reach.test_files.entry(importer.clone()).or_insert((
+                    if is_test_file(importer) || crate::runners::is_deno_test_file(importer) {
+                        reach.test_files.entry(importer.to_owned()).or_insert((
                             edge.location.start,
                             why,
                             true,
                         ));
-                    } else if visited.insert(importer.clone()) {
-                        reach.reached_files.insert(importer.clone());
-                        queue.push_back((importer.clone(), true, edge.location.start, why));
+                    } else if visited.insert(importer) {
+                        reach.reached_files.insert(importer.to_owned());
+                        queue.push_back((importer, true, edge.location.start, why));
                     }
                 }
             }
@@ -2178,6 +2320,74 @@ impl JsGraph {
         }
         reach
     }
+
+    /// Follows direct & transitive static `import` / re-export / dynamic-import
+    /// edges to discover Deno test files (`*_test.ts`, `*.test.ts`, `test.ts`),
+    /// including namespace (`import * as mod`) and side-effect imports.
+    pub(crate) fn reach_deno_tests(
+        &self,
+        index: &Index,
+        starts: &[String],
+    ) -> BTreeMap<String, (usize, String)> {
+        let mut test_files = BTreeMap::<String, (usize, String)>::new();
+        let mut visited = HashSet::<&str>::with_capacity(starts.len().max(8));
+        let mut queue = VecDeque::<(&str, String)>::new();
+        for start in starts {
+            if visited.insert(start.as_str()) {
+                queue.push_back((start.as_str(), String::new()));
+            }
+        }
+        while let Some((current, prefix_why)) = queue.pop_front() {
+            if let Some(&node_id) = self.file_nodes.get(current) {
+                for edge in index.incoming(node_id) {
+                    if edge.kind != Kind::Import {
+                        continue;
+                    }
+                    let importer = edge.location.file.as_str();
+                    if importer == current || !is_js_file(importer) {
+                        continue;
+                    }
+                    let step_why =
+                        format!("import at {}:{} → {current}", importer, edge.location.start);
+                    let why = join_why(&prefix_why, &step_why);
+                    if crate::runners::is_deno_test_file(importer) {
+                        test_files
+                            .entry(importer.to_owned())
+                            .or_insert((edge.location.start, why));
+                    } else if visited.insert(importer) {
+                        queue.push_back((importer, why));
+                    }
+                }
+            }
+            for edges in [
+                self.reexports.get(current),
+                self.dynamic_imports.get(current),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                for edge in edges {
+                    let step_why =
+                        format!("{} at {}:{} → {current}", edge.kind, edge.from, edge.line);
+                    let why = join_why(&prefix_why, &step_why);
+                    if crate::runners::is_deno_test_file(&edge.from) {
+                        test_files
+                            .entry(edge.from.clone())
+                            .or_insert((edge.line, why));
+                    } else if visited.insert(edge.from.as_str()) {
+                        queue.push_back((edge.from.as_str(), why));
+                    }
+                }
+            }
+        }
+        test_files
+    }
+}
+
+fn ends_with_path_segment(haystack: &str, needle: &str) -> bool {
+    haystack.len() > needle.len()
+        && haystack.ends_with(needle)
+        && haystack.as_bytes()[haystack.len() - needle.len() - 1] == b'/'
 }
 
 fn join_why(prefix: &str, next: &str) -> String {
@@ -2273,6 +2483,7 @@ fn is_alias_specifier(spec: &str) -> bool {
         || spec.starts_with("~/")
         || spec.starts_with('#')
         || spec.starts_with("src/")
+        || (spec.starts_with('$') && spec.contains('/'))
 }
 
 fn template_static_prefix(from_file: &str, arg: &str) -> Option<String> {
@@ -2348,9 +2559,9 @@ fn resolve_js_specifier(index: &Index, from: &str, spec: &str) -> Option<String>
 }
 
 /// Checks if a runner configuration file (`jest.config.*`, `vitest.config.*`,
-/// `vite.config.*`, `playwright.config.*`, `bunfig.toml`) under `runner_root`
-/// references `changed_file` (e.g. via `setupFiles`, `setupFilesAfterEnv`,
-/// `preload`, or `globalSetup`).
+/// `vite.config.*`, `playwright.config.*`, `bunfig.toml`, or `deno.json`/`deno.jsonc`
+/// preload/importMap entries) under `runner_root` references `changed_file` (e.g.
+/// via `setupFiles`, `setupFilesAfterEnv`, `preload`, `importMap`, or `globalSetup`).
 pub(crate) fn config_reference(
     workspace: &Workspace,
     index: &Index,
@@ -2367,7 +2578,9 @@ pub(crate) fn config_reference(
             continue;
         }
         let name = config.rsplit('/').next().unwrap_or(config);
-        let is_config = name.starts_with("jest.config.")
+        let is_deno_config = matches!(name, "deno.json" | "deno.jsonc");
+        let is_config = is_deno_config
+            || name.starts_with("jest.config.")
             || name.starts_with("vitest.config.")
             || name.starts_with("vite.config.")
             || name.starts_with("playwright.config.")
@@ -2381,7 +2594,31 @@ pub(crate) fn config_reference(
         let Ok(text) = fs::read_to_string(path) else {
             continue;
         };
+        if !text.contains(changed_stem) {
+            continue;
+        }
+        let mut in_deno_preload = false;
         for line in text.lines() {
+            // In deno.json / deno.jsonc, ignore normal library `exports` entries
+            // and inspect only setup/import-map/preload references (including
+            // multi-line `"preload": [ ... ]` arrays).
+            if is_deno_config {
+                let is_preload_key = line.contains("\"preload\"") || line.contains("'preload'");
+                if is_preload_key && line.contains('[') && !line.contains(']') {
+                    in_deno_preload = true;
+                }
+                let inspect = in_deno_preload
+                    || is_preload_key
+                    || line.contains("importMap")
+                    || line.contains("preload")
+                    || line.contains("setup");
+                if in_deno_preload && line.contains(']') {
+                    in_deno_preload = false;
+                }
+                if !inspect {
+                    continue;
+                }
+            }
             for quote in ['"', '\''] {
                 let mut parts = line.split(quote);
                 parts.next();
@@ -2392,7 +2629,7 @@ pub(crate) fn config_reference(
                             || resolve_js_specifier(index, config, lit).as_deref()
                                 == Some(changed_file)
                             || resolve_relative_path(config, lit).as_deref() == Some(changed_file)
-                            || lit.ends_with(&format!("/{changed_base}")))
+                            || ends_with_path_segment(lit, changed_base))
                     {
                         return Some(config.clone());
                     }
@@ -2402,6 +2639,375 @@ pub(crate) fn config_reference(
         }
     }
     None
+}
+
+/// Dart / Flutter `import`, `export`, and `part` dependency graph.
+#[derive(Default)]
+pub(crate) struct DartGraph {
+    /// `target_dart_file -> [importing / exporting / part edges]`.
+    pub imports: BTreeMap<String, Vec<ModuleEdge>>,
+    /// Files importing `dart:mirrors` (runtime reflection).
+    pub reflection_sites: Vec<(String, usize)>,
+}
+
+#[derive(Default)]
+pub(crate) struct DartReach {
+    /// `test_file -> (line, why)`.
+    pub test_files: BTreeMap<String, (usize, String)>,
+    /// Non-test Dart files reached transitively.
+    pub reached_files: BTreeSet<String>,
+}
+
+impl DartGraph {
+    pub(crate) fn build(workspace: &Workspace, index: &Index) -> Self {
+        let mut graph = Self::default();
+        // Discover local Dart package names from `pubspec.yaml` -> `<dir>/lib`.
+        let mut packages = HashMap::<String, String>::new();
+        for file in index.files.keys() {
+            if !(file == "pubspec.yaml" || file.ends_with("/pubspec.yaml")) {
+                continue;
+            }
+            let Ok(path) = workspace.source_path(file) else {
+                continue;
+            };
+            let Ok(text) = fs::read_to_string(path) else {
+                continue;
+            };
+            if let Some(pkg_name) = parse_pubspec_name(&text) {
+                let dir = file.rsplit_once('/').map_or("", |(d, _)| d);
+                let lib_dir = if dir.is_empty() {
+                    "lib".to_owned()
+                } else {
+                    format!("{dir}/lib")
+                };
+                packages.insert(pkg_name, lib_dir);
+            }
+        }
+        for file in index.files.keys() {
+            if !file.ends_with(".dart") {
+                continue;
+            }
+            let Ok(path) = workspace.source_path(file) else {
+                continue;
+            };
+            let Ok(text) = fs::read_to_string(path) else {
+                continue;
+            };
+            graph.scan_file(index, &packages, file, &text);
+        }
+        graph
+    }
+
+    fn scan_file(
+        &mut self,
+        index: &Index,
+        packages: &HashMap<String, String>,
+        file: &str,
+        text: &str,
+    ) {
+        let mut in_block_comment = false;
+        let mut pending: Option<(&'static str, usize, String)> = None;
+
+        for (offset, raw_line) in text.lines().enumerate() {
+            let line_no = offset + 1;
+            let mut active = raw_line;
+            if in_block_comment {
+                if let Some((_, rest)) = active.split_once("*/") {
+                    in_block_comment = false;
+                    active = rest;
+                } else {
+                    continue;
+                }
+            }
+            let mut trimmed = active.trim();
+            while let Some(after_open) = trimmed.strip_prefix("/*") {
+                if let Some((_, rest)) = after_open.split_once("*/") {
+                    trimmed = rest.trim();
+                } else {
+                    in_block_comment = true;
+                    trimmed = "";
+                    break;
+                }
+            }
+            if trimmed.is_empty() || trimmed.starts_with("//") {
+                continue;
+            }
+            let code = strip_js_line_comment(trimmed).trim();
+            if code.is_empty() {
+                continue;
+            }
+            if let Some((kind, start_line, mut buf)) = pending.take() {
+                buf.push(' ');
+                buf.push_str(code);
+                if code.contains(';') {
+                    self.record_directive(index, packages, file, start_line, kind, &buf);
+                } else {
+                    pending = Some((kind, start_line, buf));
+                }
+                continue;
+            }
+            let directive_kind = if code.starts_with("import ")
+                || code.starts_with("import'")
+                || code.starts_with("import\"")
+            {
+                Some("import")
+            } else if code.starts_with("export ")
+                || code.starts_with("export'")
+                || code.starts_with("export\"")
+            {
+                Some("export")
+            } else if code.starts_with("part of ") {
+                Some("part of")
+            } else if code.starts_with("part ")
+                || code.starts_with("part'")
+                || code.starts_with("part\"")
+            {
+                Some("part")
+            } else {
+                None
+            };
+            if let Some(kind) = directive_kind {
+                if code.contains(';') {
+                    self.record_directive(index, packages, file, line_no, kind, code);
+                } else {
+                    pending = Some((kind, line_no, code.to_owned()));
+                }
+            }
+        }
+    }
+
+    fn record_directive(
+        &mut self,
+        index: &Index,
+        packages: &HashMap<String, String>,
+        file: &str,
+        line: usize,
+        kind: &'static str,
+        directive: &str,
+    ) {
+        for uri in extract_quoted_literals(directive) {
+            if uri == "dart:mirrors" {
+                self.reflection_sites.push((file.to_owned(), line));
+                continue;
+            }
+            if uri.starts_with("dart:") || !uri.ends_with(".dart") {
+                continue;
+            }
+            let Some(target) = resolve_dart_uri(index, packages, file, uri) else {
+                continue;
+            };
+            if target == file {
+                continue;
+            }
+            if matches!(kind, "part" | "part of") {
+                // A library and its `part` share one compilation unit: edits to
+                // either side affect importers of the other.
+                self.imports
+                    .entry(target.clone())
+                    .or_default()
+                    .push(ModuleEdge {
+                        from: file.to_owned(),
+                        line,
+                        kind,
+                    });
+                self.imports
+                    .entry(file.to_owned())
+                    .or_default()
+                    .push(ModuleEdge {
+                        from: target,
+                        line,
+                        kind,
+                    });
+            } else {
+                self.imports.entry(target).or_default().push(ModuleEdge {
+                    from: file.to_owned(),
+                    line,
+                    kind,
+                });
+            }
+        }
+    }
+
+    pub(crate) fn reach_from(&self, starts: &[String]) -> DartReach {
+        let mut reach = DartReach::default();
+        let mut visited = HashSet::<&str>::with_capacity(starts.len().max(8));
+        let mut queue = VecDeque::<(&str, String)>::new();
+        for start in starts {
+            if visited.insert(start.as_str()) {
+                queue.push_back((start.as_str(), String::new()));
+            }
+        }
+        while let Some((current, prefix_why)) = queue.pop_front() {
+            if let Some(edges) = self.imports.get(current) {
+                for edge in edges {
+                    let step_why =
+                        format!("{} at {}:{} → {current}", edge.kind, edge.from, edge.line);
+                    let why = join_why(&prefix_why, &step_why);
+                    if crate::runners::is_dart_test_path(&edge.from) {
+                        reach
+                            .test_files
+                            .entry(edge.from.clone())
+                            .or_insert((edge.line, why));
+                    } else if visited.insert(edge.from.as_str()) {
+                        reach.reached_files.insert(edge.from.clone());
+                        queue.push_back((edge.from.as_str(), why));
+                    }
+                }
+            }
+        }
+        reach
+    }
+}
+
+fn parse_pubspec_name(text: &str) -> Option<String> {
+    for raw in text.lines() {
+        // Top-level YAML key (no leading indentation).
+        if raw.starts_with([' ', '\t', '#']) {
+            continue;
+        }
+        let line = raw.split('#').next().unwrap_or(raw).trim();
+        if let Some(rest) = line.strip_prefix("name:") {
+            let pkg = rest.trim().trim_matches(['"', '\'']);
+            if !pkg.is_empty() {
+                return Some(pkg.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn extract_quoted_literals(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' || b == b'"' {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() {
+                if bytes[j] == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                if bytes[j] == b {
+                    if j > start {
+                        out.push(&text[start..j]);
+                    }
+                    i = j;
+                    break;
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn resolve_dart_uri(
+    index: &Index,
+    packages: &HashMap<String, String>,
+    from: &str,
+    uri: &str,
+) -> Option<String> {
+    if let Some(rest) = uri.strip_prefix("package:") {
+        let (pkg, rel) = rest.split_once('/')?;
+        let lib_dir = packages.get(pkg)?;
+        let candidate = format!("{lib_dir}/{rel}");
+        return index.files.contains_key(&candidate).then_some(candidate);
+    }
+    let resolved = resolve_relative_path(from, uri)?;
+    index.files.contains_key(&resolved).then_some(resolved)
+}
+
+/// Maps a changed Dart source file (`lib/<path>.dart` or `lib/src/<path>.dart`)
+/// to any existing matching convention test files (`test/<path>_test.dart`).
+pub(crate) fn dart_convention_tests(index: &Index, root: &str, file: &str) -> Vec<String> {
+    let relative = if root.is_empty() {
+        file
+    } else if let Some(rest) = file
+        .strip_prefix(root)
+        .and_then(|rest| rest.strip_prefix('/'))
+    {
+        rest
+    } else {
+        return Vec::new();
+    };
+    let Some(lib_rel) = relative
+        .strip_prefix("lib/")
+        .and_then(|s| s.strip_suffix(".dart"))
+    else {
+        return Vec::new();
+    };
+    let prefix = if root.is_empty() {
+        String::new()
+    } else {
+        format!("{root}/")
+    };
+    let mut matches = Vec::new();
+    let direct = format!("{prefix}test/{lib_rel}_test.dart");
+    if index.files.contains_key(&direct) {
+        matches.push(direct);
+    }
+    if let Some(inner) = lib_rel.strip_prefix("src/") {
+        let flat = format!("{prefix}test/{inner}_test.dart");
+        if index.files.contains_key(&flat) && !matches.contains(&flat) {
+            matches.push(flat);
+        }
+    }
+    matches
+}
+
+/// Maps a changed JS/TS source file (`<path>.ts`/`.tsx`/`.js`/...) to any
+/// existing matching Deno convention test files (`<path>_test.<ext>`,
+/// `<path>.test.<ext>`, plus mirrored `tests/` and `test/` locations).
+pub(crate) fn deno_convention_tests(index: &Index, root: &str, file: &str) -> Vec<String> {
+    if crate::runners::is_deno_test_file(file) {
+        return Vec::new();
+    }
+    let relative = if root.is_empty() {
+        file
+    } else if let Some(rest) = file
+        .strip_prefix(root)
+        .and_then(|rest| rest.strip_prefix('/'))
+    {
+        rest
+    } else {
+        return Vec::new();
+    };
+    let exts = ["ts", "tsx", "mts", "js", "mjs", "jsx", "cjs", "cts"];
+    let Some((stem_path, ext)) = exts.iter().find_map(|ext| {
+        relative
+            .strip_suffix(&format!(".{ext}"))
+            .map(|stem| (stem, *ext))
+    }) else {
+        return Vec::new();
+    };
+    let prefix = if root.is_empty() {
+        String::new()
+    } else {
+        format!("{root}/")
+    };
+    let mut matches = Vec::new();
+    let mut try_stem = |base_stem: &str| {
+        for cand_ext in std::iter::once(ext).chain(["ts", "tsx", "js", "jsx", "mts", "mjs"]) {
+            for suffix in ["_test", ".test"] {
+                let candidate = format!("{prefix}{base_stem}{suffix}.{cand_ext}");
+                if index.files.contains_key(&candidate) && !matches.contains(&candidate) {
+                    matches.push(candidate);
+                }
+            }
+        }
+    };
+    try_stem(stem_path);
+    for src_prefix in ["src/", "lib/"] {
+        if let Some(inner) = stem_path.strip_prefix(src_prefix) {
+            try_stem(&format!("tests/{inner}"));
+            try_stem(&format!("test/{inner}"));
+        }
+    }
+    matches
 }
 
 /// Ruby `require_relative`/`require` graph and dynamic-loader detector.
@@ -2496,15 +3102,15 @@ impl RubyGraph {
 
     pub(crate) fn reach_from(&self, starts: &[String]) -> RubyReach {
         let mut reach = RubyReach::default();
-        let mut visited = BTreeSet::<String>::new();
-        let mut queue = std::collections::VecDeque::<(String, String)>::new();
+        let mut visited = HashSet::<&str>::with_capacity(starts.len().max(8));
+        let mut queue = VecDeque::<(&str, String)>::new();
         for start in starts {
-            if visited.insert(start.clone()) {
-                queue.push_back((start.clone(), String::new()));
+            if visited.insert(start.as_str()) {
+                queue.push_back((start.as_str(), String::new()));
             }
         }
         while let Some((current, prefix_why)) = queue.pop_front() {
-            if let Some(edges) = self.requires.get(&current) {
+            if let Some(edges) = self.requires.get(current) {
                 for edge in edges {
                     let step_why =
                         format!("{} at {}:{} → {current}", edge.kind, edge.from, edge.line);
@@ -2514,9 +3120,9 @@ impl RubyGraph {
                             .test_files
                             .entry(edge.from.clone())
                             .or_insert((edge.line, why));
-                    } else if visited.insert(edge.from.clone()) {
+                    } else if visited.insert(edge.from.as_str()) {
                         reach.reached_files.insert(edge.from.clone());
-                        queue.push_back((edge.from.clone(), why));
+                        queue.push_back((edge.from.as_str(), why));
                     }
                 }
             }
@@ -2580,9 +3186,9 @@ fn resolve_ruby_require(index: &Index, rb_files: &[String], lit: &str) -> Option
 /// name.
 pub(crate) fn rspec_subject_tests(index: &Index, ids: &[usize]) -> Vec<(usize, usize, bool)> {
     // Collect target (full_subject, short_subject, optional_method_name) from Ruby definitions.
-    let mut subjects = BTreeSet::<String>::new();
-    let mut short_subjects = BTreeSet::<String>::new();
-    let mut methods_by_subject = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut subjects = HashSet::<&str>::new();
+    let mut short_subjects = HashSet::<&str>::new();
+    let mut methods_by_subject = HashMap::<&str, HashSet<&str>>::new();
     for &id in ids {
         let def = &index.definitions[id];
         if !def.location.file.ends_with(".rb")
@@ -2593,39 +3199,35 @@ pub(crate) fn rspec_subject_tests(index: &Index, ids: &[usize]) -> Vec<(usize, u
         }
         let rel_name = name(def);
         if matches!(def.kind.as_str(), "class" | "module") {
-            subjects.insert(rel_name.to_owned());
-            short_subjects.insert(short_name(rel_name).to_owned());
+            subjects.insert(rel_name);
+            short_subjects.insert(short_name(rel_name));
         } else if let Some((owner, method)) = rel_name.rsplit_once("::") {
-            subjects.insert(owner.to_owned());
-            short_subjects.insert(short_name(owner).to_owned());
+            subjects.insert(owner);
+            short_subjects.insert(short_name(owner));
+            methods_by_subject.entry(owner).or_default().insert(method);
             methods_by_subject
-                .entry(owner.to_owned())
+                .entry(short_name(owner))
                 .or_default()
-                .insert(method.to_owned());
-            methods_by_subject
-                .entry(short_name(owner).to_owned())
-                .or_default()
-                .insert(method.to_owned());
+                .insert(method);
         }
     }
     if subjects.is_empty() {
         return Vec::new();
     }
     // Check which short class names are unambiguous across indexed Ruby classes/modules.
-    let mut short_counts = BTreeMap::<&str, usize>::new();
+    let mut short_counts = HashMap::<&str, usize>::new();
     for def in &index.definitions {
         if def.location.file.ends_with(".rb") && matches!(def.kind.as_str(), "class" | "module") {
             *short_counts.entry(short_name(name(def))).or_default() += 1;
         }
     }
-    let unique_shorts: BTreeSet<&str> = short_subjects
-        .iter()
-        .map(String::as_str)
+    let unique_shorts: HashSet<&str> = short_subjects
+        .into_iter()
         .filter(|short| short_counts.get(short).copied().unwrap_or(0) == 1)
         .collect();
 
     // Group indexed RSpec test blocks by their top-level unquoted subject.
-    let mut top_matches = BTreeMap::<String, Vec<(usize, Vec<String>)>>::new();
+    let mut top_matches = BTreeMap::<&str, Vec<(usize, Vec<String>)>>::new();
     for (id, def) in index.definitions.iter().enumerate() {
         if !def.test || !def.location.file.ends_with(".rb") {
             continue;
@@ -2637,7 +3239,7 @@ pub(crate) fn rspec_subject_tests(index: &Index, ids: &[usize]) -> Vec<(usize, u
         let matched = subjects.contains(first.as_str()) || unique_shorts.contains(first.as_str());
         if matched {
             top_matches
-                .entry(def.location.file.clone())
+                .entry(def.location.file.as_str())
                 .or_default()
                 .push((id, segments));
         }
@@ -2652,7 +3254,7 @@ pub(crate) fn rspec_subject_tests(index: &Index, ids: &[usize]) -> Vec<(usize, u
         for &(id, ref segments) in &blocks {
             if segments.len() >= 2
                 && let Some(first) = segments.first()
-                && let Some(methods) = methods_by_subject.get(first)
+                && let Some(methods) = methods_by_subject.get(first.as_str())
                 && segments[1..].iter().any(|seg| {
                     let clean = seg.trim_start_matches(['#', '.']);
                     methods.contains(clean)

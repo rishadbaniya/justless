@@ -4,7 +4,7 @@
 //!
 //! The plan is deterministic and runs nothing. `testrun` executes it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::rc::Rc;
@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::context::{Change, Since, changes, relationship};
 use crate::doctests::{Docs, Group, doc_like, markdown_examples, may_hold_examples, spans_lines};
 use crate::impact::{
-    Dependent, JsGraph, RubyGraph, Walk, config_reference, is_shared_js_config_or_setup,
+    DartGraph, Dependent, JsGraph, RubyGraph, Walk, config_reference, dart_convention_tests,
+    deno_convention_tests, is_shared_dart_helper, is_shared_js_config_or_setup,
     is_shared_ruby_helper, rspec_subject_tests, walk,
 };
 use crate::index::{Definition, Fingerprint, Index};
@@ -23,7 +24,8 @@ use crate::map::{is_test_file, name};
 use crate::polyglot::Grammar;
 use crate::runners::{
     Cargo, Kind, Package, Runner, Target, cargo_user_args, enabled_features, is_bun_test_file,
-    is_dot_test_or_spec_file, is_node_test_file, under,
+    is_dart_test_file, is_dart_test_path, is_deno_test_file, is_dot_test_or_spec_file,
+    is_node_test_file, under,
 };
 use crate::workspace::{Location, Workspace};
 
@@ -96,6 +98,10 @@ const GENERIC_NAMES: &[&str] = &[
     "config.json",
     "config.yaml",
     "config.toml",
+    "pubspec.yaml",
+    "deno.json",
+    "deno.jsonc",
+    "import_map.json",
 ];
 
 const LOCKFILES: &[&str] = &[
@@ -108,6 +114,8 @@ const LOCKFILES: &[&str] = &[
     "yarn.lock",
     "bun.lock",
     "bun.lockb",
+    "deno.lock",
+    "pubspec.lock",
     "Gemfile.lock",
     "go.sum",
 ];
@@ -683,13 +691,14 @@ fn comment_only(line: &str) -> bool {
 }
 
 /// Whether a file is code in a language some runner tests: Rust, Python,
-/// JavaScript, TypeScript and their components, Ruby, or Go. Anything else
-/// changes tests only as data.
+/// JavaScript, TypeScript and their components, Dart, Ruby, or Go. Anything
+/// else changes tests only as data.
 fn runner_language(file: &str) -> bool {
     file.ends_with(".rs")
         || file.ends_with(".py")
         || file.ends_with(".go")
         || file.ends_with(".rb")
+        || file.ends_with(".dart")
         || javascript(file)
 }
 
@@ -1023,6 +1032,8 @@ fn changed_docs(
 fn concerns(kind: Kind, name: &str, file: &str) -> bool {
     let cargo = kind.is_cargo();
     let javascript = kind.is_js();
+    let dart = kind == Kind::DartTest;
+    let deno = kind == Kind::DenoTest;
     let ruby = kind == Kind::Rspec;
     match name {
         "Cargo.lock" | "rust-toolchain" | "rust-toolchain.toml" => cargo,
@@ -1041,6 +1052,14 @@ fn concerns(kind: Kind, name: &str, file: &str) -> bool {
         | "nx.json"
         | "lerna.json" => javascript,
         "bunfig.toml" => kind == Kind::Bun,
+        "deno.json" | "deno.jsonc" | "deno.lock" | "import_map.json" | "import-map.json" => deno,
+        "pubspec.yaml"
+        | "pubspec.lock"
+        | "build.yaml"
+        | "analysis_options.yaml"
+        | "dart_test.yaml"
+        | "flutter_test_config.dart"
+        | "l10n.yaml" => dart,
         "Gemfile" | "Gemfile.lock" | ".rspec" | ".ruby-version" | "spec_helper.rb"
         | "rails_helper.rb" | "test_helper.rb" => ruby,
         "go.sum" | "go.mod" | "go.work" => kind == Kind::Go,
@@ -1049,6 +1068,7 @@ fn concerns(kind: Kind, name: &str, file: &str) -> bool {
         _ if file == ".config/nextest.toml" || file.ends_with("/.config/nextest.toml") => {
             kind == Kind::Nextest
         }
+        _ if is_shared_dart_helper(file) => dart,
         _ if name.ends_with(".gemspec")
             || file.starts_with("spec/support/")
             || file.contains("/spec/support/")
@@ -1098,7 +1118,17 @@ fn file_trigger(
     }
     let at_root = directory == runner.root;
     let workspace_config = match name {
-        "rust-toolchain" | "rust-toolchain.toml" | ".ruby-version" => true,
+        "rust-toolchain"
+        | "rust-toolchain.toml"
+        | ".ruby-version"
+        | "pubspec.yaml"
+        | "build.yaml"
+        | "analysis_options.yaml"
+        | "l10n.yaml"
+        | "deno.json"
+        | "deno.jsonc"
+        | "import_map.json"
+        | "import-map.json" => true,
         "pyproject.toml"
         | "setup.py"
         | "setup.cfg"
@@ -1114,6 +1144,7 @@ fn file_trigger(
         _ => {
             file.starts_with(".cargo/config")
                 || file.contains("/.cargo/config")
+                || (name.starts_with("build.") && name.ends_with(".yaml"))
                 || name.ends_with(".gemspec")
                 || (name.starts_with("tsconfig") && name.ends_with(".json"))
                 || name.starts_with("babel.config.")
@@ -1132,11 +1163,13 @@ fn file_trigger(
             || file == ".config/nextest.toml"
             || file.ends_with("/.config/nextest.toml"));
     let js_test_config = runner.kind.is_js() && is_shared_js_config_or_setup(file);
+    let dart_test_config = runner.kind == Kind::DartTest && is_shared_dart_helper(file);
     let ruby_test_config = runner.kind == Kind::Rspec && is_shared_ruby_helper(file);
     let test_config = matches!(name, "pytest.ini" | "tox.ini")
         || root_conftest
         || nextest_config
         || js_test_config
+        || dart_test_config
         || ruby_test_config
         || name == ".env"
         || name.starts_with(".env.");
@@ -1177,6 +1210,8 @@ fn file_trigger(
 /// The selection pipeline's shared, runner-independent facts.
 struct Analysis {
     seeds: Vec<Seed>,
+    /// `definition_id -> index in seeds` for O(1) deduplication and lookup.
+    seed_ids: HashMap<usize, usize>,
     /// Changed files and how they changed.
     files: Vec<(String, String)>,
     /// Plan notes for the seeds.
@@ -1205,6 +1240,8 @@ struct Analysis {
     unmentioned_code: BTreeSet<String>,
     /// Lazily constructed JS/TS barrel & dynamic-import graph (when JS/TS files changed).
     js_graph: Option<JsGraph>,
+    /// Lazily constructed Dart/Flutter import/export/part graph (when `.dart` files changed).
+    dart_graph: Option<DartGraph>,
     /// Lazily constructed Ruby require & dynamic-loader graph (when `.rb` files changed).
     ruby_graph: Option<RubyGraph>,
 }
@@ -1212,9 +1249,11 @@ struct Analysis {
 impl Analysis {
     /// Adds a starting definition once. Returns whether it was new.
     fn add_seed(&mut self, id: usize, origin: String) -> bool {
-        if self.seeds.iter().any(|seed| seed.id == id) {
+        if self.seed_ids.contains_key(&id) {
             return false;
         }
+        let pos = self.seeds.len();
+        self.seed_ids.insert(id, pos);
         self.seeds.push(Seed {
             id,
             origin,
@@ -1396,6 +1435,7 @@ fn analyze(
     let (changed_ids, section) = crate::impact::changed_in(workspace, index, changes);
     let mut analysis = Analysis {
         seeds: Vec::new(),
+        seed_ids: HashMap::new(),
         files: Vec::new(),
         seed_notes: Vec::new(),
         compile_files: BTreeSet::new(),
@@ -1410,6 +1450,7 @@ fn analyze(
         run_ignored,
         unmentioned_code: BTreeSet::new(),
         js_graph: None,
+        dart_graph: None,
         ruby_graph: None,
     };
     let doc_includes = doc_includes(index, &mut texts);
@@ -1425,13 +1466,17 @@ fn analyze(
     // Where each seed came from, as `affected --changes` reports it.
     let mut origins = BTreeMap::<usize, String>::new();
     let mut unknown = Vec::<(String, usize, usize)>::new();
+    let mut changed_by_qualified = HashMap::<&str, usize>::with_capacity(changed_ids.len());
+    for &id in &changed_ids {
+        changed_by_qualified
+            .entry(definitions[id].qualified.as_str())
+            .or_insert(id);
+    }
     for value in &section.values {
         let file = value["file"].as_str().unwrap_or_default().to_owned();
         if let Some(changed) = value["changed"].as_str()
             && let Some(qualified) = value["qualified"].as_str()
-            && let Some(&id) = changed_ids
-                .iter()
-                .find(|&&id| definitions[id].qualified == qualified)
+            && let Some(&id) = changed_by_qualified.get(qualified)
         {
             let origin = if value["references_deleted"].is_string() {
                 format!(
@@ -1804,11 +1849,11 @@ fn analyze(
                     format!("mentions changed {file} as {candidate} at {path}:{line}"),
                 );
                 // A mention is data flow, not a code change: no per-symbol rules.
-                if added && let Some(seed) = analysis.seeds.iter_mut().find(|seed| seed.id == id) {
-                    seed.rules = false;
+                if added && let Some(&pos) = analysis.seed_ids.get(&id) {
+                    analysis.seeds[pos].rules = false;
                 }
                 mentioned = true;
-            } else if is_test_file(&path) {
+            } else if is_test_file(&path) || is_deno_test_file(&path) {
                 analysis
                     .mentioned_files
                     .entry(path.clone())
@@ -1911,6 +1956,7 @@ fn analyze(
         // and so does a change that a function in a component depends on.
         let mut starts = vec![id];
         starts.extend(component(index, &definitions[id].location.file).filter(|&file| file != id));
+        let mut started_nodes: HashSet<usize> = starts.iter().copied().collect();
         let reached = walk(index, &starts, DEPTH);
         if reached.full || !reached.fanned.is_empty() || reached.beyond > 0 {
             seed.capped = Some(name(&definitions[id]).to_owned());
@@ -1918,11 +1964,11 @@ fn analyze(
         collect(index, &reached, &BTreeMap::new(), false, &mut seed);
         let mut inside = components_reached(index, &reached);
         for _ in 0..8 {
-            inside.retain(|node, _| !starts.contains(node));
+            inside.retain(|node, _| !started_nodes.contains(node));
             if inside.is_empty() {
                 break;
             }
-            starts.extend(inside.keys().copied());
+            started_nodes.extend(inside.keys().copied());
             let mut next = BTreeMap::new();
             for possible in [false, true] {
                 let notes: BTreeMap<usize, String> = inside
@@ -1945,7 +1991,7 @@ fn analyze(
             }
             inside = next;
         }
-        inside.retain(|node, _| !starts.contains(node));
+        inside.retain(|node, _| !started_nodes.contains(node));
         if !inside.is_empty() {
             seed.capped = Some(name(&definitions[id]).to_owned());
         }
@@ -2006,7 +2052,10 @@ fn analyze(
                         let scope = around.is_none_or(|enclosing| {
                             matches!(definitions[enclosing].kind.as_str(), "file" | "module")
                         });
-                        if family == Some("JavaScript") && is_test_file(&path) && scope {
+                        if family == Some("JavaScript")
+                            && (is_test_file(&path) || is_deno_test_file(&path))
+                            && scope
+                        {
                             // JavaScript tests are calls, not definitions: the file is the unit.
                             seed.files.entry(path.clone()).or_insert(Hit {
                                 hops: 1,
@@ -2048,7 +2097,7 @@ fn analyze(
                     .or_insert_with(|| implicitly(definitions, dependent, type_id));
             }
         }
-        let mut started: BTreeSet<usize> = starts.into_iter().collect();
+        let mut started = started_nodes;
         for _ in 0..8 {
             further.retain(|start, _| started.insert(*start));
             if further.is_empty() {
@@ -2059,7 +2108,7 @@ fn analyze(
             if reached.full || !reached.fanned.is_empty() || reached.beyond > 0 {
                 seed.capped = Some(name(&definitions[starts[0]]).to_owned());
             }
-            let known: BTreeSet<usize> = seed.dependents.keys().copied().collect();
+            let known: HashSet<usize> = seed.dependents.keys().copied().collect();
             collect(index, &reached, &further, true, &mut seed);
             further.clear();
             for &dependent in seed.dependents.keys() {
@@ -2090,13 +2139,14 @@ fn analyze(
         let js_graph = JsGraph::build(workspace, index);
         for seed in &mut analysis.seeds {
             let mut js_starts = Vec::new();
+            let mut js_seen = HashSet::<&str>::new();
             let seed_file = &definitions[seed.id].location.file;
-            if javascript(seed_file) {
+            if javascript(seed_file) && js_seen.insert(seed_file.as_str()) {
                 js_starts.push(seed_file.clone());
             }
             for &dep in seed.dependents.keys() {
                 let dep_file = &definitions[dep].location.file;
-                if javascript(dep_file) && !js_starts.contains(dep_file) {
+                if javascript(dep_file) && js_seen.insert(dep_file.as_str()) {
                     js_starts.push(dep_file.clone());
                 }
             }
@@ -2131,6 +2181,52 @@ fn analyze(
         analysis.js_graph = Some(js_graph);
     }
 
+    // Dart / Flutter `import`, `export`, and `part` augmentation.
+    if analysis
+        .files
+        .iter()
+        .any(|(file, _)| file.ends_with(".dart"))
+    {
+        let dart_graph = DartGraph::build(workspace, index);
+        for seed in &mut analysis.seeds {
+            let seed_def = &definitions[seed.id];
+            if !seed_def.location.file.ends_with(".dart") || seed_def.test {
+                continue;
+            }
+            let mut dart_starts = vec![seed_def.location.file.clone()];
+            let mut dart_seen = HashSet::from([seed_def.location.file.as_str()]);
+            for &dep in seed.dependents.keys() {
+                let dep_file = &definitions[dep].location.file;
+                if dep_file.ends_with(".dart") && dart_seen.insert(dep_file.as_str()) {
+                    dart_starts.push(dep_file.clone());
+                }
+            }
+            let reach = dart_graph.reach_from(&dart_starts);
+            for (test_file, (_line, why)) in reach.test_files {
+                seed.files.entry(test_file).or_insert(Hit {
+                    hops: 1,
+                    possible: false,
+                    why,
+                });
+            }
+        }
+        let changed_dart: Vec<String> = analysis
+            .files
+            .iter()
+            .map(|(f, _)| f.clone())
+            .filter(|f| f.ends_with(".dart"))
+            .collect();
+        let reach = dart_graph.reach_from(&changed_dart);
+        for (test_file, (_line, why)) in reach.test_files {
+            analysis.mentioned_files.entry(test_file).or_insert(Hit {
+                hops: 1,
+                possible: false,
+                why,
+            });
+        }
+        analysis.dart_graph = Some(dart_graph);
+    }
+
     // Ruby RSpec subject matching & static `require_relative`/`require` augmentation.
     if analysis.files.iter().any(|(file, _)| file.ends_with(".rb")) {
         let ruby_graph = RubyGraph::build(workspace, index);
@@ -2140,12 +2236,13 @@ fn analyze(
                 continue;
             }
             let mut rb_starts = vec![seed_def.location.file.clone()];
+            let mut rb_seen = HashSet::from([seed_def.location.file.as_str()]);
             let mut rb_ids = vec![seed.id];
             for &dep in seed.dependents.keys() {
                 let dep_file = &definitions[dep].location.file;
                 if dep_file.ends_with(".rb") {
                     rb_ids.push(dep);
-                    if !rb_starts.contains(dep_file) {
+                    if rb_seen.insert(dep_file.as_str()) {
                         rb_starts.push(dep_file.clone());
                     }
                 }
@@ -2352,17 +2449,18 @@ fn collect(
     seed: &mut Seed,
 ) {
     let definitions = &index.definitions;
-    let mut by_dependent = BTreeMap::new();
-    for (offset, level) in reached.levels.iter().enumerate() {
+    let reached_count: usize = reached.levels.iter().map(Vec::len).sum();
+    let mut by_dependent = HashMap::with_capacity(reached_count);
+    for level in &reached.levels {
         for reach in level {
-            by_dependent.insert(reach.dependent, (offset + 1, reach));
+            by_dependent.insert(reach.dependent, reach);
         }
     }
     let chain = |from: Dependent| -> String {
         let mut links = Vec::new();
         let mut current = from;
         let mut root = None;
-        while let Some((_, reach)) = by_dependent.get(&current) {
+        while let Some(reach) = by_dependent.get(&current) {
             links.push(format!(
                 "{}{} at {} → {}",
                 if reach.edge.inferred { "possible " } else { "" },
@@ -2410,7 +2508,8 @@ fn collect(
                 // JavaScript `test(...)` calls, reaches the change.
                 Dependent::Symbol(id)
                     if matches!(definitions[id].kind.as_str(), "file" | "module")
-                        && is_test_file(&definitions[id].location.file) =>
+                        && (is_test_file(&definitions[id].location.file)
+                            || is_deno_test_file(&definitions[id].location.file)) =>
                 {
                     let file = definitions[id].location.file.clone();
                     let hit = Hit {
@@ -2434,7 +2533,7 @@ fn collect(
                     *distance = (*distance).min(hops);
                 }
                 Dependent::Scope(file) => {
-                    if is_test_file(file) {
+                    if is_test_file(file) || is_deno_test_file(file) {
                         seed.files.entry(file.to_owned()).or_insert(Hit {
                             hops,
                             possible,
@@ -2522,9 +2621,13 @@ fn in_scope(runner: &Runner, file: &str) -> bool {
                 })
         }
         Kind::Pytest => file.ends_with(".py"),
-        Kind::Jest | Kind::Vitest | Kind::Bun | Kind::NodeTest | Kind::Playwright => {
-            javascript(file)
-        }
+        Kind::Jest
+        | Kind::Vitest
+        | Kind::Bun
+        | Kind::NodeTest
+        | Kind::Playwright
+        | Kind::DenoTest => javascript(file),
+        Kind::DartTest => file.ends_with(".dart"),
         Kind::Rspec => file.ends_with(".rb"),
         Kind::Go => file.ends_with(".go"),
         Kind::Command => true,
@@ -2796,7 +2899,66 @@ fn plan_runner(
                 _ => true,
             }
     };
-    for seed in &analysis.seeds {
+    // For `deno test`, trace static ES module `import` chains from each JS/TS
+    // seed (and changed files) to Deno test files so namespace (`import * as`)
+    // and duplicate-name calls still link cleanly without affecting other JS
+    // runners' per-block semantics.
+    let mut deno_seed_files = HashMap::<usize, BTreeMap<String, Hit>>::new();
+    let mut deno_extra_files = BTreeMap::<String, Hit>::new();
+    if runner.kind == Kind::DenoTest
+        && let Some(js_graph) = &analysis.js_graph
+    {
+        for (idx, seed) in analysis.seeds.iter().enumerate() {
+            let mut starts = Vec::new();
+            let mut seen = HashSet::<&str>::new();
+            let seed_file = &definitions[seed.id].location.file;
+            if javascript(seed_file) && seen.insert(seed_file.as_str()) {
+                starts.push(seed_file.clone());
+            }
+            for &dep in seed.dependents.keys() {
+                let dep_file = &definitions[dep].location.file;
+                if javascript(dep_file) && seen.insert(dep_file.as_str()) {
+                    starts.push(dep_file.clone());
+                }
+            }
+            if starts.is_empty() {
+                continue;
+            }
+            let reached = js_graph.reach_deno_tests(index, &starts);
+            if !reached.is_empty() {
+                let map = deno_seed_files.entry(idx).or_default();
+                for (test_file, (_line, why)) in reached {
+                    map.entry(test_file.clone()).or_insert_with(|| Hit {
+                        hops: 1,
+                        possible: false,
+                        why: why.clone(),
+                    });
+                    deno_extra_files.entry(test_file).or_insert(Hit {
+                        hops: 1,
+                        possible: false,
+                        why,
+                    });
+                }
+            }
+        }
+        let changed_js: Vec<String> = analysis
+            .files
+            .iter()
+            .map(|(f, _)| f.clone())
+            .filter(|f| javascript(f) && runner.contains(f) && !analysis.deleted.contains(f))
+            .collect();
+        if !changed_js.is_empty() {
+            for (test_file, (_line, why)) in js_graph.reach_deno_tests(index, &changed_js) {
+                deno_extra_files.entry(test_file).or_insert(Hit {
+                    hops: 1,
+                    possible: false,
+                    why,
+                });
+            }
+        }
+    }
+
+    for (seed_idx, seed) in analysis.seeds.iter().enumerate() {
         let definition = &definitions[seed.id];
         if !seed.rules
             || definition.test
@@ -2812,6 +2974,14 @@ fn plan_runner(
             .chain(
                 seed.files
                     .iter()
+                    .filter(|(file, _)| runnable(file))
+                    .map(|(_, hit)| hit),
+            )
+            .chain(
+                deno_seed_files
+                    .get(&seed_idx)
+                    .into_iter()
+                    .flat_map(|map| map.iter())
                     .filter(|(file, _)| runnable(file))
                     .map(|(_, hit)| hit),
             )
@@ -2884,18 +3054,23 @@ fn plan_runner(
     if runner.kind.is_js()
         && let Some(js_graph) = &analysis.js_graph
     {
-        let mut js_touched: Vec<String> = analysis
-            .files
-            .iter()
-            .map(|(f, _)| f.clone())
-            .filter(|f| javascript(f) && runner.contains(f) && !analysis.deleted.contains(f))
-            .collect();
+        let mut js_seen = HashSet::<&str>::new();
+        let mut js_touched = Vec::<String>::new();
+        for (f, _) in &analysis.files {
+            if javascript(f)
+                && runner.contains(f)
+                && !analysis.deleted.contains(f)
+                && js_seen.insert(f.as_str())
+            {
+                js_touched.push(f.clone());
+            }
+        }
         for seed in &analysis.seeds {
             for &dep in seed.dependents.keys() {
                 let dep_file = &definitions[dep].location.file;
                 if javascript(dep_file)
                     && runner.contains(dep_file)
-                    && !js_touched.contains(dep_file)
+                    && js_seen.insert(dep_file.as_str())
                 {
                     js_touched.push(dep_file.clone());
                 }
@@ -2967,6 +3142,45 @@ fn plan_runner(
         }
     }
 
+    // Conservative Dart reflection guard: if non-test `.dart` code changed and
+    // any file under the runner imports `dart:mirrors`, widen to the full suite.
+    if runner.kind == Kind::DartTest
+        && let Some(dart_graph) = &analysis.dart_graph
+        && analysis.files.iter().any(|(file, _)| {
+            file.ends_with(".dart") && runner.contains(file) && !is_dart_test_path(file)
+        })
+    {
+        for (site, line) in &dart_graph.reflection_sites {
+            if runner.contains(site) {
+                reasons.push(Reason {
+                    code: "dynamic-import",
+                    message: format!("dart:mirrors at {site}:{line} uses runtime reflection"),
+                });
+                break;
+            }
+        }
+    }
+
+    // Conservative discovery guards: never select a test file that custom runner
+    // configuration (`dart_test.yaml` or `deno.json`/`deno.jsonc`) would exclude
+    // or miss custom-matched test paths.
+    if runner.kind == Kind::DartTest
+        && let Some(cfg) = dart_custom_test_config(workspace, runner)
+    {
+        reasons.push(Reason {
+            code: "test-config",
+            message: format!("{cfg} configures custom Dart test discovery or tag filters"),
+        });
+    }
+    if runner.kind == Kind::DenoTest
+        && let Some(cfg) = deno_custom_test_config(workspace, index, runner)
+    {
+        reasons.push(Reason {
+            code: "test-config",
+            message: format!("{cfg} configures custom Deno test include/exclude rules"),
+        });
+    }
+
     let mut plan = match runner.kind {
         Kind::Cargo | Kind::Nextest => cargo_plan(
             workspace,
@@ -2976,10 +3190,15 @@ fn plan_runner(
             &package_scope,
             &whole_targets,
         ),
-        Kind::Pytest => file_plan(workspace, index, runner, analysis, true),
-        Kind::Jest | Kind::Vitest | Kind::Bun | Kind::NodeTest | Kind::Playwright | Kind::Rspec => {
-            file_plan(workspace, index, runner, analysis, false)
-        }
+        Kind::Pytest => file_plan(workspace, index, runner, analysis, true, &deno_extra_files),
+        Kind::Jest
+        | Kind::Vitest
+        | Kind::Bun
+        | Kind::NodeTest
+        | Kind::Playwright
+        | Kind::DenoTest
+        | Kind::DartTest
+        | Kind::Rspec => file_plan(workspace, index, runner, analysis, false, &deno_extra_files),
         Kind::Go => go_plan(workspace, index, runner, analysis),
         Kind::Command => full_plan(runner, Vec::new()),
     };
@@ -3009,13 +3228,182 @@ fn in_scope_language(runner: &Runner, file: &str) -> bool {
     match runner.kind {
         Kind::Cargo | Kind::Nextest => file.ends_with(".rs"),
         Kind::Pytest => file.ends_with(".py"),
-        Kind::Jest | Kind::Vitest | Kind::Bun | Kind::NodeTest | Kind::Playwright => {
-            javascript(file)
-        }
+        Kind::Jest
+        | Kind::Vitest
+        | Kind::Bun
+        | Kind::NodeTest
+        | Kind::Playwright
+        | Kind::DenoTest => javascript(file),
+        Kind::DartTest => file.ends_with(".dart"),
         Kind::Rspec => file.ends_with(".rb"),
         Kind::Go => file.ends_with(".go"),
         Kind::Command => false,
     }
+}
+
+/// Checks if `<runner.root>/dart_test.yaml` defines custom test paths, filename
+/// globs, or tag inclusion/exclusion rules that change what `dart test` runs.
+fn dart_custom_test_config(workspace: &Workspace, runner: &Runner) -> Option<String> {
+    let rel = if runner.root.is_empty() {
+        "dart_test.yaml".to_owned()
+    } else {
+        format!("{}/dart_test.yaml", runner.root)
+    };
+    let text = fs::read_to_string(workspace.root.join(&rel)).ok()?;
+    let custom = text.lines().any(|raw| {
+        if raw.starts_with([' ', '\t', '#']) {
+            return false;
+        }
+        let line = raw.split('#').next().unwrap_or(raw).trim();
+        line.starts_with("paths:")
+            || line.starts_with("filename:")
+            || line.starts_with("include_tags:")
+            || line.starts_with("exclude_tags:")
+    });
+    custom.then_some(rel)
+}
+
+/// Checks if `<runner.root>/deno.json` or `deno.jsonc` configures custom test
+/// `include`/`exclude` rules (or a top-level `exclude` matching indexed Deno
+/// test files) that change what `deno test` discovers.
+fn deno_custom_test_config(
+    workspace: &Workspace,
+    index: &Index,
+    runner: &Runner,
+) -> Option<String> {
+    for name in ["deno.json", "deno.jsonc"] {
+        let rel = if runner.root.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{}/{name}", runner.root)
+        };
+        let Ok(text) = fs::read_to_string(workspace.root.join(&rel)) else {
+            continue;
+        };
+        let cleaned = strip_jsonc(&text);
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&cleaned) else {
+            continue;
+        };
+        if json
+            .get("test")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|test| test.contains_key("include") || test.contains_key("exclude"))
+        {
+            return Some(rel);
+        }
+        if let Some(excludes) = json.get("exclude").and_then(serde_json::Value::as_array) {
+            let matches_test = excludes.iter().filter_map(|v| v.as_str()).any(|entry| {
+                let clean = entry.trim_start_matches("./").trim_end_matches('/');
+                if clean.is_empty() {
+                    return false;
+                }
+                if clean.contains('*') && clean.contains("test") {
+                    return true;
+                }
+                let prefix = format!("{clean}/");
+                index.files.keys().any(|file| {
+                    runner.contains(file) && is_deno_test_file(file) && {
+                        let local = runner.relative(file);
+                        local == clean || local.starts_with(&prefix)
+                    }
+                })
+            });
+            if matches_test {
+                return Some(rel);
+            }
+        }
+    }
+    None
+}
+
+/// Strips JSONC `//` / `/* */` comments and trailing commas outside string
+/// literals so `serde_json` can parse `deno.jsonc`.
+fn strip_jsonc(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut no_comments = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            let ch = text[i..].chars().next().unwrap();
+            no_comments.push(ch);
+            if b == b'\\' && i + 1 < bytes.len() {
+                let next = text[i + 1..].chars().next().unwrap();
+                no_comments.push(next);
+                i += 1 + next.len_utf8();
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
+            i += ch.len_utf8();
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            no_comments.push('"');
+            i += 1;
+        } else if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+        } else {
+            let ch = text[i..].chars().next().unwrap();
+            no_comments.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    let nb = no_comments.as_bytes();
+    let mut out = String::with_capacity(no_comments.len());
+    let mut j = 0;
+    in_string = false;
+    while j < nb.len() {
+        let b = nb[j];
+        if in_string {
+            let ch = no_comments[j..].chars().next().unwrap();
+            out.push(ch);
+            if b == b'\\' && j + 1 < nb.len() {
+                let next = no_comments[j + 1..].chars().next().unwrap();
+                out.push(next);
+                j += 1 + next.len_utf8();
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
+            j += ch.len_utf8();
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            out.push('"');
+            j += 1;
+        } else if b == b',' {
+            let mut k = j + 1;
+            while k < nb.len() && nb[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if k < nb.len() && matches!(nb[k], b'}' | b']') {
+                j += 1;
+                continue;
+            }
+            out.push(',');
+            j += 1;
+        } else {
+            let ch = no_comments[j..].chars().next().unwrap();
+            out.push(ch);
+            j += ch.len_utf8();
+        }
+    }
+    out
 }
 
 /// Everything selected for one runner, with the strongest evidence per unit.
@@ -3174,10 +3562,15 @@ fn cargo_plan(
     plan.steps.clear();
     let mut texts = Texts::new(workspace);
 
-    // Indexed tests in runnable targets of the packages in scope.
+    // Indexed tests in runnable targets of the packages in scope, plus per-file
+    // test definition counts so opaque-target checks stay O(1).
     let mut indexed = 0;
     let mut test_targets = BTreeSet::new();
+    let mut test_counts = HashMap::<&str, usize>::new();
     for definition in definitions.iter().filter(|d| d.test) {
+        *test_counts
+            .entry(definition.location.file.as_str())
+            .or_default() += 1;
         if let Some((package, target)) = target_of(cargo, definition)
             && cargo.scope.contains(&package.name)
             && runs(package, target, &user_args).is_ok()
@@ -3405,10 +3798,7 @@ fn cargo_plan(
                 if !target.harness {
                     why = Some(format!("{} uses a custom test harness", target.src));
                 } else {
-                    let visible = definitions
-                        .iter()
-                        .filter(|d| d.test && d.location.file == target.src)
-                        .count();
+                    let visible = test_counts.get(target.src.as_str()).copied().unwrap_or(0);
                     if test_attributes(&text) > visible {
                         why = Some(format!(
                             "{} has tests the index cannot see, such as ones a macro generates",
@@ -3899,8 +4289,8 @@ fn collectable_js(file: &str) -> bool {
 }
 
 /// Whether the runner's full suite runs tests in `file`: pytest's
-/// `python_files` and `testpaths`, Jest/Vitest/Bun/Node/Playwright test files,
-/// RSpec spec files, Go test files.
+/// `python_files` and `testpaths`, Jest/Vitest/Bun/Node/Playwright/Deno test
+/// files, Dart/Flutter `test/*_test.dart` files, RSpec spec files, Go test files.
 fn collects(runner: &Runner, file: &str) -> bool {
     runner.contains(file)
         && match runner.kind {
@@ -3909,19 +4299,23 @@ fn collects(runner: &Runner, file: &str) -> bool {
             Kind::Vitest | Kind::Playwright => is_dot_test_or_spec_file(file),
             Kind::Bun => is_bun_test_file(file),
             Kind::NodeTest => is_node_test_file(file),
+            Kind::DenoTest => is_deno_test_file(file),
+            Kind::DartTest => is_dart_test_file(&runner.root, file),
             Kind::Rspec => file.ends_with("_spec.rb"),
             Kind::Go => file.ends_with("_test.go"),
             Kind::Cargo | Kind::Nextest | Kind::Command => true,
         }
 }
 
-/// pytest (node IDs) and Jest/Vitest (test files): one step naming what to run.
+/// pytest (node IDs) and file-based runners (Jest/Vitest/Bun/Node/Playwright/Deno/Dart/RSpec):
+/// one step naming what to run.
 fn file_plan(
     workspace: &Workspace,
     index: &Index,
     runner: &Runner,
     analysis: &Analysis,
     python: bool,
+    extra_files: &BTreeMap<String, Hit>,
 ) -> RunnerPlan {
     let definitions = &index.definitions;
     let mut plan = full_plan(runner, Vec::new());
@@ -3957,7 +4351,11 @@ fn file_plan(
             why: hit.why.clone(),
         });
     }
-    for (file, hit) in &files {
+    for (file, hit) in files
+        .iter()
+        .map(|(file, hit)| (file.as_str(), *hit))
+        .chain(extra_files.iter().map(|(file, hit)| (file.as_str(), hit)))
+    {
         if !collectable(file) {
             continue;
         }
@@ -3969,6 +4367,46 @@ fn file_plan(
             confidence: confidence(hit),
             why: hit.why.clone(),
         });
+    }
+    if runner.kind == Kind::DartTest {
+        for (file, _) in &analysis.files {
+            if !file.ends_with(".dart") || !runner.contains(file) {
+                continue;
+            }
+            for candidate in dart_convention_tests(index, &runner.root, file) {
+                if !collectable(&candidate) {
+                    continue;
+                }
+                let relative = runner.relative(&candidate).to_owned();
+                whole_files.insert(relative.clone());
+                units.entry(relative.clone()).or_insert(Selected {
+                    id: relative.clone(),
+                    target: relative,
+                    confidence: "mention",
+                    why: format!("matches changed {file} by Dart test convention"),
+                });
+            }
+        }
+    }
+    if runner.kind == Kind::DenoTest {
+        for (file, _) in &analysis.files {
+            if !javascript(file) || !runner.contains(file) {
+                continue;
+            }
+            for candidate in deno_convention_tests(index, &runner.root, file) {
+                if !collectable(&candidate) {
+                    continue;
+                }
+                let relative = runner.relative(&candidate).to_owned();
+                whole_files.insert(relative.clone());
+                units.entry(relative.clone()).or_insert(Selected {
+                    id: relative.clone(),
+                    target: relative,
+                    confidence: "mention",
+                    why: format!("matches changed {file} by Deno test convention"),
+                });
+            }
+        }
     }
     if python {
         // The import net: test files that name a changed module's dotted path.
@@ -4072,7 +4510,15 @@ fn file_plan(
     }
     if !ids.is_empty() {
         let mut argv = runner.base.clone();
-        argv.extend(ids.iter().cloned());
+        if runner.kind == Kind::DenoTest
+            && let Some(sep) = argv.iter().position(|word| word == "--")
+        {
+            // Insert selected test files before `--` so trailing script args
+            // remain forwarded to `Deno.args`.
+            argv.splice(sep..sep, ids.iter().cloned());
+        } else {
+            argv.extend(ids.iter().cloned());
+        }
         plan.steps.push(Step {
             kind: StepKind::Filtered,
             argv,
@@ -4779,5 +5225,572 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         let _ = orig_helper;
+    }
+
+    #[test]
+    fn dart_and_flutter_select_convention_and_graph_affected_tests() {
+        // 1. Pure Dart package with barrel re-export (`lib/demo.dart`), `package:` import,
+        //    and convention `lib/tax.dart` -> `test/tax_test.dart`.
+        let (dir, workspace) = git_repo(&[
+            ("pubspec.yaml", "name: demo_dart\nversion: 1.0.0\n"),
+            ("lib/demo.dart", "export 'src/calc.dart';\n"),
+            (
+                "lib/src/calc.dart",
+                "int vat(int cents) {\n  return cents ~/ 5;\n}\n",
+            ),
+            ("lib/other.dart", "int noop() {\n  return 1;\n}\n"),
+            (
+                "test/calc_test.dart",
+                "import 'package:demo_dart/demo.dart';\nvoid main() {\n  test('vat', () {\n    vat(100);\n  });\n}\n",
+            ),
+            (
+                "test/summary_test.dart",
+                "import 'package:demo_dart/src/calc.dart';\nvoid main() {\n  test('summary', () {\n    vat(200);\n  });\n}\n",
+            ),
+            (
+                "test/other_test.dart",
+                "import 'package:demo_dart/other.dart';\nvoid main() {\n  test('other', () {\n    noop();\n  });\n}\n",
+            ),
+            (
+                "test/third_test.dart",
+                "void main() {\n  test('third', () {});\n}\n",
+            ),
+            (
+                "test/fourth_test.dart",
+                "void main() {\n  test('fourth', () {});\n}\n",
+            ),
+        ]);
+
+        let calc = dir.path().join("lib/src/calc.dart");
+        let orig = fs::read_to_string(&calc).unwrap();
+        fs::write(&calc, orig.replace("cents ~/ 5", "cents * 20 ~/ 100")).unwrap();
+
+        let dart_plan = plan_for(&workspace, None, false);
+        let r = &dart_plan.runners[0];
+        assert_eq!(r.runner, Kind::DartTest);
+        assert_eq!(r.mode, Mode::Subset);
+        assert_eq!(
+            r.steps[0].argv,
+            [
+                "dart",
+                "test",
+                "test/calc_test.dart",
+                "test/summary_test.dart"
+            ]
+        );
+
+        // 2. Flutter package (`sdk: flutter`) auto-detects `flutter test` and selects
+        //    the affected widget test file.
+        let (fdir, fws) = git_repo(&[
+            (
+                "pubspec.yaml",
+                "name: demo_flutter\ndependencies:\n  flutter:\n    sdk: flutter\n",
+            ),
+            (
+                "lib/counter.dart",
+                "int increment(int n) {\n  return n + 1;\n}\n",
+            ),
+            (
+                "test/counter_test.dart",
+                "import 'package:demo_flutter/counter.dart';\nvoid main() {\n  testWidgets('increments', () {\n    increment(1);\n  });\n}\n",
+            ),
+            (
+                "test/a_test.dart",
+                "void main() {\n  test('a', () {});\n}\n",
+            ),
+            (
+                "test/b_test.dart",
+                "void main() {\n  test('b', () {});\n}\n",
+            ),
+        ]);
+        let counter = fdir.path().join("lib/counter.dart");
+        let orig_counter = fs::read_to_string(&counter).unwrap();
+        fs::write(&counter, orig_counter.replace("n + 1", "n + 2")).unwrap();
+
+        let flutter_plan = plan_for(&fws, None, false);
+        let fr = &flutter_plan.runners[0];
+        assert_eq!(fr.runner, Kind::DartTest);
+        assert_eq!(fr.mode, Mode::Subset);
+        assert_eq!(
+            fr.steps[0].argv,
+            ["flutter", "test", "test/counter_test.dart"]
+        );
+    }
+
+    #[test]
+    fn deno_selects_convention_and_graph_affected_tests_and_preserves_script_args() {
+        let (dir, workspace) = git_repo(&[
+            (
+                "deno.json",
+                "{\n  \"tasks\": { \"test\": \"deno test\" }\n}\n",
+            ),
+            (
+                "src/calc.ts",
+                "export function compute(cents: number): number {\n  return cents * 0.2;\n}\n",
+            ),
+            (
+                "src/other.ts",
+                "export function compute(x: number): number {\n  return x + 1;\n}\nexport function otherFn(x: number): number {\n  return x * 2;\n}\n",
+            ),
+            (
+                "src/calc_test.ts",
+                "import * as calc from './calc.ts';\nDeno.test('vat', () => {\n  calc.compute(100);\n});\n",
+            ),
+            (
+                "src/report.test.ts",
+                "import { compute } from './calc.ts';\nDeno.test('report', () => {\n  compute(50);\n});\n",
+            ),
+            (
+                "src/other_test.ts",
+                "import { otherFn } from './other.ts';\nDeno.test('other', () => {\n  otherFn(1);\n});\n",
+            ),
+            ("src/third_test.ts", "Deno.test('third', () => {});\n"),
+            ("src/fourth_test.ts", "Deno.test('fourth', () => {});\n"),
+        ]);
+
+        let calc = dir.path().join("src/calc.ts");
+        let orig = fs::read_to_string(&calc).unwrap();
+        fs::write(&calc, orig.replace("cents * 0.2", "cents / 5")).unwrap();
+
+        // Auto-detected `deno test` selects both namespace-imported `src/calc_test.ts`
+        // and graph-connected `src/report.test.ts`, skipping unrelated tests.
+        let auto_plan = plan_for(&workspace, None, false);
+        let r = &auto_plan.runners[0];
+        assert_eq!(r.runner, Kind::DenoTest);
+        assert_eq!(
+            r.mode,
+            Mode::Subset,
+            "reasons: {:?}, tests: {:?}",
+            r.reasons
+                .iter()
+                .map(|reason| (reason.code, &reason.message))
+                .collect::<Vec<_>>(),
+            r.tests.iter().map(|t| &t.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            r.steps[0].argv,
+            ["deno", "test", "src/calc_test.ts", "src/report.test.ts"]
+        );
+
+        // Trailing `-- <script args>` stay after the selected test file arguments.
+        let with_args = plan_for(
+            &workspace,
+            Some(&["deno", "test", "--allow-env", "--", "--port=8080"]),
+            false,
+        );
+        assert_eq!(with_args.runners[0].mode, Mode::Subset);
+        assert_eq!(
+            with_args.runners[0].steps[0].argv,
+            [
+                "deno",
+                "test",
+                "--allow-env",
+                "src/calc_test.ts",
+                "src/report.test.ts",
+                "--",
+                "--port=8080"
+            ]
+        );
+    }
+
+    #[test]
+    fn dart_and_deno_config_and_harness_changes_fall_back_to_full_suite() {
+        // Dart/Flutter config & harness fallbacks.
+        let (ddir, dws) = git_repo(&[
+            ("pubspec.yaml", "name: cfg_dart\nversion: 1.0.0\n"),
+            ("pubspec.lock", "packages: {}\n"),
+            ("build.yaml", "targets:\n  $default: {}\n"),
+            ("analysis_options.yaml", "linter:\n  rules: []\n"),
+            (
+                "test/flutter_test_config.dart",
+                "Future<void> testExecutable(Future<void> Function() main) => main();\n",
+            ),
+            ("lib/calc.dart", "int calc(int x) => x + 1;\n"),
+            (
+                "test/calc_test.dart",
+                "import 'package:cfg_dart/calc.dart';\nvoid main() { test('c', () => calc(1)); }\n",
+            ),
+            ("test/b_test.dart", "void main() { test('b', () {}); }\n"),
+            ("test/c_test.dart", "void main() { test('c', () {}); }\n"),
+        ]);
+        for (rel, updated, expected_code) in [
+            (
+                "pubspec.yaml",
+                "name: cfg_dart\nversion: 1.0.1\n",
+                "workspace-config",
+            ),
+            ("pubspec.lock", "packages:\n  demo: {}\n", "lockfile"),
+            (
+                "build.yaml",
+                "targets:\n  $default:\n    builders: {}\n",
+                "workspace-config",
+            ),
+            (
+                "analysis_options.yaml",
+                "linter:\n  rules:\n    - avoid_print\n",
+                "workspace-config",
+            ),
+            (
+                "test/flutter_test_config.dart",
+                "Future<void> testExecutable(Future<void> Function() main) async { await main(); }\n",
+                "test-config",
+            ),
+        ] {
+            let p = ddir.path().join(rel);
+            let orig = fs::read_to_string(&p).unwrap();
+            fs::write(&p, updated).unwrap();
+            let planned = plan_for(&dws, None, false);
+            assert_eq!(planned.runners[0].mode, Mode::Full, "{rel} must fall back");
+            assert!(
+                planned.runners[0]
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.code == expected_code && reason.message.contains(rel)),
+                "{rel}: {:?}",
+                planned.runners[0]
+                    .reasons
+                    .iter()
+                    .map(|r| (r.code, &r.message))
+                    .collect::<Vec<_>>()
+            );
+            fs::write(&p, orig).unwrap();
+        }
+
+        // Deno config & harness fallbacks.
+        let (ndir, nws) = git_repo(&[
+            (
+                "deno.json",
+                "{\n  \"compilerOptions\": { \"strict\": true }\n}\n",
+            ),
+            ("deno.jsonc", "// config\n{}\n"),
+            ("deno.lock", "{\n  \"version\": \"4\"\n}\n"),
+            ("import_map.json", "{\n  \"imports\": {}\n}\n"),
+            ("test_setup.ts", "export const ready = true;\n"),
+            (
+                "src/calc.ts",
+                "export function calc(x: number) { return x + 1; }\n",
+            ),
+            (
+                "src/calc_test.ts",
+                "import { calc } from './calc.ts';\nDeno.test('c', () => { calc(1); });\n",
+            ),
+            ("src/b_test.ts", "Deno.test('b', () => {});\n"),
+            ("src/c_test.ts", "Deno.test('c', () => {});\n"),
+        ]);
+        for (rel, updated, expected_code) in [
+            (
+                "deno.json",
+                "{\n  \"compilerOptions\": { \"strict\": false }\n}\n",
+                "workspace-config",
+            ),
+            ("deno.jsonc", "// updated\n{}\n", "workspace-config"),
+            ("deno.lock", "{\n  \"version\": \"5\"\n}\n", "lockfile"),
+            (
+                "import_map.json",
+                "{\n  \"imports\": { \"@app/\": \"./src/\" }\n}\n",
+                "workspace-config",
+            ),
+            (
+                "test_setup.ts",
+                "export const ready = false;\n",
+                "test-config",
+            ),
+        ] {
+            let p = ndir.path().join(rel);
+            let orig = fs::read_to_string(&p).unwrap();
+            fs::write(&p, updated).unwrap();
+            let planned = plan_for(&nws, Some(&["deno", "test"]), false);
+            assert_eq!(planned.runners[0].mode, Mode::Full, "{rel} must fall back");
+            assert!(
+                planned.runners[0]
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.code == expected_code && reason.message.contains(rel)),
+                "{rel}: {:?}",
+                planned.runners[0]
+                    .reasons
+                    .iter()
+                    .map(|r| (r.code, &r.message))
+                    .collect::<Vec<_>>()
+            );
+            fs::write(&p, orig).unwrap();
+        }
+    }
+
+    #[test]
+    fn dart_and_deno_explicit_target_and_filter_args_preserve_base_command() {
+        let (dir, workspace) = git_repo(&[
+            ("pubspec.yaml", "name: keep_args\nversion: 1.0.0\n"),
+            ("deno.json", "{}\n"),
+            ("lib/calc.dart", "int calc(int x) => x + 1;\n"),
+            (
+                "test/calc_test.dart",
+                "import 'package:keep_args/calc.dart';\nvoid main() { test('c', () => calc(1)); }\n",
+            ),
+            (
+                "test/other_test.dart",
+                "void main() { test('o', () {}); }\n",
+            ),
+            (
+                "src/calc.ts",
+                "export function calc(x: number) { return x + 1; }\n",
+            ),
+            (
+                "src/calc_test.ts",
+                "import { calc } from './calc.ts';\nDeno.test('c', () => { calc(1); });\n",
+            ),
+            ("src/other_test.ts", "Deno.test('o', () => {});\n"),
+        ]);
+        fs::write(
+            dir.path().join("lib/calc.dart"),
+            "int calc(int x) => x + 2;\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/calc.ts"),
+            "export function calc(x: number) { return x + 2; }\n",
+        )
+        .unwrap();
+
+        for (cmd, expected_flag) in [
+            (
+                &["dart", "test", "test/other_test.dart"][..],
+                "test/other_test.dart",
+            ),
+            (&["flutter", "test", "--name", "widget"][..], "--name"),
+            (&["flutter", "test", "-t", "smoke"][..], "-t"),
+            (
+                &["deno", "test", "src/other_test.ts"][..],
+                "src/other_test.ts",
+            ),
+            (&["deno", "test", "--filter", "vat"][..], "--filter"),
+            (
+                &["deno", "test", "--ignore=src/slow_test.ts"][..],
+                "--ignore=src/slow_test.ts",
+            ),
+        ] {
+            let planned = plan_for(&workspace, Some(cmd), false);
+            let r = &planned.runners[0];
+            assert_eq!(r.mode, Mode::Command, "{cmd:?} must keep command as given");
+            assert_eq!(r.reasons[0].code, "command-selects");
+            assert!(
+                r.reasons[0].message.contains(expected_flag),
+                "{cmd:?}: {}",
+                r.reasons[0].message
+            );
+            assert_eq!(r.steps[0].argv, cmd);
+        }
+
+        // Verify Dart & Deno tallies parse passes, failures, zero-ran, and load errors.
+        let deno_fail = crate::runners::tally(
+            Kind::DenoTest,
+            "ERRORS\nvat fails => ./src/calc_test.ts:2:6\n\nFAILED | 2 passed | 1 failed | 1 ignored (15ms)\n",
+            "",
+        );
+        assert!(deno_fail.known);
+        assert_eq!((deno_fail.ran, deno_fail.ignored), (3, 1));
+        assert_eq!(deno_fail.failed, ["vat fails"]);
+        assert!(!deno_fail.no_tests_matched);
+        let deno_zero = crate::runners::tally(Kind::DenoTest, "", "error: No test modules found\n");
+        assert!(deno_zero.no_tests_matched);
+
+        let dart_fail = crate::runners::tally(
+            Kind::DartTest,
+            "00:01 +2 ~1 -1: test/calc_test.dart: computes tax [E]\n00:01 +2 ~1 -1: Some tests failed.\n",
+            "",
+        );
+        assert!(dart_fail.known);
+        assert_eq!((dart_fail.ran, dart_fail.ignored), (3, 1));
+        assert_eq!(dart_fail.failed, ["test/calc_test.dart: computes tax"]);
+        let dart_load_err = crate::runners::tally(
+            Kind::DartTest,
+            "00:00 +0 -1: loading test/broken_test.dart [E]\n00:00 +0 -1: Some tests failed.\n",
+            "",
+        );
+        assert_eq!(dart_load_err.errors, 1);
+        assert!(!dart_load_err.no_tests_matched);
+        let dart_cr = crate::runners::tally(
+            Kind::DartTest,
+            "00:00 +1: test/calc_test.dart\r00:01 +2: All tests passed!\r",
+            "",
+        );
+        assert!(dart_cr.known);
+        assert_eq!(dart_cr.ran, 2);
+        assert!(dart_cr.failed.is_empty());
+    }
+
+    #[test]
+    fn dart_part_mirrors_support_and_custom_discovery_configs_behave_safely() {
+        let git = |cwd: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        // 1. Dart `part` / `part of` compilation units link edits in part files to tests;
+        //    benign `dart_test.yaml` keeps subsetting; custom `paths:`/`filename:` falls back;
+        //    `dart:mirrors` and `test/support/*.dart` fall back conservatively.
+        let (dir, workspace) = git_repo(&[
+            ("pubspec.yaml", "name: part_demo\nversion: 1.0.0\n"),
+            ("dart_test.yaml", "concurrency: 4\n"),
+            ("lib/calc.dart", "library calc;\npart 'calc_part.dart';\n"),
+            (
+                "lib/calc_part.dart",
+                "part of 'calc.dart';\nint vat(int c) => c ~/ 5;\n",
+            ),
+            ("test/support/helpers.dart", "int helper() => 1;\n"),
+            (
+                "test/calc_test.dart",
+                "import 'package:part_demo/calc.dart';\nvoid main() { test('v', () => vat(10)); }\n",
+            ),
+            ("test/b_test.dart", "void main() { test('b', () {}); }\n"),
+            ("test/c_test.dart", "void main() { test('c', () {}); }\n"),
+        ]);
+        let part_path = dir.path().join("lib/calc_part.dart");
+        let orig_part = fs::read_to_string(&part_path).unwrap();
+        fs::write(&part_path, orig_part.replace("c ~/ 5", "c ~/ 4")).unwrap();
+
+        let planned = plan_for(&workspace, None, false);
+        assert_eq!(planned.runners[0].mode, Mode::Subset);
+        assert_eq!(
+            planned.runners[0].steps[0].argv,
+            ["dart", "test", "test/calc_test.dart"]
+        );
+
+        // Custom `paths:` in `dart_test.yaml` forces full suite even for a normal lib edit.
+        let cfg_path = dir.path().join("dart_test.yaml");
+        fs::write(&cfg_path, "paths:\n  - test/unit\n").unwrap();
+        git(dir.path(), &["add", "dart_test.yaml"]);
+        git(dir.path(), &["commit", "-m", "custom dart paths"]);
+        let custom_dart = plan_for(&workspace, None, false);
+        assert_eq!(custom_dart.runners[0].mode, Mode::Full);
+        assert!(
+            custom_dart.runners[0]
+                .reasons
+                .iter()
+                .any(|r| r.code == "test-config" && r.message.contains("dart_test.yaml"))
+        );
+
+        // Revert custom paths, test `dart:mirrors` guard and `test/support/*.dart` fallback.
+        fs::write(&cfg_path, "concurrency: 4\n").unwrap();
+        fs::write(
+            dir.path().join("lib/reflect.dart"),
+            "import 'dart:mirrors';\nvoid probe() {}\n",
+        )
+        .unwrap();
+        git(dir.path(), &["add", "dart_test.yaml", "lib/reflect.dart"]);
+        git(dir.path(), &["commit", "-m", "add mirrors"]);
+        let mirrors_plan = plan_for(&workspace, None, false);
+        assert_eq!(mirrors_plan.runners[0].mode, Mode::Full);
+        assert!(
+            mirrors_plan.runners[0]
+                .reasons
+                .iter()
+                .any(|r| r.code == "dynamic-import" && r.message.contains("dart:mirrors"))
+        );
+
+        fs::write(&part_path, &orig_part).unwrap();
+        fs::remove_file(dir.path().join("lib/reflect.dart")).unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-m", "remove mirrors"]);
+        fs::write(
+            dir.path().join("test/support/helpers.dart"),
+            "int helper() => 2;\n",
+        )
+        .unwrap();
+        let support_plan = plan_for(&workspace, None, false);
+        assert_eq!(support_plan.runners[0].mode, Mode::Full);
+        assert!(
+            support_plan.runners[0]
+                .reasons
+                .iter()
+                .any(|r| r.code == "test-config" && r.message.contains("test/support/helpers.dart"))
+        );
+
+        // 2. Deno multi-line `preload` config reference & custom `test.exclude` guard.
+        let (ndir, nws) = git_repo(&[
+            (
+                "deno.jsonc",
+                "{\n  // preload helper\n  \"preload\": [\n    \"./helpers/boot.ts\",\n  ],\n}\n",
+            ),
+            ("helpers/boot.ts", "export const booted = true;\n"),
+            (
+                "src/calc.ts",
+                "export function calc(x: number) { return x + 1; }\n",
+            ),
+            (
+                "src/calc_test.ts",
+                "import { calc } from './calc.ts';\nDeno.test('c', () => { calc(1); });\n",
+            ),
+            ("src/b_test.ts", "Deno.test('b', () => {});\n"),
+            ("src/c_test.ts", "Deno.test('c', () => {});\n"),
+        ]);
+        let boot = ndir.path().join("helpers/boot.ts");
+        let orig_boot = fs::read_to_string(&boot).unwrap();
+        fs::write(&boot, "export const booted = false;\n").unwrap();
+        let preload_plan = plan_for(&nws, Some(&["deno", "test"]), false);
+        assert_eq!(preload_plan.runners[0].mode, Mode::Full);
+        assert!(
+            preload_plan.runners[0]
+                .reasons
+                .iter()
+                .any(|r| r.code == "test-config" && r.message.contains("deno.jsonc"))
+        );
+        fs::write(&boot, orig_boot).unwrap();
+
+        fs::write(
+            ndir.path().join("deno.jsonc"),
+            "{\n  \"test\": {\n    \"exclude\": [\"src/b_test.ts\"],\n  },\n}\n",
+        )
+        .unwrap();
+        git(ndir.path(), &["add", "deno.jsonc"]);
+        git(ndir.path(), &["commit", "-m", "deno test exclude"]);
+        fs::write(
+            ndir.path().join("src/calc.ts"),
+            "export function calc(x: number) { return x + 2; }\n",
+        )
+        .unwrap();
+        let deno_excl = plan_for(&nws, Some(&["deno", "test"]), false);
+        assert_eq!(deno_excl.runners[0].mode, Mode::Full);
+        assert!(
+            deno_excl.runners[0]
+                .reasons
+                .iter()
+                .any(|r| r.code == "test-config" && r.message.contains("deno.jsonc"))
+        );
+
+        // 3. Regression guard: `test/support/*.rb` must still trigger fallback for Ruby RSpec.
+        let (rdir, rws) = git_repo(&[
+            (".rspec", "--format documentation\n"),
+            ("test/support/helper.rb", "module Helper; end\n"),
+            ("lib/calc.rb", "class Calc; def add(a); a + 1; end; end\n"),
+            (
+                "spec/calc_spec.rb",
+                "require_relative '../lib/calc'\nRSpec.describe Calc do\n  it 'adds' do\n    expect(Calc.new.add(1)).to eq(2)\n  end\nend\n",
+            ),
+            ("spec/b_spec.rb", "RSpec.describe 'B' do; it('b') {}; end\n"),
+            ("spec/c_spec.rb", "RSpec.describe 'C' do; it('c') {}; end\n"),
+        ]);
+        fs::write(
+            rdir.path().join("test/support/helper.rb"),
+            "module Helper; def x; 1; end; end\n",
+        )
+        .unwrap();
+        let rb_plan = plan_for(&rws, None, false);
+        assert_eq!(rb_plan.runners[0].mode, Mode::Full);
+        assert!(
+            rb_plan.runners[0]
+                .reasons
+                .iter()
+                .any(|r| r.code == "test-config" && r.message.contains("test/support/helper.rb"))
+        );
     }
 }
