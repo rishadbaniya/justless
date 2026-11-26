@@ -7,7 +7,7 @@
 //! budgeted review dossier.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
@@ -16,15 +16,17 @@ use anyhow::{Result, ensure};
 use clap::{Arg, ArgMatches, Command};
 use serde_json::{Map, Value, json};
 
-use crate::context::{Change, Deletion, Report, Since, changes, relationship};
+use crate::context::{Change, Deletion, Report, Since, relationship};
 use crate::impact::{
     Dependent, JsGraph, RubyGraph, Walk, changed_in, config_reference,
     is_shared_js_config_or_setup, is_shared_ruby_helper, rspec_subject_tests, walk,
 };
-use crate::index::{Definition, Edge, Index, nul_paths};
+use crate::index::{Definition, Edge, Index, Removed, nul_paths};
 use crate::lockdiff::{SVG_FOLD_CHANGED_LINES, is_generated_path, is_lockfile_path, is_svg_path};
-use crate::map::{Section, is_support_file, is_test_file, label, language, name, node, plural};
-use crate::rust_syntax::Kind;
+use crate::map::{
+    FileIndex, Section, is_test_file, label, language, lpa_communities, name, node, plural,
+};
+use crate::polyglot::{Grammar, Parsers};
 use crate::summary::short;
 use crate::workspace::{Location, Settings, Workspace, display_path};
 
@@ -38,8 +40,6 @@ const RESERVE: usize = 25;
 const FILTERS: usize = 8;
 /// Maximum symbol name bytes in compact lines.
 const NAME_BYTES: usize = 80;
-/// Minimum symbol count for a single-file cluster to count as a community.
-const MIN_SINGLE_FILE_COMMUNITY: usize = 5;
 
 pub fn command() -> Command<'static> {
     Command::new("review")
@@ -146,10 +146,14 @@ fn classify_file(index: &Index, path: &str, churn: usize) -> FileCategory {
 
 #[derive(Clone, Debug)]
 struct ParsedHunk {
+    old_start: usize,
+    old_count: usize,
     new_start: usize,
     new_count: usize,
     deleted: usize,
     added_lines: Vec<usize>,
+    rem_lines: Vec<String>,
+    has_block_comment_open: bool,
     deleted_after: usize,
     whitespace_only: bool,
     context_hint: Option<String>,
@@ -350,18 +354,7 @@ fn parse_diff_git_paths(line: &str) -> Option<(String, String)> {
 }
 
 fn collect_diff(workspace: &Workspace, since: &Since) -> Result<Vec<FileDiff>> {
-    let inside = workspace.git(&["rev-parse", "--is-inside-work-tree"])?;
-    ensure!(
-        inside.status.success() && inside.stdout.starts_with(b"true"),
-        "review needs a Git repository: {}",
-        first_line(&inside.stderr)
-    );
-    let head_exists = workspace
-        .git(&["rev-parse", "--verify", "--quiet", "HEAD"])?
-        .status
-        .success();
-
-    let mut args = vec![
+    let base_args = [
         "-c",
         "core.quotepath=false",
         "diff",
@@ -372,27 +365,57 @@ fn collect_diff(workspace: &Workspace, since: &Since) -> Result<Vec<FileDiff>> {
         "-M",
         "--unified=0",
     ];
-    match since {
-        Since::Staged => args.push("--cached"),
-        Since::Base { commit, .. } => args.push(commit.as_str()),
-        Since::Head if head_exists => args.push("HEAD"),
-        Since::Head => args.push("--cached"),
-    }
-    args.extend(["--", "."]);
+    let run_diff = |rev_flag: &str| -> Result<std::process::Output> {
+        let mut args = Vec::with_capacity(base_args.len() + 3);
+        args.extend_from_slice(&base_args);
+        args.push(rev_flag);
+        args.extend(["--", "."]);
+        workspace.git(&args)
+    };
 
-    let output = workspace.git(&args)?;
-    ensure!(
-        output.status.success(),
-        "git diff failed: {}",
-        first_line(&output.stderr)
-    );
+    let output = match since {
+        Since::Staged => run_diff("--cached")?,
+        Since::Base { commit, .. } => run_diff(commit.as_str())?,
+        Since::Head => {
+            let out = run_diff("HEAD")?;
+            if out.status.success() {
+                out
+            } else {
+                // Distinguish unborn HEAD (no commits yet) from non-Git directory.
+                let inside = workspace.git(&["rev-parse", "--is-inside-work-tree"])?;
+                ensure!(
+                    inside.status.success() && inside.stdout.starts_with(b"true"),
+                    "review needs a Git repository: {}",
+                    first_line(&inside.stderr)
+                );
+                let head_exists = workspace
+                    .git(&["rev-parse", "--verify", "--quiet", "HEAD"])?
+                    .status
+                    .success();
+                if !head_exists {
+                    run_diff("--cached")?
+                } else {
+                    out
+                }
+            }
+        }
+    };
+    if !output.status.success() {
+        let inside = workspace.git(&["rev-parse", "--is-inside-work-tree"])?;
+        ensure!(
+            inside.status.success() && inside.stdout.starts_with(b"true"),
+            "review needs a Git repository: {}",
+            first_line(&inside.stderr)
+        );
+        anyhow::bail!("git diff failed: {}", first_line(&output.stderr));
+    }
     let patch = String::from_utf8_lossy(&output.stdout);
     let mut files = parse_unified_diff(&patch);
 
     // On unborn HEAD with Since::Head, also pick up unstaged edits over staged files
     // and untracked files. For normal Head / Base, pick up untracked files.
     if !matches!(since, Since::Staged) {
-        let mut seen: BTreeSet<String> = files.iter().map(|f| f.path.clone()).collect();
+        let mut seen: HashSet<String> = files.iter().map(|f| f.path.clone()).collect();
         let ls = workspace.git(&[
             "ls-files",
             "--others",
@@ -423,10 +446,14 @@ fn collect_diff(workspace: &Workspace, since: &Since) -> Result<Vec<FileDiff>> {
             };
             let hunks = if !binary && line_count > 0 {
                 vec![ParsedHunk {
+                    old_start: 0,
+                    old_count: 0,
                     new_start: 1,
                     new_count: line_count,
                     deleted: 0,
                     added_lines: (1..=line_count).collect(),
+                    rem_lines: Vec::new(),
+                    has_block_comment_open: false,
                     deleted_after: 0,
                     whitespace_only: false,
                     context_hint: None,
@@ -459,6 +486,8 @@ fn collect_diff(workspace: &Workspace, since: &Since) -> Result<Vec<FileDiff>> {
 
 fn parse_unified_diff(patch: &str) -> Vec<FileDiff> {
     struct ActiveHunk {
+        old_start: usize,
+        old_count: usize,
         new_start: usize,
         new_count: usize,
         added: usize,
@@ -467,6 +496,7 @@ fn parse_unified_diff(patch: &str) -> Vec<FileDiff> {
         added_lines: Vec<usize>,
         rem_lines: Vec<String>,
         add_lines: Vec<String>,
+        has_block_comment_open: bool,
         saw_no_newline: bool,
         context_hint: Option<String>,
     }
@@ -492,10 +522,18 @@ fn parse_unified_diff(patch: &str) -> Vec<FileDiff> {
             file.semantic_deleted += h.deleted;
         }
         file.hunks.push(ParsedHunk {
+            old_start: h.old_start,
+            old_count: h.old_count,
             new_start: h.new_start,
             new_count: h.new_count,
             deleted: h.deleted,
             added_lines: h.added_lines,
+            rem_lines: if whitespace_only {
+                Vec::new()
+            } else {
+                h.rem_lines
+            },
+            has_block_comment_open: h.has_block_comment_open,
             deleted_after: h.new_start,
             whitespace_only,
             context_hint: h.context_hint,
@@ -531,9 +569,11 @@ fn parse_unified_diff(patch: &str) -> Vec<FileDiff> {
         let Some(file) = current.as_mut() else {
             continue;
         };
-        if let Some((_, _, new_start, new_count, hint)) = parse_hunk_header(line) {
+        if let Some((old_start, old_count, new_start, new_count, hint)) = parse_hunk_header(line) {
             flush_hunk(file, &mut hunk);
             hunk = Some(ActiveHunk {
+                old_start,
+                old_count,
                 new_start,
                 new_count,
                 added: 0,
@@ -542,6 +582,7 @@ fn parse_unified_diff(patch: &str) -> Vec<FileDiff> {
                 added_lines: Vec::new(),
                 rem_lines: Vec::new(),
                 add_lines: Vec::new(),
+                has_block_comment_open: false,
                 saw_no_newline: false,
                 context_hint: hint,
             });
@@ -552,6 +593,9 @@ fn parse_unified_diff(patch: &str) -> Vec<FileDiff> {
                 active.added += 1;
                 active.added_lines.push(active.next_new_line);
                 active.next_new_line += 1;
+                if has_unquoted_block_comment_open(added) {
+                    active.has_block_comment_open = true;
+                }
                 active.add_lines.push(added.to_owned());
             } else if let Some(removed) = line.strip_prefix('-') {
                 active.deleted += 1;
@@ -592,32 +636,28 @@ fn parse_unified_diff(patch: &str) -> Vec<FileDiff> {
 // ---------------------------------------------------------------------------
 // Lightweight centrality, communities & cross-community bridges
 
-fn file_area(file: &str) -> String {
-    let parts: Vec<&str> = file.split('/').collect();
-    match parts.as_slice() {
-        [_] => "(root)".to_owned(),
-        [top, _] => format!("{top}/"),
-        [top, second, ..] => format!("{top}/{second}/"),
-        [] => "(root)".to_owned(),
+fn file_area_key(file: &str) -> (&str, Option<&str>) {
+    let mut parts = file.split('/');
+    let Some(first) = parts.next() else {
+        return ("", None);
+    };
+    let Some(second) = parts.next() else {
+        return ("", None);
+    };
+    if parts.next().is_some() {
+        (first, Some(second))
+    } else {
+        (first, None)
     }
-}
-
-fn indexed_language(index: &Index, file: &str) -> &'static str {
-    if Path::new(file).extension().is_some_and(|ext| ext == "rs") {
-        return "Rust";
-    }
-    index
-        .grammar(file)
-        .map(|g| g.name())
-        .or_else(|| language(file))
-        .unwrap_or("text")
 }
 
 fn central(def: &Definition) -> bool {
     !def.test && !matches!(def.kind.as_str(), "file" | "module")
 }
 
-struct ReviewGraph {
+struct ReviewGraph<'a> {
+    files: FileIndex<'a>,
+    file_area_id: Vec<usize>,
     in_deg: Vec<usize>,
     caller_files: Vec<usize>,
     caller_areas: Vec<usize>,
@@ -626,83 +666,117 @@ struct ReviewGraph {
     community_count: usize,
 }
 
-impl ReviewGraph {
-    fn build(index: &Index) -> Self {
+impl<'a> ReviewGraph<'a> {
+    fn build(index: &'a Index) -> Self {
         let n = index.definitions.len();
+        let files = FileIndex::new(index);
+        let num_files = files.files.len();
+
+        let mut area_ids = HashMap::<(&str, Option<&str>), usize>::new();
+        let mut file_area_id = Vec::with_capacity(num_files);
+        for meta in &files.files {
+            let key = file_area_key(meta.path);
+            let next_id = area_ids.len();
+            let aid = *area_ids.entry(key).or_insert(next_id);
+            file_area_id.push(aid);
+        }
+        let num_areas = area_ids.len().max(1);
+
         let mut in_deg = vec![0usize; n];
         let mut caller_files = vec![0usize; n];
         let mut caller_areas = vec![0usize; n];
+        let mut src_scratch = Vec::<usize>::with_capacity(32);
+        let mut file_stamp = vec![0u32; num_files];
+        let mut area_stamp = vec![0u32; num_areas];
 
-        let mut incoming_pairs = BTreeSet::<(usize, Option<usize>, &str)>::new();
-        let mut file_sets = vec![BTreeSet::<&str>::new(); n];
-        let mut area_sets = vec![BTreeSet::<String>::new(); n];
+        for to in 0..n {
+            let target_fid = files.def_file[to];
+            let stamp = (to + 1) as u32;
+            src_scratch.clear();
+            let mut f_cnt = 0usize;
+            let mut a_cnt = 0usize;
 
-        for edge in &index.edges {
-            if edge.from == Some(edge.to) {
-                continue;
-            }
-            let target_file = index.definitions[edge.to].location.file.as_str();
-            let scope = if edge.from.is_none() {
-                if edge.location.file == target_file {
+            for edge in index.incoming(to) {
+                if edge.from == Some(to) {
                     continue;
                 }
-                edge.location.file.as_str()
-            } else {
-                ""
-            };
-            if incoming_pairs.insert((edge.to, edge.from, scope)) {
-                in_deg[edge.to] += 1;
+                let (src_key, caller_fid, caller_is_test) = match edge.from {
+                    Some(from) => {
+                        let cfid = files.def_file[from];
+                        let is_t = index.definitions[from].test || files.files[cfid].is_test;
+                        (from, cfid, is_t)
+                    }
+                    None => {
+                        let cfid = files.id_of(edge.location.file.as_str());
+                        if cfid == target_fid {
+                            continue;
+                        }
+                        (n + cfid, cfid, files.files[cfid].is_test)
+                    }
+                };
+                src_scratch.push(src_key);
+                if caller_fid != target_fid && !caller_is_test {
+                    if file_stamp[caller_fid] != stamp {
+                        file_stamp[caller_fid] = stamp;
+                        f_cnt += 1;
+                    }
+                    let aid = file_area_id[caller_fid];
+                    if area_stamp[aid] != stamp {
+                        area_stamp[aid] = stamp;
+                        a_cnt += 1;
+                    }
+                }
             }
-            let caller_file = match edge.from {
-                Some(from) => index.definitions[from].location.file.as_str(),
-                None => edge.location.file.as_str(),
-            };
-            let caller_is_test = edge.from.is_some_and(|from| index.definitions[from].test)
-                || is_test_file(caller_file);
-            if caller_file != target_file && !caller_is_test {
-                file_sets[edge.to].insert(caller_file);
-                area_sets[edge.to].insert(file_area(caller_file));
-            }
-        }
 
-        for id in 0..n {
-            caller_files[id] = file_sets[id].len();
-            caller_areas[id] = area_sets[id].len();
+            in_deg[to] = match src_scratch.len() {
+                0 => 0,
+                1 => 1,
+                _ => {
+                    src_scratch.sort_unstable();
+                    src_scratch.dedup();
+                    src_scratch.len()
+                }
+            };
+            caller_files[to] = f_cnt;
+            caller_areas[to] = a_cnt;
         }
 
         // Rank non-test production symbols by weighted hub score to detect top hubs.
         let mut prod_scores: Vec<(usize, usize, usize, usize)> = (0..n)
             .filter(|&id| {
-                central(&index.definitions[id])
-                    && !is_support_file(&index.definitions[id].location.file)
+                central(&index.definitions[id]) && !files.files[files.def_file[id]].is_support
             })
             .map(|id| (caller_areas[id], caller_files[id], in_deg[id], id))
             .collect();
-        prod_scores.sort_by_key(|&(areas, files, deg, id)| {
-            (Reverse(areas), Reverse(files), Reverse(deg), id)
-        });
         let top_cutoff = (prod_scores.len() / 10).max(3);
-        let top_ids: BTreeSet<usize> = prod_scores
-            .iter()
-            .take(top_cutoff)
-            .filter(|&&(areas, files, deg, _)| deg >= 3 && (files >= 2 || areas >= 2))
-            .map(|&(_, _, _, id)| id)
-            .collect();
+        let prod_key = |&(areas, f_cnt, deg, id): &(usize, usize, usize, usize)| {
+            (Reverse(areas), Reverse(f_cnt), Reverse(deg), id)
+        };
+        if prod_scores.len() > top_cutoff {
+            prod_scores.select_nth_unstable_by_key(top_cutoff, prod_key);
+        }
+        let mut is_top = vec![false; n];
+        for &(areas, f_cnt, deg, id) in prod_scores.iter().take(top_cutoff) {
+            if deg >= 3 && (f_cnt >= 2 || areas >= 2) {
+                is_top[id] = true;
+            }
+        }
 
         let mut is_hub = vec![false; n];
         for id in 0..n {
             let def = &index.definitions[id];
-            if !central(def) || is_support_file(&def.location.file) {
+            if !central(def) || files.files[files.def_file[id]].is_support {
                 continue;
             }
-            is_hub[id] = caller_areas[id] >= 2
-                || (caller_files[id] >= 3 && in_deg[id] >= 4)
-                || top_ids.contains(&id);
+            is_hub[id] =
+                caller_areas[id] >= 2 || (caller_files[id] >= 3 && in_deg[id] >= 4) || is_top[id];
         }
 
-        let (community_of, community_count) = detect_communities(index);
+        let (community_of, community_count) = lpa_communities(index, &files, 24);
 
         Self {
+            files,
+            file_area_id,
             in_deg,
             caller_files,
             caller_areas,
@@ -718,16 +792,17 @@ impl ReviewGraph {
         if !central(def) {
             return (false, false, None);
         }
-        let self_file = def.location.file.as_str();
-        let self_lang = indexed_language(index, self_file);
-        let self_area = file_area(self_file);
+        let self_fid = self.files.def_file[id];
+        let self_meta = &self.files.files[self_fid];
+        let self_lang = self_meta.indexed_lang.or(self_meta.lang).unwrap_or("text");
+        let self_area = self.file_area_id[self_fid];
         let self_comm = self.community_of[id];
 
         let mut other_langs = BTreeSet::<&'static str>::new();
         let mut in_comms = BTreeSet::<usize>::new();
         let mut out_comms = BTreeSet::<usize>::new();
-        let mut in_areas = BTreeSet::<String>::new();
-        let mut out_areas = BTreeSet::<String>::new();
+        let mut in_areas = BTreeSet::<usize>::new();
+        let mut out_areas = BTreeSet::<usize>::new();
 
         let mut inspect = |other: usize, incoming: bool| {
             if other == id {
@@ -737,8 +812,12 @@ impl ReviewGraph {
             if !central(other_def) {
                 return;
             }
-            let other_file = other_def.location.file.as_str();
-            let other_lang = indexed_language(index, other_file);
+            let other_fid = self.files.def_file[other];
+            let other_meta = &self.files.files[other_fid];
+            let other_lang = other_meta
+                .indexed_lang
+                .or(other_meta.lang)
+                .unwrap_or("text");
             if other_lang != self_lang {
                 other_langs.insert(other_lang);
             }
@@ -751,7 +830,7 @@ impl ReviewGraph {
                     out_comms.insert(c2);
                 }
             }
-            let other_area = file_area(other_file);
+            let other_area = self.file_area_id[other_fid];
             if other_area != self_area {
                 if incoming {
                     in_areas.insert(other_area);
@@ -782,138 +861,12 @@ impl ReviewGraph {
         }
         let cross_area = self.community_count < 2 && !in_areas.is_empty() && !out_areas.is_empty();
         if cross_area {
-            let all_areas: BTreeSet<&String> = in_areas.union(&out_areas).collect();
+            let all_areas: BTreeSet<usize> = in_areas.union(&out_areas).copied().collect();
             let count = all_areas.len() + 1;
             return (true, false, Some(format!("{count} areas")));
         }
         (false, false, None)
     }
-}
-
-fn detect_communities(index: &Index) -> (Vec<Option<usize>>, usize) {
-    let definitions = &index.definitions;
-    let mut nodes = definitions.len();
-    let mut file_nodes = BTreeMap::<&str, usize>::new();
-    let mut by_file = BTreeMap::<&str, Vec<usize>>::new();
-    for (id, def) in definitions.iter().enumerate() {
-        if def.kind == "file" {
-            file_nodes.insert(&def.location.file, id);
-        } else {
-            by_file.entry(&def.location.file).or_default().push(id);
-        }
-    }
-
-    let mut links = HashMap::<(usize, usize), u32>::new();
-    let mut add_link = |a: usize, b: usize, w: u32| {
-        if a != b {
-            *links.entry((a.min(b), a.max(b))).or_default() += w;
-        }
-    };
-
-    for (file, mut ids) in by_file {
-        let root = *file_nodes.entry(file).or_insert_with(|| {
-            nodes += 1;
-            nodes - 1
-        });
-        ids.sort_by_key(|&id| {
-            let span = &definitions[id].location;
-            (span.start, Reverse(span.end), id)
-        });
-        let mut stack: Vec<usize> = Vec::new();
-        for id in ids {
-            let end = definitions[id].location.end;
-            while stack
-                .last()
-                .is_some_and(|&top| definitions[top].location.end < end)
-            {
-                stack.pop();
-            }
-            add_link(id, stack.last().copied().unwrap_or(root), 3);
-            stack.push(id);
-        }
-    }
-
-    for edge in &index.edges {
-        let from = match edge.from {
-            Some(f) => f,
-            None => *file_nodes
-                .entry(edge.location.file.as_str())
-                .or_insert_with(|| {
-                    nodes += 1;
-                    nodes - 1
-                }),
-        };
-        let weight = match (edge.inferred, edge.kind) {
-            (false, _) => 2,
-            (true, Kind::Route | Kind::Data) => 1,
-            (true, _) => continue,
-        };
-        add_link(from, edge.to, weight);
-    }
-
-    let mut pairs: Vec<_> = links.into_iter().collect();
-    pairs.sort_unstable();
-    let mut adj = vec![Vec::new(); nodes];
-    for ((a, b), w) in pairs {
-        adj[a].push((b, w));
-        adj[b].push((a, w));
-    }
-
-    let mut labels: Vec<usize> = (0..nodes).collect();
-    let mut tally = HashMap::<usize, u32>::new();
-    for _ in 0..24 {
-        let mut moved = false;
-        for node in 0..nodes {
-            if adj[node].is_empty() {
-                continue;
-            }
-            tally.clear();
-            for &(other, w) in &adj[node] {
-                *tally.entry(labels[other]).or_default() += w;
-            }
-            let best = tally.values().copied().max().unwrap_or(0);
-            if tally.get(&labels[node]) == Some(&best) {
-                continue;
-            }
-            let choice = tally
-                .iter()
-                .filter(|&(_, &w)| w == best)
-                .map(|(&l, _)| l)
-                .min()
-                .unwrap_or(labels[node]);
-            if choice != labels[node] {
-                labels[node] = choice;
-                moved = true;
-            }
-        }
-        if !moved {
-            break;
-        }
-    }
-
-    let mut groups = BTreeMap::<usize, Vec<usize>>::new();
-    for (id, def) in definitions.iter().enumerate() {
-        if def.kind == "file" {
-            continue;
-        }
-        groups.entry(labels[id]).or_default().push(id);
-    }
-
-    let mut community_of = vec![None; definitions.len()];
-    let mut next_comm = 0usize;
-    for members in groups.into_values() {
-        let distinct_files: BTreeSet<&str> = members
-            .iter()
-            .map(|&id| definitions[id].location.file.as_str())
-            .collect();
-        if distinct_files.len() >= 2 || members.len() >= MIN_SINGLE_FILE_COMMUNITY {
-            for id in members {
-                community_of[id] = Some(next_comm);
-            }
-            next_comm += 1;
-        }
-    }
-    (community_of, next_comm)
 }
 
 // ---------------------------------------------------------------------------
@@ -1329,53 +1282,6 @@ fn format_line_ranges(ranges: &[(usize, usize)]) -> String {
     }
 }
 
-/// Filter `context::changes` to remove generated/lockfile files, pure renames,
-/// and pure whitespace-only hunks, returning filtered changes suitable for
-/// symbol attribution & deleted-symbol caller seeding.
-fn filter_semantic_changes(
-    index: &Index,
-    raw_changes: Vec<(String, Change)>,
-    diffs_by_path: &BTreeMap<String, &FileDiff>,
-    pure_rename_old: &BTreeSet<String>,
-    edited_rename_old: &BTreeSet<String>,
-) -> Vec<(String, Change)> {
-    let mut filtered = Vec::new();
-    for (file, change) in raw_changes {
-        if pure_rename_old.contains(&file) || edited_rename_old.contains(&file) {
-            continue;
-        }
-        let churn = diffs_by_path.get(&file).map_or(0, |d| d.added + d.deleted);
-        if classify_file(index, &file, churn) == FileCategory::Generated {
-            continue;
-        }
-        if let Some(diff) = diffs_by_path.get(&file) {
-            if diff.is_pure_rename() || diff.is_whitespace_only() {
-                continue;
-            }
-            match change {
-                Change::Ranges(_) => {
-                    // For edited renames or mixed whitespace/semantic files, prefer
-                    // the exact non-whitespace hunk ranges from `git diff -M`.
-                    let ranges = diff.semantic_ranges();
-                    if !ranges.is_empty() {
-                        filtered.push((file, Change::Ranges(ranges)));
-                    }
-                }
-                Change::Origin(_) => {}
-                Change::Deleted(deletions) => {
-                    if diff.semantic_deleted > 0 || diff.deleted_file {
-                        filtered.push((file, Change::Deleted(deletions)));
-                    }
-                }
-                other => filtered.push((file, other)),
-            }
-        } else {
-            filtered.push((file, change));
-        }
-    }
-    filtered
-}
-
 /// Attribute per-symbol `(+added, -deleted)` counts from non-whitespace hunks
 /// of `diff` against the symbols in `index`.
 fn symbol_churn(index: &Index, diff: &FileDiff) -> BTreeMap<usize, (usize, usize)> {
@@ -1475,35 +1381,309 @@ fn collect_deleted_symbols(
     out
 }
 
-/// Catches symbols deleted inside mixed `(-D +A)` hunks where Git Myers paired
-/// a deleted function's closing delimiter with an adjacent edited function, so
-/// `context::changes` reported `Change::Ranges` instead of `Change::Deleted`.
-fn detect_mixed_hunk_deletions(
+/// Conservative check for whether a single removed Rust line could have deleted
+/// an indexed symbol (or a symbol missing from `current_names` for mixed hunks).
+/// Returning `true` triggers exact `git show` + `rust_syntax::parse` verification.
+fn rust_line_may_delete_symbol(
+    line: &str,
+    pure_deletion: bool,
+    current_names: &HashSet<&str>,
+) -> bool {
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let is_ident_start = |b: u8| b.is_ascii_alphabetic() || b == b'_';
+    let is_ident_cont = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+    let mut i = 0usize;
+    let mut prev_non_ws = 0u8;
+    while i < len {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            break;
+        }
+        if b == b'"' {
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            prev_non_ws = b'"';
+            continue;
+        }
+        if b == b'!' {
+            // Custom item macro `foo! bar { ... }` has whitespace + ident after `!`.
+            let mut j = i + 1;
+            let had_ws = j < len && bytes[j].is_ascii_whitespace();
+            while j < len && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if had_ws && j < len && is_ident_start(bytes[j]) {
+                return true;
+            }
+            prev_non_ws = b;
+            i += 1;
+            continue;
+        }
+        if !is_ident_start(b) {
+            prev_non_ws = b;
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < len && is_ident_cont(bytes[i]) {
+            i += 1;
+        }
+        let tok = &line[start..i];
+        let after_ptr = prev_non_ws == b'*';
+        let after_quote = prev_non_ws == b'\'';
+        let after_raw = prev_non_ws == b'#';
+        prev_non_ws = bytes[i - 1];
+
+        if after_raw {
+            continue;
+        }
+        match tok {
+            "mod" | "macro_rules" => return true,
+            "fn" | "struct" | "enum" | "union" | "trait" | "type" | "const" | "static" => {
+                if (tok == "const" && after_ptr) || (tok == "static" && after_quote) {
+                    continue;
+                }
+                // `fn(T) -> U` function-pointer type (immediately followed by `(`).
+                if tok == "fn" && i < len && bytes[i] == b'(' {
+                    continue;
+                }
+                if pure_deletion {
+                    return true;
+                }
+                // Skip whitespace to peek the next token after the keyword.
+                let mut j = i;
+                while j < len && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j >= len {
+                    // Multiline declaration (`pub fn\n  name()`): verify via parse.
+                    return true;
+                }
+                // Handle `const fn` / `const unsafe fn` / `const extern ... fn`.
+                if tok == "const" && is_ident_start(bytes[j]) {
+                    let mut k = j + 1;
+                    while k < len && is_ident_cont(bytes[k]) {
+                        k += 1;
+                    }
+                    if matches!(&line[j..k], "fn" | "unsafe" | "extern") {
+                        continue;
+                    }
+                }
+                // Handle `static mut NAME`.
+                if tok == "static" && line[j..].starts_with("mut") {
+                    let after_mut = j + 3;
+                    if after_mut < len && bytes[after_mut].is_ascii_whitespace() {
+                        j = after_mut;
+                        while j < len && bytes[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                    }
+                }
+                // Handle raw identifiers `r#ident`.
+                if line[j..].starts_with("r#") {
+                    j += 2;
+                }
+                if j >= len || !is_ident_start(bytes[j]) {
+                    return true;
+                }
+                let ident_start = j;
+                j += 1;
+                while j < len && is_ident_cont(bytes[j]) {
+                    j += 1;
+                }
+                let ident = &line[ident_start..j];
+                if !current_names.contains(ident) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether `line` opens a `/*` block comment outside `//` line comments and
+/// double-quoted string literals (so glob patterns like `/*.md` in doc comments
+/// or strings do not falsely trigger old-file parsing).
+fn has_unquoted_block_comment_open(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    let mut in_str = false;
+    while i + 1 < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_str = true;
+            i += 1;
+            continue;
+        }
+        if b == b'/' {
+            if bytes[i + 1] == b'/' {
+                return false;
+            }
+            if bytes[i + 1] == b'*' {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether `ident` appears as a whole ASCII identifier anywhere in `lines`.
+fn contains_ident(lines: &[String], ident: &str) -> bool {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    lines.iter().any(|line| {
+        let bytes = line.as_bytes();
+        line.match_indices(ident).any(|(at, _)| {
+            let left_ok = at == 0 || !is_ident(bytes[at - 1]);
+            let end = at + ident.len();
+            let right_ok = end == bytes.len() || !is_ident(bytes[end]);
+            left_ok && right_ok
+        })
+    })
+}
+
+/// Conservative pre-check for Rust files: returns `false` only when no hunk in
+/// `diff` could have deleted or renamed an indexed symbol.
+fn rust_diff_may_delete_symbol(
+    index: &Index,
+    diff: &FileDiff,
+    file_defs: &[usize],
+    current_names: &HashSet<&str>,
+) -> bool {
+    if index.errors.contains_key(&diff.path) {
+        return true;
+    }
+    for hunk in diff.hunks.iter().filter(|h| !h.whitespace_only) {
+        if hunk.has_block_comment_open {
+            return true;
+        }
+        if hunk.deleted == 0 {
+            continue;
+        }
+        let pure_deletion = hunk.new_count == 0;
+        if hunk
+            .rem_lines
+            .iter()
+            .any(|line| rust_line_may_delete_symbol(line, pure_deletion, current_names))
+        {
+            return true;
+        }
+        // Catch multiline declaration renames (`pub fn\n old_name()` -> `pub fn\n new_name()`)
+        // whose keyword sat before the hunk while the identifier line inside the hunk changed.
+        if !pure_deletion {
+            let hunk_end = hunk.new_start + hunk.new_count.saturating_sub(1);
+            let split_header_rename = file_defs.iter().any(|&id| {
+                let def = &index.definitions[id];
+                if !(def.location.start < hunk.new_start
+                    && hunk.new_start <= def.declaration
+                    && def.declaration <= hunk_end)
+                {
+                    return false;
+                }
+                let n = name(def);
+                let tail = n.rsplit("::").next().unwrap_or(n);
+                !contains_ident(&hunk.rem_lines, tail)
+            });
+            if split_header_rename {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+type DeletedDetection = (
+    Vec<(String, String, String, (usize, usize))>,
+    Vec<(String, Change)>,
+);
+
+/// Unified single-parse detection of deleted symbols across both pure-deletion
+/// hunks (`new_count == 0`) and mixed `(-D +A)` hunks, skipping `git show` +
+/// parsing on Rust files whose removed lines cannot possibly delete a symbol.
+fn detect_deleted_symbols(
     workspace: &Workspace,
     index: &Index,
     since: &Since,
     file_diffs: &[FileDiff],
-    already_deleted: &[(String, String, String, (usize, usize))],
-) -> Vec<(String, String, String, (usize, usize))> {
+    staged_differs: &HashSet<String>,
+) -> DeletedDetection {
     let rev = since.rev();
-    let mut existing_deleted: BTreeSet<(String, String)> = already_deleted
-        .iter()
-        .map(|(f, n, _, _)| (f.clone(), n.clone()))
-        .collect();
-    let mut found = Vec::new();
+    let mut deleted_specs = Vec::<(String, String, String, (usize, usize))>::new();
+    let mut deletion_only = Vec::<(String, Change)>::new();
+    let mut existing_deleted = HashSet::<(String, String)>::new();
+    let mut parsers: Option<Parsers> = None;
 
     for diff in file_diffs {
         if diff.semantic_deleted == 0
             || diff.new_file
             || diff.deleted_file
+            || diff.binary
             || diff.is_pure_rename()
             || diff.is_whitespace_only()
+            || !index.files.contains_key(&diff.path)
+            || staged_differs.contains(&diff.path)
             || classify_file(index, &diff.path, diff.added + diff.deleted)
                 == FileCategory::Generated
         {
             continue;
         }
-        let Ok(out) = workspace.git(&["show", &format!("{rev}:./{}", diff.path)]) else {
+        let is_rust = diff.path.ends_with(".rs");
+        if !is_rust
+            && index.grammar(&diff.path).is_none()
+            && Grammar::for_file(&diff.path).is_none()
+        {
+            continue;
+        }
+
+        let file_defs = index.at(&Location {
+            file: diff.path.clone(),
+            start: 0,
+            end: usize::MAX,
+        });
+        let current_names: HashSet<&str> = file_defs
+            .iter()
+            .flat_map(|&id| {
+                let n = name(&index.definitions[id]);
+                let tail = n.rsplit("::").next().unwrap_or(n);
+                [n, tail]
+            })
+            .collect();
+
+        if is_rust && !rust_diff_may_delete_symbol(index, diff, &file_defs, &current_names) {
+            continue;
+        }
+
+        let show_path = diff.old_path.as_deref().unwrap_or(&diff.path);
+        let Ok(out) = workspace.git(&["show", &format!("{rev}:./{show_path}")]) else {
             continue;
         };
         if !out.status.success() {
@@ -1512,24 +1692,74 @@ fn detect_mixed_hunk_deletions(
         let Ok(text) = String::from_utf8(out.stdout) else {
             continue;
         };
-        let mut snap = crate::source::Snapshot::from_text(&diff.path, text);
-        if snap.index(&diff.path).is_err() {
-            continue;
+
+        // Parse the old file ONCE, extracting both display symbols and `Removed` items.
+        let mut old_syms = Vec::<(String, String, usize, usize)>::new();
+        let mut parsed_removed = Vec::<(usize, usize, Removed)>::new();
+        if is_rust {
+            let Ok(syntax) = crate::rust_syntax::parse(&text) else {
+                continue;
+            };
+            for sym in syntax.symbols {
+                old_syms.push((sym.path.join("::"), sym.kind.clone(), sym.start, sym.end));
+                parsed_removed.push((sym.start, sym.end, Removed::Rust(sym)));
+            }
+        } else if let Some(grammar) = Grammar::detect(&diff.path, &text) {
+            let p = parsers.get_or_insert_with(Parsers::default);
+            let Ok(facts) = p.parse(grammar, &text) else {
+                continue;
+            };
+            for def in facts.definitions {
+                old_syms.push((def.path.clone(), def.kind.clone(), def.start, def.end));
+                parsed_removed.push((def.start, def.end, Removed::Foreign(def)));
+            }
         }
-        let old_syms = snap.symbols();
         if old_syms.is_empty() {
             continue;
         }
-        let current_names: BTreeSet<&str> = index
-            .definitions
+
+        // 1. Pure-deletion hunks (`new_count == 0`): symbols fully inside `old` range.
+        let mut file_deletions = Vec::<Deletion>::new();
+        let mut deletion_spans = Vec::<Vec<(usize, usize)>>::new();
+        for hunk in diff
+            .hunks
             .iter()
-            .filter(|d| d.location.file == diff.path)
-            .flat_map(|d| {
-                let n = name(d);
-                let tail = n.rsplit("::").next().unwrap_or(n);
-                [n, tail]
-            })
-            .collect();
+            .filter(|h| !h.whitespace_only && h.new_count == 0 && h.old_count > 0)
+        {
+            let first = hunk.old_start;
+            let last = hunk.old_start + hunk.old_count.saturating_sub(1);
+            let inside = |s: usize, e: usize| first <= s && e <= last;
+            let mut symbols = Vec::new();
+            let mut outermost = Vec::new();
+            for (sym_name, sym_kind, start, end) in &old_syms {
+                let nested = old_syms.iter().any(|(_, _, s, e)| {
+                    (s, e) != (start, end) && inside(*s, *e) && s <= start && end <= e
+                });
+                if inside(*start, *end) && !nested {
+                    symbols.push((sym_name.clone(), sym_kind.clone()));
+                    outermost.push((*start, *end));
+                    existing_deleted.insert((diff.path.clone(), sym_name.clone()));
+                    deleted_specs.push((
+                        diff.path.clone(),
+                        sym_name.clone(),
+                        sym_kind.clone(),
+                        (first, last),
+                    ));
+                }
+            }
+            if !symbols.is_empty() {
+                file_deletions.push(Deletion {
+                    after: hunk.new_start,
+                    old: (first, last),
+                    symbols,
+                    lines: hunk.rem_lines.clone(),
+                    removed: Vec::new(),
+                });
+                deletion_spans.push(outermost);
+            }
+        }
+
+        // 2. Mixed-hunk deletions: outermost symbols missing from `current_names`.
         for (sym_name, sym_kind, start, end) in &old_syms {
             if matches!(sym_kind.as_str(), "file" | "module" | "imports") {
                 continue;
@@ -1538,7 +1768,6 @@ fn detect_mixed_hunk_deletions(
             if current_names.contains(sym_name.as_str()) || current_names.contains(tail) {
                 continue;
             }
-            // Keep outermost removed symbol (skip members of a removed outer item).
             let nested_in_removed = old_syms.iter().any(|(on, _, os, oe)| {
                 (*os, *oe) != (*start, *end)
                     && *os <= *start
@@ -1550,16 +1779,46 @@ fn detect_mixed_hunk_deletions(
                 continue;
             }
             if existing_deleted.insert((diff.path.clone(), sym_name.clone())) {
-                found.push((
+                deleted_specs.push((
                     diff.path.clone(),
                     sym_name.clone(),
                     sym_kind.clone(),
                     (*start, *end),
                 ));
+                file_deletions.push(Deletion {
+                    after: *start,
+                    old: (*start, *end),
+                    symbols: vec![(sym_name.clone(), sym_kind.clone())],
+                    lines: Vec::new(),
+                    removed: Vec::new(),
+                });
+                deletion_spans.push(vec![(*start, *end)]);
             }
         }
+
+        if !file_deletions.is_empty() {
+            for (start, end, definition) in parsed_removed {
+                let holder =
+                    file_deletions
+                        .iter_mut()
+                        .zip(&deletion_spans)
+                        .find_map(|(deletion, spans)| {
+                            let (first, last) = deletion.old;
+                            if start < first || last < end {
+                                return None;
+                            }
+                            let owner = spans.iter().position(|&(s, e)| s <= start && end <= e)?;
+                            Some((deletion, owner))
+                        });
+                if let Some((deletion, owner)) = holder {
+                    deletion.removed.push((owner, definition));
+                }
+            }
+            deletion_only.push((diff.path.clone(), Change::Deleted(file_deletions)));
+        }
     }
-    found
+
+    (deleted_specs, deletion_only)
 }
 
 pub(crate) fn render_review(
@@ -1571,9 +1830,8 @@ pub(crate) fn render_review(
     as_json: bool,
 ) -> Result<String> {
     let file_diffs = collect_diff(workspace, since)?;
-    let raw_changes = changes(workspace, index, since)?;
 
-    if file_diffs.is_empty() && raw_changes.is_empty() {
+    if file_diffs.is_empty() {
         let msg = since.nothing_changed(workspace);
         if as_json {
             let (scope, base) = scope_json(since);
@@ -1612,19 +1870,21 @@ pub(crate) fn render_review(
         return Ok(format!("{msg}\n"));
     }
 
-    let diffs_by_path: BTreeMap<String, &FileDiff> =
-        file_diffs.iter().map(|d| (d.path.clone(), d)).collect();
-    let mut pure_rename_old = BTreeSet::new();
-    let mut edited_rename_old = BTreeSet::new();
-    for diff in &file_diffs {
-        if let Some(old) = &diff.old_path {
-            if diff.is_pure_rename() {
-                pure_rename_old.insert(old.clone());
-            } else {
-                edited_rename_old.insert(old.clone());
-            }
-        }
-    }
+    let diffs_by_path: BTreeMap<&str, &FileDiff> =
+        file_diffs.iter().map(|d| (d.path.as_str(), d)).collect();
+
+    // For `--staged`, detect files where the working tree differs from the index
+    // in one Git call so we never attribute working-tree symbols to staged diffs.
+    let staged_differs: HashSet<String> = if matches!(since, Since::Staged) {
+        workspace
+            .git(&["diff", "--name-only", "-z", "--", "."])
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| nul_paths(&out.stdout).map(str::to_owned).collect())
+            .unwrap_or_default()
+    } else {
+        HashSet::new()
+    };
 
     // Count files by category & total lines.
     let mut source_files = 0usize;
@@ -1638,6 +1898,9 @@ pub(crate) fn render_review(
     let mut prod_semantic_churn = 0usize;
 
     let mut modified_files = BTreeSet::<String>::new();
+    let mut touched_ids = BTreeSet::<usize>::new();
+    let mut per_symbol_churn = BTreeMap::<usize, (usize, usize)>::new();
+
     for diff in &file_diffs {
         let cat = classify_file(index, &diff.path, diff.added + diff.deleted);
         match cat {
@@ -1656,71 +1919,28 @@ pub(crate) fn render_review(
             }
             if !diff.is_pure_rename() && !diff.is_whitespace_only() {
                 modified_files.insert(diff.path.clone());
+                if !diff.deleted_file
+                    && !diff.binary
+                    && index.files.contains_key(&diff.path)
+                    && !staged_differs.contains(&diff.path)
+                {
+                    let ranges = diff.semantic_ranges();
+                    if !ranges.is_empty() {
+                        let ids = touched_symbols_in_ranges(index, &diff.path, &ranges);
+                        touched_ids.extend(ids.iter().copied());
+                        for (id, delta) in symbol_churn(index, diff) {
+                            let entry = per_symbol_churn.entry(id).or_default();
+                            entry.0 += delta.0;
+                            entry.1 += delta.1;
+                        }
+                    }
+                }
             }
         }
     }
 
-    // Filter semantic changes for symbol resolution.
-    let filtered_changes = filter_semantic_changes(
-        index,
-        raw_changes,
-        &diffs_by_path,
-        &pure_rename_old,
-        &edited_rename_old,
-    );
-
-    // Resolve changed symbols in current files, plus deleted-symbol caller seeds via impact::changed_in.
-    let mut touched_ids = BTreeSet::<usize>::new();
-    let mut per_symbol_churn = BTreeMap::<usize, (usize, usize)>::new();
-    let mut deleted_specs = Vec::<(String, String, String, (usize, usize))>::new();
-    let mut deletion_only = Vec::<(String, Change)>::new();
-    for (file, change) in filtered_changes {
-        match change {
-            Change::Ranges(ranges) => {
-                let ids = touched_symbols_in_ranges(index, &file, &ranges);
-                touched_ids.extend(ids.iter().copied());
-                if let Some(diff) = diffs_by_path.get(&file) {
-                    for (id, delta) in symbol_churn(index, diff) {
-                        let entry = per_symbol_churn.entry(id).or_default();
-                        entry.0 += delta.0;
-                        entry.1 += delta.1;
-                    }
-                }
-            }
-            Change::Deleted(dels) => {
-                for d in &dels {
-                    for (sym_name, sym_kind) in &d.symbols {
-                        deleted_specs.push((
-                            file.clone(),
-                            sym_name.clone(),
-                            sym_kind.clone(),
-                            d.old,
-                        ));
-                    }
-                }
-                if dels.iter().any(|d| !d.symbols.is_empty()) {
-                    deletion_only.push((file, Change::Deleted(dels)));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mixed_deleted =
-        detect_mixed_hunk_deletions(workspace, index, since, &file_diffs, &deleted_specs);
-    for (file, sym_name, sym_kind, old) in mixed_deleted {
-        deletion_only.push((
-            file.clone(),
-            Change::Deleted(vec![Deletion {
-                after: old.0,
-                old,
-                symbols: vec![(sym_name.clone(), sym_kind.clone())],
-                lines: Vec::new(),
-                removed: Vec::new(),
-            }]),
-        ));
-        deleted_specs.push((file, sym_name, sym_kind, old));
-    }
+    let (deleted_specs, deletion_only) =
+        detect_deleted_symbols(workspace, index, since, &file_diffs, &staged_differs);
 
     let deletion_seed_ids: BTreeSet<usize> = if deletion_only.is_empty() {
         BTreeSet::new()
@@ -1731,8 +1951,8 @@ pub(crate) fn render_review(
     let deleted_symbols =
         collect_deleted_symbols(&deleted_specs, index, &deletion_seed_ids, &modified_files);
 
-    // Build architectural graph (hub centrality & cross-community/cross-language bridges).
-    let graph = ReviewGraph::build(index);
+    // Build architectural graph only when at least one current symbol was touched.
+    let graph = (!touched_ids.is_empty()).then(|| ReviewGraph::build(index));
 
     // Seed set for blast radius walk = all touched symbols + callers of deleted symbols.
     let mut seed_set = touched_ids.clone();
@@ -1754,51 +1974,53 @@ pub(crate) fn render_review(
     let mut hub_ids = BTreeSet::<usize>::new();
     let mut bridge_ids = BTreeSet::<usize>::new();
 
-    for &id in &touched_ids {
-        let def = &index.definitions[id];
-        let (mut added, deleted) = per_symbol_churn.get(&id).copied().unwrap_or((0, 0));
-        let is_new = diffs_by_path
-            .get(&def.location.file)
-            .is_some_and(|d| d.new_file);
-        if added == 0 && deleted == 0 && is_new {
-            added = def.location.end.saturating_sub(def.location.start) + 1;
-        }
-        let is_hub = graph.is_hub[id];
-        let (is_bridge, cross_lang, bridge_desc) = graph.bridge_info(index, id);
-        if is_hub {
-            hub_ids.insert(id);
-        }
-        if is_bridge {
-            bridge_ids.insert(id);
-        }
+    if let Some(ref graph) = graph {
+        for &id in &touched_ids {
+            let def = &index.definitions[id];
+            let (mut added, deleted) = per_symbol_churn.get(&id).copied().unwrap_or((0, 0));
+            let is_new = diffs_by_path
+                .get(def.location.file.as_str())
+                .is_some_and(|d| d.new_file);
+            if added == 0 && deleted == 0 && is_new {
+                added = def.location.end.saturating_sub(def.location.start) + 1;
+            }
+            let is_hub = graph.is_hub[id];
+            let (is_bridge, cross_lang, bridge_desc) = graph.bridge_info(index, id);
+            if is_hub {
+                hub_ids.insert(id);
+            }
+            if is_bridge {
+                bridge_ids.insert(id);
+            }
 
-        let (sym_tests, sym_files) = tests_for_symbol(index, id, depth.max(4));
-        let reachable_tests = sym_tests.len() + sym_files.len();
-        for (tid, hops, possible) in sym_tests {
-            keep_test(tid, hops, possible);
-        }
-        for (file, hit) in sym_files {
-            aggregate_test_files
-                .entry(file)
-                .and_modify(|existing| {
-                    if (hit.possible, hit.hops) < (existing.possible, existing.hops) {
-                        *existing = hit.clone();
-                    }
-                })
-                .or_insert(hit);
-        }
+            let (sym_tests, sym_files) = tests_for_symbol(index, id, depth.max(4));
+            let reachable_tests = sym_tests.len() + sym_files.len();
+            for (tid, hops, possible) in sym_tests {
+                keep_test(tid, hops, possible);
+            }
+            for (file, hit) in sym_files {
+                aggregate_test_files
+                    .entry(file)
+                    .and_modify(|existing| {
+                        if (hit.possible, hit.hops) < (existing.possible, existing.hops) {
+                            *existing = hit.clone();
+                        }
+                    })
+                    .or_insert(hit);
+            }
 
-        changed_infos.push(ChangedSymbolInfo {
-            id,
-            added,
-            deleted,
-            is_new,
-            is_hub,
-            is_bridge,
-            cross_lang,
-            bridge_desc,
-            reachable_tests,
-        });
+            changed_infos.push(ChangedSymbolInfo {
+                id,
+                added,
+                deleted,
+                is_new,
+                is_hub,
+                is_bridge,
+                cross_lang,
+                bridge_desc,
+                reachable_tests,
+            });
+        }
     }
 
     // Augment aggregate test files with JS/TS & Ruby module graphs (barrels,
@@ -2148,9 +2370,11 @@ pub(crate) fn render_review(
         if let Some(desc) = &info.bridge_desc {
             value["bridge_detail"] = json!(desc);
         }
-        value["in_degree"] = json!(graph.in_deg[info.id]);
-        value["caller_files"] = json!(graph.caller_files[info.id]);
-        value["caller_areas"] = json!(graph.caller_areas[info.id]);
+        if let Some(ref g) = graph {
+            value["in_degree"] = json!(g.in_deg[info.id]);
+            value["caller_files"] = json!(g.caller_files[info.id]);
+            value["caller_areas"] = json!(g.caller_areas[info.id]);
+        }
         value["reachable_tests"] = json!(info.reachable_tests);
         value["tested"] = json!(info.reachable_tests > 0);
         changed_section.push(line, value);

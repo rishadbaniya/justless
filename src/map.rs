@@ -465,7 +465,11 @@ pub(crate) fn is_test_file(file: &str) -> bool {
 /// than the project's primary source. Used to keep production code ahead of
 /// support code when ranking hubs, communities, links, entry points and packs.
 pub(crate) fn is_support_file(file: &str) -> bool {
-    is_test_file(file)
+    is_support_path(file, is_test_file(file))
+}
+
+fn is_support_path(file: &str, is_test: bool) -> bool {
+    is_test
         || Path::new(file)
             .parent()
             .into_iter()
@@ -533,13 +537,6 @@ pub(crate) fn plural(count: usize, noun: &str) -> String {
     }
 }
 
-fn directory(file: &str) -> String {
-    match Path::new(file).parent().and_then(Path::to_str) {
-        Some("") | None => "(root)".into(),
-        Some(parent) => format!("{parent}/"),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The map
 
@@ -547,6 +544,120 @@ fn directory(file: &str) -> String {
 /// connected by construction rather than by design.
 fn central(definition: &Definition) -> bool {
     !definition.test && !matches!(definition.kind.as_str(), "file" | "module")
+}
+
+/// Precomputed per-file metadata indexed by dense `file_id` (sorted
+/// lexicographically by file path, so `file_id` order matches `&str` order).
+pub(crate) struct FileMeta<'a> {
+    pub(crate) path: &'a str,
+    pub(crate) dir: String,
+    pub(crate) dir_id: usize,
+    pub(crate) is_test: bool,
+    pub(crate) is_support: bool,
+    pub(crate) lang: Option<&'static str>,
+    pub(crate) indexed_lang: Option<&'static str>,
+    pub(crate) in_index_files: bool,
+}
+
+/// Dense per-file table shared across graph passes (`map`, `map --explain`,
+/// `review`) so hot edge/symbol loops use `usize` indexing instead of repeated
+/// path parsing, string allocations, or map lookups.
+pub(crate) struct FileIndex<'a> {
+    pub(crate) files: Vec<FileMeta<'a>>,
+    by_path: HashMap<&'a str, usize>,
+    pub(crate) def_file: Vec<usize>,
+    pub(crate) file_def: Vec<Option<usize>>,
+}
+
+impl<'a> FileIndex<'a> {
+    pub(crate) fn new(index: &'a Index) -> Self {
+        let mut paths: Vec<&'a str> = index.files.keys().map(String::as_str).collect();
+        let mut extras = Vec::<&'a str>::new();
+        let mut last_seen = "";
+        let mut check_path = |file: &'a str| {
+            if file != last_seen {
+                last_seen = file;
+                if !index.files.contains_key(file) {
+                    extras.push(file);
+                }
+            }
+        };
+        for def in &index.definitions {
+            check_path(def.location.file.as_str());
+        }
+        for edge in &index.edges {
+            check_path(edge.location.file.as_str());
+        }
+        if !extras.is_empty() {
+            paths.extend(extras);
+            paths.sort_unstable();
+            paths.dedup();
+        }
+
+        let mut by_path = HashMap::<&'a str, usize>::with_capacity(paths.len());
+        let mut dir_ids = HashMap::<&'a str, usize>::new();
+        let mut files = Vec::with_capacity(paths.len());
+        for (fid, path) in paths.into_iter().enumerate() {
+            by_path.insert(path, fid);
+            let parent = Path::new(path)
+                .parent()
+                .and_then(Path::to_str)
+                .unwrap_or("");
+            let next_dir_id = dir_ids.len();
+            let dir_id = *dir_ids.entry(parent).or_insert(next_dir_id);
+            let dir = if parent.is_empty() {
+                "(root)".to_owned()
+            } else {
+                format!("{parent}/")
+            };
+            let is_test = is_test_file(path);
+            let is_support = is_support_path(path, is_test);
+            let lang = language(path);
+            let indexed_lang = indexed_language(index, path);
+            let in_index_files = index.files.contains_key(path);
+            files.push(FileMeta {
+                path,
+                dir,
+                dir_id,
+                is_test,
+                is_support,
+                lang,
+                indexed_lang,
+                in_index_files,
+            });
+        }
+
+        let mut def_file = Vec::with_capacity(index.definitions.len());
+        let mut file_def = vec![None; files.len()];
+        let mut cached_path = "";
+        let mut cached_fid = 0usize;
+        for (id, def) in index.definitions.iter().enumerate() {
+            let p = def.location.file.as_str();
+            let fid = if !def_file.is_empty() && p == cached_path {
+                cached_fid
+            } else {
+                cached_path = p;
+                cached_fid = by_path[p];
+                cached_fid
+            };
+            def_file.push(fid);
+            if def.kind == "file" {
+                file_def[fid] = Some(id);
+            }
+        }
+
+        Self {
+            files,
+            by_path,
+            def_file,
+            file_def,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn id_of(&self, path: &str) -> usize {
+        self.by_path[path]
+    }
 }
 
 /// Distinct dependents (callers, importers, file scopes) and dependencies of
@@ -559,39 +670,76 @@ struct Degrees {
 }
 
 impl Degrees {
-    fn new(index: &Index) -> Self {
+    fn new(index: &Index, files: &FileIndex<'_>) -> Self {
         let count = index.definitions.len();
-        let mut degrees = Self {
-            dependents: vec![0; count],
-            dependencies: vec![0; count],
-            certain_dependents: vec![0; count],
-            certain_dependencies: vec![0; count],
+        let mut dependents = vec![0usize; count];
+        let mut dependencies = vec![0usize; count];
+        let mut certain_dependents = vec![0usize; count];
+        let mut certain_dependencies = vec![0usize; count];
+
+        let mut scratch = Vec::<(usize, bool)>::with_capacity(32);
+        let tally = |buf: &mut Vec<(usize, bool)>| -> (usize, usize) {
+            match buf.len() {
+                0 => (0, 0),
+                1 => (1, usize::from(buf[0].1)),
+                _ => {
+                    buf.sort_unstable_by_key(|&(k, _)| k);
+                    let mut total = 1usize;
+                    let mut cur_key = buf[0].0;
+                    let mut cur_certain = buf[0].1;
+                    let mut certain_count = 0usize;
+                    for &(k, c) in &buf[1..] {
+                        if k == cur_key {
+                            cur_certain |= c;
+                        } else {
+                            certain_count += usize::from(cur_certain);
+                            total += 1;
+                            cur_key = k;
+                            cur_certain = c;
+                        }
+                    }
+                    certain_count += usize::from(cur_certain);
+                    (total, certain_count)
+                }
+            }
         };
-        let mut incoming = HashMap::new();
-        let mut outgoing = HashMap::new();
-        for edge in &index.edges {
-            if edge.from == Some(edge.to) {
-                continue;
+
+        for to in 0..count {
+            scratch.clear();
+            for edge in index.incoming(to) {
+                if edge.from == Some(to) {
+                    continue;
+                }
+                let key = match edge.from {
+                    Some(from) => from,
+                    None => count + files.id_of(edge.location.file.as_str()),
+                };
+                scratch.push((key, !edge.inferred));
             }
-            let scope = if edge.from.is_none() {
-                edge.location.file.as_str()
-            } else {
-                ""
-            };
-            *incoming.entry((edge.to, edge.from, scope)).or_insert(false) |= !edge.inferred;
-            if let Some(from) = edge.from {
-                *outgoing.entry((from, edge.to)).or_insert(false) |= !edge.inferred;
+            let (all, cert) = tally(&mut scratch);
+            dependents[to] = all;
+            certain_dependents[to] = cert;
+        }
+
+        for from in 0..count {
+            scratch.clear();
+            for edge in index.outgoing(from) {
+                if edge.to == from {
+                    continue;
+                }
+                scratch.push((edge.to, !edge.inferred));
             }
+            let (all, cert) = tally(&mut scratch);
+            dependencies[from] = all;
+            certain_dependencies[from] = cert;
         }
-        for ((to, _, _), certain) in incoming {
-            degrees.dependents[to] += 1;
-            degrees.certain_dependents[to] += usize::from(certain);
+
+        Self {
+            dependents,
+            dependencies,
+            certain_dependents,
+            certain_dependencies,
         }
-        for ((from, _), certain) in outgoing {
-            degrees.dependencies[from] += 1;
-            degrees.certain_dependencies[from] += usize::from(certain);
-        }
-        degrees
     }
 
     /// Ranks certain links first, so a common method name that only matches
@@ -617,6 +765,47 @@ impl Degrees {
             part("in", self.dependents[id], self.certain_dependents[id]),
             part("out", self.dependencies[id], self.certain_dependencies[id])
         )
+    }
+}
+
+/// Dense area mapping for all files in a `FileIndex`.
+struct AreaMap {
+    /// Unique area names (e.g. `"src/"`, `"(root)"`, `"tests/"`).
+    names: Vec<String>,
+    is_support: Vec<bool>,
+    /// Maps each `file_id` to its dense `area_id`.
+    file_area: Vec<usize>,
+}
+
+impl AreaMap {
+    fn new(index: &Index, files: &FileIndex<'_>) -> Self {
+        let assigned = areas(index, files);
+        let mut names = Vec::<String>::new();
+        let mut by_name = HashMap::<String, usize>::new();
+        let mut get_id = |area: &str| -> usize {
+            if let Some(&id) = by_name.get(area) {
+                return id;
+            }
+            let id = names.len();
+            names.push(area.to_owned());
+            by_name.insert(area.to_owned(), id);
+            id
+        };
+        let mut file_area = Vec::with_capacity(files.files.len());
+        for (fid, meta) in files.files.iter().enumerate() {
+            let name = if meta.in_index_files {
+                assigned[fid].as_str()
+            } else {
+                "(root)"
+            };
+            file_area.push(get_id(name));
+        }
+        let is_support = names.iter().map(|n| is_support_area(n)).collect();
+        Self {
+            names,
+            is_support,
+            file_area,
+        }
     }
 }
 
@@ -659,51 +848,70 @@ impl Centrality {
         (value * Self::SCALE).round().min(u64::MAX as f64) as u64
     }
 
-    fn new(index: &Index, areas: &BTreeMap<&str, String>) -> Self {
+    fn new(index: &Index, files: &FileIndex<'_>, area_map: &AreaMap) -> Self {
         let def_count = index.definitions.len();
-        let area_of = |file: &str| areas.get(file).map_or("(root)", String::as_str);
+        let num_files = files.files.len();
+        let num_areas = area_map.names.len().max(1);
 
-        // Map files that already have a `"file"` definition, then allocate
-        // deterministic virtual file-scope nodes for any remaining files that
-        // emit file-scope edges (`edge.from == None`, e.g. Rust imports).
-        let mut file_nodes = BTreeMap::<&str, usize>::new();
-        for (id, def) in index.definitions.iter().enumerate() {
-            if def.kind == "file" {
-                file_nodes.insert(def.location.file.as_str(), id);
-            }
-        }
-        let mut extra_files = BTreeSet::<&str>::new();
+        // Reuse existing `"file"` definitions and allocate deterministic virtual
+        // file-scope nodes in lexicographical file order for any remaining files
+        // that emit file-scope edges (`edge.from == None`).
+        let mut file_nodes = files.file_def.clone();
+        let mut needs_virtual = vec![false; num_files];
+        let mut cached_path = "";
+        let mut cached_fid = 0usize;
         for edge in &index.edges {
-            if edge.from.is_none() && !file_nodes.contains_key(edge.location.file.as_str()) {
-                extra_files.insert(edge.location.file.as_str());
+            if edge.from.is_none() {
+                let p = edge.location.file.as_str();
+                let fid = if p == cached_path && !cached_path.is_empty() {
+                    cached_fid
+                } else {
+                    cached_path = p;
+                    cached_fid = files.id_of(p);
+                    cached_fid
+                };
+                if file_nodes[fid].is_none() {
+                    needs_virtual[fid] = true;
+                }
             }
         }
-        let mut node_file: Vec<&str> = index
-            .definitions
-            .iter()
-            .map(|d| d.location.file.as_str())
-            .collect();
-        for file in extra_files {
-            let id = node_file.len();
-            file_nodes.insert(file, id);
-            node_file.push(file);
+        let mut node_file: Vec<usize> = files.def_file.clone();
+        for (fid, &need) in needs_virtual.iter().enumerate() {
+            if need {
+                let id = node_file.len();
+                file_nodes[fid] = Some(id);
+                node_file.push(fid);
+            }
         }
         let node_count = node_file.len();
-        let node_area: Vec<&str> = node_file.iter().map(|&f| area_of(f)).collect();
-        let node_support: Vec<bool> = node_file.iter().map(|&f| is_support_file(f)).collect();
+        let node_area: Vec<usize> = node_file.iter().map(|&f| area_map.file_area[f]).collect();
+        let node_support: Vec<bool> = node_file
+            .iter()
+            .map(|&f| files.files[f].is_support)
+            .collect();
 
-        // Deduplicate directed edges `(src, dst)` keeping the strongest edge weight
-        // and tracking per-definition external file/area diversity.
-        let mut edge_weights = BTreeMap::<(usize, usize), f64>::new();
-        let mut ext_in_files = vec![BTreeSet::<&str>::new(); def_count];
-        let mut ext_in_areas = vec![BTreeSet::<&str>::new(); def_count];
-        let mut ext_out_areas = vec![BTreeSet::<&str>::new(); def_count];
+        // Single pass over raw edges to compute weights, `has_strong_in`, and
+        // per-source raw edge counts for CSR bucketing.
         let mut has_strong_in = vec![false; def_count];
+        let mut out_deg = vec![0u32; node_count];
+        let mut raw_edges = Vec::<(u32, u32, f64)>::with_capacity(index.edges.len());
 
+        cached_path = "";
+        cached_fid = 0;
         for edge in &index.edges {
             let src = match edge.from {
                 Some(id) => id,
-                None => file_nodes[edge.location.file.as_str()],
+                None => {
+                    let p = edge.location.file.as_str();
+                    let fid = if p == cached_path && !cached_path.is_empty() {
+                        cached_fid
+                    } else {
+                        cached_path = p;
+                        cached_fid = files.id_of(p);
+                        cached_fid
+                    };
+                    file_nodes[fid].unwrap()
+                }
             };
             let dst = edge.to;
             if src == dst {
@@ -740,61 +948,175 @@ impl Centrality {
                 1.0
             };
             let weight = boundary * certainty * kind_w * support;
-            edge_weights
-                .entry((src, dst))
-                .and_modify(|existing| {
-                    if weight > *existing {
-                        *existing = weight;
-                    }
-                })
-                .or_insert(weight);
+            raw_edges.push((src as u32, dst as u32, weight));
+            out_deg[src] += 1;
 
-            if dst < def_count {
-                let count_caller = !node_support[src] || node_support[dst];
-                if count_caller && src_file != dst_file {
-                    ext_in_files[dst].insert(src_file);
-                }
-                if count_caller && src_area != dst_area {
-                    ext_in_areas[dst].insert(src_area);
-                }
-                if !edge.inferred || matches!(edge.kind, Kind::Route | Kind::Data) {
-                    has_strong_in[dst] = true;
-                }
-            }
-            if src < def_count && src_area != dst_area && (!node_support[dst] || node_support[src])
+            if dst < def_count && (!edge.inferred || matches!(edge.kind, Kind::Route | Kind::Data))
             {
-                ext_out_areas[src].insert(dst_area);
+                has_strong_in[dst] = true;
             }
         }
 
+        // Bucket by `src` into outgoing CSR, sort each source's slice by `dst`,
+        // deduplicate keeping max weight, and tally `out_sum` + `ext_out_areas`.
+        let mut raw_offsets = vec![0u32; node_count + 1];
+        for src in 0..node_count {
+            raw_offsets[src + 1] = raw_offsets[src] + out_deg[src];
+        }
+        let mut out_edges = vec![(0u32, 0.0f64); raw_edges.len()];
+        let mut cursor = raw_offsets[..node_count].to_vec();
+        for (src, dst, weight) in raw_edges {
+            let slot = cursor[src as usize] as usize;
+            cursor[src as usize] += 1;
+            out_edges[slot] = (dst, weight);
+        }
+
+        let mut out_offsets = vec![0u32; node_count + 1];
         let mut out_sum = vec![0.0f64; node_count];
-        let mut outgoing = vec![Vec::<(usize, f64)>::new(); def_count];
-        for (&(src, dst), &weight) in &edge_weights {
-            out_sum[src] += weight;
+        let mut in_deg = vec![0u32; node_count];
+        let mut ext_out_areas = vec![0usize; def_count];
+        let mut area_stamp = vec![0u32; num_areas];
+        let mut write = 0usize;
+
+        for src in 0..node_count {
+            let start = raw_offsets[src] as usize;
+            let end = raw_offsets[src + 1] as usize;
+            out_offsets[src] = write as u32;
+            if start == end {
+                continue;
+            }
+            if end - start > 1 {
+                out_edges[start..end].sort_unstable_by_key(|&(dst, _)| dst);
+            }
+            let stamp = (src + 1) as u32;
+            let src_area = node_area[src];
+            let src_sup = node_support[src];
+            let mut out_area_cnt = 0usize;
+            let mut sum = 0.0f64;
+
+            let mut cur_dst = out_edges[start].0;
+            let mut cur_w = out_edges[start].1;
+            let mut emit_edge = |dst: u32, w: f64, buf: &mut [(u32, f64)]| {
+                buf[write] = (dst, w);
+                write += 1;
+                sum += w;
+                let d = dst as usize;
+                in_deg[d] += 1;
+                if src < def_count
+                    && src_area != node_area[d]
+                    && (!node_support[d] || src_sup)
+                    && area_stamp[node_area[d]] != stamp
+                {
+                    area_stamp[node_area[d]] = stamp;
+                    out_area_cnt += 1;
+                }
+            };
+            for r in (start + 1)..end {
+                let (dst, w) = out_edges[r];
+                if dst == cur_dst {
+                    if w > cur_w {
+                        cur_w = w;
+                    }
+                } else {
+                    emit_edge(cur_dst, cur_w, &mut out_edges);
+                    cur_dst = dst;
+                    cur_w = w;
+                }
+            }
+            emit_edge(cur_dst, cur_w, &mut out_edges);
+            out_sum[src] = sum;
             if src < def_count {
-                outgoing[src].push((dst, weight));
+                ext_out_areas[src] = out_area_cnt;
+            }
+        }
+        out_offsets[node_count] = write as u32;
+        out_edges.truncate(write);
+
+        // Bucket deduplicated edges by `dst` to form flat caller-file groups in
+        // deterministic `(caller_file_id, src)` order for PageRank, while
+        // counting `caller_files` and `caller_areas` in the same pass.
+        let mut in_offsets = vec![0u32; node_count + 1];
+        for dst in 0..node_count {
+            in_offsets[dst + 1] = in_offsets[dst] + in_deg[dst];
+        }
+        let mut in_raw = vec![(0u32, 0u32, 0.0f64); write];
+        cursor.copy_from_slice(&in_offsets[..node_count]);
+        for src in 0..node_count {
+            let denom = out_sum[src] + Self::LEAK;
+            let s_start = out_offsets[src] as usize;
+            let s_end = out_offsets[src + 1] as usize;
+            let src_file = node_file[src] as u32;
+            for &(dst, weight) in &out_edges[s_start..s_end] {
+                let d = dst as usize;
+                let slot = cursor[d] as usize;
+                cursor[d] += 1;
+                in_raw[slot] = (src_file, src as u32, weight / denom);
             }
         }
 
-        // Pre-group each target's incoming edges by caller file in deterministic
-        // order so the power-iteration loop does zero per-iteration allocations.
-        let mut by_dst_file = vec![BTreeMap::<&str, Vec<(usize, f64)>>::new(); node_count];
-        for (&(src, dst), &weight) in &edge_weights {
-            let trans = weight / (out_sum[src] + Self::LEAK);
-            by_dst_file[dst]
-                .entry(node_file[src])
-                .or_default()
-                .push((src, trans));
+        let mut in_flat = Vec::<(u32, f64)>::with_capacity(write);
+        let mut in_groups = Vec::<(u32, u32)>::new();
+        let mut dst_groups = vec![(0u32, 0u32); node_count];
+        let mut caller_files = vec![0usize; def_count];
+        let mut caller_areas = vec![0usize; def_count];
+        area_stamp.fill(0);
+
+        for dst in 0..node_count {
+            let start = in_offsets[dst] as usize;
+            let end = in_offsets[dst + 1] as usize;
+            if start == end {
+                continue;
+            }
+            if end - start > 1 {
+                in_raw[start..end].sort_unstable_by_key(|&(fid, src, _)| (fid, src));
+            }
+            let grp_start = in_groups.len() as u32;
+            let dst_file = node_file[dst];
+            let dst_area = node_area[dst];
+            let dst_sup = node_support[dst];
+            let stamp = (dst + 1) as u32;
+            let mut file_cnt = 0usize;
+            let mut area_cnt = 0usize;
+            let mut last_counted_file = usize::MAX;
+
+            let mut run_file = in_raw[start].0;
+            let mut run_start = in_flat.len() as u32;
+            for &(fid, src, trans) in &in_raw[start..end] {
+                if fid != run_file {
+                    in_groups.push((run_start, in_flat.len() as u32));
+                    run_file = fid;
+                    run_start = in_flat.len() as u32;
+                }
+                in_flat.push((src, trans));
+                if dst < def_count {
+                    let s = src as usize;
+                    let count_caller = !node_support[s] || dst_sup;
+                    if count_caller {
+                        let sf = fid as usize;
+                        if sf != dst_file && sf != last_counted_file {
+                            last_counted_file = sf;
+                            file_cnt += 1;
+                        }
+                        let sa = node_area[s];
+                        if sa != dst_area && area_stamp[sa] != stamp {
+                            area_stamp[sa] = stamp;
+                            area_cnt += 1;
+                        }
+                    }
+                }
+            }
+            in_groups.push((run_start, in_flat.len() as u32));
+            dst_groups[dst] = (grp_start, in_groups.len() as u32);
+            if dst < def_count {
+                caller_files[dst] = file_cnt;
+                caller_areas[dst] = area_cnt;
+            }
         }
-        let incoming_groups: Vec<Vec<Vec<(usize, f64)>>> = by_dst_file
-            .into_iter()
-            .map(|groups| groups.into_values().collect())
-            .collect();
 
         // Active nodes start with base teleportation mass (support files damped).
         let base: Vec<f64> = (0..node_count)
             .map(|u| {
-                if out_sum[u] == 0.0 && incoming_groups[u].is_empty() {
+                if out_sum[u] == 0.0 && dst_groups[u].0 == dst_groups[u].1 {
                     0.0
                 } else if node_support[u] {
                     0.25
@@ -812,15 +1134,17 @@ impl Centrality {
         for _ in 0..Self::MAX_ITERS {
             let mut max_delta = 0.0f64;
             for dst in 0..node_count {
+                let (g_start, g_end) = dst_groups[dst];
                 let mut received = 0.0f64;
-                for group in &incoming_groups[dst] {
+                for &(e_start, e_end) in &in_groups[g_start as usize..g_end as usize] {
+                    let group = &in_flat[e_start as usize..e_end as usize];
                     if group.len() == 1 {
                         let (src, trans) = group[0];
-                        received += rank[src] * trans;
+                        received += rank[src as usize] * trans;
                     } else {
                         flows.clear();
                         for &(src, trans) in group {
-                            flows.push(rank[src] * trans);
+                            flows.push(rank[src as usize] * trans);
                         }
                         flows.sort_unstable_by(|a, b| b.total_cmp(a));
                         for (k, &flow) in flows.iter().enumerate() {
@@ -845,18 +1169,14 @@ impl Centrality {
 
         let mut score = vec![0.0f64; def_count];
         let mut rank_key = vec![0u64; def_count];
-        let mut caller_files = vec![0usize; def_count];
-        let mut caller_areas = vec![0usize; def_count];
         for id in 0..def_count {
-            let files = ext_in_files[id].len();
-            let in_areas = ext_in_areas[id].len();
-            let out_areas = ext_out_areas[id].len();
-            caller_files[id] = files;
-            caller_areas[id] = in_areas;
+            let files_n = caller_files[id];
+            let in_areas = caller_areas[id];
+            let out_areas = ext_out_areas[id];
             let mut value = incoming_flow[id];
             if value > 0.0 {
                 let area_factor = 1.0 + 0.35 * (in_areas as f64 + 0.5 * out_areas as f64).ln_1p();
-                let file_factor = 1.0 + 0.15 * (files as f64).ln_1p();
+                let file_factor = 1.0 + 0.15 * (files_n as f64).ln_1p();
                 let kind_factor = if matches!(
                     index.definitions[id].kind.as_str(),
                     "struct" | "class" | "enum" | "trait" | "interface" | "table" | "protocol"
@@ -879,14 +1199,13 @@ impl Centrality {
         // centrality of the architecture they orchestrate.
         let direct_reach: Vec<f64> = (0..def_count)
             .map(|src| {
-                outgoing[src]
+                let s_start = out_offsets[src] as usize;
+                let s_end = out_offsets[src + 1] as usize;
+                out_edges[s_start..s_end]
                     .iter()
                     .map(|&(dst, weight)| {
-                        let authority = if dst < def_count {
-                            0.25 + score[dst]
-                        } else {
-                            0.25
-                        };
+                        let d = dst as usize;
+                        let authority = if d < def_count { 0.25 + score[d] } else { 0.25 };
                         weight * authority
                     })
                     .sum()
@@ -896,11 +1215,13 @@ impl Centrality {
         let mut next_reach = vec![0.0f64; def_count];
         for _ in 0..4 {
             for src in 0..def_count {
+                let s_start = out_offsets[src] as usize;
+                let s_end = out_offsets[src + 1] as usize;
                 let denom = out_sum[src] + 0.25;
-                let downstream: f64 = outgoing[src]
+                let downstream: f64 = out_edges[s_start..s_end]
                     .iter()
-                    .filter(|&&(dst, _)| dst < def_count)
-                    .map(|&(dst, weight)| (weight / denom) * reach[dst])
+                    .filter(|&&(dst, _)| (dst as usize) < def_count)
+                    .map(|&(dst, weight)| (weight / denom) * reach[dst as usize])
                     .sum();
                 next_reach[src] = direct_reach[src] + 0.65 * downstream;
             }
@@ -920,41 +1241,48 @@ impl Centrality {
 
 /// Groups files into areas: top-level directories, with a directory that holds
 /// most of the symbols split into its children so one area cannot swallow the map.
-fn areas(index: &Index) -> BTreeMap<&str, String> {
-    let mut symbols = BTreeMap::<&str, usize>::new();
-    for definition in index.definitions.iter().filter(|d| d.kind != "file") {
-        *symbols
-            .entry(definition.location.file.as_str())
-            .or_default() += 1;
+fn areas(index: &Index, files: &FileIndex<'_>) -> Vec<String> {
+    let num_files = files.files.len();
+    let mut symbols = vec![0usize; num_files];
+    let mut total = 0usize;
+    for (id, definition) in index.definitions.iter().enumerate() {
+        if definition.kind != "file" {
+            symbols[files.def_file[id]] += 1;
+            total += 1;
+        }
     }
-    let total: usize = symbols.values().sum();
     let mut splits = BTreeSet::new();
-    let assign = |splits: &BTreeSet<String>| {
-        index
+    let assign = |splits: &BTreeSet<String>| -> Vec<String> {
+        files
             .files
-            .keys()
-            .map(|file| {
+            .iter()
+            .map(|meta| {
+                if !meta.in_index_files {
+                    return "(root)".to_owned();
+                }
+                let file = meta.path;
                 let parts: Vec<&str> = file.split('/').collect();
                 let mut depth = 1;
                 while depth < parts.len() && splits.contains(&parts[..depth].join("/")) {
                     depth += 1;
                 }
-                let area = if parts.len() == 1 {
+                if parts.len() == 1 {
                     "(root)".to_owned()
                 } else if depth == parts.len() {
-                    file.clone()
+                    file.to_owned()
                 } else {
                     format!("{}/", parts[..depth].join("/"))
-                };
-                (file.as_str(), area)
+                }
             })
-            .collect::<BTreeMap<_, _>>()
+            .collect()
     };
     let mut assigned = assign(&splits);
     for _ in 0..4 {
         let mut sizes = BTreeMap::<&str, usize>::new();
-        for (file, area) in &assigned {
-            *sizes.entry(area).or_default() += symbols.get(file).copied().unwrap_or(0);
+        for (fid, meta) in files.files.iter().enumerate() {
+            if meta.in_index_files {
+                *sizes.entry(assigned[fid].as_str()).or_default() += symbols[fid];
+            }
         }
         let Some((largest, size)) = sizes
             .into_iter()
@@ -972,14 +1300,14 @@ fn areas(index: &Index) -> BTreeMap<&str, String> {
         // half of its symbols.
         let mut direct_children = BTreeSet::new();
         let mut subdir_symbols = 0;
-        for (file, area) in &assigned {
-            if *area != largest {
+        for (fid, meta) in files.files.iter().enumerate() {
+            if !meta.in_index_files || assigned[fid].as_str() != largest {
                 continue;
             }
-            if let Some(rest) = file.strip_prefix(largest) {
+            if let Some(rest) = meta.path.strip_prefix(largest) {
                 direct_children.insert(rest.split('/').next().unwrap_or(rest));
                 if rest.contains('/') {
-                    subdir_symbols += symbols.get(file).copied().unwrap_or(0);
+                    subdir_symbols += symbols[fid];
                 }
             }
         }
@@ -1011,40 +1339,39 @@ struct CommunityMap<'a> {
     isolated_symbols: usize,
 }
 
-/// Asynchronous label propagation in a fixed order with the smallest label
-/// winning ties, followed by deterministic satellite consolidation and
-/// filtering to genuine architectural communities (>= 2 files OR >= 5 symbols).
-/// Isolated / leaf symbols are counted cleanly instead of inflating communities.
-fn communities(index: &Index) -> CommunityMap<'_> {
+/// Dense CSR asynchronous label propagation shared by `map` and `review`.
+/// Preserves exact deterministic node ordering and smallest-label tie-breaking
+/// while avoiding per-node hash tables via dense scratch buffers + dirty flags.
+fn run_lpa(index: &Index, files: &FileIndex<'_>, max_iters: usize) -> Vec<usize> {
     let definitions = &index.definitions;
+    let def_count = definitions.len();
+    let num_files = files.files.len();
     // Rust files have no file definition, so they get a node after the definitions.
-    let mut nodes = definitions.len();
-    let mut files = BTreeMap::<&str, usize>::new();
-    let mut by_file = BTreeMap::<&str, Vec<usize>>::new();
+    let mut nodes = def_count;
+    let mut file_nodes = files.file_def.clone();
+    let mut by_file = vec![Vec::<usize>::new(); num_files];
     for (id, definition) in definitions.iter().enumerate() {
-        if definition.kind == "file" {
-            files.insert(&definition.location.file, id);
-        } else {
-            by_file
-                .entry(&definition.location.file)
-                .or_default()
-                .push(id);
+        if definition.kind != "file" {
+            by_file[files.def_file[id]].push(id);
         }
     }
-    let mut file_node = |file| {
-        *files.entry(file).or_insert_with(|| {
-            nodes += 1;
-            nodes - 1
-        })
-    };
-    let mut links = HashMap::<(usize, usize), u32>::new();
-    let mut link = |a: usize, b: usize, weight: u32| {
+
+    let mut raw = Vec::<(u32, u32, u32)>::with_capacity(def_count + index.edges.len());
+    let mut add_link = |a: usize, b: usize, weight: u32| {
         if a != b {
-            *links.entry((a.min(b), a.max(b))).or_default() += weight;
+            raw.push((a as u32, b as u32, weight));
         }
     };
-    for (file, mut ids) in by_file {
-        let root = file_node(file);
+
+    for (fid, mut ids) in by_file.into_iter().enumerate() {
+        if ids.is_empty() {
+            continue;
+        }
+        let root = *file_nodes[fid].get_or_insert_with(|| {
+            let id = nodes;
+            nodes += 1;
+            id
+        });
         ids.sort_by_key(|&id| {
             let span = &definitions[id].location;
             (span.start, Reverse(span.end), id)
@@ -1058,12 +1385,32 @@ fn communities(index: &Index) -> CommunityMap<'_> {
             {
                 stack.pop();
             }
-            link(id, stack.last().copied().unwrap_or(root), 3);
+            add_link(id, stack.last().copied().unwrap_or(root), 3);
             stack.push(id);
         }
     }
+
+    let mut cached_path = "";
+    let mut cached_fid = 0usize;
     for edge in &index.edges {
-        let from = edge.from.unwrap_or_else(|| file_node(&edge.location.file));
+        let from = match edge.from {
+            Some(id) => id,
+            None => {
+                let p = edge.location.file.as_str();
+                let fid = if p == cached_path && !cached_path.is_empty() {
+                    cached_fid
+                } else {
+                    cached_path = p;
+                    cached_fid = files.id_of(p);
+                    cached_fid
+                };
+                *file_nodes[fid].get_or_insert_with(|| {
+                    let id = nodes;
+                    nodes += 1;
+                    id
+                })
+            }
+        };
         // Inferred calls match by name alone. Inferred routes and SQL relations
         // still describe how areas connect.
         let weight = match (edge.inferred, edge.kind) {
@@ -1071,61 +1418,219 @@ fn communities(index: &Index) -> CommunityMap<'_> {
             (true, Kind::Route | Kind::Data) => 1,
             (true, _) => continue,
         };
-        link(from, edge.to, weight);
+        add_link(from, edge.to, weight);
     }
-    let mut pairs: Vec<_> = links.into_iter().collect();
-    pairs.sort_unstable();
-    let mut adjacency = vec![Vec::new(); nodes];
-    for ((a, b), weight) in pairs {
-        adjacency[a].push((b, weight));
-        adjacency[b].push((a, weight));
+
+    // Build flat undirected CSR adjacency and coalesce duplicate neighbor pairs.
+    let mut deg = vec![0u32; nodes];
+    for &(a, b, _) in &raw {
+        deg[a as usize] += 1;
+        deg[b as usize] += 1;
     }
+    let mut raw_offsets = vec![0u32; nodes + 1];
+    for u in 0..nodes {
+        raw_offsets[u + 1] = raw_offsets[u] + deg[u];
+    }
+    let mut adj = vec![(0u32, 0u32); raw.len() * 2];
+    let mut cursor = raw_offsets[..nodes].to_vec();
+    for (a, b, w) in raw {
+        let sa = cursor[a as usize] as usize;
+        cursor[a as usize] += 1;
+        adj[sa] = (b, w);
+        let sb = cursor[b as usize] as usize;
+        cursor[b as usize] += 1;
+        adj[sb] = (a, w);
+    }
+
+    let mut offsets = vec![0u32; nodes + 1];
+    let mut write = 0usize;
+    for u in 0..nodes {
+        let start = raw_offsets[u] as usize;
+        let end = raw_offsets[u + 1] as usize;
+        offsets[u] = write as u32;
+        if start == end {
+            continue;
+        }
+        if end - start > 1 {
+            adj[start..end].sort_unstable_by_key(|&(other, _)| other);
+        }
+        let mut cur_other = adj[start].0;
+        let mut cur_w = adj[start].1;
+        for r in (start + 1)..end {
+            let (other, w) = adj[r];
+            if other == cur_other {
+                cur_w += w;
+            } else {
+                adj[write] = (cur_other, cur_w);
+                write += 1;
+                cur_other = other;
+                cur_w = w;
+            }
+        }
+        adj[write] = (cur_other, cur_w);
+        write += 1;
+    }
+    offsets[nodes] = write as u32;
+    adj.truncate(write);
+
     let mut labels: Vec<usize> = (0..nodes).collect();
-    let mut tally = HashMap::<usize, u32>::new();
-    for _ in 0..32 {
+    let mut dirty = vec![true; nodes];
+    let mut weights = vec![0u32; nodes];
+    let mut touched = Vec::<usize>::with_capacity(64);
+
+    for _ in 0..max_iters {
         let mut changed = false;
         for node in 0..nodes {
-            if adjacency[node].is_empty() {
+            if !dirty[node] {
                 continue;
             }
-            tally.clear();
-            for &(other, weight) in &adjacency[node] {
-                *tally.entry(labels[other]).or_default() += weight;
-            }
-            let best = tally.values().copied().max().unwrap_or(0);
-            if tally.get(&labels[node]) == Some(&best) {
+            dirty[node] = false;
+            let start = offsets[node] as usize;
+            let end = offsets[node + 1] as usize;
+            let nbrs = &adj[start..end];
+            if nbrs.is_empty() {
                 continue;
             }
-            let choice = tally
-                .iter()
-                .filter(|&(_, &weight)| weight == best)
-                .map(|(&label, _)| label)
-                .min()
-                .unwrap();
-            labels[node] = choice;
-            changed = true;
+            let cur = labels[node];
+            let choice = if nbrs.len() == 1 {
+                labels[nbrs[0].0 as usize]
+            } else if nbrs.len() == 2 {
+                let l0 = labels[nbrs[0].0 as usize];
+                let l1 = labels[nbrs[1].0 as usize];
+                let w0 = nbrs[0].1;
+                let w1 = nbrs[1].1;
+                if l0 == l1 || w0 > w1 {
+                    l0
+                } else if w1 > w0 {
+                    l1
+                } else if cur == l0 || cur == l1 {
+                    cur
+                } else {
+                    l0.min(l1)
+                }
+            } else {
+                touched.clear();
+                let mut best = 0u32;
+                for &(other, w) in nbrs {
+                    let lbl = labels[other as usize];
+                    let slot = &mut weights[lbl];
+                    if *slot == 0 {
+                        touched.push(lbl);
+                    }
+                    *slot += w;
+                    if *slot > best {
+                        best = *slot;
+                    }
+                }
+                let picked = if weights[cur] == best {
+                    cur
+                } else {
+                    let mut min_lbl = usize::MAX;
+                    for &lbl in &touched {
+                        if weights[lbl] == best && lbl < min_lbl {
+                            min_lbl = lbl;
+                        }
+                    }
+                    min_lbl
+                };
+                for &lbl in &touched {
+                    weights[lbl] = 0;
+                }
+                picked
+            };
+            if choice != cur {
+                labels[node] = choice;
+                changed = true;
+                for &(other, _) in nbrs {
+                    dirty[other as usize] = true;
+                }
+            }
         }
         if !changed {
             break;
         }
     }
 
-    let mut raw_groups = BTreeMap::<usize, Vec<usize>>::new();
+    labels
+}
+
+/// Lightweight community membership for `justless review`: runs dense LPA and
+/// keeps architectural clusters (`>= 2` files or `>= 5` symbols).
+pub(crate) fn lpa_communities(
+    index: &Index,
+    files: &FileIndex<'_>,
+    max_iters: usize,
+) -> (Vec<Option<usize>>, usize) {
+    let definitions = &index.definitions;
+    let labels = run_lpa(index, files, max_iters);
+    let mut label_to_group = vec![u32::MAX; labels.len()];
+    let mut groups = Vec::<(usize, Vec<usize>)>::new();
+    for (id, def) in definitions.iter().enumerate() {
+        if def.kind == "file" {
+            continue;
+        }
+        let lbl = labels[id];
+        let slot = label_to_group[lbl];
+        if slot == u32::MAX {
+            label_to_group[lbl] = groups.len() as u32;
+            groups.push((lbl, vec![id]));
+        } else {
+            groups[slot as usize].1.push(id);
+        }
+    }
+    groups.sort_unstable_by_key(|&(lbl, _)| lbl);
+
+    let mut community_of = vec![None; definitions.len()];
+    let mut next_comm = 0usize;
+    for (_, members) in groups {
+        let multi_file = if let Some(&first) = members.first() {
+            let f0 = files.def_file[first];
+            members[1..].iter().any(|&id| files.def_file[id] != f0)
+        } else {
+            false
+        };
+        if multi_file || members.len() >= MIN_SINGLE_FILE_COMMUNITY {
+            for id in members {
+                community_of[id] = Some(next_comm);
+            }
+            next_comm += 1;
+        }
+    }
+    (community_of, next_comm)
+}
+
+/// Asynchronous label propagation in a fixed order with the smallest label
+/// winning ties, followed by deterministic satellite consolidation and
+/// filtering to genuine architectural communities (>= 2 files OR >= 5 symbols).
+/// Isolated / leaf symbols are counted cleanly instead of inflating communities.
+fn communities<'a>(index: &'a Index, files: &FileIndex<'a>) -> CommunityMap<'a> {
+    let definitions = &index.definitions;
+    let num_files = files.files.len();
+    let labels = run_lpa(index, files, 32);
+
+    // Grouping in ascending `id` order naturally orders groups by `members[0]`.
+    let mut label_to_group = vec![u32::MAX; labels.len()];
+    let mut groups = Vec::<Vec<usize>>::new();
     let mut total_non_file = 0usize;
     for (id, definition) in definitions.iter().enumerate() {
         if definition.kind != "file" {
             total_non_file += 1;
-            raw_groups.entry(labels[id]).or_default().push(id);
+            let lbl = labels[id];
+            let slot = label_to_group[lbl];
+            if slot == u32::MAX {
+                label_to_group[lbl] = groups.len() as u32;
+                groups.push(vec![id]);
+            } else {
+                groups[slot as usize].push(id);
+            }
         }
     }
-    let mut groups: Vec<Vec<usize>> = raw_groups.into_values().collect();
-    groups.sort_by_key(|members| members[0]);
 
-    let single_file_of = |members: &[usize]| -> Option<&str> {
-        let first = definitions[*members.first()?].location.file.as_str();
-        members
+    let single_file_of = |members: &[usize]| -> Option<usize> {
+        let first = files.def_file[*members.first()?];
+        members[1..]
             .iter()
-            .all(|&id| definitions[id].location.file.as_str() == first)
+            .all(|&id| files.def_file[id] == first)
             .then_some(first)
     };
     let is_architectural = |members: &[usize]| -> bool {
@@ -1142,14 +1647,16 @@ fn communities(index: &Index) -> CommunityMap<'_> {
     // neighboring architectural community when at least half of their certain
     // external links point to that one community. Inferred edges are never
     // merged so cross-boundary HTTP/SQL bridges stay distinct.
+    let mut group_of = vec![u32::MAX; definitions.len()];
+    let mut ext_pairs = Vec::<(u32, u32)>::new();
     for _ in 0..2 {
-        let mut group_of = vec![None; definitions.len()];
+        group_of.fill(u32::MAX);
         for (g_idx, members) in groups.iter().enumerate() {
             for &id in members {
-                group_of[id] = Some(g_idx);
+                group_of[id] = g_idx as u32;
             }
         }
-        let mut ext_weights = BTreeMap::<usize, BTreeMap<usize, u32>>::new();
+        ext_pairs.clear();
         for edge in &index.edges {
             if edge.inferred {
                 continue;
@@ -1157,15 +1664,28 @@ fn communities(index: &Index) -> CommunityMap<'_> {
             let Some(from) = edge.from else {
                 continue;
             };
-            let (Some(g1), Some(g2)) = (group_of[from], group_of[edge.to]) else {
-                continue;
-            };
-            if g1 == g2 {
+            let g1 = group_of[from];
+            let g2 = group_of[edge.to];
+            if g1 == u32::MAX || g2 == u32::MAX || g1 == g2 {
                 continue;
             }
-            *ext_weights.entry(g1).or_default().entry(g2).or_default() += 1;
-            *ext_weights.entry(g2).or_default().entry(g1).or_default() += 1;
+            ext_pairs.push((g1, g2));
+            ext_pairs.push((g2, g1));
         }
+        ext_pairs.sort_unstable();
+        let mut ext_adj = vec![Vec::<(usize, u32)>::new(); groups.len()];
+        let mut i = 0usize;
+        while i < ext_pairs.len() {
+            let (g1, g2) = ext_pairs[i];
+            let mut count = 1u32;
+            i += 1;
+            while i < ext_pairs.len() && ext_pairs[i] == (g1, g2) {
+                count += 1;
+                i += 1;
+            }
+            ext_adj[g1 as usize].push((g2 as usize, count));
+        }
+
         let mut candidates: Vec<usize> = (0..groups.len())
             .filter(|&g| {
                 !groups[g].is_empty()
@@ -1177,20 +1697,20 @@ fn communities(index: &Index) -> CommunityMap<'_> {
 
         let mut merged_any = false;
         for g in candidates {
-            let Some(neighbors) = ext_weights.get(&g) else {
+            let neighbors = &ext_adj[g];
+            if neighbors.is_empty() {
                 continue;
-            };
-            let total: u32 = neighbors.values().sum();
+            }
+            let total: u32 = neighbors.iter().map(|&(_, w)| w).sum();
             if total == 0 {
                 continue;
             }
             let best = neighbors
                 .iter()
-                .filter(|&(&other, _)| {
-                    !groups[other].is_empty() && is_architectural(&groups[other])
-                })
-                .max_by_key(|&(&other, &w)| (w, groups[other].len(), Reverse(groups[other][0])));
-            if let Some((&target, &best_w)) = best
+                .copied()
+                .filter(|&(other, _)| !groups[other].is_empty() && is_architectural(&groups[other]))
+                .max_by_key(|&(other, w)| (w, groups[other].len(), Reverse(groups[other][0])));
+            if let Some((target, best_w)) = best
                 && best_w.saturating_mul(2) >= total
             {
                 let moved = std::mem::take(&mut groups[g]);
@@ -1208,54 +1728,82 @@ fn communities(index: &Index) -> CommunityMap<'_> {
     // `mod tests` or local helper cliques split off by LPA) into their file's
     // dominant community so one file does not emit multiple duplicate
     // single-file communities while preserving genuine multi-file communities.
-    let mut dominant_by_file = BTreeMap::<&str, (bool, bool, usize, usize, usize)>::new();
+    #[derive(Clone, Copy)]
+    struct FileDom {
+        arch: bool,
+        non_test: bool,
+        in_file: usize,
+        total: usize,
+        group: usize,
+    }
+    let mut dominant_by_file: Vec<Option<FileDom>> = vec![None; num_files];
+    let mut file_counts = vec![0usize; num_files];
+    let mut touched_files = Vec::<usize>::new();
     for (g_idx, members) in groups.iter().enumerate() {
         if members.is_empty() {
             continue;
         }
         let arch = is_architectural(members);
-        let test_only = is_test_or_module_only(members);
-        let mut counts = BTreeMap::<&str, usize>::new();
+        let non_test = !is_test_or_module_only(members);
+        touched_files.clear();
         for &id in members {
-            *counts
-                .entry(definitions[id].location.file.as_str())
-                .or_default() += 1;
+            let fid = files.def_file[id];
+            if file_counts[fid] == 0 {
+                touched_files.push(fid);
+            }
+            file_counts[fid] += 1;
         }
-        for (file, in_file) in counts {
+        for &fid in &touched_files {
+            let in_file = file_counts[fid];
+            file_counts[fid] = 0;
             let candidate = (
                 arch,
-                !test_only,
+                non_test,
                 in_file,
                 members.len(),
                 usize::MAX - members[0],
             );
-            dominant_by_file
-                .entry(file)
-                .and_modify(|best| {
+            match &mut dominant_by_file[fid] {
+                Some(best) => {
                     let best_key = (
-                        best.0,
-                        best.1,
-                        best.2,
-                        best.3,
-                        usize::MAX - groups[best.4][0],
+                        best.arch,
+                        best.non_test,
+                        best.in_file,
+                        best.total,
+                        usize::MAX - groups[best.group][0],
                     );
                     if candidate > best_key {
-                        *best = (arch, !test_only, in_file, members.len(), g_idx);
+                        *best = FileDom {
+                            arch,
+                            non_test,
+                            in_file,
+                            total: members.len(),
+                            group: g_idx,
+                        };
                     }
-                })
-                .or_insert((arch, !test_only, in_file, members.len(), g_idx));
+                }
+                None => {
+                    dominant_by_file[fid] = Some(FileDom {
+                        arch,
+                        non_test,
+                        in_file,
+                        total: members.len(),
+                        group: g_idx,
+                    });
+                }
+            }
         }
     }
     let mut same_file_merges = Vec::<(usize, usize)>::new();
     for (g_idx, members) in groups.iter().enumerate() {
-        let Some(file) = single_file_of(members) else {
+        let Some(fid) = single_file_of(members) else {
             continue;
         };
-        let Some(&(_, _, _, _, target)) = dominant_by_file.get(file) else {
+        let Some(dom) = dominant_by_file[fid] else {
             continue;
         };
-        if target != g_idx {
-            same_file_merges.push((g_idx, target));
+        if dom.group != g_idx {
+            same_file_merges.push((g_idx, dom.group));
         }
     }
     for (from_g, to_g) in same_file_merges {
@@ -1264,7 +1812,7 @@ fn communities(index: &Index) -> CommunityMap<'_> {
         groups[to_g].sort_unstable();
     }
 
-    let mut architectural = Vec::<Community<'_>>::new();
+    let mut architectural = Vec::<Community<'a>>::new();
     let mut accounted = 0usize;
     for mut members in groups {
         if members.is_empty() {
@@ -1275,17 +1823,23 @@ fn communities(index: &Index) -> CommunityMap<'_> {
             continue;
         }
         accounted += members.len();
-        let mut comm_files = BTreeMap::<&str, usize>::new();
+        touched_files.clear();
         for &id in &members {
-            *comm_files
-                .entry(definitions[id].location.file.as_str())
-                .or_default() += 1;
+            let fid = files.def_file[id];
+            if file_counts[fid] == 0 {
+                touched_files.push(fid);
+            }
+            file_counts[fid] += 1;
+        }
+        let mut comm_files = BTreeMap::<&'a str, usize>::new();
+        for &fid in &touched_files {
+            comm_files.insert(files.files[fid].path, file_counts[fid]);
+            file_counts[fid] = 0;
         }
         let name = community_name(&comm_files);
-        let support_only = members.iter().all(|&id| {
-            let def = &definitions[id];
-            def.test || is_support_file(&def.location.file)
-        });
+        let support_only = members
+            .iter()
+            .all(|&id| definitions[id].test || files.files[files.def_file[id]].is_support);
         architectural.push(Community {
             members,
             files: comm_files,
@@ -1378,36 +1932,46 @@ struct RankKey<'a> {
 /// The index with the derived facts every section uses.
 struct Graph<'a> {
     index: &'a Index,
+    files: FileIndex<'a>,
+    area_map: AreaMap,
     degrees: Degrees,
     centrality: Centrality,
-    areas: BTreeMap<&'a str, String>,
     communities: CommunityMap<'a>,
     ranked_limit: usize,
 }
 
 impl<'a> Graph<'a> {
     fn new(index: &'a Index, budget: usize) -> Self {
-        let degrees = Degrees::new(index);
-        let areas = areas(index);
-        let centrality = Centrality::new(index, &areas);
-        let communities = communities(index);
+        let files = FileIndex::new(index);
+        let degrees = Degrees::new(index, &files);
+        let area_map = AreaMap::new(index, &files);
+        let centrality = Centrality::new(index, &files, &area_map);
+        let communities = communities(index, &files);
         let ranked_limit = (budget / 40).clamp(RANKED, MAX_RANKED);
         Self {
             index,
+            files,
+            area_map,
             degrees,
             centrality,
-            areas,
             communities,
             ranked_limit,
         }
     }
 
+    #[inline]
     fn definition(&self, id: usize) -> &'a Definition {
         &self.index.definitions[id]
     }
 
-    fn area(&self, file: &str) -> &str {
-        self.areas.get(file).map_or("(root)", String::as_str)
+    #[inline]
+    fn def_meta(&self, id: usize) -> &FileMeta<'a> {
+        &self.files.files[self.files.def_file[id]]
+    }
+
+    #[inline]
+    fn def_area_id(&self, id: usize) -> usize {
+        self.area_map.file_area[self.files.def_file[id]]
     }
 
     /// Sort key that puts the most architecturally central symbol first,
@@ -1494,8 +2058,10 @@ fn build(
         .count();
     let possible = index.edges.iter().filter(|edge| edge.inferred).count();
     let mut languages = BTreeMap::<&str, usize>::new();
-    for file in index.files.keys() {
-        if let Some(language) = indexed_language(index, file) {
+    for meta in &graph.files.files {
+        if meta.in_index_files
+            && let Some(language) = meta.indexed_lang
+        {
             *languages.entry(language).or_default() += 1;
         }
     }
@@ -1564,30 +2130,40 @@ fn area_section(graph: &Graph) -> Section {
         symbols: Vec<usize>,
         languages: BTreeMap<&'static str, usize>,
     }
-    let mut grouped = BTreeMap::<&str, Area>::new();
-    for (file, name) in &graph.areas {
-        let area = grouped.entry(name).or_insert_with(|| Area {
+    let num_areas = graph.area_map.names.len();
+    let mut grouped: Vec<Option<Area<'_>>> = (0..num_areas).map(|_| None).collect();
+    for (fid, meta) in graph.files.files.iter().enumerate() {
+        if !meta.in_index_files {
+            continue;
+        }
+        let aid = graph.area_map.file_area[fid];
+        let area = grouped[aid].get_or_insert_with(|| Area {
             files: Vec::new(),
             symbols: Vec::new(),
             languages: BTreeMap::new(),
         });
-        area.files.push(file);
-        if let Some(language) = indexed_language(graph.index, file) {
+        area.files.push(meta.path);
+        if let Some(language) = meta.indexed_lang {
             *area.languages.entry(language).or_default() += 1;
         }
     }
     for (id, definition) in graph.index.definitions.iter().enumerate() {
         if definition.kind != "file"
-            && let Some(area) = grouped.get_mut(graph.area(&definition.location.file))
+            && let Some(area) = grouped[graph.def_area_id(id)].as_mut()
         {
             area.symbols.push(id);
         }
     }
-    let mut ordered: Vec<_> = grouped.into_iter().collect();
-    ordered.sort_by_key(|(name, area)| {
+    let mut ordered: Vec<(usize, Area<'_>)> = grouped
+        .into_iter()
+        .enumerate()
+        .filter_map(|(aid, area)| area.map(|a| (aid, a)))
+        .collect();
+    ordered.sort_by_key(|(aid, area)| {
+        let name = graph.area_map.names[*aid].as_str();
         let tier = if area.symbols.is_empty() {
             2u8
-        } else if is_support_area(name) {
+        } else if graph.area_map.is_support[*aid] {
             1u8
         } else {
             0u8
@@ -1596,20 +2172,21 @@ fn area_section(graph: &Graph) -> Section {
             tier,
             Reverse(area.symbols.len()),
             Reverse(area.files.len()),
-            *name,
+            name,
         )
     });
     let mut section = Section::new("areas", format!("Areas · {}", ordered.len()), 5);
     let limit = graph.ranked_limit;
     section.unlisted = ordered.len().saturating_sub(limit);
-    for (name, area) in ordered.iter().take(limit) {
+    for (aid, area) in ordered.iter().take(limit) {
+        let name = graph.area_map.names[*aid].as_str();
         let mut languages: Vec<_> = area.languages.iter().collect();
         languages.sort_by_key(|(language, files)| (Reverse(**files), **language));
         let languages: Vec<&str> = languages.iter().take(3).map(|(l, _)| **l).collect();
         let (anchor, anchor_json) = match graph.leader(&area.symbols) {
             Some(id) => {
                 let def = graph.definition(id);
-                let shown = if def.location.file == *name {
+                let shown = if def.location.file == name {
                     spot_in_file(def)
                 } else {
                     spot_under_dir(def, name)
@@ -1664,14 +2241,15 @@ fn hub_section(graph: &Graph) -> Section {
     let mut hubs: Vec<usize> = (0..graph.index.definitions.len())
         .filter(|&id| central(graph.definition(id)) && degrees.rank(id).1 > 0)
         .collect();
-    hubs.sort_by_key(|&id| {
-        (
-            is_support_file(&graph.definition(id).location.file),
-            graph.rank(id),
-        )
-    });
-    let mut section = Section::new("hubs", format!("Hubs · {} · in/out", hubs.len()), 6);
     let limit = graph.ranked_limit;
+    let hub_key = |id: usize| (graph.def_meta(id).is_support, graph.rank(id));
+    if hubs.len() > limit {
+        hubs.select_nth_unstable_by_key(limit, |&id| hub_key(id));
+        hubs[..limit].sort_unstable_by_key(|&id| hub_key(id));
+    } else {
+        hubs.sort_unstable_by_key(|&id| hub_key(id));
+    }
+    let mut section = Section::new("hubs", format!("Hubs · {} · in/out", hubs.len()), 6);
     section.unlisted = hubs.len().saturating_sub(limit);
     for &id in hubs.iter().take(limit) {
         let mut value = node(graph.definition(id));
@@ -1717,39 +2295,49 @@ fn community_section(graph: &Graph) -> Section {
     let mut section = Section::new("communities", title, 2);
     let limit = graph.ranked_limit;
     section.unlisted = groups.len().saturating_sub(limit);
+    let top_two = |ids: &[usize], central_only: bool| -> Vec<usize> {
+        let mut best: [Option<usize>; 2] = [None, None];
+        for &id in ids {
+            if central_only && !central(graph.definition(id)) {
+                continue;
+            }
+            let key = graph.rank(id);
+            if best[0].is_none_or(|b0| key < graph.rank(b0)) {
+                best[1] = best[0];
+                best[0] = Some(id);
+            } else if best[1].is_none_or(|b1| key < graph.rank(b1)) {
+                best[1] = Some(id);
+            }
+        }
+        best.into_iter().flatten().collect()
+    };
     for community in groups.iter().take(limit) {
         let members = &community.members;
         let files = &community.files;
-        let mut leaders: Vec<usize> = members
-            .iter()
-            .copied()
-            .filter(|&id| central(graph.definition(id)))
-            .collect();
+        let mut leaders = top_two(members, true);
         if leaders.is_empty() {
-            leaders = members.clone();
+            leaders = top_two(members, false);
         }
-        leaders.sort_by_key(|&id| graph.rank(id));
-        leaders.truncate(2);
         let title = &community.name;
         let single_file = files.len() == 1;
         let mut leader_spots = Vec::with_capacity(leaders.len());
-        let mut prev_file: Option<&str> = None;
+        let mut prev_fid: Option<usize> = None;
         for &id in &leaders {
             let def = graph.definition(id);
-            let file = def.location.file.as_str();
-            let rendered = if single_file || prev_file == Some(file) {
+            let fid = graph.files.def_file[id];
+            let rendered = if single_file || prev_fid == Some(fid) {
                 spot_in_file(def)
-            } else if let Some(prev) = prev_file {
-                let prev_dir = directory(prev);
-                if prev_dir != "(root)" && directory(file) == prev_dir {
-                    spot_under_dir(def, &prev_dir)
+            } else if let Some(prev) = prev_fid {
+                let prev_meta = &graph.files.files[prev];
+                if prev_meta.dir != "(root)" && graph.files.files[fid].dir_id == prev_meta.dir_id {
+                    spot_under_dir(def, &prev_meta.dir)
                 } else {
                     spot(def)
                 }
             } else {
                 spot(def)
             };
-            prev_file = Some(file);
+            prev_fid = Some(fid);
             leader_spots.push(rendered);
         }
         section.push(
@@ -1786,8 +2374,8 @@ struct Bridge<'a> {
 /// different directories or languages, ranked by pair rarity, target
 /// specificity, community scale, centrality and boundary crossing.
 fn find_bridges<'a>(graph: &'a Graph<'a>) -> Vec<Bridge<'a>> {
-    let mut pair_counts = BTreeMap::<(usize, usize), usize>::new();
-    let mut target_comm_fanin = vec![BTreeSet::<usize>::new(); graph.index.definitions.len()];
+    let mut pair_counts = HashMap::<(usize, usize), usize>::new();
+    let mut fanin_pairs = Vec::<(usize, usize)>::new();
     let mut qualifying = Vec::<(&'a Edge, usize, usize, usize, &'static str, &'static str)>::new();
 
     for edge in &graph.index.edges {
@@ -1813,36 +2401,41 @@ fn find_bridges<'a>(graph: &'a Graph<'a>) -> Vec<Bridge<'a>> {
         if c1 == c2 {
             continue;
         }
-        let from_file = from_def.location.file.as_str();
-        let to_file = to_def.location.file.as_str();
-        let from_lang = indexed_language(graph.index, from_file).unwrap_or("text");
-        let to_lang = indexed_language(graph.index, to_file).unwrap_or("text");
-        if directory(from_file) == directory(to_file) && from_lang == to_lang {
+        let from_meta = graph.def_meta(from_id);
+        let to_meta = graph.def_meta(edge.to);
+        let from_lang = from_meta.indexed_lang.unwrap_or("text");
+        let to_lang = to_meta.indexed_lang.unwrap_or("text");
+        if from_meta.dir_id == to_meta.dir_id && from_lang == to_lang {
             continue;
         }
         let pair = (c1.min(c2), c1.max(c2));
         *pair_counts.entry(pair).or_default() += 1;
-        target_comm_fanin[edge.to].insert(c1);
+        fanin_pairs.push((edge.to, c1));
         qualifying.push((edge, from_id, c1, c2, from_lang, to_lang));
     }
 
-    let mut best_by_pair = BTreeMap::<(usize, usize), Bridge<'a>>::new();
+    fanin_pairs.sort_unstable();
+    fanin_pairs.dedup();
+    let mut target_comm_fanin = HashMap::<usize, usize>::with_capacity(fanin_pairs.len());
+    for (to_id, _) in fanin_pairs {
+        *target_comm_fanin.entry(to_id).or_default() += 1;
+    }
+
+    let mut best_by_pair = HashMap::<(usize, usize), Bridge<'a>>::with_capacity(pair_counts.len());
     for (edge, from_id, c1, c2, from_lang, to_lang) in qualifying {
         let pair = (c1.min(c2), c1.max(c2));
         let pair_links = pair_counts[&pair];
         let rarity = 1.0 / (pair_links as f64).powf(0.75);
-        let fanin = target_comm_fanin[edge.to].len().max(1) as f64;
+        let fanin = target_comm_fanin.get(&edge.to).copied().unwrap_or(0).max(1) as f64;
         let specificity = 1.0 / fanin.sqrt();
         let c1_len = graph.communities.groups[c1].members.len() as f64;
         let c2_len = graph.communities.groups[c2].members.len() as f64;
         let comm_scale = (c1_len.ln_1p() * c2_len.ln_1p()).sqrt();
         let centrality =
             1.0 + (graph.centrality.score[from_id] + graph.centrality.score[edge.to]).ln_1p();
-        let from_file = graph.definition(from_id).location.file.as_str();
-        let to_file = graph.definition(edge.to).location.file.as_str();
         let boundary = if from_lang != to_lang {
             3.0
-        } else if graph.area(from_file) != graph.area(to_file) {
+        } else if graph.def_area_id(from_id) != graph.def_area_id(edge.to) {
             2.0
         } else {
             1.3
@@ -1855,8 +2448,8 @@ fn find_bridges<'a>(graph: &'a Graph<'a>) -> Vec<Bridge<'a>> {
             0.35
         };
         let score = rarity * specificity * comm_scale * centrality * boundary * confidence;
-        let support_tier =
-            usize::from(is_support_file(from_file)) + usize::from(is_support_file(to_file));
+        let support_tier = usize::from(graph.def_meta(from_id).is_support)
+            + usize::from(graph.def_meta(edge.to).is_support);
         let candidate = Bridge {
             edge,
             from_id,
@@ -1965,22 +2558,35 @@ fn link_section(graph: &Graph) -> Section {
         language_pairs: BTreeMap<(&'static str, &'static str), usize>,
         example: &'a Edge,
     }
-    let example_rank = |edge: &Edge| {
+    fn example_rank<'e>(
+        rank_key: &[u64],
+        edge: &'e Edge,
+    ) -> (u8, bool, Reverse<u64>, &'e Location) {
         (
             kind_rank(edge.kind),
             edge.inferred,
-            Reverse(graph.centrality.rank_key[edge.to]),
-            edge.location.clone(),
+            Reverse(rank_key[edge.to]),
+            &edge.location,
         )
-    };
-    let mut crossings = BTreeMap::<(&str, &str), Crossing>::new();
+    }
+    let rank_key = &graph.centrality.rank_key;
+    let mut crossings = HashMap::<(usize, usize), Crossing<'_>>::new();
+    let mut cached_path = "";
+    let mut cached_fid = 0usize;
     for edge in &graph.index.edges {
-        let source = &edge.location.file;
-        let target = &graph.definition(edge.to).location.file;
-        let from_area = graph.area(source);
-        let to_area = graph.area(target);
-        let from_lang = language(source).unwrap_or("text");
-        let to_lang = language(target).unwrap_or("text");
+        let src_path = edge.location.file.as_str();
+        let src_fid = if src_path == cached_path && !cached_path.is_empty() {
+            cached_fid
+        } else {
+            cached_path = src_path;
+            cached_fid = graph.files.id_of(src_path);
+            cached_fid
+        };
+        let dst_fid = graph.files.def_file[edge.to];
+        let from_area = graph.area_map.file_area[src_fid];
+        let to_area = graph.area_map.file_area[dst_fid];
+        let from_lang = graph.files.files[src_fid].lang.unwrap_or("text");
+        let to_lang = graph.files.files[dst_fid].lang.unwrap_or("text");
         if from_area == to_area && from_lang == to_lang {
             continue;
         }
@@ -2003,21 +2609,22 @@ fn link_section(graph: &Graph) -> Section {
                 .entry((from_lang, to_lang))
                 .or_default() += 1;
         }
-        if example_rank(edge) < example_rank(crossing.example) {
+        if example_rank(rank_key, edge) < example_rank(rank_key, crossing.example) {
             crossing.example = edge;
         }
     }
     let mut crossings: Vec<_> = crossings.into_iter().collect();
-    crossings.sort_by_key(|((from, to), crossing)| {
-        let support_tier = usize::from(is_support_area(from)) + usize::from(is_support_area(to));
+    crossings.sort_by_key(|((from_aid, to_aid), crossing)| {
+        let support_tier = usize::from(graph.area_map.is_support[*from_aid])
+            + usize::from(graph.area_map.is_support[*to_aid]);
         (
             support_tier,
-            from == to,
+            from_aid == to_aid,
             crossing.language_pairs.is_empty(),
             Reverse(crossing.certain),
             Reverse(crossing.count),
-            *from,
-            *to,
+            graph.area_map.names[*from_aid].as_str(),
+            graph.area_map.names[*to_aid].as_str(),
         )
     });
     let mut section = Section::new(
@@ -2027,7 +2634,9 @@ fn link_section(graph: &Graph) -> Section {
     );
     let limit = graph.ranked_limit;
     section.unlisted = crossings.len().saturating_sub(limit);
-    for ((from, to), crossing) in crossings.iter().take(limit) {
+    for ((from_aid, to_aid), crossing) in crossings.iter().take(limit) {
+        let from = graph.area_map.names[*from_aid].as_str();
+        let to = graph.area_map.names[*to_aid].as_str();
         let mut kinds: Vec<_> = crossing.kinds.iter().collect();
         kinds.sort_by_key(|((inferred, kind), count)| (Reverse(**count), *inferred, *kind));
         let kinds = kinds
@@ -2048,18 +2657,21 @@ fn link_section(graph: &Graph) -> Section {
             ),
             _ => example.location.to_string(),
         };
-        let target_spot = if from == to {
-            let origin_dir = directory(&example.location.file);
-            if origin_dir != "(root)" && directory(&target_def.location.file) == origin_dir {
-                spot_under_dir(target_def, &origin_dir)
+        let example_src_meta = &graph.files.files[graph.files.id_of(&example.location.file)];
+        let example_dst_meta = graph.def_meta(example.to);
+        let target_spot = if from_aid == to_aid {
+            if example_src_meta.dir != "(root)"
+                && example_dst_meta.dir_id == example_src_meta.dir_id
+            {
+                spot_under_dir(target_def, &example_src_meta.dir)
             } else {
                 spot(target_def)
             }
         } else {
             spot(target_def)
         };
-        let example_from_lang = language(&example.location.file).unwrap_or("text");
-        let example_to_lang = language(&target_def.location.file).unwrap_or("text");
+        let example_from_lang = example_src_meta.lang.unwrap_or("text");
+        let example_to_lang = example_dst_meta.lang.unwrap_or("text");
         let mut value = json!({
             "from_area": from,
             "to_area": to,
@@ -2107,7 +2719,7 @@ fn entry_section(graph: &Graph) -> Section {
     let mut has_cross_file_out = vec![false; definitions.len()];
     for edge in &graph.index.edges {
         if let Some(from) = edge.from
-            && definitions[from].location.file != definitions[edge.to].location.file
+            && graph.files.def_file[from] != graph.files.def_file[edge.to]
         {
             has_cross_file_out[from] = true;
         }
@@ -2132,16 +2744,16 @@ fn entry_section(graph: &Graph) -> Section {
             if !central(definition)
                 || !matches!(definition.kind.as_str(), "function" | "method")
                 || degrees.dependents[id] != 0
-                || is_test_file(&definition.location.file)
             {
+                return None;
+            }
+            let meta = graph.def_meta(id);
+            if meta.is_test {
                 return None;
             }
             if degrees.dependencies[id] >= 3 {
                 Some((2, id))
-            } else if degrees.dependencies[id] == 2
-                && has_cross_file_out[id]
-                && !is_support_file(&definition.location.file)
-            {
+            } else if degrees.dependencies[id] == 2 && has_cross_file_out[id] && !meta.is_support {
                 Some((3, id))
             } else {
                 None
@@ -2156,11 +2768,15 @@ fn entry_section(graph: &Graph) -> Section {
             format!("uncalled · out {}", degrees.dependencies[id]),
         ));
     }
-    let mut listed = BTreeSet::new();
-    entries.retain(|(_, id, _)| listed.insert(*id));
+    let mut listed = vec![false; definitions.len()];
+    entries.retain(|(_, id, _)| {
+        let first = !listed[*id];
+        listed[*id] = true;
+        first
+    });
     entries.sort_by_key(|(order, id, _)| {
         (
-            is_support_file(&definitions[*id].location.file),
+            graph.def_meta(*id).is_support,
             *order,
             Reverse(centrality.out_reach[*id]),
             graph.rank(*id),
@@ -2192,13 +2808,12 @@ fn test_section(graph: &Graph) -> Section {
         tests: usize,
         example: Option<usize>,
     }
-    let mut places = BTreeMap::<String, Place>::new();
+    let mut places = BTreeMap::<&str, Place>::new();
     for (id, definition) in graph.index.definitions.iter().enumerate() {
         if definition.test {
-            let place = places
-                .entry(directory(&definition.location.file))
-                .or_default();
-            place.files.insert(&definition.location.file);
+            let meta = graph.def_meta(id);
+            let place = places.entry(meta.dir.as_str()).or_default();
+            place.files.insert(meta.path);
             place.tests += 1;
             // Pick a concise representative test name (tie-break by location) so
             // long descriptive test names do not consume disproportionate budget.
@@ -2215,20 +2830,22 @@ fn test_section(graph: &Graph) -> Section {
             }
         }
     }
-    for file in graph.index.files.keys().filter(|file| is_test_file(file)) {
-        places
-            .entry(directory(file))
-            .or_default()
-            .files
-            .insert(file);
+    for meta in &graph.files.files {
+        if meta.in_index_files && meta.is_test {
+            places
+                .entry(meta.dir.as_str())
+                .or_default()
+                .files
+                .insert(meta.path);
+        }
     }
     let mut places: Vec<_> = places.into_iter().collect();
-    places.sort_by_key(|(name, place)| {
+    places.sort_by_key(|&(name, ref place)| {
         (
             is_fixture_test_dir(name),
             Reverse(place.tests),
             Reverse(place.files.len()),
-            name.clone(),
+            name,
         )
     });
     let mut section = Section::new("tests", format!("Tests · {}", places.len()), 3);
@@ -2243,7 +2860,7 @@ fn test_section(graph: &Graph) -> Section {
             ),
             None => {
                 let shown = if is_nested_dir(dir)
-                    && let Some(rel) = first.strip_prefix(dir.as_str())
+                    && let Some(rel) = first.strip_prefix(dir)
                 {
                     let rel = rel.trim_start_matches("./").trim_start_matches('/');
                     if rel.is_empty() {
@@ -2420,7 +3037,7 @@ fn classify_role(
         && matches!(def.kind.as_str(), "function" | "method")
         && deg_in == 0
         && deg_out >= 2
-        && !is_test_file(&def.location.file);
+        && !graph.def_meta(id).is_test;
     if is_main || is_route || is_orchestrator {
         return "entry point";
     }
@@ -2455,9 +3072,10 @@ fn build_explain<'a>(
     let def = graph.definition(id);
     let (rank, total_symbols) = symbol_rank(&graph, id);
     let blast = blast_radius(index, id, 3);
-    let self_file = def.location.file.as_str();
-    let self_dir = directory(self_file);
-    let self_lang = indexed_language(index, self_file).unwrap_or("text");
+    let self_meta = graph.def_meta(id);
+    let self_file = self_meta.path;
+    let self_dir_id = self_meta.dir_id;
+    let self_lang = self_meta.indexed_lang.unwrap_or("text");
     let self_comm = graph.communities.of[id];
 
     // Cross-community & cross-language bridges incident to `id`.
@@ -2483,13 +3101,13 @@ fn build_explain<'a>(
         if matches!(other_def.kind.as_str(), "file" | "module") || other_def.test {
             return;
         }
-        let other_file = other_def.location.file.as_str();
-        let other_lang = indexed_language(index, other_file).unwrap_or("text");
+        let other_meta = graph.def_meta(other);
+        let other_lang = other_meta.indexed_lang.unwrap_or("text");
         let other_comm = graph.communities.of[other];
         let crosses_lang = other_lang != self_lang;
         let crosses_comm = match (self_comm, other_comm) {
             (Some(c1), Some(c2)) => c1 != c2,
-            (Some(_), None) | (None, Some(_)) => directory(other_file) != self_dir,
+            (Some(_), None) | (None, Some(_)) => other_meta.dir_id != self_dir_id,
             (None, None) => false,
         };
         if !crosses_lang && !crosses_comm {
