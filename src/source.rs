@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::ops::Range;
@@ -11,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
+use crate::index::Index;
 use crate::polyglot::{Grammar, Parsers};
+use crate::rust_syntax::Kind as RefKind;
 use crate::syntax_check::{self, Change, Verdict};
 use crate::workspace::{Workspace, lock_state};
 
@@ -4524,6 +4527,1245 @@ fn preview(file: &str, path: &Path, before: &str, after: &str) -> Result<()> {
     Ok(io::stdout().lock().write_all(&result.stdout)?)
 }
 
+// ---------------------------------------------------------------------------
+// Deterministic Workspace-Wide AST-Safe Symbol Rename Engine
+// ---------------------------------------------------------------------------
+
+/// One exact identifier token occurrence slated for replacement inside a file.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenameSpan {
+    pub bytes: Range<usize>,
+    pub line: usize,
+    pub column: usize,
+    pub snippet: String,
+}
+
+/// All AST-verified identifier replacements planned for a single workspace file,
+/// bound to that file's path-bound content revision.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileRename {
+    pub path: String,
+    pub revision: String,
+    pub replacements: Vec<RenameSpan>,
+}
+
+/// A deterministic, dry-runnable multi-file symbol rename plan.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenamePlan {
+    pub qualified: String,
+    pub old_name: String,
+    pub new_name: String,
+    pub kind: String,
+    pub definition_file: String,
+    pub definition_line: usize,
+    pub files: Vec<FileRename>,
+}
+
+#[allow(dead_code)]
+impl RenamePlan {
+    pub fn total_replacements(&self) -> usize {
+        self.files.iter().map(|file| file.replacements.len()).sum()
+    }
+}
+
+/// Per-file summary returned by [`apply_symbol_rename`].
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenamedFile {
+    pub path: String,
+    pub revision: String,
+    pub replacements: usize,
+    pub lines: Vec<usize>,
+}
+
+/// Outcome of atomically applying a [`RenamePlan`].
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenameReport {
+    pub qualified: String,
+    pub old_name: String,
+    pub new_name: String,
+    pub files: Vec<RenamedFile>,
+    pub total_replacements: usize,
+}
+
+/// Plans a workspace-wide, AST-safe rename of `symbol_query` to `new_name`.
+///
+/// Validates identifier syntax, reserved keywords, symbol uniqueness (never
+/// guesses on ambiguous short names), and scope collisions before reading
+/// candidate files discovered across the entire workspace index.
+#[allow(dead_code)]
+pub fn plan_symbol_rename(
+    workspace: &Workspace,
+    index: &Index,
+    symbol_query: &str,
+    new_name: &str,
+    include_files: Option<&[String]>,
+) -> Result<RenamePlan> {
+    let query = symbol_query.trim();
+    ensure!(!query.is_empty(), "symbol query must not be empty");
+    let target_id = index.select(query)?;
+    let def = &index.definitions[target_id];
+    ensure!(
+        !matches!(def.kind.as_str(), "file" | "route"),
+        "cannot rename {} symbol `{}`",
+        def.kind,
+        def.qualified
+    );
+
+    let (raw_short, scope) = symbol_short_and_scope(&def.qualified);
+    let def_is_rust = def.location.file.ends_with(".rs");
+    let def_grammar = if def_is_rust {
+        None
+    } else {
+        index
+            .grammar(&def.location.file)
+            .or_else(|| Grammar::for_file(&def.location.file))
+    };
+    let old_name = if def_grammar == Some(Grammar::Sql) {
+        raw_short.rsplit_once('.').map_or(raw_short, |(_, s)| s)
+    } else {
+        raw_short
+    };
+    ensure!(
+        !old_name.is_empty() && !old_name.starts_with(['"', '/']),
+        "symbol `{}` has non-identifier name `{old_name}` and cannot be renamed",
+        def.qualified
+    );
+    ensure!(
+        new_name != old_name,
+        "new symbol name `{new_name}` is identical to current name `{old_name}`"
+    );
+    validate_rename_identifier(new_name, def_is_rust, def_grammar)?;
+
+    let (candidate_files, files_importing_target) =
+        discover_rename_files(workspace, index, target_id, old_name, include_files)?;
+    ensure!(
+        !candidate_files.is_empty(),
+        "no workspace files matched for renaming `{}`",
+        def.qualified
+    );
+
+    check_rename_collisions(
+        index,
+        target_id,
+        scope,
+        new_name,
+        &candidate_files,
+        &files_importing_target,
+    )?;
+
+    let mut ts_parser: Option<tree_sitter::Parser> = None;
+    let mut ts_lang: Option<Grammar> = None;
+    let mut files = Vec::new();
+    let mut saw_definition_file = false;
+
+    for file in &candidate_files {
+        let snap = Snapshot::open(workspace, file)
+            .with_context(|| format!("failed to open {file} while planning rename"))?;
+        let is_rust = file.ends_with(".rs");
+        let grammar = if is_rust {
+            None
+        } else {
+            index
+                .grammar(file)
+                .or_else(|| Grammar::detect(file, &snap.text))
+        };
+        if is_rust || grammar.is_some() {
+            validate_rename_identifier(new_name, is_rust, grammar)?;
+        } else if file == &def.location.file {
+            bail!("AST-safe rename is not supported for {file}");
+        } else {
+            continue;
+        }
+
+        let raw_spans = if is_rust {
+            find_rust_identifier_spans(&snap.text, old_name)
+                .with_context(|| format!("failed to parse Rust tokens in {file}"))?
+        } else if let Some(grammar) = grammar {
+            find_treesitter_identifier_spans(
+                &mut ts_parser,
+                &mut ts_lang,
+                grammar,
+                &snap.text,
+                old_name,
+            )
+            .with_context(|| format!("failed to parse AST in {file}"))?
+        } else {
+            Vec::new()
+        };
+
+        if raw_spans.is_empty() {
+            continue;
+        }
+        if file == &def.location.file {
+            saw_definition_file = true;
+        }
+        let replacements = raw_spans
+            .into_iter()
+            .map(|bytes| make_rename_span(&snap, bytes))
+            .collect();
+        files.push(FileRename {
+            path: file.clone(),
+            revision: snap.revision,
+            replacements,
+        });
+    }
+
+    ensure!(
+        !files.is_empty(),
+        "no AST identifier occurrences of `{old_name}` found to rename"
+    );
+    if candidate_files.contains(&def.location.file) {
+        ensure!(
+            saw_definition_file,
+            "could not locate identifier `{old_name}` in definition file {}",
+            def.location.file
+        );
+    }
+
+    Ok(RenamePlan {
+        qualified: def.qualified.clone(),
+        old_name: old_name.to_owned(),
+        new_name: new_name.to_owned(),
+        kind: def.kind.clone(),
+        definition_file: def.location.file.clone(),
+        definition_line: def.declaration,
+        files,
+    })
+}
+
+/// Applies `plan` atomically across all planned workspace files.
+///
+/// Re-verifies every file's path-bound revision, validates all byte spans,
+/// builds every modified file in memory, checks write permissions, and runs
+/// `syntax_check` on every modified file BEFORE writing a single byte. If an
+/// I/O error occurs mid-batch, any already-written files are rolled back to
+/// their original contents.
+#[allow(dead_code)]
+pub fn apply_symbol_rename(workspace: &Workspace, plan: &RenamePlan) -> Result<RenameReport> {
+    ensure!(!plan.files.is_empty(), "rename plan has no files to update");
+    ensure!(!plan.old_name.is_empty(), "rename plan has empty old_name");
+    ensure!(!plan.new_name.is_empty(), "rename plan has empty new_name");
+    ensure!(
+        !plan.new_name.contains('\0'),
+        "replacement name must be valid text"
+    );
+
+    workspace.prepare_state()?;
+    let _lock = lock_state(&workspace.state.join("edit.lock"))?;
+    let max_file_bytes = workspace.settings()?.max_file_bytes;
+
+    struct PreparedRename {
+        path: String,
+        abs_path: PathBuf,
+        original: Vec<u8>,
+        edited: String,
+        new_revision: String,
+        replacements: usize,
+        lines: Vec<usize>,
+    }
+
+    let mut seen_paths = BTreeSet::new();
+    let mut prepared = Vec::with_capacity(plan.files.len());
+
+    // Phase 1: verify every revision, span, permission, and syntax parse in memory.
+    for file_rename in &plan.files {
+        ensure!(
+            seen_paths.insert(file_rename.path.as_str()),
+            "duplicate file `{}` in rename plan",
+            file_rename.path
+        );
+        ensure!(
+            !file_rename.replacements.is_empty(),
+            "file `{}` in rename plan has no replacements",
+            file_rename.path
+        );
+
+        let abs_path = workspace.source_path(&file_rename.path)?;
+        let snap = Snapshot::open(workspace, &file_rename.path)
+            .with_context(|| format!("failed to read {} for rename", file_rename.path))?;
+        ensure!(
+            snap.revision == file_rename.revision,
+            "stale revision for {}: expected {}, found {}; rename aborted with 0 files modified",
+            file_rename.path,
+            file_rename.revision,
+            snap.revision
+        );
+
+        let mut spans: Vec<Range<usize>> = file_rename
+            .replacements
+            .iter()
+            .map(|r| r.bytes.clone())
+            .collect();
+        spans.sort_by_key(|range| (range.start, range.end));
+        let is_rust = file_rename.path.ends_with(".rs");
+        for (idx, span) in spans.iter().enumerate() {
+            ensure!(
+                span.start < span.end
+                    && span.end <= snap.text.len()
+                    && snap.text.is_char_boundary(span.start)
+                    && snap.text.is_char_boundary(span.end),
+                "invalid rename span {:?} in {}; rename aborted with 0 files modified",
+                span,
+                file_rename.path
+            );
+            if idx > 0 {
+                ensure!(
+                    spans[idx - 1].end <= span.start,
+                    "overlapping rename spans in {}; rename aborted with 0 files modified",
+                    file_rename.path
+                );
+            }
+            let current = &snap.text[span.clone()];
+            let matches_old = current == plan.old_name
+                || (is_rust && current.strip_prefix("r#") == Some(plan.old_name.as_str()));
+            ensure!(
+                matches_old,
+                "span {:?} in {} holds `{current}` instead of `{}`; rename aborted with 0 files modified",
+                span,
+                file_rename.path,
+                plan.old_name
+            );
+        }
+
+        let mut edited = String::with_capacity(snap.text.len());
+        let mut offset = 0usize;
+        let mut shift = 0isize;
+        let mut changes = Vec::with_capacity(spans.len());
+        let mut lines = Vec::with_capacity(spans.len());
+        for span in &spans {
+            lines.push(snap.line(span.start));
+            edited.push_str(&snap.text[offset..span.start]);
+            let after_start = span.start.saturating_add_signed(shift);
+            edited.push_str(&plan.new_name);
+            shift += plan.new_name.len() as isize - span.len() as isize;
+            changes.push(Change {
+                before: span.clone(),
+                after: after_start..after_start + plan.new_name.len(),
+            });
+            offset = span.end;
+        }
+        edited.push_str(&snap.text[offset..]);
+        lines.dedup();
+
+        ensure!(
+            edited.len() as u64 <= max_file_bytes,
+            "renamed {} exceeds max_file_bytes; rename aborted with 0 files modified",
+            file_rename.path
+        );
+
+        // Verify write permission up front before mutating any file.
+        File::options()
+            .write(true)
+            .open(&abs_path)
+            .with_context(|| {
+                format!(
+                    "{} is not writable; rename aborted with 0 files modified",
+                    file_rename.path
+                )
+            })?;
+
+        if edited != snap.text {
+            let verdict = syntax_check::judge(
+                &workspace.root,
+                &file_rename.path,
+                Some(&snap.text),
+                &edited,
+                &changes,
+                true,
+            );
+            if matches!(verdict, Some(Verdict::Introduced { certain: true, .. })) {
+                bail!(
+                    "rename aborted with 0 files modified:\n{}",
+                    rejection(
+                        workspace,
+                        &file_rename.path,
+                        &edited,
+                        &changes,
+                        verdict.as_ref()
+                    )
+                );
+            }
+        }
+
+        let new_revision = revision_for(&file_rename.path, edited.as_bytes());
+        prepared.push(PreparedRename {
+            path: file_rename.path.clone(),
+            abs_path,
+            original: snap.text.into_bytes(),
+            edited,
+            new_revision,
+            replacements: spans.len(),
+            lines,
+        });
+    }
+
+    // Phase 2: write all files, rolling back any already-written file on I/O error.
+    let mut written: Vec<usize> = Vec::with_capacity(prepared.len());
+    for (idx, item) in prepared.iter().enumerate() {
+        if item.edited.as_bytes() == item.original.as_slice() {
+            continue;
+        }
+        if let Err(err) = write_rename_bytes(&item.abs_path, item.edited.as_bytes()) {
+            let mut rollback_errors = Vec::new();
+            for &prev in written.iter().rev() {
+                let prev_item = &prepared[prev];
+                if let Err(rb_err) = write_rename_bytes(&prev_item.abs_path, &prev_item.original) {
+                    rollback_errors.push(format!("{}: {rb_err}", prev_item.path));
+                }
+            }
+            if rollback_errors.is_empty() {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed writing {}; rolled back {} previously written file(s)",
+                        item.path,
+                        written.len()
+                    )
+                });
+            }
+            return Err(err).with_context(|| {
+                format!(
+                    "failed writing {}; rollback errors: {}",
+                    item.path,
+                    rollback_errors.join(", ")
+                )
+            });
+        }
+        written.push(idx);
+    }
+
+    let mut total_replacements = 0;
+    let files = prepared
+        .into_iter()
+        .map(|item| {
+            total_replacements += item.replacements;
+            RenamedFile {
+                path: item.path,
+                revision: item.new_revision,
+                replacements: item.replacements,
+                lines: item.lines,
+            }
+        })
+        .collect();
+
+    Ok(RenameReport {
+        qualified: plan.qualified.clone(),
+        old_name: plan.old_name.clone(),
+        new_name: plan.new_name.clone(),
+        files,
+        total_replacements,
+    })
+}
+
+/// Renders a compact, high-signal preview of `plan` with per-file revisions,
+/// occurrence counts, and `L<line>` snippets.
+#[allow(dead_code)]
+pub fn render_rename_plan(plan: &RenamePlan, dry_run: bool) -> String {
+    let total = plan.total_replacements();
+    let tag = if dry_run { "rename dry-run" } else { "rename" };
+    let file_word = if plan.files.len() == 1 {
+        "file"
+    } else {
+        "files"
+    };
+    let occ_word = if total == 1 {
+        "occurrence"
+    } else {
+        "occurrences"
+    };
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "[{tag}] {} -> {} ({} · {} {file_word}, {total} {occ_word})",
+        plan.qualified,
+        plan.new_name,
+        plan.kind,
+        plan.files.len()
+    );
+    for file in &plan.files {
+        let count = file.replacements.len();
+        let word = if count == 1 {
+            "occurrence"
+        } else {
+            "occurrences"
+        };
+        let _ = writeln!(
+            out,
+            "{} · rev {} · {count} {word}",
+            file.path, file.revision
+        );
+        let mut by_line: BTreeMap<usize, (&str, usize)> = BTreeMap::new();
+        for span in &file.replacements {
+            by_line
+                .entry(span.line)
+                .and_modify(|(_, n)| *n += 1)
+                .or_insert((span.snippet.as_str(), 1));
+        }
+        for (line, (snippet, count)) in by_line {
+            if count > 1 {
+                let _ = writeln!(out, "  L{line} (×{count}): {snippet}");
+            } else {
+                let _ = writeln!(out, "  L{line}: {snippet}");
+            }
+        }
+    }
+    out
+}
+
+fn write_rename_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut target = File::options()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("{} is not writable", path.display()))?;
+    let replacement = path
+        .parent()
+        .and_then(|dir| NamedTempFile::new_in(dir).ok())
+        .filter(|temp| replaceable(path, temp));
+    match replacement {
+        Some(mut temp) => {
+            temp.write_all(bytes)?;
+            temp.as_file()
+                .set_permissions(fs::metadata(path)?.permissions())?;
+            if temp.persist(path).is_err() {
+                write_in_place(&mut target, bytes)?;
+            }
+        }
+        None => {
+            write_in_place(&mut target, bytes)?;
+        }
+    }
+    Ok(())
+}
+
+fn symbol_short_and_scope(qualified: &str) -> (&str, Option<&str>) {
+    match qualified.rsplit_once("::") {
+        Some((scope, short)) => (short, Some(scope)),
+        None => (qualified, None),
+    }
+}
+
+fn validate_rename_identifier(name: &str, is_rust: bool, grammar: Option<Grammar>) -> Result<()> {
+    ensure!(!name.is_empty(), "new symbol name must not be empty");
+    let allow_dollar = matches!(
+        grammar.map(Grammar::family),
+        Some(Grammar::JavaScript | Grammar::Java)
+    );
+    let mut chars = name.chars();
+    let first = chars.next().expect("non-empty name");
+    let valid_start = first == '_' || first.is_alphabetic() || (allow_dollar && first == '$');
+    ensure!(
+        valid_start && chars.all(|c| c == '_' || c.is_alphanumeric() || (allow_dollar && c == '$')),
+        "invalid symbol name `{name}`: must be a valid identifier without spaces or punctuation"
+    );
+    if is_language_keyword(name, is_rust, grammar) {
+        let lang = if is_rust {
+            "Rust"
+        } else {
+            grammar.map_or("target language", Grammar::name)
+        };
+        bail!("invalid symbol name `{name}`: reserved keyword in {lang}");
+    }
+    Ok(())
+}
+
+fn is_language_keyword(name: &str, is_rust: bool, grammar: Option<Grammar>) -> bool {
+    const RUST: &[&str] = &[
+        "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
+        "extern", "false", "fn", "for", "gen", "if", "impl", "in", "let", "loop", "match", "mod",
+        "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super",
+        "trait", "true", "type", "unsafe", "use", "where", "while", "abstract", "become", "box",
+        "do", "final", "macro", "override", "priv", "try", "typeof", "unsized", "virtual", "yield",
+    ];
+    const JS_TS: &[&str] = &[
+        "await",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "enum",
+        "export",
+        "extends",
+        "false",
+        "finally",
+        "for",
+        "function",
+        "if",
+        "import",
+        "in",
+        "instanceof",
+        "let",
+        "new",
+        "null",
+        "return",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typeof",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+        "implements",
+        "interface",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "static",
+        "type",
+    ];
+    const PYTHON: &[&str] = &[
+        "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class",
+        "continue", "def", "del", "elif", "else", "except", "finally", "for", "from", "global",
+        "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return",
+        "try", "while", "with", "yield",
+    ];
+    const GO: &[&str] = &[
+        "break",
+        "case",
+        "chan",
+        "const",
+        "continue",
+        "default",
+        "defer",
+        "else",
+        "fallthrough",
+        "for",
+        "func",
+        "go",
+        "goto",
+        "if",
+        "import",
+        "interface",
+        "map",
+        "package",
+        "range",
+        "return",
+        "select",
+        "struct",
+        "switch",
+        "type",
+        "var",
+    ];
+    const JVM: &[&str] = &[
+        "abstract",
+        "assert",
+        "boolean",
+        "break",
+        "byte",
+        "case",
+        "catch",
+        "char",
+        "class",
+        "const",
+        "continue",
+        "default",
+        "do",
+        "double",
+        "else",
+        "enum",
+        "extends",
+        "false",
+        "final",
+        "finally",
+        "float",
+        "for",
+        "fun",
+        "goto",
+        "if",
+        "implements",
+        "import",
+        "in",
+        "instanceof",
+        "int",
+        "interface",
+        "long",
+        "native",
+        "new",
+        "null",
+        "object",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "return",
+        "short",
+        "static",
+        "strictfp",
+        "super",
+        "switch",
+        "synchronized",
+        "this",
+        "throw",
+        "throws",
+        "transient",
+        "true",
+        "try",
+        "val",
+        "var",
+        "void",
+        "volatile",
+        "when",
+        "while",
+    ];
+    const C_FAMILY: &[&str] = &[
+        "auto",
+        "break",
+        "case",
+        "char",
+        "class",
+        "const",
+        "continue",
+        "default",
+        "delete",
+        "do",
+        "double",
+        "else",
+        "enum",
+        "extern",
+        "false",
+        "float",
+        "for",
+        "goto",
+        "if",
+        "inline",
+        "int",
+        "long",
+        "namespace",
+        "new",
+        "nullptr",
+        "register",
+        "return",
+        "short",
+        "signed",
+        "sizeof",
+        "static",
+        "struct",
+        "switch",
+        "template",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typedef",
+        "union",
+        "unsigned",
+        "virtual",
+        "void",
+        "volatile",
+        "while",
+    ];
+    const CSHARP: &[&str] = &[
+        "abstract",
+        "as",
+        "base",
+        "bool",
+        "break",
+        "byte",
+        "case",
+        "catch",
+        "char",
+        "checked",
+        "class",
+        "const",
+        "continue",
+        "decimal",
+        "default",
+        "delegate",
+        "do",
+        "double",
+        "else",
+        "enum",
+        "event",
+        "explicit",
+        "extern",
+        "false",
+        "finally",
+        "fixed",
+        "float",
+        "for",
+        "foreach",
+        "goto",
+        "if",
+        "implicit",
+        "in",
+        "int",
+        "interface",
+        "internal",
+        "is",
+        "lock",
+        "long",
+        "namespace",
+        "new",
+        "null",
+        "object",
+        "operator",
+        "out",
+        "override",
+        "params",
+        "private",
+        "protected",
+        "public",
+        "readonly",
+        "ref",
+        "return",
+        "sbyte",
+        "sealed",
+        "short",
+        "sizeof",
+        "stackalloc",
+        "static",
+        "string",
+        "struct",
+        "switch",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typeof",
+        "uint",
+        "ulong",
+        "unchecked",
+        "unsafe",
+        "ushort",
+        "using",
+        "virtual",
+        "void",
+        "volatile",
+        "while",
+    ];
+    const RUBY: &[&str] = &[
+        "BEGIN", "END", "alias", "and", "begin", "break", "case", "class", "def", "do", "else",
+        "elsif", "end", "ensure", "false", "for", "if", "in", "module", "next", "nil", "not", "or",
+        "redo", "rescue", "retry", "return", "self", "super", "then", "true", "undef", "unless",
+        "until", "when", "while", "yield",
+    ];
+    const PHP: &[&str] = &[
+        "abstract",
+        "and",
+        "array",
+        "as",
+        "break",
+        "callable",
+        "case",
+        "catch",
+        "class",
+        "clone",
+        "const",
+        "continue",
+        "declare",
+        "default",
+        "do",
+        "echo",
+        "else",
+        "elseif",
+        "empty",
+        "enddeclare",
+        "endfor",
+        "endforeach",
+        "endif",
+        "endswitch",
+        "endwhile",
+        "eval",
+        "exit",
+        "extends",
+        "final",
+        "finally",
+        "fn",
+        "for",
+        "foreach",
+        "function",
+        "global",
+        "goto",
+        "if",
+        "implements",
+        "include",
+        "instanceof",
+        "interface",
+        "isset",
+        "list",
+        "match",
+        "namespace",
+        "new",
+        "or",
+        "print",
+        "private",
+        "protected",
+        "public",
+        "readonly",
+        "require",
+        "return",
+        "static",
+        "switch",
+        "throw",
+        "trait",
+        "try",
+        "unset",
+        "use",
+        "var",
+        "while",
+        "xor",
+        "yield",
+    ];
+    const FALLBACK: &[&str] = &[
+        "if", "else", "for", "while", "return", "fn", "def", "func", "class", "struct", "enum",
+        "true", "false", "null", "nil", "let", "var", "const", "import", "pub", "end", "do", "in",
+    ];
+    let list = if is_rust {
+        RUST
+    } else {
+        match grammar.map(Grammar::family) {
+            Some(Grammar::JavaScript) => JS_TS,
+            Some(Grammar::Python) => PYTHON,
+            Some(Grammar::Go) => GO,
+            Some(Grammar::Java) => JVM,
+            Some(Grammar::C) => C_FAMILY,
+            Some(Grammar::CSharp) => CSHARP,
+            Some(Grammar::Ruby) => RUBY,
+            Some(Grammar::Php) => PHP,
+            _ => FALLBACK,
+        }
+    };
+    list.contains(&name)
+}
+
+fn normalize_rename_filter(workspace: &Workspace, raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    ensure!(!trimmed.is_empty(), "include_files entry must not be empty");
+    let rel = workspace_file(workspace, trimmed, true)?;
+    let slashed = rel.replace('\\', "/");
+    let clean = slashed
+        .strip_prefix("./")
+        .unwrap_or(&slashed)
+        .trim_end_matches('/');
+    ensure!(!clean.is_empty(), "include_files entry must not be empty");
+    Ok(clean.to_owned())
+}
+
+fn discover_rename_files(
+    workspace: &Workspace,
+    index: &Index,
+    target_id: usize,
+    old_name: &str,
+    include_files: Option<&[String]>,
+) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let def = &index.definitions[target_id];
+    let mut candidates = BTreeSet::new();
+    let mut importing_target = BTreeSet::new();
+    candidates.insert(def.location.file.clone());
+
+    for edge in index.incoming(target_id) {
+        candidates.insert(edge.location.file.clone());
+        if edge.kind == RefKind::Import {
+            importing_target.insert(edge.location.file.clone());
+        }
+        if let Some(from_id) = edge.from {
+            candidates.insert(index.definitions[from_id].location.file.clone());
+        }
+    }
+
+    // Include polyglot files that import the definition's file module (e.g.
+    // `import * as m from './a'` or `import a`) unless they define a competing
+    // symbol with the same short name.
+    if let Some(file_def_id) = index
+        .definitions
+        .iter()
+        .position(|d| d.kind == "file" && d.location.file == def.location.file)
+    {
+        let competing_files: BTreeSet<&str> = index
+            .definitions
+            .iter()
+            .enumerate()
+            .filter(|&(id, d)| {
+                id != target_id
+                    && d.kind != "file"
+                    && symbol_short_and_scope(&d.qualified).0 == old_name
+            })
+            .map(|(_, d)| d.location.file.as_str())
+            .collect();
+        for edge in index.incoming(file_def_id) {
+            if edge.kind == RefKind::Import
+                && !competing_files.contains(edge.location.file.as_str())
+            {
+                candidates.insert(edge.location.file.clone());
+            }
+        }
+    }
+
+    if let Some(filters) = include_files {
+        let mut normalized = Vec::with_capacity(filters.len());
+        for raw in filters {
+            normalized.push(normalize_rename_filter(workspace, raw)?);
+        }
+        candidates.retain(|file| {
+            normalized.iter().any(|entry| {
+                file == entry
+                    || file
+                        .strip_prefix(entry.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+        });
+        for entry in &normalized {
+            if workspace
+                .source_path(entry)
+                .is_ok_and(|path| path.is_file())
+            {
+                candidates.insert(entry.clone());
+            }
+        }
+    }
+
+    Ok((candidates, importing_target))
+}
+
+fn check_rename_collisions(
+    index: &Index,
+    target_id: usize,
+    scope: Option<&str>,
+    new_name: &str,
+    candidate_files: &BTreeSet<String>,
+    importing_target: &BTreeSet<String>,
+) -> Result<()> {
+    let def = &index.definitions[target_id];
+    let expected_qualified = scope.map_or_else(
+        || new_name.to_owned(),
+        |prefix| format!("{prefix}::{new_name}"),
+    );
+
+    for (other_id, other) in index.definitions.iter().enumerate() {
+        if other_id == target_id || other.kind == "file" {
+            continue;
+        }
+        if other.qualified == expected_qualified {
+            bail!(
+                "name collision: `{new_name}` already exists as `{}` at {}",
+                other.qualified,
+                other.location
+            );
+        }
+        let (other_short, other_scope) = symbol_short_and_scope(&other.qualified);
+        if other_short != new_name {
+            continue;
+        }
+        if other.location.file == def.location.file && other_scope == scope {
+            bail!(
+                "name collision: `{new_name}` is already defined in {} at {}",
+                other.location.file,
+                other.location
+            );
+        }
+        if candidate_files.contains(&other.location.file)
+            && importing_target.contains(&other.location.file)
+        {
+            let file_level = if other.location.file.ends_with(".rs") {
+                !matches!(other.kind.as_str(), "method" | "field" | "variant")
+            } else {
+                other_scope == Some(other.location.file.as_str())
+            };
+            if file_level {
+                bail!(
+                    "name collision: `{new_name}` is already defined at {} and would conflict with renamed import in {}",
+                    other.location,
+                    other.location.file
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn make_rename_span(snap: &Snapshot, bytes: Range<usize>) -> RenameSpan {
+    let line = snap.line(bytes.start);
+    let line_idx = line.saturating_sub(1);
+    let line_start = snap.lines.get(line_idx).copied().unwrap_or(0);
+    let line_end = snap
+        .lines
+        .get(line_idx + 1)
+        .copied()
+        .unwrap_or(snap.text.len());
+    let column = snap
+        .text
+        .get(line_start..bytes.start)
+        .map_or(1, |prefix| prefix.chars().count() + 1);
+    let raw_line = snap
+        .text
+        .get(line_start..line_end)
+        .unwrap_or_default()
+        .trim_end_matches(['\n', '\r']);
+    RenameSpan {
+        bytes,
+        line,
+        column,
+        snippet: clipped(raw_line, 120),
+    }
+}
+
+fn rust_token_offset(text: &str) -> usize {
+    let content = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut offset = text.len() - content.len();
+    if let Some(after) = content.strip_prefix("#!") {
+        let trimmed = after.trim_start();
+        if !trimmed.starts_with('[') && !trimmed.starts_with("//") && !trimmed.starts_with("/*") {
+            offset += content.find('\n').unwrap_or(content.len());
+        }
+    }
+    offset
+}
+
+/// Locates every true Rust identifier token equal to `old_name` using
+/// `proc_macro2`'s lexer, skipping comments, doc comments, string/char/byte
+/// literals, lifetimes/loop labels, and substring identifiers.
+fn find_rust_identifier_spans(text: &str, old_name: &str) -> Result<Vec<Range<usize>>> {
+    let offset = rust_token_offset(text);
+    let content = &text[offset..];
+    let tokens: proc_macro2::TokenStream = content
+        .parse()
+        .map_err(|err| anyhow::anyhow!("Rust lexer error: {err}"))?;
+    let mut spans = Vec::new();
+    let mut stack: Vec<(proc_macro2::token_stream::IntoIter, bool)> =
+        vec![(tokens.into_iter(), false)];
+    while let Some((iter, prev_joint_apostrophe)) = stack.last_mut() {
+        let Some(tree) = iter.next() else {
+            stack.pop();
+            continue;
+        };
+        let was_apostrophe = *prev_joint_apostrophe;
+        *prev_joint_apostrophe = false;
+        match tree {
+            proc_macro2::TokenTree::Punct(punct) => {
+                if punct.as_char() == '\'' && punct.spacing() == proc_macro2::Spacing::Joint {
+                    *prev_joint_apostrophe = true;
+                }
+            }
+            proc_macro2::TokenTree::Group(group) => {
+                stack.push((group.stream().into_iter(), false));
+            }
+            proc_macro2::TokenTree::Ident(ident) => {
+                if was_apostrophe {
+                    continue;
+                }
+                let ident_text = ident.to_string();
+                let clean = ident_text.strip_prefix("r#").unwrap_or(&ident_text);
+                if clean != old_name {
+                    continue;
+                }
+                let raw = ident.span().byte_range();
+                let start = raw.start + offset;
+                let end = raw.end + offset;
+                if start > 0 && text.as_bytes()[start - 1] == b'\'' {
+                    continue;
+                }
+                if let Some(slice) = text.get(start..end)
+                    && (slice == old_name || slice.strip_prefix("r#") == Some(old_name))
+                {
+                    spans.push(start..end);
+                }
+            }
+            proc_macro2::TokenTree::Literal(_) => {}
+        }
+    }
+    spans.sort_by_key(|range| (range.start, range.end));
+    spans.dedup();
+    Ok(spans)
+}
+
+fn is_treesitter_identifier(grammar: Grammar, node: tree_sitter::Node<'_>) -> bool {
+    if !node.is_named() || node.child_count() != 0 || node.is_missing() || node.is_error() {
+        return false;
+    }
+    match node.kind() {
+        "identifier"
+        | "type_identifier"
+        | "property_identifier"
+        | "field_identifier"
+        | "shorthand_property_identifier"
+        | "shorthand_property_identifier_pattern"
+        | "namespace_identifier"
+        | "package_identifier"
+        | "simple_identifier" => true,
+        "constant" if grammar == Grammar::Ruby => true,
+        "name" if grammar == Grammar::Php => true,
+        "alias" if grammar == Grammar::Elixir => true,
+        "simple_name" if grammar == Grammar::PowerShell => true,
+        _ => false,
+    }
+}
+
+/// Locates every true Tree-sitter AST identifier leaf equal to `old_name`,
+/// skipping comments, string literals, and substring matches.
+fn find_treesitter_identifier_spans(
+    parser_slot: &mut Option<tree_sitter::Parser>,
+    cached_lang: &mut Option<Grammar>,
+    grammar: Grammar,
+    text: &str,
+    old_name: &str,
+) -> Result<Vec<Range<usize>>> {
+    let (parse_grammar, masked) = match grammar {
+        Grammar::Vue | Grammar::Svelte | Grammar::Astro => {
+            let (script_text, jsx) = crate::components::scripts(text, grammar == Grammar::Astro);
+            let lang = if jsx {
+                Grammar::Tsx
+            } else {
+                Grammar::TypeScript
+            };
+            (lang, Some(script_text))
+        }
+        _ => (grammar, None),
+    };
+    let parser = parser_slot.get_or_insert_with(tree_sitter::Parser::new);
+    if *cached_lang != Some(parse_grammar) {
+        *cached_lang = None;
+        parser
+            .set_language(&parse_grammar.language())
+            .with_context(|| format!("failed to load {} grammar", parse_grammar.name()))?;
+        *cached_lang = Some(parse_grammar);
+    }
+    let parse_input = masked.as_deref().unwrap_or(text);
+    let tree = parser
+        .parse(parse_input, None)
+        .context("Tree-sitter parse cancelled")?;
+
+    let mut spans = Vec::new();
+    let mut cursor = tree.walk();
+    'walk: loop {
+        let node = cursor.node();
+        let kind = node.kind();
+        let skip_subtree = kind.contains("comment");
+        if !skip_subtree && is_treesitter_identifier(parse_grammar, node) {
+            let range = node.byte_range();
+            if text.get(range.clone()) == Some(old_name) {
+                spans.push(range);
+            }
+        }
+        if !skip_subtree && cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+        }
+    }
+    spans.sort_by_key(|range| (range.start, range.end));
+    spans.dedup();
+    Ok(spans)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6282,6 +7524,325 @@ mod tests {
                 .entries
                 .iter()
                 .any(|e| e.kind == "resource" && e.name == "aws_s3_bucket.logs")
+        );
+    }
+
+    #[test]
+    fn rename_rust_multifile_updates_definition_and_caller_preserving_strings_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub mod math;\npub mod caller;\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/math.rs"),
+            concat!(
+                "/// old_fn doc comment stays untouched\n",
+                "pub fn old_fn(x: i32) -> i32 {\n",
+                "    // old_fn inline comment\n",
+                "    let label = \"old_fn\";\n",
+                "    let old_fn_helper = x + 1;\n",
+                "    label.len() as i32 + old_fn_helper\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/caller.rs"),
+            concat!(
+                "use crate::math::old_fn;\n\n",
+                "// old_fn should not change in comment\n",
+                "pub fn run(n: i32) -> (&'static str, i32) {\n",
+                "    let my_old_fn_2 = old_fn(n);\n",
+                "    (\"old_fn\", my_old_fn_2)\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+
+        let ws = test_workspace(dir.path());
+        let index = Index::open(&ws).unwrap();
+        let plan = plan_symbol_rename(&ws, &index, "old_fn", "compute_score", None).unwrap();
+        assert_eq!(plan.files.len(), 2);
+        assert_eq!(plan.total_replacements(), 3);
+
+        let preview = render_rename_plan(&plan, true);
+        assert!(preview.contains("[rename dry-run]"), "{preview}");
+        assert!(preview.contains("src/math.rs · rev "), "{preview}");
+        assert!(preview.contains("src/caller.rs · rev "), "{preview}");
+        assert!(preview.contains("L2:"), "{preview}");
+        assert!(preview.contains("L5:"), "{preview}");
+
+        let report = apply_symbol_rename(&ws, &plan).unwrap();
+        assert_eq!(report.files.len(), 2);
+        assert_eq!(report.total_replacements, 3);
+
+        let math = fs::read_to_string(dir.path().join("src/math.rs")).unwrap();
+        let caller = fs::read_to_string(dir.path().join("src/caller.rs")).unwrap();
+        assert!(
+            math.contains("pub fn compute_score(x: i32) -> i32"),
+            "{math}"
+        );
+        assert!(
+            math.contains("/// old_fn doc comment stays untouched"),
+            "{math}"
+        );
+        assert!(math.contains("// old_fn inline comment"), "{math}");
+        assert!(math.contains("let label = \"old_fn\";"), "{math}");
+        assert!(math.contains("let old_fn_helper = x + 1;"), "{math}");
+
+        assert!(
+            caller.contains("use crate::math::compute_score;"),
+            "{caller}"
+        );
+        assert!(
+            caller.contains("let my_old_fn_2 = compute_score(n);"),
+            "{caller}"
+        );
+        assert!(
+            caller.contains("// old_fn should not change in comment"),
+            "{caller}"
+        );
+        assert!(caller.contains("(\"old_fn\", my_old_fn_2)"), "{caller}");
+
+        assert_eq!(
+            syntax_check::judge(&ws.root, "src/math.rs", None, &math, &[], false),
+            Some(Verdict::Clean)
+        );
+        assert_eq!(
+            syntax_check::judge(&ws.root, "src/caller.rs", None, &caller, &[], false),
+            Some(Verdict::Clean)
+        );
+    }
+
+    #[test]
+    fn rename_polyglot_typescript_and_python_multifile_ast_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::create_dir_all(dir.path().join("pkg")).unwrap();
+
+        fs::write(
+            dir.path().join("src/math.ts"),
+            concat!(
+                "// calcTotal comment\n",
+                "export function calcTotal(a: number, b: number): number {\n",
+                "  const tag = \"calcTotal\";\n",
+                "  const calcTotal_v2 = a + b;\n",
+                "  return tag.length + calcTotal_v2;\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/app.ts"),
+            concat!(
+                "import { calcTotal } from \"./math\";\n\n",
+                "export function run(): string {\n",
+                "  /* calcTotal block comment */\n",
+                "  const my_calcTotal_2 = calcTotal(2, 3);\n",
+                "  return `calcTotal=${my_calcTotal_2}`;\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+
+        fs::write(
+            dir.path().join("pkg/util.py"),
+            concat!(
+                "# fetch_user comment\n",
+                "def fetch_user(uid: int) -> str:\n",
+                "    \"\"\"fetch_user docstring\"\"\"\n",
+                "    label = \"fetch_user\"\n",
+                "    fetch_user_cache = str(uid)\n",
+                "    return label + fetch_user_cache\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("pkg/service.py"),
+            concat!(
+                "from pkg.util import fetch_user\n\n",
+                "def handle(uid: int) -> str:\n",
+                "    # fetch_user note\n",
+                "    my_fetch_user_2 = fetch_user(uid)\n",
+                "    return f\"fetch_user:{my_fetch_user_2}\"\n",
+            ),
+        )
+        .unwrap();
+
+        let ws = test_workspace(dir.path());
+        let index = Index::open(&ws).unwrap();
+
+        let ts_plan = plan_symbol_rename(&ws, &index, "calcTotal", "sumValues", None).unwrap();
+        assert_eq!(ts_plan.files.len(), 2);
+        assert_eq!(ts_plan.total_replacements(), 3);
+        let ts_report = apply_symbol_rename(&ws, &ts_plan).unwrap();
+        assert_eq!(ts_report.total_replacements, 3);
+
+        let ts_math = fs::read_to_string(dir.path().join("src/math.ts")).unwrap();
+        let ts_app = fs::read_to_string(dir.path().join("src/app.ts")).unwrap();
+        assert!(ts_math.contains("export function sumValues("), "{ts_math}");
+        assert!(ts_math.contains("// calcTotal comment"), "{ts_math}");
+        assert!(ts_math.contains("const tag = \"calcTotal\";"), "{ts_math}");
+        assert!(ts_math.contains("const calcTotal_v2 = a + b;"), "{ts_math}");
+        assert!(
+            ts_app.contains("import { sumValues } from \"./math\";"),
+            "{ts_app}"
+        );
+        assert!(
+            ts_app.contains("const my_calcTotal_2 = sumValues(2, 3);"),
+            "{ts_app}"
+        );
+        assert!(ts_app.contains("/* calcTotal block comment */"), "{ts_app}");
+        assert!(ts_app.contains("`calcTotal=${my_calcTotal_2}`"), "{ts_app}");
+
+        let py_plan = plan_symbol_rename(&ws, &index, "fetch_user", "load_account", None).unwrap();
+        assert_eq!(py_plan.files.len(), 2);
+        assert_eq!(py_plan.total_replacements(), 3);
+        let py_report = apply_symbol_rename(&ws, &py_plan).unwrap();
+        assert_eq!(py_report.total_replacements, 3);
+
+        let py_util = fs::read_to_string(dir.path().join("pkg/util.py")).unwrap();
+        let py_service = fs::read_to_string(dir.path().join("pkg/service.py")).unwrap();
+        assert!(
+            py_util.contains("def load_account(uid: int) -> str:"),
+            "{py_util}"
+        );
+        assert!(py_util.contains("# fetch_user comment"), "{py_util}");
+        assert!(
+            py_util.contains("\"\"\"fetch_user docstring\"\"\""),
+            "{py_util}"
+        );
+        assert!(py_util.contains("label = \"fetch_user\""), "{py_util}");
+        assert!(py_util.contains("fetch_user_cache = str(uid)"), "{py_util}");
+        assert!(
+            py_service.contains("from pkg.util import load_account"),
+            "{py_service}"
+        );
+        assert!(
+            py_service.contains("my_fetch_user_2 = load_account(uid)"),
+            "{py_service}"
+        );
+        assert!(py_service.contains("# fetch_user note"), "{py_service}");
+        assert!(
+            py_service.contains("f\"fetch_user:{my_fetch_user_2}\""),
+            "{py_service}"
+        );
+    }
+
+    #[test]
+    fn rename_rejects_ambiguous_invalid_identifier_keyword_and_collision_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let lib_src = "pub mod a;\npub mod b;\n";
+        let a_src = "pub fn dup() -> i32 { 1 }\npub fn taken_name() -> i32 { 2 }\n";
+        let b_src = "pub fn dup() -> i32 { 3 }\n";
+        let py_src = "def py_worker():\n    return 1\n";
+        fs::write(dir.path().join("src/lib.rs"), lib_src).unwrap();
+        fs::write(dir.path().join("src/a.rs"), a_src).unwrap();
+        fs::write(dir.path().join("src/b.rs"), b_src).unwrap();
+        fs::write(dir.path().join("worker.py"), py_src).unwrap();
+
+        let ws = test_workspace(dir.path());
+        let index = Index::open(&ws).unwrap();
+
+        let ambiguous = plan_symbol_rename(&ws, &index, "dup", "unique_fn", None)
+            .unwrap_err()
+            .to_string();
+        assert!(ambiguous.contains("ambiguous"), "{ambiguous}");
+        assert!(ambiguous.contains("demo::a::dup"), "{ambiguous}");
+        assert!(ambiguous.contains("demo::b::dup"), "{ambiguous}");
+
+        for bad in ["", "123bad", "bad name", "bad-name", "fn", "struct"] {
+            let err = plan_symbol_rename(&ws, &index, "a::dup", bad, None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("invalid") || err.contains("empty") || err.contains("keyword"),
+                "expected identifier error for `{bad}`, got: {err}"
+            );
+        }
+
+        let py_kw = plan_symbol_rename(&ws, &index, "py_worker", "def", None)
+            .unwrap_err()
+            .to_string();
+        assert!(py_kw.contains("keyword"), "{py_kw}");
+
+        let collision = plan_symbol_rename(&ws, &index, "a::dup", "taken_name", None)
+            .unwrap_err()
+            .to_string();
+        assert!(collision.contains("collision"), "{collision}");
+
+        // Every file must remain byte-for-byte untouched.
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/lib.rs")).unwrap(),
+            lib_src
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/a.rs")).unwrap(),
+            a_src
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/b.rs")).unwrap(),
+            b_src
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("worker.py")).unwrap(),
+            py_src
+        );
+    }
+
+    #[test]
+    fn rename_aborts_atomically_on_stale_concurrent_edit_leaving_all_files_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub mod math;\npub mod caller;\n",
+        )
+        .unwrap();
+        let math_orig = "pub fn old_fn(x: i32) -> i32 {\n    x + 1\n}\n";
+        let caller_orig = "use crate::math::old_fn;\n\npub fn run() -> i32 {\n    old_fn(5)\n}\n";
+        fs::write(dir.path().join("src/math.rs"), math_orig).unwrap();
+        fs::write(dir.path().join("src/caller.rs"), caller_orig).unwrap();
+
+        let ws = test_workspace(dir.path());
+        let index = Index::open(&ws).unwrap();
+        let plan = plan_symbol_rename(&ws, &index, "old_fn", "new_fn", None).unwrap();
+        assert_eq!(plan.files.len(), 2);
+
+        // Simulate a concurrent edit to the second planned file after planning.
+        let caller_concurrent = format!("{caller_orig}// concurrent edit\n");
+        fs::write(dir.path().join("src/caller.rs"), &caller_concurrent).unwrap();
+
+        let err = apply_symbol_rename(&ws, &plan).unwrap_err().to_string();
+        assert!(err.contains("stale revision"), "{err}");
+
+        // Atomic guarantee: NEITHER file was modified by apply_symbol_rename.
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/math.rs")).unwrap(),
+            math_orig
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/caller.rs")).unwrap(),
+            caller_concurrent
         );
     }
 }

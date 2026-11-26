@@ -15,6 +15,7 @@
 //! leaves brackets that no longer pair up, which no version of the language
 //! accepts. Other errors are reported, and the edit is not blocked.
 
+use std::cell::RefCell;
 use std::ops::{ControlFlow, Range};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -22,6 +23,10 @@ use std::time::{Duration, Instant};
 use tree_sitter::{ParseOptions, ParseState, Parser, Tree};
 
 use crate::polyglot::Grammar;
+
+thread_local! {
+    static PARSER_CACHE: RefCell<(Parser, Option<Grammar>)> = RefCell::new((Parser::new(), None));
+}
 
 /// The most problems collected from one file.
 const MAX_PROBLEMS: usize = 16;
@@ -124,14 +129,8 @@ pub enum Verdict {
     GaveUp,
 }
 
-/// The parser that checks `file`, named for messages, or `None` when edits to
-/// this kind of file are not checked. SQL is left out because its one grammar
-/// rejects much of each dialect's syntax.
-pub fn parser_name(file: &str) -> Option<&'static str> {
-    if file.ends_with(".rs") {
-        return Some("Rust");
-    }
-    Some(match Grammar::for_file(file)? {
+fn grammar_parser_name(grammar: Grammar) -> Option<&'static str> {
+    Some(match grammar {
         Grammar::Sql => return None,
         Grammar::C => "C",
         Grammar::Cpp => "C++",
@@ -163,6 +162,31 @@ pub fn parser_name(file: &str) -> Option<&'static str> {
     })
 }
 
+/// The parser that checks `file`, named for messages, or `None` when edits to
+/// this kind of file are not checked. SQL is left out because its one grammar
+/// rejects much of each dialect's syntax.
+pub fn parser_name(file: &str) -> Option<&'static str> {
+    if file.ends_with(".rs") {
+        return Some("Rust");
+    }
+    grammar_parser_name(Grammar::for_file(file)?)
+}
+
+fn grammar_blocks(grammar: Option<Grammar>) -> bool {
+    !matches!(
+        grammar,
+        Some(
+            Grammar::C
+                | Grammar::Cpp
+                | Grammar::Bash
+                | Grammar::ObjectiveC
+                | Grammar::PowerShell
+                | Grammar::Julia
+                | Grammar::Groovy
+        )
+    )
+}
+
 /// Whether a certain problem in `file` blocks an edit. The C, C++ and Bash
 /// grammars reject valid code, such as macros, Objective-C headers and the
 /// POSIX `for NAME do` loop, so their problems are only reported. In a scan of
@@ -180,18 +204,7 @@ pub fn parser_name(file: &str) -> Option<&'static str> {
 /// of 766 files, nearly all from Julia 1.11.1; and Groovy in 527 of 3,174 files
 /// from Groovy 4.0.23 and Spock 2.3, Gradle scripts included.
 pub fn blocks(file: &str) -> bool {
-    !matches!(
-        Grammar::for_file(file),
-        Some(
-            Grammar::C
-                | Grammar::Cpp
-                | Grammar::Bash
-                | Grammar::ObjectiveC
-                | Grammar::PowerShell
-                | Grammar::Julia
-                | Grammar::Groovy
-        )
-    )
+    grammar_blocks(Grammar::for_file(file))
 }
 
 /// The parse problems in `text` read as `file`, in source order, or `None`
@@ -201,8 +214,46 @@ fn problems(file: &str, text: &str) -> Option<Vec<Problem>> {
     parse(file, text).map(|parse| parse.problems)
 }
 
+fn parse_with_tree_sitter(grammar: Grammar, text: &str) -> Option<Tree> {
+    let run = |parser: &mut Parser, cached: &mut Option<Grammar>| -> Option<Tree> {
+        if *cached != Some(grammar) {
+            *cached = None;
+            parser.set_language(&grammar.language()).ok()?;
+            *cached = Some(grammar);
+        }
+        parser.reset();
+        let started = Instant::now();
+        let mut progress = |_: &ParseState| {
+            if started.elapsed() > PARSE_LIMIT {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        };
+        let bytes = text.as_bytes();
+        let tree = parser.parse_with_options(
+            &mut |offset, _| bytes.get(offset..).unwrap_or_default(),
+            None,
+            Some(ParseOptions::new().progress_callback(&mut progress)),
+        );
+        if tree.is_none() {
+            parser.reset();
+        }
+        tree
+    };
+    PARSER_CACHE.with(|cell| {
+        if let Ok(mut guard) = cell.try_borrow_mut() {
+            let (parser, cached) = &mut *guard;
+            run(parser, cached)
+        } else {
+            let mut parser = Parser::new();
+            let mut cached = None;
+            run(&mut parser, &mut cached)
+        }
+    })
+}
+
 fn parse(file: &str, text: &str) -> Option<Parse> {
-    parser_name(file)?;
     if file.ends_with(".rs") {
         let error = crate::rust_syntax::first_error(text);
         return Some(Parse {
@@ -219,57 +270,51 @@ fn parse(file: &str, text: &str) -> Option<Parse> {
         });
     }
     let grammar = Grammar::for_file(file)?;
-    let mut parser = Parser::new();
-    parser.set_language(&grammar.language()).ok()?;
-    let started = Instant::now();
-    let mut progress = |_: &ParseState| {
-        if started.elapsed() > PARSE_LIMIT {
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
-        }
-    };
-    let bytes = text.as_bytes();
-    let tree = parser.parse_with_options(
-        &mut |offset, _| bytes.get(offset..).unwrap_or_default(),
-        None,
-        Some(ParseOptions::new().progress_callback(&mut progress)),
-    )?;
+    grammar_parser_name(grammar)?;
+    let tree = parse_with_tree_sitter(grammar, text)?;
     let mut found = Vec::new();
-    let mut cursor = tree.walk();
-    'walk: loop {
-        let node = cursor.node();
-        let descend = if node.is_missing() {
-            found.push(Problem {
-                bytes: node.start_byte()..node.start_byte(),
-                message: format!("missing {}", describe(node.kind(), node.is_named())),
-                missing: true,
-                bracket: false,
-            });
-            false
-        } else if node.is_error() {
-            found.push(error_node(node));
-            false
-        } else {
-            node.has_error()
-        };
-        if found.len() >= MAX_PROBLEMS {
-            break;
-        }
-        if descend && cursor.goto_first_child() {
-            continue;
-        }
-        while !cursor.goto_next_sibling() {
-            if !cursor.goto_parent() {
-                break 'walk;
+    if tree.root_node().has_error() {
+        let mut cursor = tree.walk();
+        'walk: loop {
+            let node = cursor.node();
+            let descend = if node.is_missing() {
+                found.push(Problem {
+                    bytes: node.start_byte()..node.start_byte(),
+                    message: format!("missing {}", describe(node.kind(), node.is_named())),
+                    missing: true,
+                    bracket: false,
+                });
+                false
+            } else if node.is_error() {
+                found.push(error_node(node));
+                false
+            } else {
+                node.has_error()
+            };
+            if found.len() >= MAX_PROBLEMS {
+                break;
+            }
+            if descend && cursor.goto_first_child() {
+                continue;
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    break 'walk;
+                }
             }
         }
     }
-    drop(cursor);
     Some(Parse {
         problems: found,
         tree: Some(tree),
     })
+}
+
+fn has_ascii_bracket(slice: &str) -> bool {
+    slice
+        .as_bytes()
+        .iter()
+        .any(|&b| matches!(b, b'(' | b')' | b'[' | b']' | b'{' | b'}'))
 }
 
 /// Opening minus closing brackets among the punctuation tokens of `tree`, a
@@ -284,24 +329,28 @@ fn brackets(tree: &Tree, text: &str) -> Option<[isize; 3]> {
             // brackets may be in a string or a comment, so they cannot be counted.
             let mut at = node.start_byte();
             let mut children = node.walk();
-            let mut skipped = String::new();
             for child in node.children(&mut children) {
-                skipped.push_str(text.get(at..child.start_byte()).unwrap_or_default());
+                if let Some(gap) = text.get(at..child.start_byte())
+                    && has_ascii_bracket(gap)
+                {
+                    return None;
+                }
                 at = child.end_byte();
             }
-            skipped.push_str(text.get(at..node.end_byte()).unwrap_or_default());
-            if skipped.contains(['(', ')', '[', ']', '{', '}']) {
+            if let Some(gap) = text.get(at..node.end_byte())
+                && has_ascii_bracket(gap)
+            {
                 return None;
             }
         } else if node.child_count() == 0 && !node.is_named() && !node.is_missing() {
-            for c in node.kind().chars() {
-                match c {
-                    '(' => count[0] += 1,
-                    ')' => count[0] -= 1,
-                    '[' => count[1] += 1,
-                    ']' => count[1] -= 1,
-                    '{' => count[2] += 1,
-                    '}' => count[2] -= 1,
+            for &b in node.kind().as_bytes() {
+                match b {
+                    b'(' => count[0] += 1,
+                    b')' => count[0] -= 1,
+                    b'[' => count[1] += 1,
+                    b']' => count[1] -= 1,
+                    b'{' => count[2] += 1,
+                    b'}' => count[2] -= 1,
                     _ => {}
                 }
             }
@@ -422,14 +471,19 @@ pub fn judge(
     changes: &[Change],
     need_before: bool,
 ) -> Option<Verdict> {
-    parser_name(file)?;
-    // MATLAB and Octave use `.m` too: a `.m` file is Objective-C only when its
-    // text says so, as the index decides.
-    if Grammar::for_file(file) == Some(Grammar::ObjectiveC)
-        && Grammar::detect(file, after).is_none()
-    {
-        return None;
-    }
+    let is_rust = file.ends_with(".rs");
+    let grammar = if is_rust {
+        None
+    } else {
+        let g = Grammar::for_file(file)?;
+        grammar_parser_name(g)?;
+        // MATLAB and Octave use `.m` too: a `.m` file is Objective-C only when its
+        // text says so, as the index decides.
+        if g == Grammar::ObjectiveC && Grammar::detect(file, after).is_none() {
+            return None;
+        }
+        Some(g)
+    };
     let parsed = match before {
         Some(before) if need_before => both(file, before, after),
         _ => parse(file, after).and_then(|now| {
@@ -468,8 +522,8 @@ pub fn judge(
             .find(|problem| problem.missing || unbalanced && problem.bracket)
             .unwrap_or(first)
             .clone();
-        let certain = blocks(file)
-            && if file.ends_with(".rs") {
+        let certain = grammar_blocks(grammar)
+            && if is_rust {
                 problem.bracket || !unstable_rust(root, file, after)
             } else {
                 problem.missing || unbalanced
@@ -591,9 +645,13 @@ pub fn line_column(text: &str, offset: usize) -> (usize, usize) {
     while !text.is_char_boundary(offset) {
         offset -= 1;
     }
-    let start = text[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let bytes = text.as_bytes();
+    let start = bytes[..offset]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
     (
-        text[..start].matches('\n').count() + 1,
+        bytes[..start].iter().filter(|&&b| b == b'\n').count() + 1,
         text[start..offset].chars().count() + 1,
     )
 }

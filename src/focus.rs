@@ -6,8 +6,10 @@
 //! term rank first. A long line shows the windows of it that hold the most terms. Each
 //! excerpt keeps its `stdout:N` marker for `justless log`.
 
+use std::borrow::Cow;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, VecDeque};
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
@@ -126,8 +128,13 @@ fn tokens(text: &str, mut emit: impl FnMut(usize, &str)) {
 /// than its word and never longer.
 fn stem(word: &str) -> String {
     let mut word = word.to_owned();
+    stem_in_place(&mut word);
+    word
+}
+
+fn stem_in_place(word: &mut String) {
     if word.bytes().any(|b| b.is_ascii_digit()) {
-        return word;
+        return;
     }
     if word.len() > 4 && word.ends_with("ies") {
         word.truncate(word.len() - 3);
@@ -153,7 +160,6 @@ fn stem(word: &str) -> String {
     if word.len() > 3 && word.ends_with('e') {
         word.pop();
     }
-    word
 }
 
 /// One match of a term in a line.
@@ -173,17 +179,39 @@ struct Analysis {
     /// Byte lengths an ASCII word needs to stem to a word term.
     shortest: usize,
     longest: usize,
+    has_words: bool,
+    has_phrases: bool,
+    /// Reusable buffer for per-token lowercasing + stemming.
+    scratch: String,
+    /// Reusable buffer for ASCII-lowercased lines during phrase scans.
+    lower: String,
 }
 
 impl Analysis {
     fn new(terms: &[Term]) -> Self {
-        let words = terms.iter().filter(|term| !term.phrase);
+        let mut shortest = usize::MAX;
+        let mut longest = 0;
+        let mut has_words = false;
+        let mut has_phrases = false;
+        for term in terms {
+            if term.phrase {
+                has_phrases = true;
+            } else {
+                has_words = true;
+                shortest = shortest.min(term.text.len());
+                longest = longest.max(term.text.len() + 5);
+            }
+        }
         Self {
             counts: vec![0; terms.len()],
             spans: Vec::new(),
             words: 0,
-            shortest: words.clone().map(|term| term.text.len()).min().unwrap_or(0),
-            longest: words.map(|term| term.text.len() + 5).max().unwrap_or(0),
+            shortest: if has_words { shortest } else { 0 },
+            longest,
+            has_words,
+            has_phrases,
+            scratch: String::with_capacity(32),
+            lower: String::new(),
         }
     }
 
@@ -191,17 +219,24 @@ impl Analysis {
         self.counts.fill(0);
         self.spans.clear();
         self.words = 0;
-        let has_words = terms.iter().any(|term| !term.phrase);
+        let has_words = self.has_words;
         let (shortest, longest) = (self.shortest, self.longest);
         tokens(line, |start, token| {
             self.words += 1;
-            // Most words cannot stem to a term, and skipping them saves an allocation.
+            // Most words cannot stem to a term, and skipping them saves work.
             if !has_words || token.is_ascii() && !(shortest..=longest).contains(&token.len()) {
                 return;
             }
-            let word = stem(&token.to_lowercase());
+            self.scratch.clear();
+            if token.is_ascii() {
+                self.scratch.push_str(token);
+                self.scratch.make_ascii_lowercase();
+            } else {
+                self.scratch.push_str(&token.to_lowercase());
+            }
+            stem_in_place(&mut self.scratch);
             for (index, term) in terms.iter().enumerate() {
-                if !term.phrase && term.text == word {
+                if !term.phrase && term.text == self.scratch {
                     self.counts[index] += 1;
                     if self.spans.len() < SPAN_LIMIT {
                         self.spans.push(Span {
@@ -213,9 +248,16 @@ impl Analysis {
                 }
             }
         });
-        if terms.iter().any(|term| term.phrase) {
+        if self.has_phrases {
             // ASCII lowercasing keeps byte offsets, so matches map back to the line.
-            let lower = line.to_ascii_lowercase();
+            let lower: &str = if line.bytes().any(|b| b.is_ascii_uppercase()) {
+                self.lower.clear();
+                self.lower.push_str(line);
+                self.lower.make_ascii_lowercase();
+                &self.lower
+            } else {
+                line
+            };
             for (index, term) in terms.iter().enumerate() {
                 if term.phrase {
                     for (start, _) in lower.match_indices(&term.text) {
@@ -263,6 +305,7 @@ struct Excerpt {
 }
 
 impl Excerpt {
+    #[cfg(test)]
     fn new(line: &str, focus: usize) -> Self {
         if line.len() <= EXCERPT {
             return Self {
@@ -286,11 +329,19 @@ impl Excerpt {
         }
     }
 
-    /// The excerpt within `cap` bytes, marking each clipped side with an ellipsis, and
-    /// the range of `text` it shows.
+    #[cfg(test)]
     fn render(&self, cap: usize) -> (String, usize, usize) {
+        let mut out = String::new();
+        let (start, end) = self.render_into(cap, &mut out);
+        (out, start, end)
+    }
+
+    /// Appends the excerpt within `cap` bytes into `out`, marking each clipped
+    /// side with an ellipsis, and returns the byte range of `text` it shows.
+    fn render_into(&self, cap: usize, out: &mut String) -> (usize, usize) {
         if !self.before && !self.after && self.text.len() <= cap {
-            return (self.text.clone(), 0, self.text.len());
+            out.push_str(&self.text);
+            return (0, self.text.len());
         }
         let room = cap.saturating_sub(2 * '…'.len_utf8());
         let text = &self.text;
@@ -302,15 +353,14 @@ impl Excerpt {
                 .min(text.len().saturating_sub(room)),
         );
         let end = text.floor_char_boundary((start + room).min(text.len()));
-        let mut excerpt = String::new();
         if self.before || start > 0 {
-            excerpt.push('…');
+            out.push('…');
         }
-        excerpt.push_str(&text[start..end]);
+        out.push_str(&text[start..end]);
         if self.after || end < text.len() {
-            excerpt.push('…');
+            out.push('…');
         }
-        (excerpt, start, end)
+        (start, end)
     }
 }
 
@@ -345,6 +395,69 @@ impl Window {
     }
 }
 
+type WindowScore = (usize, u32, f64, usize, usize);
+
+fn cmp_window_score(a: &WindowScore, b: &WindowScore) -> Ordering {
+    b.1.cmp(&a.1)
+        .then(b.2.total_cmp(&a.2))
+        .then(a.3.cmp(&b.3))
+        .then(b.4.cmp(&a.4))
+        .then(a.0.cmp(&b.0))
+}
+
+fn score_window(start: usize, spans: &[Span], idf: &[f64], inside: &mut Vec<Span>) -> WindowScore {
+    let end = start + EXCERPT;
+    let first = spans.partition_point(|inner| inner.start < start);
+    inside.clear();
+    inside.extend(
+        spans[first..]
+            .iter()
+            .take_while(|inner| inner.start < end)
+            .filter(|inner| inner.start + inner.len <= end)
+            .copied(),
+    );
+    let (mut seen, mut weight) = (0u32, 0.0);
+    for inner in inside.iter() {
+        if seen & 1 << inner.term == 0 {
+            seen |= 1 << inner.term;
+            weight += idf[inner.term];
+        }
+    }
+    (
+        start,
+        seen.count_ones(),
+        weight,
+        tightest(inside, seen),
+        inside.len(),
+    )
+}
+
+/// The single best window of `line`, without allocating sorting buffers.
+fn best_window(line: &str, spans: &[Span], idf: &[f64]) -> Window {
+    if line.len() <= EXCERPT || spans.is_empty() {
+        return Window::at(line, 0, spans);
+    }
+    let last = line.len() - EXCERPT;
+    let mut inside = Vec::new();
+    let mut prev_start = None;
+    let mut best: Option<WindowScore> = None;
+    for span in spans {
+        let start = line.floor_char_boundary(span.start.saturating_sub(LEAD).min(last));
+        if prev_start == Some(start) {
+            continue;
+        }
+        prev_start = Some(start);
+        let candidate = score_window(start, spans, idf, &mut inside);
+        if best
+            .as_ref()
+            .is_none_or(|current| cmp_window_score(&candidate, current).is_lt())
+        {
+            best = Some(candidate);
+        }
+    }
+    Window::at(line, best.map_or(0, |entry| entry.0), spans)
+}
+
 /// Up to `limit` windows of `line` that do not overlap, best first: the most distinct
 /// terms weighted by rarity, then the closest together, then the most matches, then
 /// the earliest. Terms close together usually belong to one record.
@@ -352,9 +465,13 @@ fn windows(line: &str, spans: &[Span], idf: &[f64], limit: usize) -> Vec<Window>
     if line.len() <= EXCERPT || spans.is_empty() {
         return vec![Window::at(line, 0, spans)];
     }
+    if limit == 1 {
+        return vec![best_window(line, spans, idf)];
+    }
     let last = line.len() - EXCERPT;
     // A window that starts `LEAD` bytes before each match, scored by what it holds.
-    let mut scored: Vec<(usize, u32, f64, usize, usize)> = Vec::new();
+    let mut scored: Vec<WindowScore> = Vec::new();
+    let mut inside = Vec::new();
     for span in spans {
         let start = line.floor_char_boundary(span.start.saturating_sub(LEAD).min(last));
         if scored
@@ -363,36 +480,9 @@ fn windows(line: &str, spans: &[Span], idf: &[f64], limit: usize) -> Vec<Window>
         {
             continue;
         }
-        let end = start + EXCERPT;
-        let first = spans.partition_point(|inner| inner.start < start);
-        let inside: Vec<Span> = spans[first..]
-            .iter()
-            .take_while(|inner| inner.start < end)
-            .filter(|inner| inner.start + inner.len <= end)
-            .copied()
-            .collect();
-        let (mut seen, mut weight) = (0u32, 0.0);
-        for inner in &inside {
-            if seen & 1 << inner.term == 0 {
-                seen |= 1 << inner.term;
-                weight += idf[inner.term];
-            }
-        }
-        scored.push((
-            start,
-            seen.count_ones(),
-            weight,
-            tightest(&inside, seen),
-            inside.len(),
-        ));
+        scored.push(score_window(start, spans, idf, &mut inside));
     }
-    scored.sort_by(|a, b| {
-        b.1.cmp(&a.1)
-            .then(b.2.total_cmp(&a.2))
-            .then(a.3.cmp(&b.3))
-            .then(b.4.cmp(&a.4))
-            .then(a.0.cmp(&b.0))
-    });
+    scored.sort_by(cmp_window_score);
     let mut chosen: Vec<usize> = Vec::new();
     for (start, ..) in scored {
         if chosen.len() == limit {
@@ -534,6 +624,15 @@ struct Layout {
     shown: Vec<Shown>,
 }
 
+fn decimal_digits(mut n: usize) -> usize {
+    let mut digits = 1;
+    while n >= 10 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
+}
+
 impl Layout {
     fn has(&self, line: usize) -> bool {
         self.shown.iter().any(|shown| shown.line == line)
@@ -556,11 +655,16 @@ impl Layout {
         {
             return false;
         }
-        let marker = format!("stdout:{line}: ");
-        let cap = limit.min(self.body.saturating_sub(marker.len() + 1));
-        let (text, from, to) = window.excerpt.render(cap);
-        let entry = format!("{marker}{text}\n");
-        if cap == 0 || self.used + entry.len() > self.body {
+        let marker_len = "stdout:".len() + decimal_digits(line) + ": ".len();
+        let cap = limit.min(self.body.saturating_sub(marker_len + 1));
+        if cap == 0 {
+            return false;
+        }
+        let mut entry = String::with_capacity(marker_len + window.excerpt.text.len().min(cap) + 8);
+        let _ = write!(entry, "stdout:{line}: ");
+        let (from, to) = window.excerpt.render_into(cap, &mut entry);
+        entry.push('\n');
+        if self.used + entry.len() > self.body {
             return false;
         }
         self.used += entry.len();
@@ -613,30 +717,32 @@ impl Trailer<'_> {
             } else {
                 ("", self.runs)
             };
-            text.push_str(&format!(
+            let _ = write!(
+                text,
                 "{} more match every term{every_runs}, {} more match some{some_runs}",
                 self.every, self.some
-            ));
+            );
         } else {
-            text.push_str(&format!("{} more match{}", self.every, self.runs));
+            let _ = write!(text, "{} more match{}", self.every, self.runs);
         }
-        let mut clauses = Vec::new();
         if self.inside > 0 {
-            clauses.push(format!(
-                "{} more matches inside shown lines; print one record per line to rank them",
-                self.inside
-            ));
-        }
-        if self.cut {
-            clauses.push(format!(
-                "lines over {LINE_LIMIT_SHOWN} were ranked on their first {LINE_LIMIT_SHOWN}"
-            ));
-        }
-        for clause in clauses {
             if !text.ends_with(' ') {
                 text.push_str("; ");
             }
-            text.push_str(&clause);
+            let _ = write!(
+                text,
+                "{} more matches inside shown lines; print one record per line to rank them",
+                self.inside
+            );
+        }
+        if self.cut {
+            if !text.ends_with(' ') {
+                text.push_str("; ");
+            }
+            let _ = write!(
+                text,
+                "lines over {LINE_LIMIT_SHOWN} were ranked on their first {LINE_LIMIT_SHOWN}"
+            );
         }
         text.push_str(self.log);
         text.push('\n');
@@ -745,8 +851,12 @@ pub fn preview(
         if dropped && !anchor {
             return;
         }
-        let first = windows(line, &analysis.spans, &idf, 1).remove(0);
+        let first = best_window(line, &analysis.spans, &idf);
         if anchor {
+            if dropped {
+                anchors.push((number, distinct, matches, first));
+                return;
+            }
             anchors.push((number, distinct, matches, first.clone()));
         }
         if dropped {
@@ -1042,9 +1152,10 @@ pub fn outline(
     let inner = tail.strip_suffix(b"\n").unwrap_or(&tail);
     let (tail, whole) = match inner.iter().position(|&byte| byte == b'\n') {
         found if at_line || found.is_some() => {
-            let tail = found
-                .filter(|_| !at_line)
-                .map_or(tail.clone(), |index| tail[index + 1..].to_vec());
+            let tail = match found.filter(|_| !at_line) {
+                Some(index) => tail[index + 1..].to_vec(),
+                None => tail,
+            };
             let whole =
                 newlines_in(&tail) + usize::from(!tail.is_empty() && !tail.ends_with(b"\n"));
             (tail, whole)
@@ -1126,9 +1237,20 @@ fn fallback(
     };
     let body = max_bytes.saturating_sub(header.len() + trailer.len());
     let entry = |number: usize, line: &str| {
-        let marker = format!("stdout:{number}: ");
-        let cap = ANCHOR.min(body.saturating_sub(marker.len() + 1));
-        format!("{marker}{}\n", Excerpt::new(line, 0).render(cap).0)
+        let marker_len = "stdout:".len() + decimal_digits(number) + ": ".len();
+        let cap = ANCHOR.min(body.saturating_sub(marker_len + 1));
+        let mut out = String::with_capacity(marker_len + line.len().min(cap) + 8);
+        let _ = write!(out, "stdout:{number}: ");
+        if line.len() <= cap {
+            out.push_str(line);
+        } else {
+            let room = cap.saturating_sub(2 * '…'.len_utf8());
+            let end = line.floor_char_boundary(room.min(line.len()));
+            out.push_str(&line[..end]);
+            out.push('…');
+        }
+        out.push('\n');
+        out
     };
     let mut head = Vec::new();
     let mut head_bytes = 0;
@@ -1187,8 +1309,12 @@ fn each_line(path: &Path, mut visit: impl FnMut(usize, &str, bool)) -> io::Resul
     while let Some(cut) = read_line(&mut file, &mut raw)? {
         number += 1;
         let text = String::from_utf8_lossy(&raw);
-        let text = ANSI.replace_all(&text, "");
-        visit(number, text.trim_end_matches(['\n', '\r']), cut);
+        let clean = if text.as_bytes().contains(&0x1b) {
+            ANSI.replace_all(&text, "")
+        } else {
+            Cow::Borrowed(text.as_ref())
+        };
+        visit(number, clean.trim_end_matches(['\n', '\r']), cut);
         raw.clear();
     }
     Ok(())
