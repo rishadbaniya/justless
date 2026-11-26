@@ -12,14 +12,13 @@
 //! Only command labels and byte counts leave this module's callers; command lines
 //! and output are scanned, never printed.
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use crate::discover::{Group, Route};
+use crate::discover::{Group, Route, for_each_jsonl_line};
 
 /// One shell command Antigravity CLI ran.
 pub(crate) struct Shell {
@@ -62,24 +61,18 @@ pub(crate) fn home() -> Option<PathBuf> {
 /// Conversation IDs recorded under `root` in `<home>/history.jsonl`.
 fn workspace_sessions(home: &Path, root: &Path) -> BTreeSet<String> {
     let mut sessions = BTreeSet::new();
-    let Ok(handle) = File::open(home.join("history.jsonl")) else {
-        return sessions;
-    };
-    for line in BufReader::new(handle).lines() {
-        let Ok(line) = line else {
-            break;
-        };
+    for_each_jsonl_line(&home.join("history.jsonl"), None, |_, line| {
         if !line.contains("\"conversationId\"") || !line.contains("\"workspace\"") {
-            continue;
+            return true;
         }
-        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
-            continue;
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            return true;
         };
         let (Some(id), Some(workspace)) = (
             entry["conversationId"].as_str(),
             entry["workspace"].as_str(),
         ) else {
-            continue;
+            return true;
         };
         let raw = Path::new(workspace.strip_prefix("file://").unwrap_or(workspace));
         let resolved = raw.canonicalize().ok();
@@ -90,7 +83,8 @@ fn workspace_sessions(home: &Path, root: &Path) -> BTreeSet<String> {
         {
             sessions.insert(id.to_owned());
         }
-    }
+        true
+    });
     sessions
 }
 
@@ -135,6 +129,22 @@ pub(crate) fn scan(root: &Path, since_ms: u64, mut each: impl FnMut(Shell)) -> S
     scan
 }
 
+fn agy_line_wanted(line: &str, has_pending: bool, has_pending_tasks: bool) -> bool {
+    if has_pending {
+        if line.contains("\"GENERIC\"")
+            || line.contains("\"PLANNER_RESPONSE\"")
+            || line.contains("\"USER_INPUT\"")
+        {
+            return true;
+        }
+    } else if line.contains("\"PLANNER_RESPONSE\"") && line.contains("\"run_command\"") {
+        return true;
+    }
+    has_pending_tasks
+        && line.contains("\"SYSTEM_MESSAGE\"")
+        && line.contains("finished with result:")
+}
+
 fn read(
     file: &Path,
     session: &str,
@@ -143,37 +153,68 @@ fn read(
     scan: &mut Scan,
     each: &mut impl FnMut(Shell),
 ) {
-    let Ok(handle) = File::open(file) else {
-        return;
-    };
+    read_inner(file, session, compact, since_ms, scan, true, None, each);
+}
+
+#[cfg(test)]
+pub(crate) fn read_for_test(
+    file: &Path,
+    session: &str,
+    compact: bool,
+    since_ms: u64,
+    use_prefilter: bool,
+) -> (Scan, Vec<Shell>, usize) {
+    let mut scan = Scan::default();
+    let mut shells = Vec::new();
+    let mut parsed = 0usize;
+    read_inner(
+        file,
+        session,
+        compact,
+        since_ms,
+        &mut scan,
+        use_prefilter,
+        Some(&mut parsed),
+        &mut |shell| shells.push(shell),
+    );
+    (scan, shells, parsed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_inner(
+    file: &Path,
+    session: &str,
+    compact: bool,
+    since_ms: u64,
+    scan: &mut Scan,
+    use_prefilter: bool,
+    mut parsed_lines: Option<&mut usize>,
+    each: &mut impl FnMut(Shell),
+) {
     // Each `tool_calls` slot matches the next `GENERIC` result in order:
     // `Some((command, cwd, time_ms))` for `run_command`, `None` for any other tool.
+    // Trailing `None`s are trimmed so turns with no `run_command` never force parsing
+    // of subsequent `GENERIC` file-read outputs.
     let mut pending: VecDeque<Option<(String, String, u64)>> = VecDeque::new();
     // Background `run_command` calls return a task id first and deliver their
     // real exit code and output in a later `SYSTEM_MESSAGE`.
     let mut pending_tasks: HashMap<String, (String, String, u64, bool)> = HashMap::new();
-    for (index, line) in BufReader::new(handle).lines().enumerate() {
-        let Ok(line) = line else {
-            break;
-        };
-        let wanted = line.contains("\"PLANNER_RESPONSE\"")
-            || line.contains("\"USER_INPUT\"")
-            || !pending.is_empty() && line.contains("\"GENERIC\"")
-            || !pending_tasks.is_empty()
-                && line.contains("\"SYSTEM_MESSAGE\"")
-                && line.contains("finished with result:");
-        if !wanted {
-            continue;
+    for_each_jsonl_line(file, None, |index, line| {
+        if use_prefilter && !agy_line_wanted(line, !pending.is_empty(), !pending_tasks.is_empty()) {
+            return true;
         }
-        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
-            continue;
+        if let Some(count) = parsed_lines.as_deref_mut() {
+            *count += 1;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            return true;
         };
         match entry["type"].as_str() {
             Some("USER_INPUT") => pending.clear(),
             Some("PLANNER_RESPONSE") => {
                 pending.clear();
                 let Some(calls) = entry["tool_calls"].as_array() else {
-                    continue;
+                    return true;
                 };
                 let time_ms = entry["created_at"]
                     .as_str()
@@ -193,13 +234,16 @@ fn read(
                         pending.push_back(None);
                     }
                 }
+                while pending.back().is_some_and(Option::is_none) {
+                    pending.pop_back();
+                }
             }
             Some("GENERIC") => {
                 let Some(slot) = pending.pop_front() else {
-                    continue;
+                    return true;
                 };
                 let Some((command, cwd, call_time)) = slot else {
-                    continue;
+                    return true;
                 };
                 let raw = entry["content"].as_str().unwrap_or("");
                 if let Some((started_rewrote, task_id)) = background_task_id(raw) {
@@ -207,7 +251,7 @@ fn read(
                         task_id.to_owned(),
                         (command, cwd, call_time, started_rewrote),
                     );
-                    continue;
+                    return true;
                 }
                 let result_time = entry["created_at"]
                     .as_str()
@@ -219,7 +263,7 @@ fn read(
                     call_time
                 };
                 if time_ms > 0 && time_ms < since_ms {
-                    continue;
+                    return true;
                 }
                 let (hook_rewrote, status, body) = parse_result(raw);
                 scan.sessions.insert(session.to_owned());
@@ -239,12 +283,12 @@ fn read(
             Some("SYSTEM_MESSAGE") => {
                 let raw = entry["content"].as_str().unwrap_or("");
                 let Some((task_id, task_body)) = parse_task_completion(raw) else {
-                    continue;
+                    return true;
                 };
                 let Some((command, cwd, call_time, started_rewrote)) =
                     pending_tasks.remove(task_id)
                 else {
-                    continue;
+                    return true;
                 };
                 let result_time = entry["created_at"]
                     .as_str()
@@ -256,7 +300,7 @@ fn read(
                     call_time
                 };
                 if time_ms > 0 && time_ms < since_ms {
-                    continue;
+                    return true;
                 }
                 let (finished_rewrote, status, body) = parse_result(task_body);
                 scan.sessions.insert(session.to_owned());
@@ -275,7 +319,8 @@ fn read(
             }
             _ => {}
         }
-    }
+        true
+    });
 }
 
 /// Compact `transcript.jsonl` stores each tool argument as a JSON-encoded string

@@ -28,14 +28,12 @@
 //! Only labels and byte counts leave this module's callers; output is scanned, never
 //! printed.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use crate::discover::{Group, Route};
+use crate::discover::{Group, Route, for_each_jsonl_line, ids_may_match};
 
 /// One shell command Codex ran.
 pub(crate) struct Shell {
@@ -118,6 +116,30 @@ struct Call {
     status: Option<i32>,
 }
 
+fn rollout_line_wanted(
+    line: &str,
+    has_session: bool,
+    calls: &HashMap<String, Call>,
+    scripts: &HashSet<String>,
+) -> bool {
+    if !has_session {
+        return line.contains("\"session_meta\"");
+    }
+    (line.contains("\"turn_context\"") && line.contains("\"cwd\""))
+        || (line.contains("\"function_call\"")
+            && (line.contains("\"exec_command\"")
+                || line.contains("\"shell_command\"")
+                || line.contains("\"shell\"")))
+        || (line.contains("\"item_completed\"") && line.contains("\"CommandExecution\""))
+        || (line.contains("\"custom_tool_call\"") && line.contains("\"exec\""))
+        || (!calls.is_empty()
+            && line.contains("\"function_call_output\"")
+            && ids_may_match(calls.keys().map(String::as_str), calls.len(), line))
+        || (!scripts.is_empty()
+            && line.contains("\"custom_tool_call_output\"")
+            && ids_may_match(scripts.iter().map(String::as_str), scripts.len(), line))
+}
+
 fn read(
     file: &Path,
     root: &Path,
@@ -126,9 +148,44 @@ fn read(
     scan: &mut Scan,
     each: &mut impl FnMut(Shell),
 ) {
-    let Ok(handle) = File::open(file) else {
-        return;
-    };
+    read_inner(file, root, since_ms, seen, scan, true, None, each);
+}
+
+#[cfg(test)]
+pub(crate) fn read_for_test(
+    file: &Path,
+    root: &Path,
+    since_ms: u64,
+    use_prefilter: bool,
+) -> (Scan, Vec<Shell>, usize) {
+    let mut seen = HashSet::new();
+    let mut scan = Scan::default();
+    let mut shells = Vec::new();
+    let mut parsed = 0usize;
+    read_inner(
+        file,
+        root,
+        since_ms,
+        &mut seen,
+        &mut scan,
+        use_prefilter,
+        Some(&mut parsed),
+        &mut |shell| shells.push(shell),
+    );
+    (scan, shells, parsed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_inner(
+    file: &Path,
+    root: &Path,
+    since_ms: u64,
+    seen: &mut HashSet<String>,
+    scan: &mut Scan,
+    use_prefilter: bool,
+    mut parsed_lines: Option<&mut usize>,
+    each: &mut impl FnMut(Shell),
+) {
     let within = |cwd: &str| Path::new(cwd).starts_with(root);
     let mut session: Option<String> = None;
     let mut turn = String::new();
@@ -137,26 +194,16 @@ fn read(
     let mut answered: HashSet<String> = HashSet::new();
     let mut running: HashMap<String, Call> = HashMap::new();
     let mut scripts: HashSet<String> = HashSet::new();
-    for (index, line) in BufReader::new(handle).lines().enumerate() {
-        let Ok(line) = line else {
-            break;
-        };
-        // Parse only lines that can matter; script results are most of a rollout.
-        let wanted = if session.is_none() {
-            line.contains("\"session_meta\"")
-        } else {
-            line.contains("\"turn_context\"")
-                || line.contains("\"function_call\"")
-                || line.contains("\"CommandExecution\"")
-                || line.contains("\"custom_tool_call\"")
-                || !calls.is_empty() && line.contains("\"function_call_output\"")
-                || !scripts.is_empty() && line.contains("\"custom_tool_call_output\"")
-        };
-        if !wanted {
-            continue;
+    for_each_jsonl_line(file, None, |index, line| {
+        // Parse only lines that can matter; script results and non-shell calls are most of a rollout.
+        if use_prefilter && !rollout_line_wanted(line, session.is_some(), &calls, &scripts) {
+            return true;
         }
-        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
-            continue;
+        if let Some(count) = parsed_lines.as_deref_mut() {
+            *count += 1;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            return true;
         };
         let payload = &entry["payload"];
         let time_ms = entry["timestamp"]
@@ -168,7 +215,7 @@ fn read(
             (Some("session_meta"), _) if session.is_none() => {
                 let cwd = native(&payload["cwd"]);
                 if !within(cwd) {
-                    return;
+                    return false;
                 }
                 let thread = payload["session_id"].as_str().or(payload["id"].as_str());
                 session = Some(thread.unwrap_or_default().to_owned());
@@ -184,7 +231,7 @@ fn read(
             (Some("response_item"), Some("function_call")) => {
                 let name = payload["name"].as_str().unwrap_or_default();
                 let (Some(id), true) = (id(), SHELL_TOOLS.contains(&name)) else {
-                    continue;
+                    return true;
                 };
                 let arguments: Value = payload["arguments"]
                     .as_str()
@@ -200,7 +247,7 @@ fn read(
                     _ => None,
                 };
                 let Some(command) = command else {
-                    continue;
+                    return true;
                 };
                 let cwd = match arguments["workdir"].as_str() {
                     Some(dir) => Path::new(&turn).join(dir).to_string_lossy().into_owned(),
@@ -239,11 +286,11 @@ fn read(
             (Some("event_msg"), Some("item_completed")) => {
                 let item = &payload["item"];
                 let Some(id) = item["id"].as_str() else {
-                    continue;
+                    return true;
                 };
                 // The user's own `!` commands are not the agent's.
                 if item["type"] != "CommandExecution" || item["source"] == "user_shell" {
-                    continue;
+                    return true;
                 }
                 let status = item["exit_code"]
                     .as_i64()
@@ -254,11 +301,11 @@ fn read(
                     if item["cwd"].is_string() {
                         native(&item["cwd"]).clone_into(&mut call.cwd);
                     }
-                    continue;
+                    return true;
                 }
                 let direct = running.remove(id);
                 if direct.is_none() && answered.contains(id) {
-                    continue;
+                    return true;
                 }
                 let cwd = match native(&item["cwd"]) {
                     "" => turn.clone(),
@@ -273,11 +320,11 @@ fn read(
                     ),
                 };
                 let (Some(command), true) = (command, time_ms >= since_ms && within(&cwd)) else {
-                    continue;
+                    return true;
                 };
                 if !seen.insert(id.to_owned()) {
                     scan.repeated += 1;
-                    continue;
+                    return true;
                 }
                 let output = item["aggregated_output"]
                     .as_str()
@@ -301,21 +348,21 @@ fn read(
             (Some("response_item"), Some("function_call_output")) => {
                 let Some(call) = id().and_then(|id| calls.remove(&id).map(|call| (id, call)))
                 else {
-                    continue;
+                    return true;
                 };
                 let (id, call) = call;
                 answered.insert(id.clone());
                 if call.time_ms < since_ms || !within(&call.cwd) {
-                    continue;
+                    return true;
                 }
                 let whole = text(&payload["output"]);
                 let Some((status, output)) = result(&whole) else {
                     running.insert(id, call);
-                    continue;
+                    return true;
                 };
                 if !seen.insert(id) {
                     scan.repeated += 1;
-                    continue;
+                    return true;
                 }
                 let thread = session.clone().unwrap_or_default();
                 scan.sessions.insert(thread.clone());
@@ -334,7 +381,8 @@ fn read(
             }
             _ => {}
         }
-    }
+        true
+    });
 }
 
 /// A directory Codex recorded, as a path or, in newer items, a `file://` URI. Like
