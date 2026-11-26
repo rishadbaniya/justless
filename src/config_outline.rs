@@ -1,5 +1,6 @@
 //! Structural outlines for config, DevOps, stylesheet, IDL, proxy, and markup files:
-//! TOML, YAML (including GitHub Actions workflows and OpenAPI/Swagger specs),
+//! TOML, YAML (including GitHub Actions workflows, OpenAPI/Swagger specs,
+//! Docker Compose files, and multi-document Kubernetes manifests),
 //! JSON/JSONC (including OpenAPI/Swagger, root arrays, and large minified JSON),
 //! Terraform/OpenTofu/Terragrunt HCL (`*.tf`, `*.tofu`, `*.hcl`, `*.tfvars`),
 //! Nix (`*.nix`), Makefile/Justfile, Dockerfile/Containerfile,
@@ -392,6 +393,9 @@ fn yaml_sections(file: &str, text: &str, line_starts: &[usize]) -> Vec<Section> 
     }
     let docs = split_yaml_docs(text, line_starts);
     if docs.len() >= 2 {
+        if let Some(k8s) = k8s_multi_doc_sections(text, line_starts, &docs) {
+            return k8s;
+        }
         return yaml_multi_doc_sections(text, line_starts, &docs);
     }
     let (start, end) = docs.first().copied().unwrap_or((0, line_starts.len()));
@@ -403,16 +407,24 @@ fn yaml_sections(file: &str, text: &str, line_starts: &[usize]) -> Vec<Section> 
     {
         return workflow;
     }
+    if let Some(compose) = docker_compose_yaml_sections(file, text, line_starts, start, end) {
+        return compose;
+    }
     yaml_single_doc_sections(text, line_starts, start, end, None)
 }
 
 fn split_yaml_docs(text: &str, line_starts: &[usize]) -> Vec<(usize, usize)> {
     let mut markers = Vec::new();
     let mut block_indent: Option<usize> = None;
+    let mut quoted: Option<u8> = None;
 
     for idx in 0..line_starts.len() {
         let line = line_text(text, line_starts, idx);
         let trimmed = line.trim();
+        if quoted.is_some() {
+            advance_yaml_quoted(trimmed, &mut quoted);
+            continue;
+        }
         let indent = line.bytes().take_while(|&b| b == b' ').count();
         if let Some(parent) = block_indent {
             if !trimmed.is_empty() && indent <= parent {
@@ -421,12 +433,16 @@ fn split_yaml_docs(text: &str, line_starts: &[usize]) -> Vec<(usize, usize)> {
                 continue;
             }
         }
-        if indent == 0 && (trimmed == "---" || trimmed.starts_with("--- ")) {
+        if indent == 0
+            && (trimmed == "---" || trimmed.starts_with("--- ") || trimmed.starts_with("---\t"))
+        {
             markers.push(idx);
             continue;
         }
-        if yaml_opens_block_scalar(trimmed) {
-            block_indent = Some(indent);
+        if let Some(parent) = yaml_block_scalar_parent_indent(indent, trimmed) {
+            block_indent = Some(parent);
+        } else {
+            advance_yaml_quoted(trimmed, &mut quoted);
         }
     }
 
@@ -437,7 +453,13 @@ fn split_yaml_docs(text: &str, line_starts: &[usize]) -> Vec<(usize, usize)> {
     let has_content = |a: usize, b: usize| {
         (a..b).any(|i| {
             let t = line_text(text, line_starts, i).trim();
-            !t.is_empty() && !t.starts_with('#') && t != "---" && t != "..."
+            !t.is_empty()
+                && !t.starts_with('#')
+                && !t.starts_with('%')
+                && t != "---"
+                && !t.starts_with("--- ")
+                && !t.starts_with("---\t")
+                && t != "..."
         })
     };
 
@@ -467,7 +489,11 @@ fn yaml_multi_doc_sections(
         let sig_line = (start..end)
             .find(|&i| {
                 let t = line_text(text, line_starts, i).trim();
-                !t.is_empty() && !t.starts_with('#') && t != "---"
+                !t.is_empty()
+                    && !t.starts_with('#')
+                    && t != "---"
+                    && !t.starts_with("--- ")
+                    && !t.starts_with("---\t")
             })
             .unwrap_or(start);
         out.push(Section {
@@ -497,43 +523,34 @@ fn yaml_doc_label(text: &str, line_starts: &[usize], start: usize, end: usize) -
     let mut meta_name: Option<String> = None;
     let mut top_name: Option<String> = None;
     let mut in_metadata = false;
-    let mut block_indent: Option<usize> = None;
+    let mut meta_indent: Option<usize> = None;
 
-    for idx in start..end {
-        let line = line_text(text, line_starts, idx);
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed == "---" || trimmed == "..." {
-            continue;
-        }
-        let indent = line.bytes().take_while(|&b| b == b' ').count();
-        if let Some(parent) = block_indent {
-            if indent <= parent {
-                block_indent = None;
-            } else {
-                continue;
-            }
-        }
+    yaml_visit_lines(text, line_starts, start, end, |_, indent, trimmed| {
         if indent == 0 {
             in_metadata = false;
+            meta_indent = None;
             if let Some((k, v)) = yaml_mapping_key(trimmed) {
+                let clean = yaml_clean_scalar(v);
                 match k {
-                    "kind" if !v.is_empty() => kind = Some(unquote(v).to_owned()),
-                    "name" if !v.is_empty() => top_name = Some(unquote(v).to_owned()),
+                    "kind" if !clean.is_empty() => kind = Some(clean.to_owned()),
+                    "name" if !clean.is_empty() => top_name = Some(clean.to_owned()),
                     "metadata" => in_metadata = true,
                     _ => {}
                 }
             }
-        } else if in_metadata
-            && indent == 2
-            && let Some(("name", v)) = yaml_mapping_key(trimmed)
-            && !v.is_empty()
-        {
-            meta_name = Some(unquote(v).to_owned());
+        } else if in_metadata {
+            let target = *meta_indent.get_or_insert(indent);
+            if indent == target
+                && let Some(("name", v)) = yaml_mapping_key(trimmed)
+            {
+                let clean = yaml_clean_scalar(v);
+                if !clean.is_empty() {
+                    meta_name = Some(clean.to_owned());
+                }
+            }
         }
-        if yaml_opens_block_scalar(trimmed) {
-            block_indent = Some(indent);
-        }
-    }
+        true
+    });
     match (kind, meta_name, top_name) {
         (Some(k), Some(n), _) => Some(format!("{k}/{n}")),
         (Some(k), None, _) => Some(k),
@@ -645,7 +662,7 @@ fn yaml_first_child_indent(
             continue;
         }
         let indent = line.bytes().take_while(|&b| b == b' ').count();
-        return (indent > 0 && !trimmed.starts_with("- ")).then_some(indent);
+        return (indent > 0 && trimmed != "-" && !trimmed.starts_with("- ")).then_some(indent);
     }
     None
 }
@@ -658,31 +675,14 @@ fn yaml_keys_at_indent(
     target_indent: usize,
 ) -> Vec<(usize, String)> {
     let mut keys = Vec::new();
-    let mut block_indent: Option<usize> = None;
-
-    for idx in start..end {
-        let line = line_text(text, line_starts, idx);
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed == "---" || trimmed == "..." {
-            continue;
-        }
-        let indent = line.bytes().take_while(|&b| b == b' ').count();
-        if let Some(parent) = block_indent {
-            if indent <= parent {
-                block_indent = None;
-            } else {
-                continue;
-            }
-        }
+    yaml_visit_lines(text, line_starts, start, end, |idx, indent, trimmed| {
         if indent == target_indent
             && let Some((key, _)) = yaml_mapping_key(trimmed)
         {
             keys.push((idx, key.to_owned()));
         }
-        if yaml_opens_block_scalar(trimmed) {
-            block_indent = Some(indent);
-        }
-    }
+        true
+    });
     keys
 }
 
@@ -693,7 +693,9 @@ fn yaml_mapping_key(trimmed: &str) -> Option<(&str, &str)> {
     let bytes = trimmed.as_bytes();
     let mut quote: Option<u8> = None;
     let mut escaped = false;
-    for (idx, &b) in bytes.iter().enumerate() {
+    let mut idx = 0;
+    while idx < bytes.len() {
+        let b = bytes[idx];
         match quote {
             Some(b'"') => {
                 if escaped {
@@ -706,7 +708,11 @@ fn yaml_mapping_key(trimmed: &str) -> Option<(&str, &str)> {
             }
             Some(b'\'') => {
                 if b == b'\'' {
-                    quote = None;
+                    if bytes.get(idx + 1) == Some(&b'\'') {
+                        idx += 1;
+                    } else {
+                        quote = None;
+                    }
                 }
             }
             Some(_) => {}
@@ -726,19 +732,79 @@ fn yaml_mapping_key(trimmed: &str) -> Option<(&str, &str)> {
                 _ => {}
             },
         }
+        idx += 1;
     }
     None
+}
+
+fn strip_yaml_comment(raw: &str) -> &str {
+    let bytes = raw.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(b'"') => {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    quote = None;
+                }
+            }
+            Some(b'\'') => {
+                if b == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
+                        i += 1;
+                    } else {
+                        quote = None;
+                    }
+                }
+            }
+            Some(_) => {}
+            None => match b {
+                b'"' | b'\'' if i == 0 || bytes[i - 1].is_ascii_whitespace() => {
+                    quote = Some(b);
+                }
+                b'#' if i == 0 || bytes[i - 1].is_ascii_whitespace() => {
+                    return raw[..i].trim_end();
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    raw.trim_end()
+}
+
+fn yaml_clean_scalar(raw: &str) -> &str {
+    unquote(strip_yaml_comment(raw).trim()).trim()
+}
+
+fn yaml_is_block_scalar_indicator(raw: &str) -> bool {
+    let clean = strip_yaml_comment(raw).trim();
+    let Some(tail) = clean.strip_prefix(['|', '>']) else {
+        return false;
+    };
+    let mut saw_chomp = false;
+    let mut saw_indent = false;
+    for b in tail.bytes() {
+        match b {
+            b'+' | b'-' if !saw_chomp => saw_chomp = true,
+            b'1'..=b'9' if !saw_indent => saw_indent = true,
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn yaml_opens_block_scalar(trimmed: &str) -> bool {
     let Some((_, rest)) = yaml_mapping_key(trimmed) else {
         return false;
     };
-    let rest = rest.split_once(" #").map_or(rest, |(head, _)| head).trim();
-    let Some(tail) = rest.strip_prefix(['|', '>']) else {
-        return false;
-    };
-    tail.len() <= 2 && tail.bytes().all(|b| matches!(b, b'+' | b'-' | b'1'..=b'9'))
+    yaml_is_block_scalar_indicator(rest)
 }
 
 fn yaml_block_scalar_parent_indent(indent: usize, trimmed: &str) -> Option<usize> {
@@ -747,12 +813,117 @@ fn yaml_block_scalar_parent_indent(indent: usize, trimmed: &str) -> Option<usize
     }
     let after_dash = trimmed.strip_prefix("- ")?;
     let key_part = after_dash.trim_start();
+    if yaml_is_block_scalar_indicator(key_part) {
+        return Some(indent);
+    }
     if yaml_opens_block_scalar(key_part) {
         let extra = trimmed.len() - key_part.len();
         Some(indent + extra)
     } else {
         None
     }
+}
+
+/// Track multiline YAML single- and double-quoted scalar values without false
+/// positives on apostrophes inside plain scalars (e.g. `summary: Alice's API`).
+fn advance_yaml_quoted(trimmed: &str, quote: &mut Option<u8>) {
+    let (scan, active_q, start_idx) = if let Some(q) = *quote {
+        (trimmed, q, 0usize)
+    } else {
+        let val = if let Some(after) = trimmed.strip_prefix("- ") {
+            let after = after.trim_start();
+            yaml_mapping_key(after).map_or(after, |(_, rest)| rest)
+        } else if let Some((_, rest)) = yaml_mapping_key(trimmed) {
+            rest
+        } else {
+            return;
+        };
+        let Some(&first @ (b'"' | b'\'')) = val.as_bytes().first() else {
+            return;
+        };
+        (val, first, 1usize)
+    };
+
+    let bytes = scan.as_bytes();
+    let mut i = start_idx;
+    let mut escaped = false;
+    let mut closed = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if active_q == b'"' {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                closed = true;
+                break;
+            }
+        } else if b == b'\'' {
+            if bytes.get(i + 1) == Some(&b'\'') {
+                i += 1;
+            } else {
+                closed = true;
+                break;
+            }
+        }
+        i += 1;
+    }
+
+    *quote = if closed { None } else { Some(active_q) };
+}
+
+/// Visit non-comment YAML content lines in `start..end` while skipping block
+/// scalars (`|`/`>`) and multiline quoted scalars. Returns `true` if a quoted
+/// scalar remains unclosed at the end of the range.
+fn yaml_visit_lines(
+    text: &str,
+    line_starts: &[usize],
+    start: usize,
+    end: usize,
+    mut visit: impl FnMut(usize, usize, &str) -> bool,
+) -> bool {
+    let mut block_indent: Option<usize> = None;
+    let mut quoted: Option<u8> = None;
+    for idx in start..end {
+        let line = line_text(text, line_starts, idx);
+        let trimmed = line.trim();
+        if quoted.is_some() {
+            advance_yaml_quoted(trimmed, &mut quoted);
+            continue;
+        }
+        let indent = line.bytes().take_while(|&b| b == b' ').count();
+        if let Some(parent) = block_indent {
+            if !trimmed.is_empty() && indent <= parent {
+                block_indent = None;
+            } else {
+                continue;
+            }
+        }
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || (indent == 0
+                && (trimmed == "---"
+                    || trimmed.starts_with("--- ")
+                    || trimmed.starts_with("---\t")))
+            || trimmed == "..."
+        {
+            continue;
+        }
+        if !visit(idx, indent, trimmed) {
+            break;
+        }
+        if let Some(parent) = yaml_block_scalar_parent_indent(indent, trimmed) {
+            block_indent = Some(parent);
+        } else {
+            advance_yaml_quoted(trimmed, &mut quoted);
+        }
+    }
+    quoted.is_some()
+}
+
+fn yaml_has_unclosed_quote(text: &str, line_starts: &[usize], start: usize, end: usize) -> bool {
+    yaml_visit_lines(text, line_starts, start, end, |_, _, _| true)
 }
 
 fn is_github_workflow_path(file: &str) -> bool {
@@ -1290,6 +1461,835 @@ fn openapi_yaml_sections(
     }
 
     (out.len() >= 2).then_some(out)
+}
+
+// ---------------------------------------------------------------------------
+// Docker Compose & Multi-Document Kubernetes YAML
+// ---------------------------------------------------------------------------
+
+fn format_bracketed_label(base: &str, parts: &[String], max_bytes: usize) -> String {
+    if parts.is_empty() {
+        return clip_label(base, max_bytes);
+    }
+    let summary = parts.join(", ");
+    let full = format!("{base} [{summary}]");
+    if full.len() <= max_bytes {
+        return full;
+    }
+    // Keep base name + closing `]` intact while UTF-8-safely clipping the summary.
+    let overhead = base.len() + " […]".len();
+    if overhead < max_bytes {
+        let budget = max_bytes - overhead;
+        let cut = char_floor(&summary, budget);
+        let head = summary[..cut].trim_end_matches(|c: char| c.is_whitespace() || c == ',');
+        if !head.is_empty() {
+            return format!("{base} [{head}…]");
+        }
+    }
+    clip_label(&full, max_bytes)
+}
+
+fn is_docker_compose_path(file: &str) -> bool {
+    let file_name = Path::new(file)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let Some(stem) = file_name
+        .strip_suffix(".yml")
+        .or_else(|| file_name.strip_suffix(".yaml"))
+    else {
+        return false;
+    };
+    stem.starts_with("docker-compose")
+        || stem == "compose"
+        || stem.starts_with("compose.")
+        || stem.starts_with("compose-")
+        || stem.starts_with("compose_")
+}
+
+struct ComposeService {
+    first: usize,
+    next: usize,
+    name: String,
+    image: Option<String>,
+    build: Option<String>,
+    ports: Vec<String>,
+    total_ports: usize,
+}
+
+fn parse_compose_build(
+    text: &str,
+    line_starts: &[usize],
+    first: usize,
+    next: usize,
+    inline_val: &str,
+) -> Option<String> {
+    let clean = yaml_clean_scalar(inline_val);
+    if !clean.is_empty() && !yaml_is_block_scalar_indicator(inline_val) && !clean.starts_with('{') {
+        return Some(clean.to_owned());
+    }
+    let child_indent = yaml_first_child_indent(text, line_starts, first + 1, next)?;
+    let children = yaml_keys_at_indent(text, line_starts, first + 1, next, child_indent);
+    let mut context = None;
+    let mut dockerfile = None;
+    for (cline, ckey) in &children {
+        if let Some((_, raw)) = yaml_mapping_key(line_text(text, line_starts, *cline).trim()) {
+            let val = yaml_clean_scalar(raw);
+            if val.is_empty() || yaml_is_block_scalar_indicator(raw) {
+                continue;
+            }
+            match ckey.as_str() {
+                "context" if context.is_none() => context = Some(val.to_owned()),
+                "dockerfile" if dockerfile.is_none() => dockerfile = Some(val.to_owned()),
+                _ => {}
+            }
+        }
+    }
+    context
+        .or(dockerfile)
+        .or_else(|| (!children.is_empty()).then(|| ".".to_owned()))
+}
+
+fn parse_compose_ports(
+    text: &str,
+    line_starts: &[usize],
+    first: usize,
+    next: usize,
+    inline_val: &str,
+    prop_indent: usize,
+) -> (Vec<String>, usize) {
+    let mut ports = Vec::new();
+    let mut total = 0usize;
+    let push_port = |val: String, ports: &mut Vec<String>, total: &mut usize| {
+        if !val.is_empty() {
+            *total += 1;
+            if ports.len() < 2 {
+                ports.push(clip_label(&val, 24));
+            }
+        }
+    };
+
+    // Inline flow list: `ports: ["8080:8080", "8443:8443"]`
+    let inline = strip_yaml_comment(inline_val).trim();
+    if let Some(inner) = inline.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        for item in inner.split(',') {
+            let clean = unquote(item.trim()).trim();
+            if !clean.is_empty() {
+                push_port(clean.to_owned(), &mut ports, &mut total);
+            }
+        }
+        return (ports, total);
+    }
+
+    // Block sequence under `ports:` (short syntax `"8080:80"` or long syntax `target:`/`published:`)
+    let mut item_indent: Option<usize> = None;
+    let mut item_starts = Vec::new();
+    yaml_visit_lines(
+        text,
+        line_starts,
+        first + 1,
+        next,
+        |idx, indent, trimmed| {
+            if indent < prop_indent {
+                return false;
+            }
+            let target_indent = match item_indent {
+                Some(ind) => ind,
+                None => {
+                    if trimmed == "-" || trimmed.starts_with("- ") {
+                        item_indent = Some(indent);
+                        indent
+                    } else {
+                        return false;
+                    }
+                }
+            };
+            if indent == target_indent && (trimmed == "-" || trimmed.starts_with("- ")) {
+                item_starts.push(idx);
+            }
+            true
+        },
+    );
+
+    for (pos, &sfirst) in item_starts.iter().enumerate() {
+        let snext = item_starts.get(pos + 1).copied().unwrap_or(next);
+        let first_trimmed = line_text(text, line_starts, sfirst).trim();
+        let after_dash = first_trimmed
+            .strip_prefix("- ")
+            .map(str::trim_start)
+            .unwrap_or_default();
+        if !after_dash.is_empty() && yaml_mapping_key(after_dash).is_none() {
+            let clean = yaml_clean_scalar(after_dash);
+            if !clean.is_empty() && !yaml_is_block_scalar_indicator(after_dash) {
+                push_port(clean.to_owned(), &mut ports, &mut total);
+                continue;
+            }
+        }
+        // Long-syntax port mapping (`published:` + `target:`)
+        let mut published: Option<String> = None;
+        let mut target: Option<String> = None;
+        for idx in sfirst..snext {
+            let trimmed = line_text(text, line_starts, idx).trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let kv_str = if idx == sfirst {
+                trimmed
+                    .strip_prefix("- ")
+                    .map(str::trim_start)
+                    .unwrap_or(trimmed)
+            } else {
+                trimmed
+            };
+            if let Some((k, raw)) = yaml_mapping_key(kv_str) {
+                let val = yaml_clean_scalar(raw);
+                if val.is_empty() {
+                    continue;
+                }
+                match k {
+                    "published" if published.is_none() => published = Some(val.to_owned()),
+                    "target" if target.is_none() => target = Some(val.to_owned()),
+                    _ => {}
+                }
+            }
+        }
+        match (published, target) {
+            (Some(p), Some(t)) => push_port(format!("{p}:{t}"), &mut ports, &mut total),
+            (None, Some(t)) => push_port(t, &mut ports, &mut total),
+            (Some(p), None) => push_port(p, &mut ports, &mut total),
+            (None, None) => {}
+        }
+    }
+    (ports, total)
+}
+
+fn parse_compose_service(
+    text: &str,
+    line_starts: &[usize],
+    first: usize,
+    next: usize,
+    name: String,
+) -> ComposeService {
+    let mut image = None;
+    let mut build = None;
+    let mut ports = Vec::new();
+    let mut total_ports = 0usize;
+
+    if let Some(prop_indent) = yaml_first_child_indent(text, line_starts, first + 1, next) {
+        let props = yaml_keys_at_indent(text, line_starts, first + 1, next, prop_indent);
+        for (ppos, (pfirst, pkey)) in props.iter().enumerate() {
+            let pnext = props.get(ppos + 1).map_or(next, |p| p.0);
+            let trimmed = line_text(text, line_starts, *pfirst).trim();
+            let raw_val = yaml_mapping_key(trimmed).map_or("", |(_, v)| v);
+            match pkey.as_str() {
+                "image" if image.is_none() => {
+                    let clean = yaml_clean_scalar(raw_val);
+                    if !clean.is_empty() && !yaml_is_block_scalar_indicator(raw_val) {
+                        image = Some(clean.to_owned());
+                    }
+                }
+                "build" if build.is_none() => {
+                    build = parse_compose_build(text, line_starts, *pfirst, pnext, raw_val);
+                }
+                "ports" if total_ports == 0 => {
+                    (ports, total_ports) = parse_compose_ports(
+                        text,
+                        line_starts,
+                        *pfirst,
+                        pnext,
+                        raw_val,
+                        prop_indent,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    ComposeService {
+        first,
+        next,
+        name,
+        image,
+        build,
+        ports,
+        total_ports,
+    }
+}
+
+fn docker_compose_yaml_sections(
+    file: &str,
+    text: &str,
+    line_starts: &[usize],
+    start: usize,
+    end: usize,
+) -> Option<Vec<Section>> {
+    if yaml_has_unclosed_quote(text, line_starts, start, end) {
+        return None;
+    }
+    let top_keys = yaml_keys_at_indent(text, line_starts, start, end, 0);
+    // Do not hijack Kubernetes manifests.
+    if top_keys.iter().any(|(_, k)| k == "apiVersion")
+        && top_keys.iter().any(|(_, k)| k == "kind")
+        && top_keys.iter().any(|(_, k)| k == "metadata")
+    {
+        return None;
+    }
+
+    let services_pos = top_keys.iter().position(|(_, k)| k == "services")?;
+    let services_first = top_keys[services_pos].0;
+    let services_next = top_keys.get(services_pos + 1).map_or(end, |k| k.0);
+    if let Some((_, rest)) = yaml_mapping_key(line_text(text, line_starts, services_first).trim())
+        && !strip_yaml_comment(rest).trim().is_empty()
+    {
+        return None;
+    }
+    let svc_indent = yaml_first_child_indent(text, line_starts, services_first + 1, services_next)?;
+    let svc_keys = yaml_keys_at_indent(
+        text,
+        line_starts,
+        services_first + 1,
+        services_next,
+        svc_indent,
+    );
+    if svc_keys.is_empty() {
+        return None;
+    }
+
+    let mut services = Vec::with_capacity(svc_keys.len());
+    for (spos, (sfirst, sname)) in svc_keys.iter().enumerate() {
+        let snext = svc_keys.get(spos + 1).map_or(services_next, |s| s.0);
+        services.push(parse_compose_service(
+            text,
+            line_starts,
+            *sfirst,
+            snext,
+            sname.clone(),
+        ));
+    }
+
+    let has_compose_signal = services
+        .iter()
+        .any(|s| s.image.is_some() || s.build.is_some() || s.total_ports > 0);
+    if !is_docker_compose_path(file) && !has_compose_signal {
+        return None;
+    }
+
+    let offset = |line: usize| line_offset(line_starts, text.len(), line);
+    let mut out = Vec::new();
+    for (pos, (first, key)) in top_keys.iter().enumerate() {
+        let next = top_keys.get(pos + 1).map_or(end, |k| k.0);
+        match key.as_str() {
+            "services" => {
+                for svc in &services {
+                    let mut summary = Vec::new();
+                    if let Some(ref img) = svc.image {
+                        summary.push(format!("image={}", clip_label(img, 42)));
+                    } else if let Some(ref bld) = svc.build {
+                        summary.push(format!("build={}", clip_label(bld, 36)));
+                    }
+                    if !svc.ports.is_empty() {
+                        let extra = svc.total_ports.saturating_sub(svc.ports.len());
+                        let mut p = svc.ports.join(", ");
+                        if extra > 0 {
+                            p.push_str(&format!(", +{extra}"));
+                        }
+                        summary.push(format!("ports={p}"));
+                    }
+                    let base = format!("service.{}", svc.name);
+                    out.push(Section {
+                        name: format_bracketed_label(&base, &summary, 96),
+                        kind: "service",
+                        bytes: offset(svc.first)..offset(svc.next),
+                        signature_start: offset(svc.first),
+                        header_end: offset(svc.first),
+                    });
+                }
+            }
+            "volumes" | "networks" | "configs" | "secrets" => {
+                // Only extract child key names (NEVER values, file paths, or secret literals).
+                let mut child_preview = Vec::new();
+                if let Some(child_indent) =
+                    yaml_first_child_indent(text, line_starts, *first + 1, next)
+                {
+                    let children =
+                        yaml_keys_at_indent(text, line_starts, *first + 1, next, child_indent);
+                    for (_, cname) in children.iter().take(3) {
+                        child_preview.push(clip_label(cname, 24));
+                    }
+                    let extra = children.len().saturating_sub(3);
+                    if extra > 0 {
+                        child_preview.push(format!("+{extra}"));
+                    }
+                }
+                out.push(Section {
+                    name: format_bracketed_label(key, &child_preview, 96),
+                    kind: "section",
+                    bytes: offset(*first)..offset(next),
+                    signature_start: offset(*first),
+                    header_end: offset(*first),
+                });
+            }
+            _ => {
+                let raw_val = yaml_mapping_key(line_text(text, line_starts, *first).trim())
+                    .map_or("", |(_, rest)| rest);
+                let has_inline_value = !strip_yaml_comment(raw_val).trim().is_empty();
+                let is_sensitive_key = key.to_ascii_lowercase().contains("secret")
+                    || key.to_ascii_lowercase().contains("token")
+                    || key.to_ascii_lowercase().contains("password");
+                out.push(Section {
+                    name: clip_label(key, 96),
+                    kind: if has_inline_value { "key" } else { "section" },
+                    bytes: offset(*first)..offset(next),
+                    signature_start: offset(*first),
+                    header_end: if has_inline_value && !is_sensitive_key {
+                        offset(*first + 1)
+                    } else {
+                        offset(*first)
+                    },
+                });
+            }
+        }
+    }
+
+    (out.len() >= 2).then_some(out)
+}
+
+struct K8sDocInfo {
+    start: usize,
+    end: usize,
+    label: String,
+    has_rich_detail: bool,
+}
+
+fn k8s_mapping_key_count(
+    text: &str,
+    line_starts: &[usize],
+    start: usize,
+    end: usize,
+    keys_out: &mut BTreeSet<String>,
+) {
+    if let Some(child_indent) = yaml_first_child_indent(text, line_starts, start, end) {
+        for (_, k) in yaml_keys_at_indent(text, line_starts, start, end, child_indent) {
+            keys_out.insert(k);
+        }
+    }
+}
+
+fn k8s_sequence_item_count(
+    text: &str,
+    line_starts: &[usize],
+    start: usize,
+    end: usize,
+    min_indent: usize,
+) -> usize {
+    let mut item_indent: Option<usize> = None;
+    let mut count = 0usize;
+    yaml_visit_lines(text, line_starts, start, end, |_, indent, trimmed| {
+        if indent < min_indent {
+            return false;
+        }
+        let target = match item_indent {
+            Some(ind) => ind,
+            None => {
+                if trimmed == "-" || trimmed.starts_with("- ") {
+                    item_indent = Some(indent);
+                    indent
+                } else {
+                    return false;
+                }
+            }
+        };
+        if indent == target && (trimmed == "-" || trimmed.starts_with("- ")) {
+            count += 1;
+        }
+        true
+    });
+    count
+}
+
+fn k8s_workload_summary(
+    text: &str,
+    line_starts: &[usize],
+    spec_start: usize,
+    spec_end: usize,
+) -> (Vec<String>, bool) {
+    let mut replicas: Option<String> = None;
+    let mut schedule: Option<String> = None;
+    let mut images: Vec<String> = Vec::new();
+    let mut total_images = 0usize;
+
+    if let Some(spec_indent) = yaml_first_child_indent(text, line_starts, spec_start, spec_end) {
+        for (l, k) in yaml_keys_at_indent(text, line_starts, spec_start, spec_end, spec_indent) {
+            if let Some((_, raw)) = yaml_mapping_key(line_text(text, line_starts, l).trim()) {
+                let val = yaml_clean_scalar(raw);
+                if val.is_empty() || yaml_is_block_scalar_indicator(raw) {
+                    continue;
+                }
+                match k.as_str() {
+                    "replicas" if replicas.is_none() => replicas = Some(val.to_owned()),
+                    "schedule" if schedule.is_none() => schedule = Some(val.to_owned()),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    yaml_visit_lines(text, line_starts, spec_start, spec_end, |_, _, trimmed| {
+        let kv_str = trimmed
+            .strip_prefix("- ")
+            .map(str::trim_start)
+            .unwrap_or(trimmed);
+        if let Some(("image", raw)) = yaml_mapping_key(kv_str) {
+            let val = yaml_clean_scalar(raw);
+            if !val.is_empty() && !yaml_is_block_scalar_indicator(raw) {
+                total_images += 1;
+                if images.is_empty() {
+                    images.push(val.to_owned());
+                }
+            }
+        }
+        true
+    });
+
+    let has_rich = total_images > 0 || schedule.is_some();
+    let mut parts = Vec::new();
+    if let Some(r) = replicas {
+        parts.push(format!("replicas={}", clip_label(&r, 12)));
+    }
+    if let Some(sched) = schedule {
+        parts.push(format!("schedule={}", clip_label(&sched, 24)));
+    }
+    if let Some(first_img) = images.first() {
+        let mut s = format!("image={}", clip_label(first_img, 42));
+        if total_images > 1 {
+            s.push_str(&format!(" +{}", total_images - 1));
+        }
+        parts.push(s);
+    }
+    (parts, has_rich)
+}
+
+fn k8s_service_summary(
+    text: &str,
+    line_starts: &[usize],
+    spec_start: usize,
+    spec_end: usize,
+) -> (Vec<String>, bool) {
+    let mut svc_type: Option<String> = None;
+    let mut ports: Vec<String> = Vec::new();
+    let mut total_ports = 0usize;
+
+    if let Some(spec_indent) = yaml_first_child_indent(text, line_starts, spec_start, spec_end) {
+        let props = yaml_keys_at_indent(text, line_starts, spec_start, spec_end, spec_indent);
+        for (ppos, (pfirst, pkey)) in props.iter().enumerate() {
+            let pnext = props.get(ppos + 1).map_or(spec_end, |p| p.0);
+            match pkey.as_str() {
+                "type" if svc_type.is_none() => {
+                    if let Some((_, raw)) =
+                        yaml_mapping_key(line_text(text, line_starts, *pfirst).trim())
+                    {
+                        let val = yaml_clean_scalar(raw);
+                        if !val.is_empty() && !yaml_is_block_scalar_indicator(raw) {
+                            svc_type = Some(val.to_owned());
+                        }
+                    }
+                }
+                "ports" if total_ports == 0 => {
+                    yaml_visit_lines(text, line_starts, *pfirst + 1, pnext, |_, _, trimmed| {
+                        let kv_str = trimmed
+                            .strip_prefix("- ")
+                            .map(str::trim_start)
+                            .unwrap_or(trimmed);
+                        if let Some(("port", raw)) = yaml_mapping_key(kv_str) {
+                            let val = yaml_clean_scalar(raw);
+                            if !val.is_empty() {
+                                total_ports += 1;
+                                if ports.len() < 3 {
+                                    ports.push(clip_label(val, 12));
+                                }
+                            }
+                        }
+                        true
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let has_rich = svc_type.is_some() || total_ports > 0;
+    let mut parts = Vec::new();
+    if let Some(t) = svc_type {
+        parts.push(clip_label(&t, 20));
+    }
+    if !ports.is_empty() {
+        let extra = total_ports.saturating_sub(ports.len());
+        let mut s = format!("ports={}", ports.join(", "));
+        if extra > 0 {
+            s.push_str(&format!(", +{extra}"));
+        }
+        parts.push(s);
+    }
+    (parts, has_rich)
+}
+
+fn k8s_ingress_summary(
+    text: &str,
+    line_starts: &[usize],
+    spec_start: usize,
+    spec_end: usize,
+) -> Vec<String> {
+    let mut hosts = Vec::new();
+    let mut total_hosts = 0usize;
+    let mut class_name: Option<String> = None;
+
+    yaml_visit_lines(text, line_starts, spec_start, spec_end, |_, _, trimmed| {
+        let kv_str = trimmed
+            .strip_prefix("- ")
+            .map(str::trim_start)
+            .unwrap_or(trimmed);
+        if let Some((k, raw)) = yaml_mapping_key(kv_str) {
+            let val = yaml_clean_scalar(raw);
+            if !val.is_empty() && !yaml_is_block_scalar_indicator(raw) {
+                match k {
+                    "host" => {
+                        total_hosts += 1;
+                        if hosts.len() < 2 {
+                            hosts.push(clip_label(val, 32));
+                        }
+                    }
+                    "ingressClassName" if class_name.is_none() => {
+                        class_name = Some(val.to_owned());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        true
+    });
+
+    let mut parts = Vec::new();
+    if !hosts.is_empty() {
+        let extra = total_hosts.saturating_sub(hosts.len());
+        let mut s = hosts.join(", ");
+        if extra > 0 {
+            s.push_str(&format!(", +{extra}"));
+        }
+        parts.push(s);
+    } else if let Some(cls) = class_name {
+        parts.push(clip_label(&cls, 24));
+    }
+    parts
+}
+
+fn parse_k8s_doc(
+    text: &str,
+    line_starts: &[usize],
+    start: usize,
+    end: usize,
+) -> Option<K8sDocInfo> {
+    let top_keys = yaml_keys_at_indent(text, line_starts, start, end, 0);
+    let mut has_api_version = false;
+    let mut kind: Option<String> = None;
+    let mut metadata_span: Option<(usize, usize)> = None;
+    let mut spec_span: Option<(usize, usize)> = None;
+    let mut rules_span: Option<(usize, usize)> = None;
+    let mut secret_type: Option<String> = None;
+    let mut data_spans: Vec<(usize, usize)> = Vec::new();
+
+    for (pos, (first, key)) in top_keys.iter().enumerate() {
+        let next = top_keys.get(pos + 1).map_or(end, |k| k.0);
+        let raw_val =
+            yaml_mapping_key(line_text(text, line_starts, *first).trim()).map_or("", |(_, v)| v);
+        match key.as_str() {
+            "apiVersion" => {
+                if !yaml_clean_scalar(raw_val).is_empty() {
+                    has_api_version = true;
+                }
+            }
+            "kind" => {
+                let val = yaml_clean_scalar(raw_val);
+                if !val.is_empty() && !yaml_is_block_scalar_indicator(raw_val) {
+                    kind = Some(val.to_owned());
+                }
+            }
+            "metadata" => metadata_span = Some((*first + 1, next)),
+            "spec" => spec_span = Some((*first + 1, next)),
+            "rules" => rules_span = Some((*first + 1, next)),
+            "type" => {
+                let val = yaml_clean_scalar(raw_val);
+                if !val.is_empty() && !yaml_is_block_scalar_indicator(raw_val) {
+                    secret_type = Some(val.to_owned());
+                }
+            }
+            "data" | "stringData" | "binaryData" => {
+                data_spans.push((*first + 1, next));
+            }
+            _ => {}
+        }
+    }
+
+    if !has_api_version {
+        return None;
+    }
+    let kind = kind?;
+    let (meta_start, meta_end) = metadata_span?;
+
+    let mut meta_name: Option<String> = None;
+    let mut meta_gen_name: Option<String> = None;
+    let mut meta_namespace: Option<String> = None;
+    if let Some(meta_indent) = yaml_first_child_indent(text, line_starts, meta_start, meta_end) {
+        for (l, k) in yaml_keys_at_indent(text, line_starts, meta_start, meta_end, meta_indent) {
+            if let Some((_, raw)) = yaml_mapping_key(line_text(text, line_starts, l).trim()) {
+                let val = yaml_clean_scalar(raw);
+                if val.is_empty() || yaml_is_block_scalar_indicator(raw) {
+                    continue;
+                }
+                match k.as_str() {
+                    "name" if meta_name.is_none() => meta_name = Some(val.to_owned()),
+                    "generateName" if meta_gen_name.is_none() => {
+                        meta_gen_name = Some(val.to_owned())
+                    }
+                    "namespace" if meta_namespace.is_none() => {
+                        meta_namespace = Some(val.to_owned())
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let resource_name = meta_name.or(meta_gen_name);
+    let base = match (&meta_namespace, &resource_name) {
+        (Some(ns), Some(n)) => format!("{kind}/{ns}/{n}"),
+        (None, Some(n)) => format!("{kind}/{n}"),
+        (Some(ns), None) => format!("{kind}/{ns}"),
+        (None, None) => kind.clone(),
+    };
+
+    let mut has_rich_detail = meta_namespace.is_some();
+    let mut summary: Vec<String> = Vec::new();
+    let lower_kind = kind.to_ascii_lowercase();
+
+    match lower_kind.as_str() {
+        "secret" => {
+            // Security contract: NEVER read or print Secret `data:`/`stringData:` values!
+            has_rich_detail = true;
+            if let Some(t) = secret_type {
+                summary.push(clip_label(&t, 28));
+            }
+            let mut key_names = BTreeSet::new();
+            for &(ds, de) in &data_spans {
+                k8s_mapping_key_count(text, line_starts, ds, de, &mut key_names);
+            }
+            let count = key_names.len();
+            if count > 0 {
+                let noun = if count == 1 { "key" } else { "keys" };
+                summary.push(format!("{count} {noun}"));
+            }
+        }
+        "configmap" => {
+            has_rich_detail = true;
+            let mut key_names = BTreeSet::new();
+            for &(ds, de) in &data_spans {
+                k8s_mapping_key_count(text, line_starts, ds, de, &mut key_names);
+            }
+            let count = key_names.len();
+            if count > 0 {
+                let noun = if count == 1 { "key" } else { "keys" };
+                summary.push(format!("{count} {noun}"));
+            }
+        }
+        "deployment"
+        | "statefulset"
+        | "daemonset"
+        | "replicaset"
+        | "replicationcontroller"
+        | "job"
+        | "cronjob"
+        | "pod" => {
+            if let Some((ss, se)) = spec_span {
+                let (parts, rich) = k8s_workload_summary(text, line_starts, ss, se);
+                summary.extend(parts);
+                has_rich_detail |= rich;
+            }
+        }
+        "service" => {
+            if let Some((ss, se)) = spec_span {
+                let (parts, rich) = k8s_service_summary(text, line_starts, ss, se);
+                summary.extend(parts);
+                has_rich_detail |= rich;
+            }
+        }
+        "ingress" => {
+            has_rich_detail = true;
+            if let Some((ss, se)) = spec_span {
+                summary.extend(k8s_ingress_summary(text, line_starts, ss, se));
+            }
+        }
+        "role" | "clusterrole" => {
+            has_rich_detail = true;
+            if let Some((rs, re)) = rules_span {
+                let count = k8s_sequence_item_count(text, line_starts, rs, re, 0);
+                if count > 0 {
+                    let noun = if count == 1 { "rule" } else { "rules" };
+                    summary.push(format!("{count} {noun}"));
+                }
+            }
+        }
+        _ => {
+            if lower_kind.ends_with("secret") {
+                has_rich_detail = true;
+            }
+        }
+    }
+
+    Some(K8sDocInfo {
+        start,
+        end,
+        label: format_bracketed_label(&base, &summary, 96),
+        has_rich_detail,
+    })
+}
+
+fn k8s_multi_doc_sections(
+    text: &str,
+    line_starts: &[usize],
+    docs: &[(usize, usize)],
+) -> Option<Vec<Section>> {
+    if docs.len() < 2 || yaml_has_unclosed_quote(text, line_starts, 0, line_starts.len()) {
+        return None;
+    }
+
+    let mut parsed = Vec::with_capacity(docs.len());
+    for &(start, end) in docs {
+        parsed.push(parse_k8s_doc(text, line_starts, start, end)?);
+    }
+
+    // Activate enriched Kubernetes resource outlining for manifests with
+    // namespaces, workload images, service types/ports, ConfigMap/Secret/RBAC/
+    // Ingress resources, 3+ documents, or substantial length so tiny synthetic
+    // stub fixtures keep the compact generic multi-doc YAML view.
+    let rich =
+        docs.len() >= 3 || line_starts.len() >= 20 || parsed.iter().any(|d| d.has_rich_detail);
+    if !rich {
+        return None;
+    }
+
+    let offset = |line: usize| line_offset(line_starts, text.len(), line);
+    let mut out = Vec::with_capacity(parsed.len());
+    for doc in parsed {
+        out.push(Section {
+            name: doc.label,
+            kind: "resource",
+            bytes: offset(doc.start)..offset(doc.end),
+            signature_start: offset(doc.start),
+            header_end: offset(doc.start),
+        });
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -3737,7 +4737,9 @@ fn find_html_raw_close(text: &str, start: usize, tag: &str) -> Option<usize> {
         let close_start = i + rel;
         let name_start = close_start + 2;
         let name_end = name_start + tag.len();
-        if name_end <= bytes.len() && text[name_start..name_end].eq_ignore_ascii_case(tag) {
+        if name_end <= bytes.len()
+            && bytes[name_start..name_end].eq_ignore_ascii_case(tag.as_bytes())
+        {
             let mut j = name_end;
             while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                 j += 1;
@@ -7470,5 +8472,373 @@ mod tests {
                 "expected fail-closed for {file}: {broken:?}"
             );
         }
+    }
+
+    #[test]
+    fn docker_compose_yaml_outlines_services_and_top_level_sections() {
+        let compose = concat!(
+            "# 🚀 Production stack — 日本語コメント\n",
+            "name: acme-stack\n\n",
+            "services:\n",
+            "  api:\n",
+            "    build:\n",
+            "      context: ./services/api\n",
+            "      dockerfile: Dockerfile.prod\n",
+            "    ports:\n",
+            "      - \"8080:8080\"\n",
+            "      - target: 8443\n",
+            "        published: \"8443\"\n",
+            "    environment:\n",
+            "      API_MASTER_KEY: super_secret_env_never_leak\n",
+            "    command: |\n",
+            "      #!/bin/sh\n",
+            "      # fake_block_svc:\n",
+            "      #   image: evil:1\n",
+            "      fake_inline_svc:\n",
+            "        image: evil:2\n",
+            "      exec /app/server\n",
+            "    depends_on:\n",
+            "      - db\n\n",
+            "  db:\n",
+            "    image: postgres:16-alpine # primary DB\n",
+            "    ports: [\"5432:5432\"]\n",
+            "    volumes:\n",
+            "      - pgdata:/var/lib/postgresql/data\n\n",
+            "  worker:\n",
+            "    image: ghcr.io/acme/worker:2.1\n",
+            "    entrypoint:\n",
+            "      - /bin/sh\n",
+            "      - -c\n",
+            "      - >-\n",
+            "        fake_list_svc:\n",
+            "          image: evil:3\n",
+            "        exec /app/worker\n",
+            "    labels:\n",
+            "      note: \"multiline label\n",
+            "  fake_quoted_svc:\n",
+            "    image: evil:4\n",
+            "      done\"\n\n",
+            "volumes:\n",
+            "  pgdata:\n",
+            "    driver: local\n\n",
+            "networks:\n",
+            "  backend:\n",
+            "    driver: bridge\n\n",
+            "configs:\n",
+            "  nginx_conf:\n",
+            "    file: ./nginx.conf\n\n",
+            "secrets:\n",
+            "  db_password:\n",
+            "    file: ./private/db_pass_secret_path.txt\n",
+            "  api_token: literal_secret_token_never_leak\n",
+        );
+
+        for path in ["docker-compose.yml", "compose.prod.yaml", "infra/stack.yml"] {
+            let found = sections(path, compose, &line_starts(compose));
+            assert_section_invariants(compose, &found);
+            let pairs: Vec<_> = found.iter().map(|s| (s.kind, s.name.as_str())).collect();
+            assert_eq!(
+                pairs,
+                [
+                    ("key", "name"),
+                    (
+                        "service",
+                        "service.api [build=./services/api, ports=8080:8080, 8443:8443]"
+                    ),
+                    (
+                        "service",
+                        "service.db [image=postgres:16-alpine, ports=5432:5432]"
+                    ),
+                    ("service", "service.worker [image=ghcr.io/acme/worker:2.1]"),
+                    ("section", "volumes [pgdata]"),
+                    ("section", "networks [backend]"),
+                    ("section", "configs [nginx_conf]"),
+                    ("section", "secrets [db_password, api_token]"),
+                ],
+                "path={path}"
+            );
+
+            // Byte-exact spans for services and top-level sections.
+            let api_block = &compose[found[1].bytes.clone()];
+            assert!(api_block.starts_with("  api:\n"));
+            assert!(api_block.contains("exec /app/server"));
+            assert!(!api_block.contains("postgres:16-alpine"));
+            let db_block = &compose[found[2].bytes.clone()];
+            assert!(db_block.starts_with("  db:\n"));
+            assert!(db_block.contains("pgdata:/var/lib/postgresql/data"));
+            assert!(!db_block.contains("ghcr.io/acme/worker:2.1"));
+            let secrets_block = &compose[found[7].bytes.clone()];
+            assert!(secrets_block.starts_with("secrets:\n"));
+            assert!(secrets_block.ends_with("api_token: literal_secret_token_never_leak\n"));
+        }
+
+        // End-to-end Snapshot outline, byte reduction, and secret non-leakage.
+        let mut snap = crate::source::Snapshot::from_text("docker-compose.yml", compose.to_owned());
+        snap.index("docker-compose.yml").unwrap();
+        let page = snap.page("", None, 40, 4096).unwrap().display();
+        assert!(
+            page.contains(
+                "service service.api [build=./services/api, ports=8080:8080, 8443:8443]\n"
+            ),
+            "{page}"
+        );
+        assert!(
+            page.contains("section secrets [db_password, api_token]\n"),
+            "{page}"
+        );
+        for forbidden in [
+            "fake_block_svc",
+            "fake_inline_svc",
+            "fake_list_svc",
+            "fake_quoted_svc",
+            "super_secret_env_never_leak",
+            "db_pass_secret_path",
+            "literal_secret_token_never_leak",
+        ] {
+            assert!(!page.contains(forbidden), "leaked {forbidden} in:\n{page}");
+            let matched = snap.page(forbidden, None, 40, 4096).unwrap().display();
+            assert!(
+                !matched.contains("service.") && !matched.contains("secrets"),
+                "secret/fake {forbidden} matched in:\n{matched}"
+            );
+        }
+        assert!(
+            page.len() < compose.len() / 2,
+            "expected >50% outline reduction: outline={}B raw={}B",
+            page.len(),
+            compose.len()
+        );
+    }
+
+    #[test]
+    fn k8s_multi_doc_yaml_outlines_resources_without_leaking_secrets() {
+        let manifests = concat!(
+            "# ☸️ Production Kubernetes manifests — クラスター設定\n",
+            "---\n",
+            "apiVersion: apps/v1\n",
+            "kind: Deployment\n",
+            "metadata:\n",
+            "  name: api\n",
+            "  namespace: prod\n",
+            "spec:\n",
+            "  replicas: 3\n",
+            "  selector:\n",
+            "    matchLabels:\n",
+            "      app: api\n",
+            "  template:\n",
+            "    spec:\n",
+            "      containers:\n",
+            "        - name: api\n",
+            "          image: ghcr.io/acme/api:1.2.0\n",
+            "          command:\n",
+            "            - /bin/sh\n",
+            "            - -c\n",
+            "            - |\n",
+            "                ---\n",
+            "                image: fake-inside-block:0\n",
+            "                exec /app/api\n",
+            "        - image: envoyproxy/envoy:v1.31\n",
+            "          name: proxy\n",
+            "---\n",
+            "apiVersion: v1\n",
+            "kind: Service\n",
+            "metadata:\n",
+            "  name: api-svc\n",
+            "  namespace: prod\n",
+            "spec:\n",
+            "  type: ClusterIP\n",
+            "  ports:\n",
+            "    - name: http\n",
+            "      port: 80\n",
+            "      targetPort: 8080\n",
+            "    - port: 443\n",
+            "      targetPort: 8443\n",
+            "---\n",
+            "apiVersion: v1\n",
+            "kind: ConfigMap\n",
+            "metadata:\n",
+            "  name: app-config\n",
+            "  namespace: prod\n",
+            "data:\n",
+            "  LOG_LEVEL: info\n",
+            "  banner.txt: |\n",
+            "    Welcome 🚀\n",
+            "    ---\n",
+            "    not_a_doc: true\n",
+            "  quoted.txt: \"line one\n",
+            "---\n",
+            "still inside quoted scalar\"\n",
+            "---\n",
+            "apiVersion: v1\n",
+            "kind: Secret\n",
+            "metadata:\n",
+            "  name: db-creds\n",
+            "  namespace: prod\n",
+            "type: Opaque\n",
+            "data:\n",
+            "  DB_PASSWORD: c3VwZXItc2VjcmV0LXBhc3N3b3Jk\n",
+            "stringData:\n",
+            "  API_TOKEN: sk_live_never_leak_999\n",
+            "---\n",
+            "apiVersion: rbac.authorization.k8s.io/v1\n",
+            "kind: ClusterRole\n",
+            "metadata:\n",
+            "  name: pod-reader\n",
+            "rules:\n",
+            "  - apiGroups: [\"\"]\n",
+            "    resources: [\"pods\"]\n",
+            "    verbs: [\"get\", \"list\"]\n",
+        );
+
+        let found = sections("k8s/manifests.yaml", manifests, &line_starts(manifests));
+        assert_section_invariants(manifests, &found);
+        let pairs: Vec<_> = found.iter().map(|s| (s.kind, s.name.as_str())).collect();
+        assert_eq!(
+            pairs,
+            [
+                (
+                    "resource",
+                    "Deployment/prod/api [replicas=3, image=ghcr.io/acme/api:1.2.0 +1]"
+                ),
+                (
+                    "resource",
+                    "Service/prod/api-svc [ClusterIP, ports=80, 443]"
+                ),
+                ("resource", "ConfigMap/prod/app-config [3 keys]"),
+                ("resource", "Secret/prod/db-creds [Opaque, 2 keys]"),
+                ("resource", "ClusterRole/pod-reader [1 rule]"),
+            ]
+        );
+
+        // Byte-exact spans for every document (exact concatenation reproduces all docs).
+        assert!(manifests[found[0].bytes.clone()].starts_with("---\napiVersion: apps/v1\n"));
+        assert!(manifests[found[0].bytes.clone()].contains("envoyproxy/envoy:v1.31"));
+        assert!(!manifests[found[0].bytes.clone()].contains("kind: Service"));
+        assert!(manifests[found[2].bytes.clone()].contains("still inside quoted scalar\""));
+        assert!(manifests[found[3].bytes.clone()].contains("sk_live_never_leak_999"));
+        assert!(manifests[found[4].bytes.clone()].ends_with("verbs: [\"get\", \"list\"]\n"));
+        let first_doc_start = manifests.find("---\n").unwrap();
+        let rejoined: String = found.iter().map(|s| &manifests[s.bytes.clone()]).collect();
+        assert_eq!(rejoined, &manifests[first_doc_start..]);
+
+        // End-to-end Snapshot outline, byte reduction, and strict Secret non-leakage.
+        let mut snap =
+            crate::source::Snapshot::from_text("k8s/manifests.yaml", manifests.to_owned());
+        snap.index("k8s/manifests.yaml").unwrap();
+        let page = snap.page("", None, 40, 4096).unwrap().display();
+        assert!(
+            page.contains(
+                "resource Deployment/prod/api [replicas=3, image=ghcr.io/acme/api:1.2.0 +1]\n"
+            ),
+            "{page}"
+        );
+        assert!(
+            page.contains("resource Secret/prod/db-creds [Opaque, 2 keys]\n"),
+            "{page}"
+        );
+        for forbidden in [
+            "c3VwZXItc2VjcmV0LXBhc3N3b3Jk",
+            "sk_live_never_leak_999",
+            "fake-inside-block",
+            "not_a_doc",
+        ] {
+            assert!(!page.contains(forbidden), "leaked {forbidden} in:\n{page}");
+            let matched = snap.page(forbidden, None, 40, 4096).unwrap().display();
+            assert!(
+                !matched.contains("resource "),
+                "secret/fake {forbidden} matched in:\n{matched}"
+            );
+        }
+        assert!(
+            page.len() < manifests.len() / 2,
+            "expected >50% outline reduction: outline={}B raw={}B",
+            page.len(),
+            manifests.len()
+        );
+    }
+
+    #[test]
+    fn config_outline_utf8_safety_and_yaml_fail_closed_fallbacks() {
+        // 1. Non-compose YAML with `services:` lacking `image:`/`build:`/`ports:` fails closed
+        //    to generic YAML sections.
+        let generic_yaml = concat!(
+            "app: demo\n",
+            "services:\n",
+            "  billing:\n",
+            "    owner: finance\n",
+            "    tier: gold\n",
+            "  shipping:\n",
+            "    owner: logistics\n",
+            "    tier: silver\n",
+            "  support:\n",
+            "    owner: ops\n",
+            "    tier: bronze\n",
+        );
+        let generic = sections("config/app.yaml", generic_yaml, &line_starts(generic_yaml));
+        assert_section_invariants(generic_yaml, &generic);
+        assert!(generic.iter().all(|s| s.kind != "service"), "{generic:?}");
+        assert!(
+            generic
+                .iter()
+                .any(|s| s.kind == "key" && s.name == "services")
+        );
+
+        // 2. Malformed unclosed quote in compose / k8s YAML fails closed to generic YAML.
+        let broken_compose = concat!(
+            "services:\n",
+            "  web:\n",
+            "    image: \"unclosed\n",
+            "  db:\n",
+            "    image: postgres:16\n",
+        );
+        let bc = sections(
+            "docker-compose.yml",
+            broken_compose,
+            &line_starts(broken_compose),
+        );
+        assert_section_invariants(broken_compose, &bc);
+        assert!(bc.iter().all(|s| s.kind != "service"), "{bc:?}");
+
+        let broken_k8s = concat!(
+            "---\n",
+            "apiVersion: v1\n",
+            "kind: ConfigMap\n",
+            "metadata:\n",
+            "  name: a\n",
+            "data:\n",
+            "  msg: \"unclosed\n",
+            "---\n",
+            "apiVersion: v1\n",
+            "kind: Service\n",
+            "metadata:\n",
+            "  name: b\n",
+        );
+        let bk = sections("broken-k8s.yaml", broken_k8s, &line_starts(broken_k8s));
+        assert_section_invariants(broken_k8s, &bk);
+        assert!(bk.iter().all(|s| s.kind != "resource"), "{bk:?}");
+
+        // 3. Long multi-byte UTF-8 / emoji labels and HTML raw close never panic.
+        let long_utf8 = "🚀日本語サービス名前テスト".repeat(6);
+        let utf8_compose = format!(
+            "services:\n  api:\n    image: registry.example.com/{long_utf8}:latest\n    ports:\n      - \"8080:8080\"\n  db:\n    image: postgres:16\n"
+        );
+        let uc = sections("compose.yml", &utf8_compose, &line_starts(&utf8_compose));
+        assert_section_invariants(&utf8_compose, &uc);
+        assert_eq!(uc.len(), 2);
+        assert!(uc[0].name.ends_with(']'), "{}", uc[0].name);
+
+        let utf8_html = concat!(
+            "<html>\n",
+            "  <head>\n",
+            "    <script>const x = \"</abc🚀>\";</script>\n",
+            "  </head>\n",
+            "  <body>\n",
+            "    <main id=\"app\"><p>hello</p></main>\n",
+            "  </body>\n",
+            "</html>\n",
+        );
+        let uh = sections("index.html", utf8_html, &line_starts(utf8_html));
+        assert_section_invariants(utf8_html, &uh);
+        assert!(!uh.is_empty());
     }
 }
