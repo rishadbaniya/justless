@@ -8,6 +8,7 @@
 //!
 //! Only replaces the ordinary preview when the log is long enough and the
 //! folded summary fits within `max_bytes` and saves meaningful space.
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::sync::LazyLock;
@@ -44,12 +45,11 @@ static K8S_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\[(?:pod|deployment|statefulset|daemonset|job)/([^\]]+)\]\s?(.*)$").unwrap()
 });
 
-static COMPOSE_PREFIX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^([A-Za-z0-9][A-Za-z0-9_.-]{0,63})\s*\|\s?(.*)$").unwrap());
-
 static KLOG_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^([IWEF])(\d{4})\s+(\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+\d+\s+([^\]]+)\]\s?(.*)$")
-        .unwrap()
+    Regex::new(
+        r"^([IWEF])(\d{4})\s+(\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(?:0x[0-9a-fA-F]+|\d+)\s+([^\]]+)\]\s?(.*)$",
+    )
+    .unwrap()
 });
 
 // Consume a single separator space after the leading timestamp so indented
@@ -124,9 +124,6 @@ static IPV4_RE: LazyLock<Regex> =
 static HEX_ADDR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b0x[0-9a-fA-F]{4,}\b").unwrap());
 
-static HEX_TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b[0-9a-fA-F]{7,}\b").unwrap());
-
 static PREFIXED_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b([A-Za-z][A-Za-z0-9_]{1,15}[-_])([0-9a-fA-F]{6,}|\d{3,})\b").unwrap()
 });
@@ -144,8 +141,6 @@ static BRACKET_PID_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[\d+\]")
 static STANDALONE_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b\d+(?:\.\d+)?\b").unwrap());
 
-static MULTI_SPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t]{2,}").unwrap());
-
 static ZERO_ERROR_NOISE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:0\s+(?:errors?|warnings?|failures?|failed)|(?:errors?|warnings?|failures?|failed|err_count|error_count|fail_count|warn_count)\s*[=:]\s*0)\b")
         .unwrap()
@@ -162,6 +157,129 @@ static STRONG_ERROR_WORD: LazyLock<Regex> = LazyLock::new(|| {
 
 static STRONG_WARN_WORD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(?:warn|warning|deprecated)\b").unwrap());
+
+#[inline]
+fn strip_ansi(raw: &str) -> Cow<'_, str> {
+    if raw.contains('\x1b') {
+        crate::capture::ANSI.replace_all(raw, "")
+    } else {
+        Cow::Borrowed(raw)
+    }
+}
+
+#[inline]
+fn contains_ascii_icase(haystack: &[u8], needle_lower: &[u8]) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle_lower.len() {
+        return false;
+    }
+    let first_lo = needle_lower[0];
+    let first_hi = first_lo.to_ascii_uppercase();
+    let limit = haystack.len() - needle_lower.len();
+    let mut i = 0;
+    while i <= limit {
+        let b = haystack[i];
+        if (b == first_lo || b == first_hi)
+            && haystack[i..i + needle_lower.len()].eq_ignore_ascii_case(needle_lower)
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+#[inline]
+fn looks_like_klog(body: &str) -> bool {
+    let b = body.as_bytes();
+    b.len() >= 18
+        && matches!(b[0], b'I' | b'W' | b'E' | b'F')
+        && b[1].is_ascii_digit()
+        && b[2].is_ascii_digit()
+        && b[3].is_ascii_digit()
+        && b[4].is_ascii_digit()
+        && matches!(b[5], b' ' | b'\t')
+        && body.contains(']')
+}
+
+#[inline]
+fn may_start_with_ts(line: &str) -> bool {
+    let b = line.as_bytes();
+    let Some(&first) = b.first() else {
+        return false;
+    };
+    if first.is_ascii_digit() {
+        return b.len() >= 9 && (b[2] == b':' || b[2] == b'/' || b[4] == b'-' || b[4] == b'/');
+    }
+    if first == b'[' {
+        return b.len() >= 11
+            && (b[1].is_ascii_digit()
+                || matches!(b[1], b'J' | b'F' | b'M' | b'A' | b'S' | b'O' | b'N' | b'D'));
+    }
+    b.len() >= 15
+        && matches!(first, b'J' | b'F' | b'M' | b'A' | b'S' | b'O' | b'N' | b'D')
+        && b[3].is_ascii_whitespace()
+}
+
+#[inline]
+fn may_start_with_level(line: &str) -> bool {
+    let Some(&b) = line.as_bytes().first() else {
+        return false;
+    };
+    matches!(
+        b.to_ascii_uppercase(),
+        b'[' | b'('
+            | b'T'
+            | b'D'
+            | b'I'
+            | b'L'
+            | b'N'
+            | b'W'
+            | b'E'
+            | b'F'
+            | b'C'
+            | b'P'
+            | b'A'
+            | b'S'
+    )
+}
+
+#[inline]
+fn may_have_exception_name(line: &str) -> bool {
+    line.contains("Error")
+        || line.contains("Exception")
+        || line.contains("Fault")
+        || line.contains("Failure")
+}
+
+#[inline]
+fn may_have_http_status(text: &str) -> bool {
+    ((text.contains('=') || text.contains(':')) && contains_ascii_icase(text.as_bytes(), b"status"))
+        || text.contains("GET")
+        || text.contains("POST")
+        || text.contains("PUT")
+        || text.contains("PATCH")
+        || text.contains("DELETE")
+        || text.contains("HEAD")
+        || text.contains("OPTIONS")
+}
+
+#[inline]
+fn looks_like_dart_frame(trimmed: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix('#') else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return false;
+    }
+    let after = &rest[digits..];
+    after.starts_with([' ', '\t'])
+        && after.ends_with(')')
+        && (after.contains("(package:") || after.contains("(dart:") || after.contains(".dart:"))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Severity {
@@ -309,12 +427,6 @@ impl OpenBlock {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct PatternKey {
-    service: Option<String>,
-    template: String,
-}
-
 struct PatternEntry {
     service: Option<String>,
     template: String,
@@ -327,17 +439,24 @@ struct PatternEntry {
 }
 
 impl PatternEntry {
-    fn record(&mut self, stream: &str, line_no: usize, ts: Option<String>) {
+    fn record(&mut self, stream: &str, line_no: usize, ts: Option<&str>) {
         self.count += 1;
-        self.streams
-            .entry(stream.to_owned())
-            .and_modify(|(_, last)| *last = line_no)
-            .or_insert((line_no, line_no));
+        if let Some((_, last)) = self.streams.get_mut(stream) {
+            *last = line_no;
+        } else {
+            self.streams.insert(stream.to_owned(), (line_no, line_no));
+        }
         if let Some(ts) = ts {
             if self.first_ts.is_none() {
-                self.first_ts = Some(ts.clone());
+                self.first_ts = Some(ts.to_owned());
             }
-            self.last_ts = Some(ts);
+            match &mut self.last_ts {
+                Some(buf) => {
+                    buf.clear();
+                    buf.push_str(ts);
+                }
+                None => self.last_ts = Some(ts.to_owned()),
+            }
         }
     }
 
@@ -375,42 +494,61 @@ struct TailLine {
 
 struct Collector {
     services: Vec<String>,
-    service_seen: HashMap<String, ()>,
+    service_ids: HashMap<String, usize>,
     errors: Vec<ErrorEntry>,
     error_index: HashMap<ErrorKey, usize>,
     patterns: Vec<PatternEntry>,
-    pattern_index: HashMap<PatternKey, usize>,
+    /// Per-service template -> index in `patterns`. Bucket `0` is `service == None`,
+    /// bucket `svc_id + 1` is `Some(&services[svc_id])`. Enables zero-allocation
+    /// `&str` lookups on already-seen templates.
+    pattern_buckets: Vec<HashMap<String, usize>>,
     overflow_patterns: usize,
-    open_blocks: HashMap<(String, Option<String>), OpenBlock>,
+    /// Active error/warning blocks awaiting stack-trace continuations (typically 0..4).
+    open_blocks: Vec<OpenBlock>,
+    /// Reusable buffer for building normalized routine templates without per-line allocs.
+    scratch: String,
     next_order: usize,
     non_empty_lines: usize,
     total_lines: usize,
 }
 
 impl Collector {
-    fn new() -> Self {
+    fn new(expected_lines: usize) -> Self {
+        let pat_cap = expected_lines.min(64);
+        let mut pattern_buckets = Vec::with_capacity(8);
+        pattern_buckets.push(HashMap::with_capacity(pat_cap));
         Self {
-            services: Vec::new(),
-            service_seen: HashMap::new(),
-            errors: Vec::new(),
-            error_index: HashMap::new(),
-            patterns: Vec::new(),
-            pattern_index: HashMap::new(),
+            services: Vec::with_capacity(8),
+            service_ids: HashMap::with_capacity(8),
+            errors: Vec::with_capacity(16),
+            error_index: HashMap::with_capacity(16),
+            patterns: Vec::with_capacity(pat_cap),
+            pattern_buckets,
             overflow_patterns: 0,
-            open_blocks: HashMap::new(),
+            open_blocks: Vec::new(),
+            scratch: String::with_capacity(256),
             next_order: 0,
             non_empty_lines: 0,
-            total_lines: 0,
+            total_lines: expected_lines,
         }
     }
 
-    fn note_service(&mut self, service: Option<&str>) {
-        if let Some(svc) = service
-            && !svc.is_empty()
-            && self.service_seen.insert(svc.to_owned(), ()).is_none()
-        {
-            self.services.push(svc.to_owned());
+    fn note_service(&mut self, service: Option<&str>) -> usize {
+        let Some(svc) = service else {
+            return 0;
+        };
+        if svc.is_empty() {
+            return 0;
         }
+        if let Some(&id) = self.service_ids.get(svc) {
+            return id + 1;
+        }
+        let id = self.services.len();
+        let owned = svc.to_owned();
+        self.service_ids.insert(owned.clone(), id);
+        self.services.push(owned);
+        self.pattern_buckets.push(HashMap::with_capacity(16));
+        id + 1
     }
 
     fn add_error_entry(&mut self, key: ErrorKey, entry: ErrorEntry) {
@@ -425,16 +563,40 @@ impl Collector {
         }
     }
 
-    fn flush_open(&mut self, stream: &str, service: &Option<String>) {
-        let block_key = (stream.to_owned(), service.clone());
-        if let Some(block) = self.open_blocks.remove(&block_key) {
+    fn flush_open(&mut self, stream: &str, service: Option<&str>) {
+        if self.open_blocks.is_empty() {
+            return;
+        }
+        if let Some(pos) = self
+            .open_blocks
+            .iter()
+            .position(|b| b.stream == stream && b.service.as_deref() == service)
+        {
+            let block = self.open_blocks.swap_remove(pos);
             let (key, entry) = block.into_parts();
             self.add_error_entry(key, entry);
         }
     }
 
+    fn push_open_block(&mut self, block: OpenBlock) {
+        if !self.open_blocks.is_empty()
+            && let Some(pos) = self
+                .open_blocks
+                .iter()
+                .position(|b| b.stream == block.stream && b.service == block.service)
+        {
+            let prev = self.open_blocks.swap_remove(pos);
+            let (key, entry) = prev.into_parts();
+            self.add_error_entry(key, entry);
+        }
+        self.open_blocks.push(block);
+    }
+
     fn flush_all_open(&mut self) {
-        let mut pending: Vec<OpenBlock> = self.open_blocks.drain().map(|(_, b)| b).collect();
+        if self.open_blocks.is_empty() {
+            return;
+        }
+        let mut pending = std::mem::take(&mut self.open_blocks);
         pending.sort_by_key(|b| b.order);
         for block in pending {
             let (key, entry) = block.into_parts();
@@ -442,38 +604,39 @@ impl Collector {
         }
     }
 
-    fn record_routine(
+    /// Record a routine log event whose normalized template has already been
+    /// written into `self.scratch`. Performs zero heap allocations when the
+    /// `(service, template)` key has already been seen.
+    fn record_routine_from_scratch(
         &mut self,
         stream: &str,
         line_no: usize,
-        service: Option<String>,
-        template: String,
-        sample: String,
-        ts: Option<String>,
+        bucket: usize,
+        service: Option<&str>,
+        ts: Option<&str>,
+        make_sample: impl FnOnce() -> String,
     ) {
-        let key = PatternKey {
-            service: service.clone(),
-            template: template.clone(),
-        };
-        if let Some(&idx) = self.pattern_index.get(&key) {
+        if let Some(&idx) = self.pattern_buckets[bucket].get(self.scratch.as_str()) {
             self.patterns[idx].record(stream, line_no, ts);
         } else if self.patterns.len() < MAX_TRACKED_PATTERNS {
             let order = self.next_order;
             self.next_order += 1;
             let mut streams = BTreeMap::new();
             streams.insert(stream.to_owned(), (line_no, line_no));
+            let template = self.scratch.clone();
+            let ts_owned = ts.map(str::to_owned);
             let entry = PatternEntry {
-                service,
-                template,
-                sample,
+                service: service.map(str::to_owned),
+                template: template.clone(),
+                sample: make_sample(),
                 count: 1,
                 streams,
-                first_ts: ts.clone(),
-                last_ts: ts,
+                first_ts: ts_owned.clone(),
+                last_ts: ts_owned,
                 order,
             };
             let idx = self.patterns.len();
-            self.pattern_index.insert(key, idx);
+            self.pattern_buckets[bucket].insert(template, idx);
             self.patterns.push(entry);
         } else {
             self.overflow_patterns += 1;
@@ -525,24 +688,24 @@ fn format_streams(streams: &[(&str, &str)], max_bytes: usize) -> Option<String> 
         return None;
     }
 
-    let mut collector = Collector::new();
-    collector.total_lines = total_lines;
-    let mut tails_per_stream: Vec<VecDeque<TailLine>> = Vec::new();
+    let mut collector = Collector::new(total_lines);
+    let mut tails_per_stream: Vec<(&str, VecDeque<(usize, &str)>)> =
+        Vec::with_capacity(streams.len());
 
     for &(stream, text) in streams {
         if text.is_empty() {
             continue;
         }
         let compose_mode = detect_compose_stream(text);
-        let mut tail: VecDeque<TailLine> = VecDeque::with_capacity(MAX_TAIL_LINES);
+        let mut tail: VecDeque<(usize, &str)> = VecDeque::with_capacity(MAX_TAIL_LINES);
 
         for (idx, raw) in text.split_inclusive('\n').enumerate() {
             let line_no = idx + 1;
-            let stripped_ansi = crate::capture::ANSI.replace_all(raw, "");
+            let stripped_ansi = strip_ansi(raw);
             let line = stripped_ansi.trim_end_matches(['\n', '\r']);
             if line.trim().is_empty() {
                 // Blank line closes any open stack trace on the default (unprefixed) service.
-                collector.flush_open(stream, &None);
+                collector.flush_open(stream, None);
                 continue;
             }
             collector.non_empty_lines += 1;
@@ -550,17 +713,13 @@ fn format_streams(streams: &[(&str, &str)], max_bytes: usize) -> Option<String> 
             if tail.len() == MAX_TAIL_LINES {
                 tail.pop_front();
             }
-            tail.push_back(TailLine {
-                stream: stream.to_owned(),
-                line_no,
-                text: line.to_owned(),
-            });
+            tail.push_back((line_no, raw));
 
             observe_line(&mut collector, stream, line_no, line, compose_mode);
         }
 
         if !tail.is_empty() {
-            tails_per_stream.push(tail);
+            tails_per_stream.push((stream, tail));
         }
     }
     collector.flush_all_open();
@@ -599,7 +758,7 @@ fn detect_compose_stream(text: &str) -> bool {
     let mut non_empty = 0usize;
     let mut matched = 0usize;
     for raw in text.split_inclusive('\n') {
-        let stripped = crate::capture::ANSI.replace_all(raw, "");
+        let stripped = strip_ansi(raw);
         let line = stripped.trim_end_matches(['\n', '\r']);
         if line.trim().is_empty() {
             continue;
@@ -613,58 +772,94 @@ fn detect_compose_stream(text: &str) -> bool {
 }
 
 fn parse_compose_prefix(line: &str) -> Option<(&str, &str)> {
-    let caps = COMPOSE_PREFIX.captures(line)?;
-    let name = caps.get(1)?.as_str();
-    let rest = caps.get(2)?.as_str();
+    let bytes = line.as_bytes();
+    if !bytes.first().is_some_and(u8::is_ascii_alphanumeric) {
+        return None;
+    }
+    let bar = line.find('|')?;
+    let name = line[..bar].trim_end_matches([' ', '\t']);
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+    {
+        return None;
+    }
     if !name.bytes().any(|b| b.is_ascii_alphabetic()) || is_level_word(name) {
         return None;
     }
+    let after_bar = &line[bar + 1..];
+    let rest = after_bar
+        .strip_prefix(' ')
+        .or_else(|| after_bar.strip_prefix('\t'))
+        .unwrap_or(after_bar);
     Some((name, rest))
 }
 
 fn is_level_word(word: &str) -> bool {
-    matches!(
-        word.to_ascii_uppercase().as_str(),
-        "TRACE"
-            | "TRC"
-            | "DEBUG"
-            | "DBG"
-            | "INFO"
-            | "INF"
-            | "LOG"
-            | "NOTICE"
-            | "WARN"
-            | "WARNING"
-            | "WRN"
-            | "ERROR"
-            | "ERR"
-            | "ERRO"
-            | "FATAL"
-            | "FATA"
-            | "CRIT"
-            | "CRITICAL"
-            | "PANIC"
-            | "EMERG"
-            | "ALERT"
-            | "SEVERE"
-            | "FINE"
-            | "FINER"
-            | "FINEST"
-            | "ALL"
-            | "OFF"
-    )
+    if !(3..=8).contains(&word.len()) {
+        return false;
+    }
+    const LEVELS: &[&str] = &[
+        "TRACE", "TRC", "DEBUG", "DBG", "INFO", "INF", "LOG", "NOTICE", "WARN", "WARNING", "WRN",
+        "ERROR", "ERR", "ERRO", "FATAL", "FATA", "CRIT", "CRITICAL", "PANIC", "EMERG", "ALERT",
+        "SEVERE", "FINE", "FINER", "FINEST", "ALL", "OFF",
+    ];
+    LEVELS.iter().any(|lvl| word.eq_ignore_ascii_case(lvl))
 }
 
-fn strip_container_prefix(line: &str, compose_mode: bool) -> (Option<String>, &str) {
-    if let Some(caps) = K8S_PREFIX.captures(line) {
-        let svc = caps.get(1).unwrap().as_str().to_owned();
+fn strip_container_prefix(line: &str, compose_mode: bool) -> (Option<&str>, &str) {
+    if line.starts_with('[')
+        && matches!(line.as_bytes().get(1), Some(b'p' | b'd' | b's' | b'j'))
+        && let Some(caps) = K8S_PREFIX.captures(line)
+    {
+        let svc = caps.get(1).unwrap().as_str();
         let rest = caps.get(2).unwrap().as_str();
         return (Some(svc), rest);
     }
     if compose_mode && let Some((name, rest)) = parse_compose_prefix(line) {
-        return (Some(name.to_owned()), rest);
+        return (Some(name), rest);
     }
     (None, line)
+}
+
+fn handle_klog_line(
+    collector: &mut Collector,
+    stream: &str,
+    line_no: usize,
+    prefix_service: Option<&str>,
+    caps: &regex::Captures<'_>,
+) {
+    collector.flush_open(stream, prefix_service);
+    let sev_char = caps.get(1).unwrap().as_str();
+    let ts = caps.get(3).map(|m| m.as_str());
+    let src = caps.get(4).unwrap().as_str();
+    let msg = caps.get(5).unwrap().as_str();
+    let level_label = match sev_char {
+        "E" => "ERROR",
+        "F" => "FATAL",
+        "W" => "WARN",
+        _ => "INFO",
+    };
+    let severity = match sev_char {
+        "E" | "F" => Severity::Error,
+        "W" => Severity::Warning,
+        _ => classify_plain_severity(msg, true),
+    };
+    let bucket = collector.note_service(prefix_service);
+    let mut full = String::with_capacity(level_label.len() + src.len() + msg.len() + 4);
+    let _ = write!(full, "{level_label} {src}] {msg}");
+    record_plain_line(
+        collector,
+        stream,
+        line_no,
+        bucket,
+        prefix_service,
+        &full,
+        ts,
+        severity,
+    );
 }
 
 fn observe_line(
@@ -676,46 +871,22 @@ fn observe_line(
 ) {
     let (prefix_service, body) = strip_container_prefix(line, compose_mode);
     if body.trim().is_empty() {
-        collector.flush_open(stream, &prefix_service);
+        collector.flush_open(stream, prefix_service);
         return;
     }
 
     // Check if this line is a JSON/NDJSON object (possibly after a leading timestamp).
     if let Some(parsed_json) = try_parse_json_log(body) {
-        collector.flush_open(stream, &prefix_service);
+        collector.flush_open(stream, prefix_service);
         handle_json_log(collector, stream, line_no, prefix_service, parsed_json);
         return;
     }
 
     // Handle klog/glog format: `E1125 10:00:01.123456 1 main.go:42] message`
-    if let Some(caps) = KLOG_PREFIX.captures(body) {
-        collector.flush_open(stream, &prefix_service);
-        let sev_char = caps.get(1).unwrap().as_str();
-        let ts = Some(caps.get(3).unwrap().as_str().to_owned());
-        let src = caps.get(4).unwrap().as_str();
-        let msg = caps.get(5).unwrap().as_str();
-        let level_label = match sev_char {
-            "E" => "ERROR",
-            "F" => "FATAL",
-            "W" => "WARN",
-            _ => "INFO",
-        };
-        let severity = match sev_char {
-            "E" | "F" => Severity::Error,
-            "W" => Severity::Warning,
-            _ => classify_plain_severity(msg, true),
-        };
-        collector.note_service(prefix_service.as_deref());
-        let full = format!("{level_label} {src}] {msg}");
-        record_plain_line(
-            collector,
-            stream,
-            line_no,
-            prefix_service,
-            &full,
-            ts,
-            severity,
-        );
+    if looks_like_klog(body)
+        && let Some(caps) = KLOG_PREFIX.captures(body)
+    {
+        handle_klog_line(collector, stream, line_no, prefix_service, &caps);
         return;
     }
 
@@ -727,35 +898,45 @@ fn observe_line(
     };
     let had_ts = ts.is_some();
 
+    // Also handle klog/glog wrapped by `kubectl logs --timestamps` / `docker logs -t`.
+    if had_ts
+        && looks_like_klog(after_ts)
+        && let Some(caps) = KLOG_PREFIX.captures(after_ts)
+    {
+        handle_klog_line(collector, stream, line_no, prefix_service, &caps);
+        return;
+    }
+
     // Check syslog / journalctl `<host> <unit>[<pid>]: <msg>` when no container prefix was set.
-    let (service, effective_body, display_error_body) = if prefix_service.is_none() && had_ts {
+    let (service, effective_body, syslog_pid) = if prefix_service.is_none() && had_ts {
         if let Some((unit, pid, msg)) = parse_syslog_unit(after_ts) {
-            let err_body = match pid {
-                Some(p) => format!("[pid {p}] {}", msg.trim()),
-                None => msg.trim().to_owned(),
-            };
-            (Some(unit.to_owned()), msg, err_body)
+            (Some(unit), msg, pid)
         } else {
-            (None, after_ts, after_ts.trim().to_owned())
+            (None, after_ts, None)
         }
     } else {
-        (prefix_service, after_ts, after_ts.trim().to_owned())
+        (prefix_service, after_ts, None)
     };
 
     // Check if this line continues an open error/warning block on the same (stream, service).
     // Checking AFTER timestamp and syslog unit extraction lets stack traces stay attached even
     // under `docker logs -t`, `kubectl logs --prefix --timestamps`, and `journalctl`.
-    let block_key = (stream.to_owned(), service.clone());
-    if let Some(open) = collector.open_blocks.get(&block_key)
-        && is_continuation_line(effective_body, had_ts, open)
+    if !collector.open_blocks.is_empty()
+        && let Some(pos) = collector
+            .open_blocks
+            .iter()
+            .position(|b| b.stream == stream && b.service.as_deref() == service)
     {
-        let open = collector.open_blocks.get_mut(&block_key).unwrap();
-        open.push_frame(effective_body, line_no);
-        return;
+        if is_continuation_line(effective_body, had_ts, &collector.open_blocks[pos]) {
+            collector.open_blocks[pos].push_frame(effective_body, line_no);
+            return;
+        }
+        let block = collector.open_blocks.swap_remove(pos);
+        let (key, entry) = block.into_parts();
+        collector.add_error_entry(key, entry);
     }
-    collector.flush_open(stream, &service);
 
-    collector.note_service(service.as_deref());
+    let bucket = collector.note_service(service);
 
     let trimmed = effective_body.trim();
     let severity = classify_plain_severity(trimmed, false);
@@ -763,13 +944,17 @@ fn observe_line(
         let order = collector.next_order;
         collector.next_order += 1;
         let norm_header = normalize_template(trimmed);
+        let display_error_body = match syslog_pid {
+            Some(p) => format!("[pid {p}] {trimmed}"),
+            None => trimmed.to_owned(),
+        };
         let has_traceback = trimmed.starts_with("Traceback")
             || trimmed.starts_with("Stack trace:")
             || trimmed.starts_with("stack backtrace:")
-            || GOROUTINE_HEADER.is_match(trimmed);
+            || (trimmed.starts_with("goroutine ") && GOROUTINE_HEADER.is_match(trimmed));
         let block = OpenBlock {
             severity,
-            service: service.clone(),
+            service: service.map(str::to_owned),
             stream: stream.to_owned(),
             start_line: line_no,
             end_line: line_no,
@@ -782,23 +967,24 @@ fn observe_line(
             expect_chained_traceback: false,
             order,
         };
-        collector
-            .open_blocks
-            .insert((stream.to_owned(), service), block);
+        collector.push_open_block(block);
     } else {
-        let template = normalize_template(trimmed);
-        let sample = collapse_spaces(trimmed);
-        collector.record_routine(stream, line_no, service, template, sample, ts);
+        normalize_template_into(trimmed, &mut collector.scratch);
+        collector.record_routine_from_scratch(stream, line_no, bucket, service, ts, || {
+            collapse_spaces(trimmed)
+        });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_plain_line(
     collector: &mut Collector,
     stream: &str,
     line_no: usize,
-    service: Option<String>,
+    bucket: usize,
+    service: Option<&str>,
     body: &str,
-    ts: Option<String>,
+    ts: Option<&str>,
     severity: Severity,
 ) {
     let trimmed = body.trim();
@@ -807,7 +993,7 @@ fn record_plain_line(
         collector.next_order += 1;
         let block = OpenBlock {
             severity,
-            service: service.clone(),
+            service: service.map(str::to_owned),
             stream: stream.to_owned(),
             start_line: line_no,
             end_line: line_no,
@@ -820,22 +1006,24 @@ fn record_plain_line(
             expect_chained_traceback: false,
             order,
         };
-        collector
-            .open_blocks
-            .insert((stream.to_owned(), service), block);
+        collector.push_open_block(block);
     } else {
-        let template = normalize_template(trimmed);
-        let sample = collapse_spaces(trimmed);
-        collector.record_routine(stream, line_no, service, template, sample, ts);
+        normalize_template_into(trimmed, &mut collector.scratch);
+        collector.record_routine_from_scratch(stream, line_no, bucket, service, ts, || {
+            collapse_spaces(trimmed)
+        });
     }
 }
 
-fn extract_leading_ts(line: &str) -> (Option<String>, &str) {
+fn extract_leading_ts(line: &str) -> (Option<&str>, &str) {
+    if !may_start_with_ts(line) {
+        return (None, line);
+    }
     if let Some(caps) = LEADING_TS.captures(line) {
         let full = caps.get(0).unwrap();
         let rest = &line[full.end()..];
         if !rest.is_empty() {
-            let ts = caps.get(1).map(|m| m.as_str().to_owned());
+            let ts = caps.get(1).map(|m| m.as_str());
             return (ts, rest);
         }
     }
@@ -843,6 +1031,14 @@ fn extract_leading_ts(line: &str) -> (Option<String>, &str) {
 }
 
 fn parse_syslog_unit(line: &str) -> Option<(&str, Option<&str>, &str)> {
+    if !line.contains(": ")
+        || !line
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+    {
+        return None;
+    }
     let caps = SYSLOG_UNIT.captures(line)?;
     let host = caps.get(1)?.as_str();
     let unit = caps.get(2)?.as_str();
@@ -868,7 +1064,9 @@ fn is_continuation_line(body: &str, had_ts: bool, open: &OpenBlock) -> bool {
         return false;
     }
     // A fresh explicit log level (e.g. `INFO ...`, `ERROR ...`) always starts a new event.
-    if EXPLICIT_LEVEL.is_match(trimmed) || KLOG_PREFIX.is_match(trimmed) {
+    if (may_start_with_level(trimmed) && EXPLICIT_LEVEL.is_match(trimmed))
+        || (looks_like_klog(trimmed) && KLOG_PREFIX.is_match(trimmed))
+    {
         return false;
     }
     if trimmed.starts_with("Traceback (most recent call last):") {
@@ -882,15 +1080,22 @@ fn is_continuation_line(body: &str, had_ts: bool, open: &OpenBlock) -> bool {
         || trimmed.starts_with("The above exception was the direct cause")
         || trimmed.starts_with("Stack trace:")
         || trimmed.starts_with("stack backtrace:")
+        || trimmed.starts_with("Stack backtrace:")
         || trimmed.starts_with("note: run with `RUST_BACKTRACE")
         || (trimmed.starts_with("... ") && trimmed.ends_with(" more"))
-        || GOROUTINE_HEADER.is_match(trimmed)
+        || (trimmed.starts_with("goroutine ") && GOROUTINE_HEADER.is_match(trimmed))
         || trimmed.starts_with("created by ")
+        || trimmed == "<asynchronous suspension>"
+        || looks_like_dart_frame(trimmed)
     {
         return true;
     }
     // Final Python/Ruby/Java exception line after a traceback block.
-    if open.has_traceback && EXCEPTION_NAME.is_match(trimmed) && trimmed.contains(':') {
+    if open.has_traceback
+        && trimmed.contains(':')
+        && may_have_exception_name(trimmed)
+        && EXCEPTION_NAME.is_match(trimmed)
+    {
         return true;
     }
     // Indented lines are stack frames, Python traceback lines, or error elaboration.
@@ -903,33 +1108,38 @@ fn is_continuation_line(body: &str, had_ts: bool, open: &OpenBlock) -> bool {
     }
 }
 
-struct ParsedJson {
-    ts: Option<String>,
+struct ParsedJson<'a> {
+    leading_ts: Option<&'a str>,
     map: Map<String, Value>,
 }
 
-fn try_parse_json_log(body: &str) -> Option<ParsedJson> {
+fn try_parse_json_log(body: &str) -> Option<ParsedJson<'_>> {
     let trimmed = body.trim();
-    let (leading_ts, candidate) = if trimmed.starts_with('{') && trimmed.ends_with('}') {
+    // Fast path: JSON objects always end with `}` (even when preceded by a timestamp).
+    if !trimmed.ends_with('}') {
+        return None;
+    }
+    let (leading_ts, candidate) = if trimmed.starts_with('{') {
         (None, trimmed)
-    } else {
+    } else if trimmed.contains('{') {
         let (ts, rest) = extract_leading_ts(trimmed);
-        let rest_trimmed = rest.trim();
-        if rest_trimmed.starts_with('{') && rest_trimmed.ends_with('}') {
+        let rest_trimmed = rest.trim_start();
+        if rest_trimmed.starts_with('{') {
             (ts, rest_trimmed)
         } else {
             return None;
         }
+    } else {
+        return None;
     };
 
     let Value::Object(map) = serde_json::from_str::<Value>(candidate).ok()? else {
         return None;
     };
-    let ts = extract_json_ts(&map).or(leading_ts);
-    Some(ParsedJson { ts, map })
+    Some(ParsedJson { leading_ts, map })
 }
 
-fn extract_json_ts(map: &Map<String, Value>) -> Option<String> {
+fn extract_json_ts(map: &Map<String, Value>) -> Option<Cow<'_, str>> {
     for key in [
         "ts",
         "timestamp",
@@ -941,23 +1151,30 @@ fn extract_json_ts(map: &Map<String, Value>) -> Option<String> {
     ] {
         if let Some(val) = map.get(key) {
             match val {
-                Value::String(s) if !s.is_empty() => return Some(s.clone()),
+                Value::String(s) if !s.is_empty() => return Some(Cow::Borrowed(s.as_str())),
                 Value::Number(n) => {
-                    if let Some(v) = n.as_u64() {
-                        // Unix epoch in milliseconds or seconds (Pino/Bunyan/Zap).
-                        if v >= 1_000_000_000 {
-                            let secs = if v >= 10_000_000_000_000 {
-                                v / 1_000_000
-                            } else if v >= 10_000_000_000 {
-                                v / 1_000
-                            } else {
-                                v
-                            };
-                            let h = (secs / 3600) % 24;
-                            let m = (secs / 60) % 60;
-                            let s = secs % 60;
-                            return Some(format!("{h:02}:{m:02}:{s:02}Z"));
-                        }
+                    // Unix epoch in s/ms/us/ns as integer or float (Pino/Bunyan/Zap/K8s klog JSON).
+                    let v_opt = n.as_u64().or_else(|| {
+                        n.as_f64()
+                            .filter(|f| f.is_finite() && *f >= 1_000_000_000.0)
+                            .map(|f| f as u64)
+                    });
+                    if let Some(v) = v_opt
+                        && v >= 1_000_000_000
+                    {
+                        let secs = if v >= 10_000_000_000_000_000 {
+                            v / 1_000_000_000
+                        } else if v >= 10_000_000_000_000 {
+                            v / 1_000_000
+                        } else if v >= 10_000_000_000 {
+                            v / 1_000
+                        } else {
+                            v
+                        };
+                        let h = (secs / 3600) % 24;
+                        let m = (secs / 60) % 60;
+                        let s = secs % 60;
+                        return Some(Cow::Owned(format!("{h:02}:{m:02}:{s:02}Z")));
                     }
                 }
                 _ => {}
@@ -967,7 +1184,7 @@ fn extract_json_ts(map: &Map<String, Value>) -> Option<String> {
     None
 }
 
-fn extract_json_level(map: &Map<String, Value>) -> (Option<String>, Severity) {
+fn extract_json_level(map: &Map<String, Value>) -> (Option<Cow<'static, str>>, Severity) {
     for key in [
         "level",
         "severity",
@@ -979,36 +1196,73 @@ fn extract_json_level(map: &Map<String, Value>) -> (Option<String>, Severity) {
         if let Some(val) = map.get(key) {
             match val {
                 Value::String(s) if !s.is_empty() => {
-                    let upper = s.trim().to_ascii_uppercase();
-                    let sev = match upper.as_str() {
-                        "ERROR" | "ERR" | "ERRO" | "FATAL" | "FATA" | "CRIT" | "CRITICAL"
-                        | "PANIC" | "DPANIC" | "EMERG" | "EMERGENCY" | "ALERT" | "SEVERE" => {
-                            Severity::Error
-                        }
-                        "WARN" | "WARNING" | "WRN" => Severity::Warning,
-                        _ => Severity::Routine,
-                    };
-                    let label = match upper.as_str() {
-                        "WARNING" | "WRN" => "WARN".to_owned(),
-                        "ERR" | "ERRO" => "ERROR".to_owned(),
-                        "FATA" => "FATAL".to_owned(),
-                        "INF" => "INFO".to_owned(),
-                        "DBG" => "DEBUG".to_owned(),
-                        "TRC" => "TRACE".to_owned(),
-                        other => other.to_owned(),
-                    };
-                    return (Some(label), sev);
+                    let t = s.trim();
+                    if t.eq_ignore_ascii_case("info") || t.eq_ignore_ascii_case("inf") {
+                        return (Some(Cow::Borrowed("INFO")), Severity::Routine);
+                    }
+                    if t.eq_ignore_ascii_case("debug") || t.eq_ignore_ascii_case("dbg") {
+                        return (Some(Cow::Borrowed("DEBUG")), Severity::Routine);
+                    }
+                    if t.eq_ignore_ascii_case("trace") || t.eq_ignore_ascii_case("trc") {
+                        return (Some(Cow::Borrowed("TRACE")), Severity::Routine);
+                    }
+                    if t.eq_ignore_ascii_case("warn")
+                        || t.eq_ignore_ascii_case("warning")
+                        || t.eq_ignore_ascii_case("wrn")
+                    {
+                        return (Some(Cow::Borrowed("WARN")), Severity::Warning);
+                    }
+                    if t.eq_ignore_ascii_case("error")
+                        || t.eq_ignore_ascii_case("err")
+                        || t.eq_ignore_ascii_case("erro")
+                    {
+                        return (Some(Cow::Borrowed("ERROR")), Severity::Error);
+                    }
+                    if t.eq_ignore_ascii_case("fatal") || t.eq_ignore_ascii_case("fata") {
+                        return (Some(Cow::Borrowed("FATAL")), Severity::Error);
+                    }
+                    if t.eq_ignore_ascii_case("crit") {
+                        return (Some(Cow::Borrowed("CRIT")), Severity::Error);
+                    }
+                    if t.eq_ignore_ascii_case("critical") {
+                        return (Some(Cow::Borrowed("CRITICAL")), Severity::Error);
+                    }
+                    if t.eq_ignore_ascii_case("panic") {
+                        return (Some(Cow::Borrowed("PANIC")), Severity::Error);
+                    }
+                    if t.eq_ignore_ascii_case("dpanic") {
+                        return (Some(Cow::Borrowed("DPANIC")), Severity::Error);
+                    }
+                    if t.eq_ignore_ascii_case("emerg") {
+                        return (Some(Cow::Borrowed("EMERG")), Severity::Error);
+                    }
+                    if t.eq_ignore_ascii_case("emergency") {
+                        return (Some(Cow::Borrowed("EMERGENCY")), Severity::Error);
+                    }
+                    if t.eq_ignore_ascii_case("alert") {
+                        return (Some(Cow::Borrowed("ALERT")), Severity::Error);
+                    }
+                    if t.eq_ignore_ascii_case("severe") {
+                        return (Some(Cow::Borrowed("SEVERE")), Severity::Error);
+                    }
+                    if t.eq_ignore_ascii_case("notice") {
+                        return (Some(Cow::Borrowed("NOTICE")), Severity::Routine);
+                    }
+                    if t.eq_ignore_ascii_case("log") {
+                        return (Some(Cow::Borrowed("LOG")), Severity::Routine);
+                    }
+                    return (Some(Cow::Owned(t.to_ascii_uppercase())), Severity::Routine);
                 }
                 Value::Number(n) => {
                     // Pino / Bunyan numeric log levels.
                     if let Some(v) = n.as_u64() {
                         return match v {
-                            0..=15 => (Some("TRACE".to_owned()), Severity::Routine),
-                            16..=25 => (Some("DEBUG".to_owned()), Severity::Routine),
-                            26..=35 => (Some("INFO".to_owned()), Severity::Routine),
-                            36..=45 => (Some("WARN".to_owned()), Severity::Warning),
-                            46..=55 => (Some("ERROR".to_owned()), Severity::Error),
-                            _ => (Some("FATAL".to_owned()), Severity::Error),
+                            0..=15 => (Some(Cow::Borrowed("TRACE")), Severity::Routine),
+                            16..=25 => (Some(Cow::Borrowed("DEBUG")), Severity::Routine),
+                            26..=35 => (Some(Cow::Borrowed("INFO")), Severity::Routine),
+                            36..=45 => (Some(Cow::Borrowed("WARN")), Severity::Warning),
+                            46..=55 => (Some(Cow::Borrowed("ERROR")), Severity::Error),
+                            _ => (Some(Cow::Borrowed("FATAL")), Severity::Error),
                         };
                     }
                 }
@@ -1048,8 +1302,8 @@ fn handle_json_log(
     collector: &mut Collector,
     stream: &str,
     line_no: usize,
-    prefix_service: Option<String>,
-    parsed: ParsedJson,
+    prefix_service: Option<&str>,
+    parsed: ParsedJson<'_>,
 ) {
     let map = &parsed.map;
     let json_service = extract_json_string(
@@ -1066,8 +1320,8 @@ fn handle_json_log(
             "subsystem",
         ],
     );
-    let service = prefix_service.or_else(|| json_service.map(str::to_owned));
-    collector.note_service(service.as_deref());
+    let service = prefix_service.or(json_service);
+    let bucket = collector.note_service(service);
 
     let (level_opt, mut severity) = extract_json_level(map);
     let msg = extract_json_string(map, &["msg", "message", "event", "text"]);
@@ -1077,6 +1331,7 @@ fn handle_json_log(
         "err",
         "error",
         "exception",
+        "exc_info",
         "stack",
         "stacktrace",
         "traceback",
@@ -1109,21 +1364,21 @@ fn handle_json_log(
         && let Some(m) = msg
     {
         // Even on an INFO JSON entry, escalate unmistakable crash/panic/OOM messages.
-        let lower = m.to_ascii_lowercase();
-        if lower.contains("panic")
-            || lower.contains("oomkilled")
-            || lower.contains("out of memory")
-            || lower.contains("unhandled exception")
-            || lower.contains("fatal:")
+        let mb = m.as_bytes();
+        if contains_ascii_icase(mb, b"panic")
+            || contains_ascii_icase(mb, b"oomkilled")
+            || contains_ascii_icase(mb, b"out of memory")
+            || contains_ascii_icase(mb, b"unhandled exception")
+            || contains_ascii_icase(mb, b"fatal:")
         {
             severity = Severity::Error;
         }
     }
 
-    let level_label = level_opt.unwrap_or_else(|| match severity {
-        Severity::Error => "ERROR".to_owned(),
-        Severity::Warning => "WARN".to_owned(),
-        Severity::Routine => "INFO".to_owned(),
+    let level_label = level_opt.unwrap_or(match severity {
+        Severity::Error => Cow::Borrowed("ERROR"),
+        Severity::Warning => Cow::Borrowed("WARN"),
+        Severity::Routine => Cow::Borrowed("INFO"),
     });
 
     if severity != Severity::Routine {
@@ -1131,14 +1386,15 @@ fn handle_json_log(
         let order = collector.next_order;
         collector.next_order += 1;
         let line_ref = LineRef::single(stream, line_no);
+        let service_owned = service.map(str::to_owned);
         let key = ErrorKey {
             severity,
-            service: service.clone(),
+            service: service_owned.clone(),
             signature: sig,
         };
         let entry = ErrorEntry {
             severity,
-            service,
+            service: service_owned,
             header: truncate_line(&header, MAX_ERROR_LINE_BYTES),
             frames,
             omitted_frames: omitted,
@@ -1151,30 +1407,34 @@ fn handle_json_log(
         return;
     }
 
-    // Routine JSON log: fold by (service, level, normalized_msg).
-    let (template_body, sample_body) = if let Some(m) = msg {
-        let norm = normalize_template(m);
-        (
-            format!("{level_label} {norm}"),
-            format!("{level_label} {}", collapse_spaces(m)),
-        )
+    let ts = extract_json_ts(map).or_else(|| parsed.leading_ts.map(Cow::Borrowed));
+
+    // Routine JSON log: fold by (service, level, normalized_msg) with zero alloc on hit.
+    collector.scratch.clear();
+    collector.scratch.push_str(&level_label);
+    collector.scratch.push(' ');
+    if let Some(m) = msg {
+        append_normalized_template(m, &mut collector.scratch);
+        collector.record_routine_from_scratch(
+            stream,
+            line_no,
+            bucket,
+            service,
+            ts.as_deref(),
+            || format!("{level_label} {}", collapse_spaces_cow(m)),
+        );
     } else {
         let synth = synthesize_json_summary(map);
-        let norm = normalize_template(&synth);
-        (
-            format!("{level_label} {norm}"),
-            format!("{level_label} {synth}"),
-        )
-    };
-
-    collector.record_routine(
-        stream,
-        line_no,
-        service,
-        template_body,
-        sample_body,
-        parsed.ts,
-    );
+        append_normalized_template(&synth, &mut collector.scratch);
+        collector.record_routine_from_scratch(
+            stream,
+            line_no,
+            bucket,
+            service,
+            ts.as_deref(),
+            || format!("{level_label} {synth}"),
+        );
+    }
 }
 
 fn format_json_error(
@@ -1186,18 +1446,18 @@ fn format_json_error(
     let mut sig = String::from(level);
     if let Some(m) = msg {
         header.push(' ');
-        header.push_str(&collapse_spaces(m));
+        header.push_str(&collapse_spaces_cow(m));
         sig.push(' ');
-        sig.push_str(&normalize_template(m));
+        append_normalized_template(m, &mut sig);
     }
 
     // Collect embedded stack traces (top-level or nested inside `err`/`error`).
-    let mut stack_text: Option<String> = None;
-    for key in ["stack", "stacktrace", "traceback"] {
+    let mut stack_text: Option<&str> = None;
+    for key in ["stack", "stacktrace", "traceback", "exc_info"] {
         if let Some(Value::String(s)) = map.get(key)
             && !s.trim().is_empty()
         {
-            stack_text = Some(s.clone());
+            stack_text = Some(s.as_str());
             break;
         }
     }
@@ -1208,9 +1468,10 @@ fn format_json_error(
                     .get("stack")
                     .or_else(|| inner.get("stacktrace"))
                     .or_else(|| inner.get("traceback"))
+                    .or_else(|| inner.get("exc_info"))
                 && !s.trim().is_empty()
             {
-                stack_text = Some(s.clone());
+                stack_text = Some(s.as_str());
                 break;
             }
         }
@@ -1231,6 +1492,7 @@ fn format_json_error(
         "method",
         "path",
         "route",
+        "caller",
         "req_id",
         "request_id",
     ];
@@ -1264,6 +1526,7 @@ fn format_json_error(
         "stack",
         "stacktrace",
         "traceback",
+        "exc_info",
         "pid",
         "hostname",
         "v",
@@ -1299,6 +1562,23 @@ fn format_json_error(
         let formatted = format_json_field_value(val, false);
         if !formatted.is_empty() && formatted.len() <= 80 {
             details.push(format!("{key}={formatted}"));
+            if !matches!(
+                key.as_str(),
+                "trace_id"
+                    | "span_id"
+                    | "correlation_id"
+                    | "rid"
+                    | "cid"
+                    | "id"
+                    | "latency"
+                    | "latency_ms"
+                    | "duration"
+                    | "duration_ms"
+                    | "elapsed"
+                    | "elapsed_ms"
+            ) {
+                sig_details.push(format!("{key}={}", normalize_template(&formatted)));
+            }
             extra_budget -= 1;
         }
     }
@@ -1335,7 +1615,7 @@ fn format_json_error(
 
     if let Some(first_frame) = frames.first() {
         sig.push('\n');
-        sig.push_str(&normalize_template(first_frame.trim()));
+        append_normalized_template(first_frame.trim(), &mut sig);
     }
 
     (header, frames, omitted, sig)
@@ -1347,17 +1627,20 @@ fn format_json_field_value(val: &Value, strip_nested_stack: bool) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
         Value::String(s) => {
-            let clean = collapse_spaces(s.trim());
+            let clean = collapse_spaces_cow(s.trim());
             if clean.contains(' ') {
                 format!("\"{clean}\"")
             } else {
-                clean
+                clean.into_owned()
             }
         }
         Value::Object(obj) if strip_nested_stack => {
             let mut filtered = Map::new();
             for (k, v) in obj {
-                if !matches!(k.as_str(), "stack" | "stacktrace" | "traceback") {
+                if !matches!(
+                    k.as_str(),
+                    "stack" | "stacktrace" | "traceback" | "exc_info"
+                ) {
                     filtered.insert(k.clone(), v.clone());
                 }
             }
@@ -1420,27 +1703,58 @@ fn synthesize_json_summary(map: &Map<String, Value>) -> String {
 }
 
 fn classify_plain_severity(line: &str, explicit_info: bool) -> Severity {
-    // 1. Check explicit log-level prefix.
+    // 1. Check explicit log-level prefix (byte-guarded to skip numeric/non-level lines).
     let mut has_explicit_routine = explicit_info;
-    if let Some(caps) = EXPLICIT_LEVEL.captures(line) {
-        let lvl = caps.get(1).unwrap().as_str().to_ascii_uppercase();
-        match lvl.as_str() {
-            "ERROR" | "ERR" | "ERRO" | "FATAL" | "FATA" | "CRIT" | "CRITICAL" | "PANIC"
-            | "EMERG" | "ALERT" | "SEVERE" => return Severity::Error,
-            "WARN" | "WARNING" | "WRN" => return Severity::Warning,
-            _ => has_explicit_routine = true,
+    if may_start_with_level(line)
+        && let Some(caps) = EXPLICIT_LEVEL.captures(line)
+    {
+        let lvl = caps.get(1).unwrap().as_str();
+        if lvl.eq_ignore_ascii_case("error")
+            || lvl.eq_ignore_ascii_case("err")
+            || lvl.eq_ignore_ascii_case("erro")
+            || lvl.eq_ignore_ascii_case("fatal")
+            || lvl.eq_ignore_ascii_case("fata")
+            || lvl.eq_ignore_ascii_case("crit")
+            || lvl.eq_ignore_ascii_case("critical")
+            || lvl.eq_ignore_ascii_case("panic")
+            || lvl.eq_ignore_ascii_case("emerg")
+            || lvl.eq_ignore_ascii_case("alert")
+            || lvl.eq_ignore_ascii_case("severe")
+        {
+            return Severity::Error;
         }
+        if lvl.eq_ignore_ascii_case("warn")
+            || lvl.eq_ignore_ascii_case("warning")
+            || lvl.eq_ignore_ascii_case("wrn")
+        {
+            return Severity::Warning;
+        }
+        has_explicit_routine = true;
     }
 
-    // 2. HTTP 5xx in access logs is always an error.
-    if HTTP_5XX.is_match(line) {
+    // 2. HTTP 5xx in access logs is always an error (requires ASCII `'5'` and HTTP verb/status key).
+    if line.as_bytes().contains(&b'5') && may_have_http_status(line) && HTTP_5XX.is_match(line) {
         return Severity::Error;
     }
 
     // 3. Unmistakable crash / panic / traceback / OOM / runtime exception signals
     //    always escalate to Error even if prefixed with INFO.
-    let lower = line.to_ascii_lowercase();
-    if [
+    //    Lowercase into a stack buffer for typical lines (<= 512 B) to avoid heap allocs.
+    let src = line.as_bytes();
+    let mut stack = [0u8; 512];
+    let heap: Vec<u8>;
+    let lower_bytes: &[u8] = if src.len() <= stack.len() {
+        for (dst, &b) in stack[..src.len()].iter_mut().zip(src) {
+            *dst = b.to_ascii_lowercase();
+        }
+        &stack[..src.len()]
+    } else {
+        heap = src.to_ascii_lowercase();
+        &heap
+    };
+    let lower = std::str::from_utf8(lower_bytes).unwrap_or(line);
+
+    const CRASH_NEEDLES: &[&str] = &[
         "panic:",
         "panicked at",
         "traceback (most recent call last)",
@@ -1472,12 +1786,12 @@ fn classify_plain_severity(line: &str, explicit_info: bool) -> Severity {
         "failed with ",
         "could not ",
         "unable to ",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-        || GOROUTINE_HEADER.is_match(line)
-        || EXCEPTION_NAME.is_match(line)
-        || EXIT_NONZERO.is_match(line)
+    ];
+
+    if CRASH_NEEDLES.iter().any(|needle| lower.contains(needle))
+        || (line.starts_with("goroutine ") && GOROUTINE_HEADER.is_match(line))
+        || (may_have_exception_name(line) && EXCEPTION_NAME.is_match(line))
+        || (lower.contains("exit") && EXIT_NONZERO.is_match(line))
     {
         return Severity::Error;
     }
@@ -1485,7 +1799,11 @@ fn classify_plain_severity(line: &str, explicit_info: bool) -> Severity {
     // 4. For lines without an explicit INFO/DEBUG/TRACE/LOG prefix, also inspect
     //    general error/warning words (while ignoring `0 errors` / `errors=0` noise).
     if !has_explicit_routine {
-        let cleaned = ZERO_ERROR_NOISE.replace_all(line, "");
+        let cleaned = if src.contains(&b'0') {
+            ZERO_ERROR_NOISE.replace_all(line, "")
+        } else {
+            Cow::Borrowed(line)
+        };
         if STRONG_ERROR_WORD.is_match(&cleaned) {
             return Severity::Error;
         }
@@ -1501,98 +1819,260 @@ fn classify_plain_severity(line: &str, explicit_info: bool) -> Severity {
 /// while preserving `[redacted:...]` / `[REDACTED ...]` markers and HTTP status
 /// codes verbatim.
 fn normalize_template(line: &str) -> String {
-    // Split around redaction markers so no normalization pass can ever touch them.
     let mut out = String::with_capacity(line.len());
+    append_normalized_template(line, &mut out);
+    out
+}
+
+fn normalize_template_into(line: &str, out: &mut String) {
+    out.clear();
+    append_normalized_template(line, out);
+}
+
+fn append_normalized_template(line: &str, out: &mut String) {
+    // Fast path: skip `REDACTED_MARKER` regex completely unless `[` + `redacted` appear.
+    let has_redacted = line.contains('[') && contains_ascii_icase(line.as_bytes(), b"redacted");
+    if !has_redacted {
+        let norm = normalize_chunk(line);
+        let collapsed = collapse_spaces_cow(norm.trim());
+        out.push_str(&collapsed);
+        return;
+    }
+
+    // Split around redaction markers so no normalization pass can ever touch them.
+    let mut buf = String::with_capacity(line.len());
     let mut last = 0usize;
     for m in REDACTED_MARKER.find_iter(line) {
         if m.start() > last {
-            out.push_str(&normalize_chunk(&line[last..m.start()]));
+            buf.push_str(&normalize_chunk(&line[last..m.start()]));
         }
-        out.push_str(m.as_str());
+        buf.push_str(m.as_str());
         last = m.end();
     }
     if last < line.len() {
-        out.push_str(&normalize_chunk(&line[last..]));
+        buf.push_str(&normalize_chunk(&line[last..]));
     }
-    collapse_spaces(out.trim())
+    out.push_str(&collapse_spaces_cow(buf.trim()));
 }
 
-fn normalize_chunk(chunk: &str) -> String {
-    let s = INLINE_TS.replace_all(chunk, "<ts>");
-    let s = UUID_RE.replace_all(&s, "<id>");
-    let s = KV_ID_RE.replace_all(&s, "${1}${2}<id>");
-    let s = IPV6_RE.replace_all(&s, "<ip>");
-    let s = IPV4_RE.replace_all(&s, "<ip>");
-    let s = HEX_ADDR_RE.replace_all(&s, "<id>");
-    let s = replace_hex_ids(&s);
-    let s = replace_prefixed_ids(&s);
-    let s = DURATION_RE.replace_all(&s, "<dur>");
-    let s = BYTE_SIZE_RE.replace_all(&s, "<size>");
-    let s = replace_path_numeric_segments(&s);
-    let s = BRACKET_PID_RE.replace_all(&s, "[<id>]");
-    replace_numbers_preserving_context(&s)
+fn normalize_chunk(chunk: &str) -> Cow<'_, str> {
+    let mut has_digit = false;
+    let mut has_colon = false;
+    let mut has_eq = false;
+    let mut has_dot = false;
+    let mut has_slash = false;
+    let mut has_dash = false;
+    let mut has_underscore = false;
+    let mut has_lbracket = false;
+    for &b in chunk.as_bytes() {
+        match b {
+            b'0'..=b'9' => has_digit = true,
+            b':' => has_colon = true,
+            b'=' => has_eq = true,
+            b'.' => has_dot = true,
+            b'/' => has_slash = true,
+            b'-' => has_dash = true,
+            b'_' => has_underscore = true,
+            b'[' => has_lbracket = true,
+            _ => {}
+        }
+    }
+
+    // Fast path: plain text with no digits and no `=`/`:` key-value IDs needs zero regexes.
+    if !has_digit && !has_eq && !has_colon {
+        return Cow::Borrowed(chunk);
+    }
+
+    let mut s = Cow::Borrowed(chunk);
+
+    if has_digit && has_colon && (has_dash || has_slash) {
+        s = cow_replace(&INLINE_TS, s, "<ts>");
+    }
+    if has_digit && has_dash && s.len() >= 36 {
+        s = cow_replace(&UUID_RE, s, "<id>");
+    }
+    if has_eq || has_colon {
+        s = cow_replace(&KV_ID_RE, s, "${1}${2}<id>");
+    }
+    if !has_digit {
+        return s;
+    }
+
+    if has_colon && (has_lbracket || s.contains("::ffff:")) {
+        s = cow_replace(&IPV6_RE, s, "<ip>");
+    }
+    if has_dot {
+        s = cow_replace(&IPV4_RE, s, "<ip>");
+    }
+    if s.contains("0x") {
+        s = cow_replace(&HEX_ADDR_RE, s, "<id>");
+    }
+    if s.len() >= 7 {
+        s = cow_map(s, replace_hex_ids);
+    }
+    if has_dash || has_underscore {
+        s = cow_map(s, replace_prefixed_ids);
+    }
+    if s.bytes().any(|b| b.is_ascii_digit()) {
+        s = cow_replace(&DURATION_RE, s, "<dur>");
+    } else {
+        return s;
+    }
+    // Re-check digits after UUID/IP/ID/duration normalization: many log lines have none left!
+    if !s.bytes().any(|b| b.is_ascii_digit()) {
+        return s;
+    }
+    if s.contains(['b', 'B']) {
+        s = cow_replace(&BYTE_SIZE_RE, s, "<size>");
+    }
+    if has_slash {
+        s = cow_map(s, replace_path_numeric_segments);
+    }
+    if has_lbracket {
+        s = cow_replace(&BRACKET_PID_RE, s, "[<id>]");
+    }
+    if s.bytes().any(|b| b.is_ascii_digit()) {
+        s = cow_map(s, replace_numbers_preserving_context);
+    }
+    s
 }
 
-fn replace_hex_ids(text: &str) -> String {
-    HEX_TOKEN_RE
-        .replace_all(text, |caps: &regex::Captures| {
-            let tok = caps.get(0).unwrap().as_str();
-            let has_digit = tok.bytes().any(|b| b.is_ascii_digit());
-            let has_alpha = tok.bytes().any(|b| b.is_ascii_alphabetic());
-            // Replace mixed hex IDs (>= 7 chars) or very long pure hex digests (>= 16 chars),
-            // leaving English words (like `deadbeef`, `affected`) untouched and deferring pure
-            // digits to `<num>` / `<id>` rules.
-            if (has_digit && has_alpha) || (tok.len() >= 16 && has_digit) {
-                "<id>".to_owned()
-            } else {
-                tok.to_owned()
-            }
-        })
-        .into_owned()
+#[inline]
+fn cow_replace<'a>(re: &Regex, input: Cow<'a, str>, rep: &str) -> Cow<'a, str> {
+    match re.replace_all(&input, rep) {
+        Cow::Borrowed(_) => input,
+        Cow::Owned(owned) => Cow::Owned(owned),
+    }
 }
 
-fn replace_prefixed_ids(text: &str) -> String {
-    PREFIXED_ID_RE
-        .replace_all(text, |caps: &regex::Captures| {
-            let prefix = caps.get(1).unwrap().as_str();
-            let suffix = caps.get(2).unwrap().as_str();
-            let stem = prefix.trim_end_matches(['-', '_']).to_ascii_lowercase();
-            // Preserve well-known protocol/encoding/crypto identifiers.
-            if matches!(
-                stem.as_str(),
-                "utf"
-                    | "sha"
-                    | "aes"
-                    | "rsa"
-                    | "md"
-                    | "tls"
-                    | "ssl"
-                    | "http"
-                    | "rfc"
-                    | "iso"
-                    | "x86"
-                    | "arm"
-                    | "amd"
-                    | "win"
-                    | "ipv"
-                    | "base"
-            ) {
-                return caps.get(0).unwrap().as_str().to_owned();
+#[inline]
+fn cow_map<'a>(input: Cow<'a, str>, f: impl FnOnce(&str) -> Cow<'_, str>) -> Cow<'a, str> {
+    match f(&input) {
+        Cow::Borrowed(_) => input,
+        Cow::Owned(owned) => Cow::Owned(owned),
+    }
+}
+
+#[inline]
+fn is_word_boundary_before(text: &str, idx: usize) -> bool {
+    if idx == 0 {
+        return true;
+    }
+    let prev = text.as_bytes()[idx - 1];
+    if prev.is_ascii() {
+        !prev.is_ascii_alphanumeric() && prev != b'_'
+    } else {
+        text[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+    }
+}
+
+#[inline]
+fn is_word_boundary_after(text: &str, idx: usize) -> bool {
+    if idx >= text.len() {
+        return true;
+    }
+    let next = text.as_bytes()[idx];
+    if next.is_ascii() {
+        !next.is_ascii_alphanumeric() && next != b'_'
+    } else {
+        text[idx..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+    }
+}
+
+/// Pure-byte replacement of mixed hex IDs (`>= 7` hex chars with both digit & alpha)
+/// and long pure hex digests (`>= 16` chars with digit), returning `Cow::Borrowed`
+/// when nothing is replaced.
+fn replace_hex_ids(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    let mut copied = 0usize;
+    let mut out = String::new();
+
+    while i < len {
+        if bytes[i].is_ascii_hexdigit() {
+            let start = i;
+            let mut has_digit = false;
+            let mut has_alpha = false;
+            while i < len && bytes[i].is_ascii_hexdigit() {
+                if bytes[i].is_ascii_digit() {
+                    has_digit = true;
+                } else {
+                    has_alpha = true;
+                }
+                i += 1;
             }
-            let has_digit = suffix.bytes().any(|b| b.is_ascii_digit());
-            if has_digit {
-                format!("{prefix}<id>")
-            } else {
-                caps.get(0).unwrap().as_str().to_owned()
+            let tok_len = i - start;
+            if tok_len >= 7
+                && ((has_digit && has_alpha) || (tok_len >= 16 && has_digit))
+                && is_word_boundary_before(text, start)
+                && is_word_boundary_after(text, i)
+            {
+                if copied == 0 {
+                    out.reserve(len);
+                }
+                out.push_str(&text[copied..start]);
+                out.push_str("<id>");
+                copied = i;
             }
-        })
-        .into_owned()
+        } else {
+            i += 1;
+        }
+    }
+
+    if copied == 0 {
+        Cow::Borrowed(text)
+    } else {
+        out.push_str(&text[copied..]);
+        Cow::Owned(out)
+    }
+}
+
+fn replace_prefixed_ids(text: &str) -> Cow<'_, str> {
+    let mut copied = 0usize;
+    let mut out = String::new();
+    for caps in PREFIXED_ID_RE.captures_iter(text) {
+        let full = caps.get(0).unwrap();
+        let prefix = caps.get(1).unwrap().as_str();
+        let suffix = caps.get(2).unwrap().as_str();
+        if !suffix.bytes().any(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let stem = prefix.trim_end_matches(['-', '_']);
+        // Preserve well-known protocol/encoding/crypto identifiers.
+        const PRESERVE: &[&str] = &[
+            "utf", "sha", "aes", "rsa", "md", "tls", "ssl", "http", "rfc", "iso", "x86", "arm",
+            "amd", "win", "ipv", "base",
+        ];
+        if PRESERVE.iter().any(|p| stem.eq_ignore_ascii_case(p)) {
+            continue;
+        }
+        if copied == 0 {
+            out.reserve(text.len());
+        }
+        out.push_str(&text[copied..full.start()]);
+        out.push_str(prefix);
+        out.push_str("<id>");
+        copied = full.end();
+    }
+    if copied == 0 {
+        Cow::Borrowed(text)
+    } else {
+        out.push_str(&text[copied..]);
+        Cow::Owned(out)
+    }
 }
 
 /// Replace pure numeric URL path segments (`/users/12345/orders/99` -> `/users/<id>/orders/<id>`).
-fn replace_path_numeric_segments(text: &str) -> String {
+fn replace_path_numeric_segments(text: &str) -> Cow<'_, str> {
     let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
+    let mut out = String::new();
     let mut i = 0usize;
     let mut copied = 0usize;
 
@@ -1613,6 +2093,9 @@ fn replace_path_numeric_segments(text: &str) -> String {
                         b'/' | b'?' | b'#' | b' ' | b'\t' | b'"' | b'\'' | b')' | b',' | b']'
                     );
                 if boundary {
+                    if copied == 0 {
+                        out.reserve(text.len());
+                    }
                     out.push_str(&text[copied..=i]);
                     out.push_str("<id>");
                     copied = j;
@@ -1625,25 +2108,27 @@ fn replace_path_numeric_segments(text: &str) -> String {
     }
 
     if copied == 0 {
-        text.to_owned()
+        Cow::Borrowed(text)
     } else {
         out.push_str(&text[copied..]);
-        out
+        Cow::Owned(out)
     }
 }
 
 /// Replace standalone numbers with `<num>`, preserving HTTP status codes and
 /// protocol/version numbers (such as `HTTP/1.1`, `v2`, `UTF-8`, `SHA256`).
-fn replace_numbers_preserving_context(text: &str) -> String {
+fn replace_numbers_preserving_context(text: &str) -> Cow<'_, str> {
     let mut protected: Vec<(usize, usize)> = Vec::new();
-    for caps in HTTP_STATUS_SPAN.captures_iter(text) {
-        if let Some(m) = caps.get(1).or_else(|| caps.get(2)) {
-            protected.push((m.start(), m.end()));
+    if may_have_http_status(text) {
+        for caps in HTTP_STATUS_SPAN.captures_iter(text) {
+            if let Some(m) = caps.get(1).or_else(|| caps.get(2)) {
+                protected.push((m.start(), m.end()));
+            }
         }
     }
 
     let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
+    let mut out = String::new();
     let mut last = 0usize;
 
     for m in STANDALONE_NUM_RE.find_iter(text) {
@@ -1654,16 +2139,19 @@ fn replace_numbers_preserving_context(text: &str) -> String {
         if is_protected {
             continue;
         }
+        if last == 0 {
+            out.reserve(text.len());
+        }
         out.push_str(&text[last..start]);
         out.push_str("<num>");
         last = end;
     }
 
     if last == 0 {
-        text.to_owned()
+        Cow::Borrowed(text)
     } else {
         out.push_str(&text[last..]);
-        out
+        Cow::Owned(out)
     }
 }
 
@@ -1682,8 +2170,8 @@ fn is_version_or_proto_num(text: &str, bytes: &[u8], start: usize) -> bool {
     {
         return true;
     }
-    // Preserve `v1`, `v2.0`, etc. (note: `\b` wouldn't fire after `v`, but handle `v 1`? No,
-    // handle dots inside `v1.2.3` where `.2` starts after `.`!).
+    // Preserve `v1`, `v2.0`, etc. (note: `\b` wouldn't fire after `v`, but handle
+    // dots inside `v1.2.3` where `.2` starts after `.`!).
     if bytes[start - 1] == b'.' {
         // Preserve semver/protocol dotted components like `HTTP/1.1` or `v1.2.3`.
         let prev = &bytes[..start - 1];
@@ -1705,8 +2193,42 @@ fn is_version_or_proto_num(text: &str, bytes: &[u8], start: usize) -> bool {
     false
 }
 
+fn collapse_spaces_cow(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if matches!(bytes[i], b' ' | b'\t') && matches!(bytes[i + 1], b' ' | b'\t') {
+            let mut out = String::with_capacity(text.len());
+            out.push_str(&text[..i]);
+            out.push(' ');
+            i += 2;
+            while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+                i += 1;
+            }
+            let mut copied = i;
+            while i + 1 < bytes.len() {
+                if matches!(bytes[i], b' ' | b'\t') && matches!(bytes[i + 1], b' ' | b'\t') {
+                    out.push_str(&text[copied..i]);
+                    out.push(' ');
+                    i += 2;
+                    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+                        i += 1;
+                    }
+                    copied = i;
+                } else {
+                    i += 1;
+                }
+            }
+            out.push_str(&text[copied..]);
+            return Cow::Owned(out);
+        }
+        i += 1;
+    }
+    Cow::Borrowed(text)
+}
+
 fn collapse_spaces(text: &str) -> String {
-    MULTI_SPACE_RE.replace_all(text, " ").into_owned()
+    collapse_spaces_cow(text).into_owned()
 }
 
 fn truncate_line(text: &str, limit: usize) -> String {
@@ -1773,17 +2295,31 @@ fn split_date_time(ts: &str) -> Option<(&str, &str)> {
     }
 }
 
-fn select_tail_lines(mut per_stream: Vec<VecDeque<TailLine>>) -> Vec<TailLine> {
+fn materialize_tail_line(stream: &str, line_no: usize, raw: &str) -> TailLine {
+    let stripped = strip_ansi(raw);
+    let line = stripped.trim_end_matches(['\n', '\r']);
+    TailLine {
+        stream: stream.to_owned(),
+        line_no,
+        text: line.to_owned(),
+    }
+}
+
+fn select_tail_lines(mut per_stream: Vec<(&str, VecDeque<(usize, &str)>)>) -> Vec<TailLine> {
     if per_stream.is_empty() {
         return Vec::new();
     }
     if per_stream.len() == 1 {
-        return per_stream.pop().unwrap().into_iter().collect();
+        let (stream, queue) = per_stream.pop().unwrap();
+        return queue
+            .into_iter()
+            .map(|(line_no, raw)| materialize_tail_line(stream, line_no, raw))
+            .collect();
     }
     // Both stdout and stderr have content: keep up to 2 recent stdout + 1 recent stderr.
     let mut out = Vec::with_capacity(MAX_TAIL_LINES);
-    let mut first = per_stream.remove(0);
-    let mut second = per_stream.remove(0);
+    let (stream1, mut first) = per_stream.remove(0);
+    let (stream2, mut second) = per_stream.remove(0);
     let take_first = if second.is_empty() {
         MAX_TAIL_LINES
     } else {
@@ -1792,9 +2328,11 @@ fn select_tail_lines(mut per_stream: Vec<VecDeque<TailLine>>) -> Vec<TailLine> {
     while first.len() > take_first {
         first.pop_front();
     }
-    out.extend(first);
-    if let Some(last_second) = second.pop_back() {
-        out.push(last_second);
+    for (line_no, raw) in first {
+        out.push(materialize_tail_line(stream1, line_no, raw));
+    }
+    if let Some((line_no, raw)) = second.pop_back() {
+        out.push(materialize_tail_line(stream2, line_no, raw));
     }
     out
 }
@@ -1820,7 +2358,8 @@ fn render_report(
     if header.len() > max_bytes {
         return None;
     }
-    let mut out = header;
+    let mut out = String::with_capacity(max_bytes.min(raw_bytes));
+    out.push_str(&header);
 
     // 1. Errors & Warnings section FIRST — routine chatter can never displace errors.
     if !collector.errors.is_empty() {
@@ -2664,5 +3203,179 @@ mod tests {
         // Binary data with NUL returns None.
         let bin = "INFO ok\0binary\n".repeat(20);
         assert_eq!(format(&bin, "", 8192), None);
+    }
+
+    #[test]
+    fn json_zap_pino_zerolog_slog_burst_dedup_pins_errors_warns_verbatim() {
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut line_no = 0usize;
+
+        // 1) Zap float-second timestamps with repetitive info/debug bursts + 1 caller-annotated error.
+        for i in 1..=60 {
+            let ts = 1712001600.0 + (i as f64) * 1.25;
+            stdout.push_str(&format!(
+                r#"{{"level":"info","ts":{ts:.6},"service":"billing","caller":"billing/worker.go:42","msg":"processed invoice inv-{i:04} in {i}ms"}}"#
+            ));
+            stdout.push('\n');
+            line_no += 1;
+            stdout.push_str(&format!(
+                r#"{{"level":"debug","ts":{ts:.6},"service":"billing","msg":"cache lookup key=user-{i:04} hit"}}"#
+            ));
+            stdout.push('\n');
+            line_no += 1;
+        }
+        stdout.push_str(
+            r#"{"level":"error","ts":1712001690.500000,"service":"billing","caller":"billing/charge.go:91","msg":"stripe charge declined","error":"card_declined","req_id":"req-9001"}"#,
+        );
+        stdout.push('\n');
+        line_no += 1;
+        let zap_err_line = line_no;
+
+        // 2) Pino numeric levels (20=debug, 30=info, 40=warn, 60=fatal) + nested err stack.
+        for i in 1..=40 {
+            let ts_ms = 1712001700000u64 + (i as u64) * 1000;
+            stdout.push_str(&format!(
+                r#"{{"time":{ts_ms},"level":30,"service":"gateway","msg":"proxy ok 10.0.0.{} GET /orders/{} 200 {}ms"}}"#,
+                (i % 20) + 1,
+                1000 + i,
+                i + 2
+            ));
+            stdout.push('\n');
+            line_no += 1;
+        }
+        stdout.push_str(
+            r#"{"time":1712001750000,"level":40,"service":"gateway","msg":"slow upstream","route":"/orders","latency_ms":2450}"#,
+        );
+        stdout.push('\n');
+        line_no += 1;
+        let pino_warn_line = line_no;
+
+        // Distinct semantic warning with same msg but different route must NOT merge with /orders!
+        stdout.push_str(
+            r#"{"time":1712001751000,"level":40,"service":"gateway","msg":"slow upstream","route":"/refunds","latency_ms":3100}"#,
+        );
+        stdout.push('\n');
+        line_no += 1;
+        let pino_warn2_line = line_no;
+
+        // 3) Kubernetes klog JSON with float ms timestamps + zerolog/slog fatal on stderr.
+        let k8s_start = line_no + 1;
+        for i in 1..=30 {
+            let ts_ms = 1712001800000.25 + (i as f64) * 500.0;
+            stdout.push_str(&format!(
+                r#"{{"ts":{ts_ms:.3},"caller":"controller/sync.go:88","service":"k8s","msg":"Synced pod default/web-{i:04}","v":0}}"#
+            ));
+            stdout.push('\n');
+            line_no += 1;
+        }
+        let k8s_end = line_no;
+        stderr.push_str(
+            r#"{"time":"2026-04-01T12:05:00Z","level":"FATAL","service":"gateway","msg":"tls cert expired","err":{"message":"x509: certificate has expired","stack":"Error: x509\n  at loadTls (/app/tls.js:18:9)"}}"#,
+        );
+        stderr.push('\n');
+
+        let raw_len = stdout.len() + stderr.len();
+        let out = format(&stdout, &stderr, 8192).expect("structured JSON log burst should fold");
+        let reduction = 100.0 * (1.0 - out.len() as f64 / raw_len as f64);
+        assert!(
+            reduction >= 80.0,
+            "expected >= 80% reduction, got {reduction:.1}%\n{out}"
+        );
+
+        // Info/debug bursts collapse into ×N templates with Zap float-ts time spans.
+        assert!(
+            out.contains("×60 [billing] INFO processed invoice inv-<id> in <dur> ("),
+            "{out}"
+        );
+        assert!(
+            out.contains("×60 [billing] DEBUG cache lookup key=user-<id> hit ("),
+            "{out}"
+        );
+        assert!(
+            out.contains("×40 [gateway] INFO proxy ok <ip> GET /orders/<id> 200 <dur> ("),
+            "{out}"
+        );
+        assert!(
+            out.contains("×30 [k8s] INFO Synced pod default/web-<id> (")
+                && out.contains(&format!("[stdout:{k8s_start}-{k8s_end}]")),
+            "{out}"
+        );
+
+        // Error, fatal, and BOTH distinct warnings are pinned verbatim with exact line refs!
+        assert!(
+            out.contains(&format!(
+                "[billing] ERROR stripe charge declined | error=card_declined caller=billing/charge.go:91 req_id=req-9001 [stdout:{zap_err_line}]"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "[gateway] WARN slow upstream | route=/orders latency_ms=2450 [stdout:{pino_warn_line}]"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "[gateway] WARN slow upstream | route=/refunds latency_ms=3100 [stdout:{pino_warn2_line}]"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("[gateway] FATAL tls cert expired")
+                && out.contains("[stderr:1]")
+                && out.contains("at loadTls (/app/tls.js:18:9)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn klog_glog_with_timestamps_and_prefixed_pods_folds_info_and_pins_errors_warns() {
+        let mut stdout = String::new();
+        let mut line_no = 0usize;
+
+        for i in 1..=50 {
+            stdout.push_str(&format!(
+                "2026-04-01T12:00:{:02}.123456Z I0401 12:00:{:02}.123456 12345 controller.go:88] synced pod default/worker-{i:04} in {i}ms\n",
+                i % 60,
+                i % 60,
+            ));
+            line_no += 1;
+        }
+        stdout.push_str(
+            "2026-04-01T12:00:51.000001Z W0401 12:00:51.000001 12345 controller.go:112] retry backoff 4000ms for pod default/db-0\n",
+        );
+        line_no += 1;
+        let warn_line = line_no;
+
+        stdout.push_str(
+            "2026-04-01T12:00:52.000002Z E0401 12:00:52.000002 12345 controller.go:140] reconcile failed for pod default/db-0: etcd timeout\n",
+        );
+        line_no += 1;
+        let err_line = line_no;
+
+        let raw_len = stdout.len();
+        let out = format(&stdout, "", 8192).expect("timestamped klog should fold");
+        let reduction = 100.0 * (1.0 - out.len() as f64 / raw_len as f64);
+        assert!(
+            reduction >= 80.0,
+            "expected >= 80% reduction, got {reduction:.1}%\n{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "ERROR controller.go:140] reconcile failed for pod default/db-0: etcd timeout [stdout:{err_line}]"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "WARN controller.go:112] retry backoff 4000ms for pod default/db-0 [stdout:{warn_line}]"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("×50 INFO controller.go:<num>] synced pod default/worker-<id> in <dur>"),
+            "{out}"
+        );
     }
 }

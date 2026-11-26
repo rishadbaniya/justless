@@ -1,13 +1,14 @@
 //! Workspace-aware stack-trace frame collapsing across Node/V8/Deno/Bun,
-//! Python, Java/Kotlin/Scala, Go, and Rust.
+//! Python, Java/Kotlin/Scala, Go, Rust, and Dart/Flutter.
 //!
 //! Keeps 100% of error/panic/exception headers, the immediate throw-site frame
-//! (top-most for Node/Java/Go/Rust, bottom-most for Python), 100% of workspace
-//! frames, and any frame containing a redaction marker. Contiguous runs of 3 or
-//! more non-kept external/runtime frames collapse into a single summary line
-//! naming the top 1–2 external packages and the exact 1-based archive line
-//! range, only when strictly smaller than the frames it replaces.
+//! (top-most for Node/Java/Go/Rust/Dart, bottom-most for Python), 100% of
+//! workspace frames, and any frame containing a redaction marker. Contiguous
+//! runs of 3 or more non-kept external/runtime frames collapse into a single
+//! summary line naming the top 1–2 external packages and the exact 1-based
+//! archive line range, only when strictly smaller than the frames it replaces.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::LazyLock;
@@ -34,11 +35,6 @@ static JAVA_FRAME: LazyLock<Regex> = LazyLock::new(|| {
     .expect("java frame pattern")
 });
 
-/// Rust backtrace frame header: `   0: symbol` or `   0: 0x1234 - symbol`.
-static RUST_FRAME: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(\s*)(\d+):\s+(?:0x[0-9a-fA-F]+\s+-\s+)?(\S.*)$").expect("rust frame pattern")
-});
-
 /// Rust backtrace source line: `             at path:line[:col]`.
 static RUST_AT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s+at\s+(.+?):(\d+)(?::\d+)?\s*$").expect("rust at pattern"));
@@ -58,6 +54,7 @@ pub(crate) enum Runtime {
     Java,
     Go,
     Rust,
+    Dart,
 }
 
 /// One line emitted by [`StreamCollapser`], with the 1-based archive line range
@@ -94,11 +91,12 @@ pub(crate) fn normalize_summary_for_dedup(line: &str) -> Option<String> {
 }
 
 /// Whether `line` (ANSI-stripped, no newline) is a single-line inline stack
-/// frame (Node/V8/Deno/Bun `at ...`, Java/Kotlin/Scala `\tat ...(...)`, or
-/// JVM `... N more` / `... N common frames omitted`).
+/// frame (Node/V8/Deno/Bun `at ...`, Java/Kotlin/Scala `\tat ...(...)`,
+/// Dart/Flutter `#N  Sym (package:...)`, or JVM `... N more`).
 pub(crate) fn is_inline_frame(line: &str) -> bool {
     parse_java_frame(line).is_some()
         || parse_node_frame(line).is_some()
+        || parse_dart_frame(line).is_some()
         || is_java_elided_line(line)
 }
 
@@ -120,7 +118,7 @@ fn is_java_elided_line(line: &str) -> bool {
 
 /// Whether `line` (ANSI-stripped, no newline) is a Go stack frame location line.
 pub(crate) fn is_go_location_line(line: &str) -> bool {
-    GO_LOC.is_match(line)
+    parse_go_location(line).is_some()
 }
 
 /// Whether `line` (ANSI-stripped, no newline) could be the function-call line
@@ -154,20 +152,18 @@ pub(crate) fn is_go_func_line(line: &str) -> bool {
 
 /// Whether `line` (ANSI-stripped, no newline) starts a Rust backtrace frame.
 pub(crate) fn is_rust_frame_start(line: &str, in_backtrace: bool) -> bool {
-    let Some(caps) = RUST_FRAME.captures(line) else {
+    let Some((indent, index, symbol)) = parse_rust_frame(line) else {
         return false;
     };
-    let indent = caps.get(1).map_or("", |m| m.as_str());
-    let symbol = caps.get(3).map_or("", |m| m.as_str());
     if in_backtrace {
-        return !indent.is_empty() || caps[2].len() >= 4 || looks_like_rust_symbol(symbol);
+        return !indent.is_empty() || index >= 1000 || looks_like_rust_symbol(symbol);
     }
     !indent.is_empty() && looks_like_rust_symbol(symbol)
 }
 
 /// Whether `line` (ANSI-stripped, no newline) is a Rust `at path:line[:col]` line.
 pub(crate) fn is_rust_at_line(line: &str) -> bool {
-    RUST_AT.is_match(line)
+    parse_rust_at(line).is_some()
 }
 
 /// Collapse external/runtime stack-trace frames in `text` (1-based archive line
@@ -175,7 +171,7 @@ pub(crate) fn is_rust_at_line(line: &str) -> bool {
 /// external frames was collapsed and the output is strictly shorter than `text`.
 pub fn collapse(text: &str, workspace_root: Option<&Path>, stream: Option<&str>) -> Option<String> {
     let mut collapser = StreamCollapser::new(workspace_root, stream);
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity((text.len() / 64).clamp(16, 4096));
     for (index, raw) in text.split_inclusive('\n').enumerate() {
         collapser.push(raw, index + 1, false, &mut out);
     }
@@ -183,8 +179,15 @@ pub fn collapse(text: &str, workspace_root: Option<&Path>, stream: Option<&str>)
     if !collapser.collapsed_any() {
         return None;
     }
-    let collapsed: String = out.into_iter().map(|line| line.text).collect();
-    (collapsed.len() < text.len()).then_some(collapsed)
+    let total_len: usize = out.iter().map(|line| line.text.len()).sum();
+    if total_len >= text.len() {
+        return None;
+    }
+    let mut collapsed = String::with_capacity(total_len);
+    for line in out {
+        collapsed.push_str(&line.text);
+    }
+    Some(collapsed)
 }
 
 /// Collapse external/runtime stack-trace frames across a slice of `(line_no, text)`
@@ -196,7 +199,7 @@ pub(crate) fn collapse_numbered(
 ) -> Option<String> {
     let orig_len: usize = lines.iter().map(|(_, s)| s.len()).sum();
     let mut collapser = StreamCollapser::new(workspace_root, stream);
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(lines.len());
     for (line_no, raw) in lines {
         collapser.push(raw, *line_no, true, &mut out);
     }
@@ -204,8 +207,15 @@ pub(crate) fn collapse_numbered(
     if !collapser.collapsed_any() {
         return None;
     }
-    let collapsed: String = out.into_iter().map(|line| line.text).collect();
-    (collapsed.len() < orig_len).then_some(collapsed)
+    let total_len: usize = out.iter().map(|line| line.text.len()).sum();
+    if total_len >= orig_len {
+        return None;
+    }
+    let mut collapsed = String::with_capacity(total_len);
+    for line in out {
+        collapsed.push_str(&line.text);
+    }
+    Some(collapsed)
 }
 
 /// Workspace vs external path classifier.
@@ -218,12 +228,12 @@ impl Classifier {
     fn new(workspace_root: Option<&Path>) -> Self {
         let mut roots = Vec::new();
         if let Some(root) = workspace_root {
-            let norm = normalize_path(&root.to_string_lossy());
+            let norm = normalize_path(&root.to_string_lossy()).into_owned();
             if !norm.is_empty() {
                 roots.push(norm);
             }
             if let Ok(canon) = root.canonicalize() {
-                let canon_norm = normalize_path(&canon.to_string_lossy());
+                let canon_norm = normalize_path(&canon.to_string_lossy()).into_owned();
                 if !canon_norm.is_empty() && !roots.contains(&canon_norm) {
                     roots.push(canon_norm);
                 }
@@ -404,6 +414,9 @@ impl Classifier {
                 }
                 return (true, String::new());
             }
+            if is_rust_runtime_shim(symbol) {
+                return (false, rust_symbol_pkg(symbol));
+            }
             return (true, String::new());
         }
         if is_rust_external_symbol(symbol) {
@@ -411,6 +424,47 @@ impl Classifier {
         } else {
             (true, String::new())
         }
+    }
+
+    fn classify_dart(&self, raw_loc: &str) -> (bool, String) {
+        let loc = strip_line_col(raw_loc.trim());
+        if let Some(rest) = loc.strip_prefix("dart:") {
+            let lib = rest.split(['/', ':']).next().unwrap_or(rest);
+            let lib = lib.strip_suffix("-patch").unwrap_or(lib);
+            let pkg = if lib.is_empty() {
+                "dart".to_owned()
+            } else {
+                format!("dart:{lib}")
+            };
+            return (false, pkg);
+        }
+        if let Some(rest) = loc.strip_prefix("package:") {
+            let pkg = rest.split('/').next().unwrap_or(rest);
+            if is_dart_external_package(pkg) {
+                return (false, format!("package:{pkg}"));
+            }
+            return (true, String::new());
+        }
+        let norm = normalize_path(loc);
+        if let Some(pkg) = dart_file_pkg(&norm) {
+            return (false, pkg);
+        }
+        if has_dep_segment(&norm) {
+            return (false, external_dir_pkg(&norm));
+        }
+        if is_absolute_path(&norm) {
+            if let Some(rel) = self.strip_workspace_root(&norm) {
+                if has_dep_segment(rel) {
+                    return (false, external_dir_pkg(rel));
+                }
+                return (true, String::new());
+            }
+            if is_system_or_runtime_path(&norm) || !self.roots.is_empty() {
+                return (false, external_dir_pkg(&norm));
+            }
+            return (true, String::new());
+        }
+        (true, String::new())
     }
 }
 
@@ -519,7 +573,11 @@ impl StreamCollapser {
         out: &mut Vec<OutputLine>,
     ) {
         let stripped_nl = raw.strip_suffix('\n').unwrap_or(raw);
-        let plain_cow = crate::capture::ANSI.replace_all(stripped_nl, "");
+        let plain_cow = if stripped_nl.contains('\x1b') {
+            crate::capture::ANSI.replace_all(stripped_nl, "")
+        } else {
+            Cow::Borrowed(stripped_nl)
+        };
         let plain = plain_cow.trim_end_matches('\r');
 
         // Resolve any pending multi-line frame candidate before handling this line.
@@ -702,7 +760,11 @@ impl StreamCollapser {
         }
 
         let trimmed = plain.trim_start();
-        if trimmed == "stack backtrace:" || trimmed.starts_with("stack backtrace:") {
+        if trimmed.eq_ignore_ascii_case("stack backtrace:")
+            || trimmed.eq_ignore_ascii_case("backtrace:")
+            || trimmed.starts_with("stack backtrace:")
+            || trimmed.starts_with("Stack backtrace:")
+        {
             self.flush_run(out, true);
             self.saw_rust_header = true;
             self.last_rust_index = None;
@@ -774,7 +836,26 @@ impl StreamCollapser {
             return;
         }
 
-        // 4. Rust backtrace frame candidate (`   0: symbol`)
+        // 4. Dart / Flutter frame (`#0      AuthService.login (package:app/auth.dart:42:5)`)
+        if let Some(loc) = parse_dart_frame(plain) {
+            self.saw_rust_header = false;
+            self.last_rust_index = None;
+            let (is_workspace, pkg) = self.classifier.classify_dart(loc);
+            self.push_frame(
+                Runtime::Dart,
+                Frame {
+                    lines: vec![(line_no, raw.to_owned(), marked)],
+                    is_workspace,
+                    has_redacted: plain.contains("[redacted:"),
+                    pkg,
+                    indent: leading_ws(plain).to_owned(),
+                },
+                out,
+            );
+            return;
+        }
+
+        // 5. Rust backtrace frame candidate (`   0: symbol`)
         if let Some((indent_str, index, symbol)) = parse_rust_frame(plain) {
             if self.run_runtime.is_some_and(|rt| rt != Runtime::Rust) {
                 self.flush_run(out, true);
@@ -939,7 +1020,7 @@ impl StreamCollapser {
             self.continued_run = false;
             return;
         };
-        let frames = std::mem::take(&mut self.run);
+        let mut frames = std::mem::take(&mut self.run);
         let continued = self.continued_run;
         if end_of_run {
             self.continued_run = false;
@@ -963,7 +1044,7 @@ impl StreamCollapser {
         let mut i = 0;
         while i < len {
             if kept[i] {
-                emit_frame(&frames[i], out);
+                emit_frame_owned(std::mem::take(&mut frames[i].lines), out);
                 i += 1;
                 continue;
             }
@@ -988,20 +1069,20 @@ impl StreamCollapser {
                     continue;
                 }
             }
-            for frame in run {
-                emit_frame(frame, out);
+            for frame in &mut frames[start..i] {
+                emit_frame_owned(std::mem::take(&mut frame.lines), out);
             }
         }
     }
 }
 
-fn emit_frame(frame: &Frame, out: &mut Vec<OutputLine>) {
-    for (line_no, text, marked) in &frame.lines {
+fn emit_frame_owned(lines: Vec<(usize, String, bool)>, out: &mut Vec<OutputLine>) {
+    for (line_no, text, marked) in lines {
         out.push(OutputLine {
-            text: text.clone(),
-            range: (*line_no, *line_no),
+            text,
+            range: (line_no, line_no),
             summary: false,
-            marked: *marked,
+            marked,
         });
     }
 }
@@ -1053,6 +1134,9 @@ fn top_packages(run: &[Frame]) -> Vec<&str> {
 // --- Frame Parsers ---
 
 fn parse_python_frame(plain: &str) -> Option<&str> {
+    if !plain.starts_with([' ', '\t']) || !plain.trim_start().starts_with("File \"") {
+        return None;
+    }
     let caps = PYTHON_FRAME.captures(plain)?;
     Some(caps.get(1)?.as_str())
 }
@@ -1066,6 +1150,16 @@ fn is_python_caret_line(plain: &str, frame_indent: usize) -> bool {
 }
 
 fn parse_java_frame(plain: &str) -> Option<(&str, &str)> {
+    if !plain.starts_with([' ', '\t']) {
+        return None;
+    }
+    let trimmed = plain.trim_start();
+    if !(trimmed.starts_with("at ") || trimmed.starts_with("at\t"))
+        || !trimmed.contains('(')
+        || !trimmed.trim_end().ends_with(')')
+    {
+        return None;
+    }
     let caps = JAVA_FRAME.captures(plain)?;
     let symbol = caps.get(1)?.as_str();
     let source = caps.get(2)?.as_str();
@@ -1148,30 +1242,114 @@ fn looks_like_node_location(loc: &str) -> bool {
             || stripped.contains(':'))
 }
 
+/// Zero-regex parser for Dart/Flutter stack frames:
+/// `#0      AuthService.login (package:app/auth.dart:42:5)`
+/// `#12     _rootRunUnary (dart:async/zone.dart:1407:47)`
+fn parse_dart_frame(plain: &str) -> Option<&str> {
+    let trimmed = plain.trim_start();
+    let rest = trimmed.strip_prefix('#')?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let after_num = &rest[digits..];
+    let after_ws = after_num.trim_start_matches([' ', '\t']);
+    if after_ws.len() == after_num.len() {
+        return None;
+    }
+    let body = after_ws.trim_end();
+    let (symbol, inside_with_close) = body.rsplit_once(" (")?;
+    let loc = inside_with_close.strip_suffix(')')?;
+    if symbol.trim().is_empty() || !looks_like_dart_location(loc) {
+        return None;
+    }
+    Some(loc)
+}
+
+fn looks_like_dart_location(loc: &str) -> bool {
+    if loc.starts_with("dart:") {
+        return loc.len() > 5;
+    }
+    if let Some(after) = loc.strip_prefix("package:") {
+        let stripped = strip_line_col(after);
+        return stripped.contains('/') && stripped.ends_with(".dart");
+    }
+    let stripped = strip_line_col(loc);
+    stripped.len() < loc.len() && stripped.ends_with(".dart")
+}
+
+/// Zero-regex parser for Rust backtrace frame headers:
+/// `   0: std::panicking::begin_panic_handler`
+/// `   1: 0x102a3b4c - my_app::orders::validate`
 fn parse_rust_frame(plain: &str) -> Option<(&str, usize, &str)> {
-    let caps = RUST_FRAME.captures(plain)?;
-    let indent = caps.get(1)?.as_str();
-    let index: usize = caps.get(2)?.as_str().parse().ok()?;
-    let symbol = caps.get(3)?.as_str().trim_end();
+    let trimmed = plain.trim_start();
+    if !trimmed.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    let indent = &plain[..plain.len() - trimmed.len()];
+    let digits_end = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+    let rest = trimmed.get(digits_end..)?.strip_prefix(':')?;
+    let after_ws = rest.trim_start_matches([' ', '\t']);
+    if after_ws.len() == rest.len() {
+        return None;
+    }
+    let after_ws = after_ws.trim_end();
+    if after_ws.is_empty() {
+        return None;
+    }
+    let symbol = if let Some(hex_rest) = after_ws.strip_prefix("0x") {
+        let hex_len = hex_rest.bytes().take_while(u8::is_ascii_hexdigit).count();
+        if hex_len > 0 {
+            let after_hex = &hex_rest[hex_len..];
+            let after_ws1 = after_hex.trim_start_matches([' ', '\t']);
+            if after_ws1.len() < after_hex.len()
+                && let Some(after_dash) = after_ws1.strip_prefix('-')
+            {
+                let after_ws2 = after_dash.trim_start_matches([' ', '\t']);
+                if after_ws2.len() < after_dash.len() && !after_ws2.is_empty() {
+                    after_ws2
+                } else {
+                    after_ws
+                }
+            } else {
+                after_ws
+            }
+        } else {
+            after_ws
+        }
+    } else {
+        after_ws
+    };
+    let index: usize = trimmed[..digits_end].parse().ok()?;
     Some((indent, index, symbol))
 }
 
 fn parse_rust_at(plain: &str) -> Option<&str> {
+    if !plain.starts_with([' ', '\t']) {
+        return None;
+    }
+    let trimmed = plain.trim_start();
+    if !(trimmed.starts_with("at ") || trimmed.starts_with("at\t")) || !trimmed.contains(':') {
+        return None;
+    }
     let caps = RUST_AT.captures(plain)?;
     Some(caps.get(1)?.as_str())
 }
 
 fn parse_go_location(plain: &str) -> Option<&str> {
+    if !plain.trim_start_matches(' ').starts_with('\t') || !plain.contains(':') {
+        return None;
+    }
     let caps = GO_LOC.captures(plain)?;
     Some(caps.get(1)?.as_str())
 }
 
 // --- Path & Symbol Classification Helpers ---
 
-fn normalize_path(path: &str) -> String {
+fn normalize_path(path: &str) -> Cow<'_, str> {
     let stripped = path.strip_prefix("file://").unwrap_or(path);
     // `file:///C:/foo` -> `C:/foo` on Windows-style URIs.
-    let stripped = if stripped.len() >= 3
+    let mut stripped = if stripped.len() >= 3
         && stripped.starts_with('/')
         && stripped.as_bytes()[1].is_ascii_alphabetic()
         && stripped.as_bytes()[2] == b':'
@@ -1180,11 +1358,17 @@ fn normalize_path(path: &str) -> String {
     } else {
         stripped
     };
+    if !stripped.contains('\\') {
+        while let Some(rest) = stripped.strip_prefix("./") {
+            stripped = rest;
+        }
+        return Cow::Borrowed(stripped);
+    }
     let mut out = stripped.replace('\\', "/");
     while let Some(rest) = out.strip_prefix("./") {
         out = rest.to_owned();
     }
-    out
+    Cow::Owned(out)
 }
 
 fn is_absolute_path(norm: &str) -> bool {
@@ -1521,6 +1705,15 @@ fn rust_path_pkg(norm: &str) -> Option<String> {
     {
         return Some(crate_name.to_owned());
     }
+    if let Some(lib_tail) = norm.strip_prefix("library/")
+        && let Some(crate_name) = lib_tail.split('/').next()
+        && matches!(
+            crate_name,
+            "std" | "core" | "alloc" | "test" | "panic_unwind" | "panic_abort" | "proc_macro"
+        )
+    {
+        return Some(crate_name.to_owned());
+    }
     if let Some((_, after)) = norm.split_once("cargo/registry/src/") {
         // `<index>/<crate>-<version>/...`
         let mut parts = after.split('/');
@@ -1542,8 +1735,38 @@ fn strip_crate_version(name_ver: &str) -> &str {
     name_ver
 }
 
+fn is_rust_runtime_shim(symbol: &str) -> bool {
+    let sym = symbol
+        .trim_start_matches(['<', '&', '('])
+        .trim_start_matches("mut ");
+    sym.starts_with("__rust")
+        || sym.starts_with("rust_begin_unwind")
+        || sym.starts_with("rust_panic")
+        || sym.starts_with("__libc")
+        || sym.starts_with("_pthread_start")
+        || matches!(
+            sym,
+            "_start"
+                | "main"
+                | "<unknown>"
+                | "unknown>"
+                | "start_thread"
+                | "clone"
+                | "clone3"
+                | "thread_start"
+                | "BaseThreadInitThunk"
+                | "RtlUserThreadStart"
+                | "invoke_main"
+        )
+}
+
 fn is_rust_external_symbol(symbol: &str) -> bool {
-    let sym = symbol.trim_start_matches('<');
+    if is_rust_runtime_shim(symbol) {
+        return true;
+    }
+    let sym = symbol
+        .trim_start_matches(['<', '&', '('])
+        .trim_start_matches("mut ");
     const PREFIXES: &[&str] = &[
         "std::",
         "core::",
@@ -1591,33 +1814,19 @@ fn is_rust_external_symbol(symbol: &str) -> bool {
         "clap::",
         "clap_",
         "anyhow::",
-        "__rust",
-        "rust_begin_unwind",
-        "rust_panic",
-        "__libc",
-        "_pthread_start",
     ];
     PREFIXES.iter().any(|p| sym.starts_with(p))
-        || matches!(
-            sym,
-            "_start"
-                | "main"
-                | "<unknown>"
-                | "unknown>"
-                | "start_thread"
-                | "clone"
-                | "clone3"
-                | "thread_start"
-                | "BaseThreadInitThunk"
-                | "RtlUserThreadStart"
-                | "invoke_main"
-        )
 }
 
 fn rust_symbol_pkg(symbol: &str) -> String {
-    let sym = symbol.trim_start_matches('<');
+    let sym = symbol
+        .trim_start_matches(['<', '&', '('])
+        .trim_start_matches("mut ");
     if sym.starts_with("__libc") {
         return "libc".to_owned();
+    }
+    if sym.starts_with("__rustc::") {
+        return "std".to_owned();
     }
     if let Some((crate_name, _)) = sym.split_once("::")
         && !crate_name.is_empty()
@@ -1625,6 +1834,77 @@ fn rust_symbol_pkg(symbol: &str) -> String {
         return crate_name.to_owned();
     }
     "runtime".to_owned()
+}
+
+fn is_dart_external_package(pkg: &str) -> bool {
+    const PACKAGES: &[&str] = &[
+        "flutter",
+        "flutter_test",
+        "flutter_driver",
+        "flutter_web_plugins",
+        "flutter_localizations",
+        "sky_engine",
+        "test",
+        "test_api",
+        "test_core",
+        "matcher",
+        "stack_trace",
+        "async",
+        "stream_channel",
+        "fake_async",
+        "clock",
+        "meta",
+        "collection",
+        "typed_data",
+        "vector_math",
+        "characters",
+        "material_color_utilities",
+        "bloc",
+        "flutter_bloc",
+        "provider",
+        "riverpod",
+        "flutter_riverpod",
+        "hooks_riverpod",
+        "go_router",
+        "dio",
+        "http",
+        "grpc",
+        "shelf",
+        "shelf_router",
+        "get",
+        "mobx",
+        "redux",
+        "sqflite",
+        "drift",
+        "hive",
+        "firebase_core",
+        "cloud_firestore",
+        "firebase_auth",
+    ];
+    PACKAGES.contains(&pkg)
+}
+
+fn dart_file_pkg(norm: &str) -> Option<String> {
+    if let Some((_, after)) = norm.split_once("/flutter/packages/")
+        && let Some(pkg) = after.split('/').find(|s| !s.is_empty())
+    {
+        return Some(format!("package:{pkg}"));
+    }
+    for marker in ["/.pub-cache/hosted/", "/pub-cache/hosted/"] {
+        if let Some((_, after)) = norm.split_once(marker) {
+            let mut parts = after.split('/').filter(|s| !s.is_empty());
+            let _host = parts.next()?;
+            let pkg_ver = parts.next()?;
+            return Some(format!("package:{}", strip_crate_version(pkg_ver)));
+        }
+    }
+    if norm.contains("/.pub-cache/") || norm.contains("/pub-cache/") {
+        return Some("pub-cache".to_owned());
+    }
+    if norm.contains("/dart-sdk/") {
+        return Some("dart:sdk".to_owned());
+    }
+    None
 }
 
 fn leading_ws(line: &str) -> &str {
@@ -1912,5 +2192,130 @@ mod tests {
         // Ordinary numbered lists are not mistaken for Rust backtraces.
         let list = "   0: alpha\n   1: beta\n   2: gamma\n   3: delta\n   4: epsilon\n";
         assert_eq!(collapse(list, None, Some("stdout")), None);
+    }
+
+    #[test]
+    fn rust_backtrace_full_and_anyhow_collapses_std_core_alloc_tokio_pinning_workspace() {
+        let trace = concat!(
+            "thread 'tokio-runtime-worker' panicked at crates/billing/src/charge.rs:88:13:\n",
+            "assertion `left == right` failed\n",
+            "Stack backtrace:\n",
+            "   0: __rustc::rust_begin_unwind\n",
+            "             at library/std/src/panicking.rs:665:5\n",
+            "   1: core::panicking::panic_fmt\n",
+            "             at library/core/src/panicking.rs:76:14\n",
+            "   2: alloc::vec::Vec<T,A>::swap_remove::assert_failed\n",
+            "             at library/alloc/src/vec/mod.rs:1540:13\n",
+            "   3: <alloc::boxed::Box<F,A> as core::ops::function::FnOnce<Args>>::call_once\n",
+            "   4: billing::charge::apply_discount\n",
+            "             at /work/crates/billing/src/charge.rs:88:13\n",
+            "   5: billing::api::handle_checkout\n",
+            "             at ./src/api.rs:42:9\n",
+            "   6: tokio::runtime::task::core::Core<T,S>::poll\n",
+            "             at /home/ci/.cargo/registry/src/index.crates.io-6f17d22bba15001f/tokio-1.40.0/src/runtime/task/core.rs:328:17\n",
+            "   7: tokio::runtime::task::harness::Harness<T,S>::poll\n",
+            "             at /home/ci/.cargo/registry/src/index.crates.io-6f17d22bba15001f/tokio-1.40.0/src/runtime/task/harness.rs:208:19\n",
+            "   8: tokio::runtime::scheduler::multi_thread::worker::Context::run_task\n",
+            "             at /home/ci/.cargo/registry/src/index.crates.io-6f17d22bba15001f/tokio-1.40.0/src/runtime/scheduler/multi_thread/worker.rs:598:13\n",
+            "   9: std::sys::backtrace::__rust_begin_short_backtrace\n",
+            "             at library/std/src/sys/backtrace.rs:154:18\n",
+            "  10: my_app::main_worker_entry\n",
+            "  11: std::rt::lang_start_internal\n",
+            "             at library/std/src/rt.rs:141:20\n",
+            "  12: main\n",
+            "  13: __libc_start_call_main\n",
+            "             at ./csu/../sysdeps/nptl/libc_start_call_main.h:58:16\n",
+            "  14: _start\n",
+        );
+        let out = collapse(trace, Some(Path::new("/work")), Some("stderr"))
+            .expect("rust backtrace should collapse runtime runs");
+        assert!(out.len() < trace.len(), "{out}");
+
+        // Throw-site and ALL workspace frames (absolute, relative, symbol-only) are pinned verbatim.
+        assert!(out.contains("   0: __rustc::rust_begin_unwind\n"), "{out}");
+        assert!(
+            out.contains(
+                "   4: billing::charge::apply_discount\n             at /work/crates/billing/src/charge.rs:88:13\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "   5: billing::api::handle_checkout\n             at ./src/api.rs:42:9\n"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("  10: my_app::main_worker_entry\n"), "{out}");
+
+        // Relative `library/{std,core,alloc}`, symbol-only `<alloc::...>`, `tokio`, and libc collapse with exact line spans.
+        assert!(
+            out.contains("   [… 3 runtime/dependency frames (alloc, core) in stderr:6-10]\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("   [… 4 runtime/dependency frames (tokio, std) in stderr:15-22]\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  [… 4 runtime/dependency frames (runtime, std) in stderr:24-29]\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn dart_flutter_stack_trace_collapses_sdk_and_flutter_frames_keeping_app_frames() {
+        let trace = concat!(
+            "StateError: Bad state: Session expired\n",
+            "#0  AuthService.login (package:app/auth.dart:42:5)\n",
+            "#1  _rootRunUnary (dart:async/zone.dart:1407:47)\n",
+            "#2  _CustomZone.runUnary (dart:async/zone.dart:1308:19)\n",
+            "#3  _FutureListener.handleValue (dart:async/future_impl.dart:162:18)\n",
+            "#4  Future._propagateToListeners.handleValueCallback (dart:async/future_impl.dart:838:45)\n",
+            "<asynchronous suspension>\n",
+            "#5  _LoginScreenState._submit (package:app/screens/login.dart:88:12)\n",
+            "#6  _InkResponseState.handleTap (package:flutter/src/material/ink_well.dart:1154:21)\n",
+            "#7  GestureRecognizer.invokeCallback (package:flutter/src/gestures/recognizer.dart:315:24)\n",
+            "#8  TapGestureRecognizer.handleTapUp (package:flutter/src/gestures/tap.dart:652:11)\n",
+            "#9  BaseTapGestureRecognizer._checkUp (package:flutter/src/gestures/tap.dart:309:5)\n",
+            "#10 RenderBox.handleEvent (package:flutter/src/rendering/box.dart:2410:12)\n",
+        );
+        let out = collapse(trace, Some(Path::new("/app")), Some("stderr"))
+            .expect("dart/flutter trace should fold runtime/framework runs");
+        assert!(out.len() < trace.len(), "{out}");
+
+        // Error header, throw-site, async boundary, and ALL app frames stay verbatim.
+        assert!(
+            out.contains("StateError: Bad state: Session expired\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("#0  AuthService.login (package:app/auth.dart:42:5)\n"),
+            "{out}"
+        );
+        assert!(out.contains("<asynchronous suspension>\n"), "{out}");
+        assert!(
+            out.contains("#5  _LoginScreenState._submit (package:app/screens/login.dart:88:12)\n"),
+            "{out}"
+        );
+
+        // `dart:async` and `package:flutter` runs collapse with exact stderr line pointers.
+        assert!(
+            out.contains("[… 4 runtime/dependency frames (dart:async) in stderr:3-6]\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("[… 5 runtime/dependency frames (package:flutter) in stderr:9-13]\n"),
+            "{out}"
+        );
+
+        // `is_inline_frame` recognizes Dart frames and rejects markdown headings / issue refs.
+        assert!(is_inline_frame(
+            "#0  AuthService.login (package:app/auth.dart:42:5)"
+        ));
+        assert!(is_inline_frame(
+            "#1  _rootRunUnary (dart:async/zone.dart:1407:47)"
+        ));
+        assert!(!is_inline_frame("#1 Heading (notes)"));
+        assert!(!is_inline_frame("#42 fix login bug (WIP)"));
     }
 }
