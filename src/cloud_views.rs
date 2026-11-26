@@ -403,16 +403,60 @@ fn indent_of(line: &str) -> usize {
     line.bytes().take_while(|&b| b == b' ').count()
 }
 
-fn unquote_yaml(raw: &str) -> &str {
-    let trimmed = raw.trim();
-    if trimmed.len() >= 2
-        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
-            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
-    {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
-        trimmed
+/// Strip leading YAML node properties (`!tag`, `!!str`, `&anchor`) before a scalar/flow value.
+fn strip_yaml_properties(mut s: &str) -> &str {
+    loop {
+        s = s.trim_start_matches([' ', '\t']);
+        if matches!(s.bytes().next(), Some(b'!' | b'&')) {
+            if let Some((_, after)) = s.split_once([' ', '\t']) {
+                s = after;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
     }
+    s.trim_start_matches([' ', '\t'])
+}
+
+/// Strip an unquoted trailing YAML comment (` #...` or `\t#...`) from a plain slice.
+#[inline]
+fn strip_yaml_inline_comment(s: &str) -> &str {
+    let s = s.split_once(" #").map_or(s, |(v, _)| v);
+    s.split_once("\t#").map_or(s, |(v, _)| v)
+}
+
+fn unquote_yaml(raw: &str) -> &str {
+    let s = strip_yaml_properties(raw.trim());
+    let bytes = s.as_bytes();
+    if let Some(&q @ (b'"' | b'\'')) = bytes.first() {
+        let mut i = 1;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if q == b'"' && b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                if q == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                let tail = s[i + 1..].trim_start_matches([' ', '\t']);
+                if tail.is_empty() || tail.starts_with('#') {
+                    return &s[1..i];
+                }
+                break;
+            }
+            i += 1;
+        }
+    }
+    let plain = strip_yaml_inline_comment(s).trim();
+    if plain.starts_with('#') {
+        return "";
+    }
+    plain
 }
 
 fn collapse_spaces(s: &str) -> Cow<'_, str> {
@@ -463,52 +507,6 @@ fn ends_with_ascii_icase(haystack: &str, suffix: &str) -> bool {
     haystack.len() >= suffix.len()
         && haystack.as_bytes()[haystack.len() - suffix.len()..]
             .eq_ignore_ascii_case(suffix.as_bytes())
-}
-
-/// Count top-level keys inside an inline YAML flow mapping (`{ k1: v1, k2: v2 }`)
-/// without allocating or retaining any values (safe for `Secret` data).
-fn count_yaml_flow_keys(raw: &str) -> usize {
-    let trimmed = raw.trim();
-    let Some(inner) = trimmed
-        .strip_prefix('{')
-        .and_then(|s| s.strip_suffix('}'))
-        .map(str::trim)
-    else {
-        return 0;
-    };
-    if inner.is_empty() {
-        return 0;
-    }
-    let bytes = inner.as_bytes();
-    let mut count = 0usize;
-    let mut depth = 0usize;
-    let mut quote: u8 = 0;
-    let mut escaped = false;
-    let mut saw_colon_in_entry = false;
-    for &b in bytes {
-        if quote != 0 {
-            if escaped {
-                escaped = false;
-            } else if quote == b'"' && b == b'\\' {
-                escaped = true;
-            } else if b == quote {
-                quote = 0;
-            }
-            continue;
-        }
-        match b {
-            b'"' | b'\'' => quote = b,
-            b'{' | b'[' => depth += 1,
-            b'}' | b']' => depth = depth.saturating_sub(1),
-            b':' if depth == 0 && !saw_colon_in_entry => {
-                count += 1;
-                saw_colon_in_entry = true;
-            }
-            b',' if depth == 0 => saw_colon_in_entry = false,
-            _ => {}
-        }
-    }
-    count
 }
 
 fn clip(s: &str, max: usize) -> &str {
@@ -1287,27 +1285,29 @@ fn is_helm_notes_header(trimmed: &str) -> bool {
     trimmed == "NOTES:" || trimmed.starts_with("NOTES: ")
 }
 
-/// Whether `line` opens a YAML block scalar (`|`, `>`, `|-`, `|+`, `|2-`, etc.).
+/// Whether `line` opens a YAML block scalar (`|`, `>`, `|-`, `|+`, `|2-`, `!!str |`, `&a |`, etc.).
 fn starts_yaml_block_scalar(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return false;
     }
-    let rest = if let Some((_, after)) = trimmed.split_once(": ") {
-        after
-    } else if let Some((_, after)) = trimmed.split_once(":\t") {
-        after
-    } else if let Some(after) = trimmed.strip_prefix("- ") {
-        after
-    } else {
-        return false;
+    let rest = match (trimmed.find(": "), trimmed.find(":\t")) {
+        (Some(a), Some(b)) => &trimmed[a.min(b) + 2..],
+        (Some(a), None) => &trimmed[a + 2..],
+        (None, Some(b)) => &trimmed[b + 2..],
+        (None, None) => {
+            if let Some(after) = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("-\t"))
+            {
+                after
+            } else {
+                return false;
+            }
+        }
     };
-    let val = rest
-        .split_once(" #")
-        .map_or(rest, |(v, _)| v)
-        .split_once("\t#")
-        .map_or(rest, |(v, _)| v)
-        .trim();
+    let val = strip_yaml_inline_comment(rest).trim();
+    let val = strip_yaml_properties(val);
     let Some(tail) = val.strip_prefix(['|', '>']) else {
         return false;
     };
@@ -1326,14 +1326,38 @@ fn starts_yaml_block_scalar(line: &str) -> bool {
     true
 }
 
-/// Track YAML double-quoted (`\"`/`\\` escape-aware) and single-quoted (`''` escape-aware)
-/// multiline scalar state across lines so scalar bodies cannot forge top-level directives.
-fn advance_yaml_quote_state(line: &str, mut open: Option<u8>) -> Option<u8> {
+/// Multiline YAML scalar & flow-collection nesting state tracked across lines so
+/// scalar bodies and multiline `{...}`/`[...]` flow mappings cannot forge col-0
+/// directives (`kind:`, `type:`, `WARNING:`, `NOTES:`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct YamlState {
+    open_quote: Option<u8>,
+    flow_depth: usize,
+    /// Whether the current entry at `flow_depth == 1` has already seen its key/value `:`.
+    flow_entry_has_colon: bool,
+}
+
+impl YamlState {
+    #[inline]
+    fn in_multiline(self) -> bool {
+        self.open_quote.is_some() || self.flow_depth > 0
+    }
+}
+
+/// Advance quote (`\"`/`\\` and `''` escape-aware) and flow (`{...}`/`[...]`) nesting
+/// across `line`, opening quotes only at YAML value/token starts (never mid-plain-scalar).
+/// Returns `(next_state, top_level_flow_keys_seen)` for safe key counting without retaining values.
+fn advance_yaml_state(line: &str, mut state: YamlState) -> (YamlState, usize) {
     let bytes = line.as_bytes();
     let mut i = 0;
+    let mut flow_keys = 0usize;
+    let mut expect_token = state.open_quote.is_none();
+    let mut just_closed_quote = false;
+    let mut saw_block_colon = false;
+
     while i < bytes.len() {
         let b = bytes[i];
-        match open {
+        match state.open_quote {
             Some(b'"') => {
                 if b == b'\\' {
                     // Escape the next byte on this line; a trailing `\` escapes the line break.
@@ -1341,7 +1365,9 @@ fn advance_yaml_quote_state(line: &str, mut open: Option<u8>) -> Option<u8> {
                     continue;
                 }
                 if b == b'"' {
-                    open = None;
+                    state.open_quote = None;
+                    expect_token = false;
+                    just_closed_quote = true;
                 }
                 i += 1;
             }
@@ -1351,7 +1377,9 @@ fn advance_yaml_quote_state(line: &str, mut open: Option<u8>) -> Option<u8> {
                         i += 2;
                         continue;
                     }
-                    open = None;
+                    state.open_quote = None;
+                    expect_token = false;
+                    just_closed_quote = true;
                 }
                 i += 1;
             }
@@ -1359,16 +1387,250 @@ fn advance_yaml_quote_state(line: &str, mut open: Option<u8>) -> Option<u8> {
                 if b == b'#' && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t')) {
                     break;
                 }
-                if matches!(b, b'"' | b'\'')
-                    && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b':' | b',' | b'[' | b'{'))
-                {
-                    open = Some(b);
+                if matches!(b, b' ' | b'\t') {
+                    i += 1;
+                    continue;
                 }
+                if expect_token && matches!(b, b'!' | b'&') {
+                    // Skip YAML tag (`!!str`, `!tag`) or anchor (`&a`) before the token.
+                    while i < bytes.len() && !matches!(bytes[i], b' ' | b'\t' | b',' | b']' | b'}')
+                    {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if expect_token && matches!(b, b'"' | b'\'') {
+                    state.open_quote = Some(b);
+                    expect_token = false;
+                    just_closed_quote = false;
+                    i += 1;
+                    continue;
+                }
+                if (state.flow_depth > 0 || expect_token) && matches!(b, b'{' | b'[') {
+                    if state.flow_depth == 0 {
+                        state.flow_entry_has_colon = false;
+                    }
+                    state.flow_depth += 1;
+                    expect_token = true;
+                    just_closed_quote = false;
+                    i += 1;
+                    continue;
+                }
+                if state.flow_depth > 0 && matches!(b, b'}' | b']') {
+                    state.flow_depth -= 1;
+                    if state.flow_depth == 0 {
+                        state.flow_entry_has_colon = false;
+                    }
+                    expect_token = false;
+                    just_closed_quote = false;
+                    i += 1;
+                    continue;
+                }
+                if state.flow_depth > 0 && b == b',' {
+                    if state.flow_depth == 1 {
+                        state.flow_entry_has_colon = false;
+                    }
+                    expect_token = true;
+                    just_closed_quote = false;
+                    i += 1;
+                    continue;
+                }
+                if b == b':' {
+                    let next_ws_or_eol =
+                        bytes.get(i + 1).is_none_or(|&n| matches!(n, b' ' | b'\t'));
+                    if state.flow_depth > 0 {
+                        let next_flow_sep = bytes
+                            .get(i + 1)
+                            .is_none_or(|&n| matches!(n, b' ' | b'\t' | b',' | b']' | b'}'));
+                        if just_closed_quote || next_flow_sep {
+                            if state.flow_depth == 1 && !state.flow_entry_has_colon {
+                                flow_keys += 1;
+                                state.flow_entry_has_colon = true;
+                            }
+                            expect_token = true;
+                            just_closed_quote = false;
+                            i += 1;
+                            continue;
+                        }
+                    } else if !saw_block_colon && (just_closed_quote || next_ws_or_eol) {
+                        saw_block_colon = true;
+                        expect_token = true;
+                        just_closed_quote = false;
+                        i += 1;
+                        continue;
+                    }
+                }
+                if state.flow_depth == 0
+                    && expect_token
+                    && matches!(b, b'-' | b'?')
+                    && bytes.get(i + 1).is_none_or(|&n| matches!(n, b' ' | b'\t'))
+                {
+                    just_closed_quote = false;
+                    i += 1;
+                    continue;
+                }
+                expect_token = false;
+                just_closed_quote = false;
                 i += 1;
             }
         }
     }
-    open
+    (state, flow_keys)
+}
+
+#[inline]
+fn is_yaml_doc_sep(line: &str, trimmed: &str) -> bool {
+    indent_of(line) == 0 && (trimmed == "---" || trimmed.starts_with("--- "))
+}
+
+#[inline]
+fn starts_yaml_doc_key(trimmed: &str) -> bool {
+    let Some((k, _)) = trimmed.split_once(':') else {
+        return false;
+    };
+    matches!(
+        unquote_yaml(k),
+        "apiVersion"
+            | "kind"
+            | "metadata"
+            | "data"
+            | "binaryData"
+            | "stringData"
+            | "type"
+            | "immutable"
+            | "items"
+            | "spec"
+    )
+}
+
+/// Detect `kind: Secret` / `kind: SecretList` inside inline or multiline YAML flow syntax.
+fn flow_line_has_secret_kind(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut quote: u8 = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if quote != 0 {
+            if quote == b'"' && b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == quote {
+                if quote == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                quote = 0;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'#' && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t')) {
+            break;
+        }
+        let at_key_boundary = i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'{' | b',' | b'[');
+        if at_key_boundary {
+            let key_end =
+                if bytes[i..].starts_with(b"\"kind\"") || bytes[i..].starts_with(b"'kind'") {
+                    Some(i + 6)
+                } else if bytes[i..].starts_with(b"kind") {
+                    Some(i + 4)
+                } else {
+                    None
+                };
+            if let Some(mut j) = key_end {
+                while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') {
+                    j += 1;
+                }
+                if bytes.get(j) == Some(&b':') {
+                    let rest = &line[j + 1..];
+                    let val_raw = rest.split_once([',', '}', ']']).map_or(rest, |(v, _)| v);
+                    if matches!(unquote_yaml(val_raw), "Secret" | "SecretList") {
+                        return true;
+                    }
+                }
+            }
+        }
+        if matches!(b, b'"' | b'\'') {
+            quote = b;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// First-pass check over a `---`-delimited YAML document chunk (1-based inclusive line range):
+/// returns `true` for `Secret`, `SecretList`, or a `List` containing any `Secret`/`SecretList`,
+/// regardless of YAML key order (e.g. `data:`/`stringData:` before `kind: Secret`).
+fn chunk_is_secret(lines: &[Cow<'_, str>], start: usize, end: usize) -> bool {
+    let mut yaml_state = YamlState::default();
+    let mut block_scalar_indent: Option<usize> = None;
+    let mut is_list = false;
+    let mut has_nested_secret = false;
+
+    for line_no in start..=end {
+        let raw = lines[line_no - 1].as_ref();
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || is_yaml_doc_sep(raw, trimmed) {
+            continue;
+        }
+        let ind = indent_of(raw);
+        if yaml_state.in_multiline() {
+            if yaml_state.open_quote.is_none() && flow_line_has_secret_kind(raw) {
+                has_nested_secret = true;
+            }
+            yaml_state = advance_yaml_state(raw, yaml_state).0;
+            continue;
+        }
+        if let Some(base_ind) = block_scalar_indent {
+            if ind > base_ind {
+                continue;
+            }
+            block_scalar_indent = None;
+        }
+        if trimmed.starts_with('#') {
+            continue;
+        }
+
+        if ind == 0 && !trimmed.starts_with("- ") && !trimmed.starts_with("-\t") {
+            if let Some((k, v)) = trimmed.split_once(':') {
+                let key = unquote_yaml(k);
+                let val = unquote_yaml(v);
+                if key == "kind" {
+                    if matches!(val, "Secret" | "SecretList") {
+                        return true;
+                    }
+                    if val == "List" {
+                        is_list = true;
+                    }
+                } else if v.contains('{') && flow_line_has_secret_kind(v) {
+                    has_nested_secret = true;
+                }
+            }
+        } else {
+            let content = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("-\t"))
+                .unwrap_or(trimmed)
+                .trim_start();
+            if let Some((k, v)) = content.split_once(':')
+                && unquote_yaml(k) == "kind"
+                && matches!(unquote_yaml(v), "Secret" | "SecretList")
+            {
+                has_nested_secret = true;
+            } else if content.contains('{') && flow_line_has_secret_kind(content) {
+                has_nested_secret = true;
+            }
+        }
+
+        if starts_yaml_block_scalar(raw) {
+            block_scalar_indent = Some(ind);
+        } else {
+            yaml_state = advance_yaml_state(raw, YamlState::default()).0;
+        }
+    }
+
+    is_list && has_nested_secret
 }
 
 fn format_helm_manifest(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -> Option<String> {
@@ -1379,135 +1641,122 @@ fn format_helm_manifest(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -
         return None;
     }
 
-    let mut warnings: Vec<(usize, &str)> = Vec::new();
-    let mut notes: Vec<(usize, &str)> = Vec::new();
-    let mut doc_ranges: Vec<(usize, usize, bool)> = Vec::new();
-    let mut cur_start: Option<usize> = None;
-    let mut in_notes = false;
-    let mut in_secret = false;
-    let mut doc_has_kind = false;
-    let mut open_quote: Option<u8> = None;
-    let mut block_scalar_indent: Option<usize> = None;
-
+    // Pass 1: split into col-0 `---`-delimited chunks so every doc's kind (`Secret`,
+    // `SecretList`, or Secret-bearing `List`) is known before any warning/note/field is emitted.
+    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    let mut chunk_start = 1usize;
     for (idx, cow) in lines.iter().enumerate() {
         let line_no = idx + 1;
         let line = cow.as_ref();
-        let trimmed = line.trim();
-        let ind = indent_of(line);
-
-        if ind == 0 && (trimmed == "---" || trimmed.starts_with("--- ")) {
-            in_notes = false;
-            open_quote = None;
-            block_scalar_indent = None;
-            if let Some(start) = cur_start.take()
-                && line_no > start
-            {
-                doc_ranges.push((start, line_no - 1, in_secret));
-            }
-            in_secret = false;
-            doc_has_kind = false;
-            cur_start = Some(line_no);
-            continue;
+        if line_no > 1 && is_yaml_doc_sep(line, line.trim()) {
+            chunks.push((chunk_start, line_no - 1));
+            chunk_start = line_no;
         }
+    }
+    if !lines.is_empty() && chunk_start <= lines.len() {
+        chunks.push((chunk_start, lines.len()));
+    }
 
-        if trimmed.is_empty() {
-            continue;
-        }
+    let mut warnings: Vec<(usize, &str)> = Vec::new();
+    let mut notes: Vec<(usize, &str)> = Vec::new();
+    let mut doc_ranges: Vec<(usize, usize, bool)> = Vec::new();
 
-        if !in_notes && open_quote.is_some() {
-            open_quote = advance_yaml_quote_state(line, open_quote);
-            continue;
-        }
+    for (c_start, c_end) in chunks {
+        let chunk_secret = chunk_is_secret(lines, c_start, c_end);
+        let mut cur_start: Option<usize> = None;
+        let mut in_notes = false;
+        let mut yaml_state = YamlState::default();
+        let mut block_scalar_indent: Option<usize> = None;
 
-        if !in_notes && let Some(base_ind) = block_scalar_indent {
-            if ind > base_ind {
+        for line_no in c_start..=c_end {
+            let line = lines[line_no - 1].as_ref();
+            let trimmed = line.trim();
+            let ind = indent_of(line);
+
+            if is_yaml_doc_sep(line, trimmed) {
+                cur_start = Some(line_no);
                 continue;
             }
-            block_scalar_indent = None;
-        }
 
-        if in_notes {
-            if ind == 0
-                && (trimmed.starts_with("# Source:")
-                    || trimmed.starts_with("apiVersion:")
-                    || trimmed.starts_with("kind:"))
-            {
-                in_notes = false;
-                in_secret = false;
-                doc_has_kind = false;
-                open_quote = None;
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            if !in_notes && yaml_state.in_multiline() {
+                yaml_state = advance_yaml_state(line, yaml_state).0;
+                continue;
+            }
+
+            if !in_notes && let Some(base_ind) = block_scalar_indent {
+                if ind > base_ind {
+                    continue;
+                }
                 block_scalar_indent = None;
-                cur_start = Some(line_no);
-            } else {
+            }
+
+            if in_notes {
+                if ind == 0
+                    && (trimmed.starts_with("# Source:")
+                        || trimmed.starts_with("apiVersion:")
+                        || trimmed.starts_with("kind:"))
+                {
+                    in_notes = false;
+                    yaml_state = YamlState::default();
+                    block_scalar_indent = None;
+                    cur_start = Some(line_no);
+                } else {
+                    if ind == 0 && is_warning_or_error(line) {
+                        warnings.push((line_no, trimmed));
+                        continue;
+                    }
+                    notes.push((line_no, line.trim_end()));
+                    continue;
+                }
+            }
+
+            if !chunk_secret && ind == 0 && is_helm_notes_header(trimmed) {
+                if let Some(start) = cur_start.take()
+                    && line_no > start
+                {
+                    doc_ranges.push((start, line_no - 1, false));
+                }
+                in_notes = true;
+                yaml_state = YamlState::default();
+                block_scalar_indent = None;
+                notes.push((line_no, trimmed));
+                continue;
+            }
+
+            if cur_start.is_none() {
                 if ind == 0 && is_warning_or_error(line) {
                     warnings.push((line_no, trimmed));
                     continue;
                 }
-                notes.push((line_no, line.trim_end()));
-                continue;
+                if ind == 0 && (trimmed.starts_with("# Source:") || starts_yaml_doc_key(trimmed)) {
+                    cur_start = Some(line_no);
+                }
             }
-        }
 
-        if !in_secret && ind == 0 && is_helm_notes_header(trimmed) {
-            if let Some(start) = cur_start.take()
-                && line_no > start
-            {
-                doc_ranges.push((start, line_no - 1, in_secret));
-            }
-            in_notes = true;
-            in_secret = false;
-            doc_has_kind = false;
-            open_quote = None;
-            block_scalar_indent = None;
-            notes.push((line_no, trimmed));
-            continue;
-        }
-
-        if cur_start.is_none() {
-            if is_warning_or_error(line) {
-                warnings.push((line_no, trimmed));
-                continue;
-            }
-            if trimmed.starts_with("# Source:")
-                || trimmed.starts_with("apiVersion:")
-                || trimmed.starts_with("kind:")
-            {
-                cur_start = Some(line_no);
-            }
-        }
-
-        if cur_start.is_some() {
-            if !doc_has_kind
-                && ind == 0
-                && let Some((k, v)) = trimmed.split_once(':')
-                && unquote_yaml(k) == "kind"
-            {
-                let kind_val = unquote_yaml(v);
-                if !kind_val.is_empty() {
-                    doc_has_kind = true;
-                    if kind_val == "Secret" {
-                        in_secret = true;
+            if cur_start.is_some() {
+                if !chunk_secret
+                    && ind == 0
+                    && is_warning_or_error(line)
+                    && !trimmed.starts_with("apiVersion:")
+                {
+                    warnings.push((line_no, trimmed));
+                }
+                if !trimmed.starts_with('#') {
+                    if starts_yaml_block_scalar(line) {
+                        block_scalar_indent = Some(ind);
+                    } else {
+                        yaml_state = advance_yaml_state(line, YamlState::default()).0;
                     }
                 }
             }
-            if !in_secret
-                && ind == 0
-                && is_warning_or_error(line)
-                && !trimmed.starts_with("apiVersion:")
-            {
-                warnings.push((line_no, trimmed));
-            }
-            if !trimmed.starts_with('#') {
-                if starts_yaml_block_scalar(line) {
-                    block_scalar_indent = Some(ind);
-                } else {
-                    open_quote = advance_yaml_quote_state(line, None);
-                }
-            }
         }
-    }
-    if let Some(start) = cur_start.take() {
-        doc_ranges.push((start, lines.len(), in_secret));
+        if let Some(start) = cur_start.take() {
+            doc_ranges.push((start, c_end, chunk_secret));
+        }
     }
 
     let mut docs: Vec<HelmManifestDoc<'_>> = Vec::with_capacity(doc_ranges.len());
@@ -1524,7 +1773,7 @@ fn format_helm_manifest(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -
                 break;
             }
         }
-        if let Some(doc) = parse_helm_doc(lines, start, tight_end) {
+        if let Some(doc) = parse_helm_doc(lines, start, tight_end, doc_is_secret) {
             docs.push(doc);
         }
     }
@@ -1716,6 +1965,7 @@ fn parse_helm_doc<'a>(
     lines: &'a [Cow<'a, str>],
     start: usize,
     end: usize,
+    doc_is_secret: bool,
 ) -> Option<HelmManifestDoc<'a>> {
     let mut source: Option<&'a str> = None;
     let mut api_version: &'a str = "";
@@ -1761,7 +2011,7 @@ fn parse_helm_doc<'a>(
     let mut scale_ref_indent = 0usize;
     let mut in_crd_names = false;
     let mut crd_names_indent = 0usize;
-    let mut open_quote: Option<u8> = None;
+    let mut yaml_state = YamlState::default();
     let mut block_scalar_indent: Option<usize> = None;
 
     for line_no in start..=end {
@@ -1771,13 +2021,17 @@ fn parse_helm_doc<'a>(
             continue;
         }
         let ind = indent_of(raw);
-        if ind == 0 && (trimmed == "---" || trimmed.starts_with("--- ")) {
-            open_quote = None;
+        if is_yaml_doc_sep(raw, trimmed) {
+            yaml_state = YamlState::default();
             block_scalar_indent = None;
             continue;
         }
-        if open_quote.is_some() {
-            open_quote = advance_yaml_quote_state(raw, open_quote);
+        if yaml_state.in_multiline() {
+            let (next_state, flow_keys) = advance_yaml_state(raw, yaml_state);
+            if matches!(top_section, "data" | "binaryData" | "stringData") {
+                data_keys += flow_keys;
+            }
+            yaml_state = next_state;
             continue;
         }
         if let Some(base_ind) = block_scalar_indent {
@@ -1796,15 +2050,18 @@ fn parse_helm_doc<'a>(
             continue;
         }
 
-        if starts_yaml_block_scalar(raw) {
+        let flow_keys = if starts_yaml_block_scalar(raw) {
             block_scalar_indent = Some(ind);
+            0
         } else {
-            open_quote = advance_yaml_quote_state(raw, None);
-        }
+            let (next_state, keys) = advance_yaml_state(raw, YamlState::default());
+            yaml_state = next_state;
+            keys
+        };
 
         // Handle indent-0 YAML sequence items under top-level lists (`rules:`, `imagePullSecrets:`, `secrets:`).
         if ind == 0 && (trimmed == "-" || trimmed.starts_with("- ")) {
-            if kind == "Secret" {
+            if doc_is_secret {
                 continue;
             }
             match top_section {
@@ -1838,13 +2095,13 @@ fn parse_helm_doc<'a>(
         }
 
         if ind == 0 {
-            if kind != "Secret" && is_warning_or_error(raw) && !trimmed.starts_with("apiVersion:") {
+            if !doc_is_secret && is_warning_or_error(raw) && !trimmed.starts_with("apiVersion:") {
                 continue;
             }
             if let Some((k, v)) = trimmed.split_once(':') {
                 let key = unquote_yaml(k);
                 let val = unquote_yaml(v);
-                if kind == "Secret"
+                if doc_is_secret
                     && !matches!(
                         key,
                         "apiVersion"
@@ -1857,6 +2114,8 @@ fn parse_helm_doc<'a>(
                             | "stringData"
                     )
                 {
+                    top_section = "";
+                    data_entry_indent = None;
                     continue;
                 }
                 data_entry_indent = None;
@@ -1873,12 +2132,14 @@ fn parse_helm_doc<'a>(
                     }
                     "kind" if kind.is_empty() && !val.is_empty() => kind = val,
                     "type" if secret_type.is_none() && !val.is_empty() => secret_type = Some(val),
-                    "automountServiceAccountToken" if kind != "Secret" && !val.is_empty() => {
+                    "automountServiceAccountToken" if !doc_is_secret && !val.is_empty() => {
                         sa_automount = Some(val);
                     }
-                    "aggregationRule" if kind != "Secret" => has_aggregation_rule = true,
-                    "data" | "binaryData" | "stringData" if v.trim().starts_with('{') => {
-                        data_keys += count_yaml_flow_keys(v);
+                    "aggregationRule" if !doc_is_secret => has_aggregation_rule = true,
+                    "data" | "binaryData" | "stringData"
+                        if strip_yaml_properties(v).starts_with('{') =>
+                    {
+                        data_keys += flow_keys;
                     }
                     _ => {}
                 }
@@ -1910,7 +2171,7 @@ fn parse_helm_doc<'a>(
                     data_keys += 1;
                 }
             }
-            _ if kind == "Secret" => {}
+            _ if doc_is_secret => {}
             "rules" => {
                 let item_ind = *rules_item_indent.get_or_insert(ind);
                 if ind == item_ind && (trimmed == "-" || trimmed.starts_with("- ")) {
@@ -4737,6 +4998,173 @@ spec:
             "db_password",
             "Deployment ×2",
         ] {
+            assert!(!view.contains(forbidden), "leaked {forbidden:?}:\n{view}");
+        }
+    }
+
+    #[test]
+    fn helm_secret_all_seven_yaml_leak_vectors_emit_zero_secret_substrings() {
+        let s1 = "SECRET_LEAK_BLOCK_COMMENT_101";
+        let s2 = "SECRET_LEAK_MID_PLAIN_QUOTE_102";
+        let s3 = "SECRET_LEAK_DATA_BEFORE_KIND_103";
+        let s4 = "SECRET_LEAK_FLOW_BEFORE_KIND_104";
+        let s5 = "SECRET_LEAK_FLOW_TYPE_FORGE_105";
+        let s6 = "SECRET_LEAK_KIND_COMMENT_106";
+        let s7 = "SECRET_LEAK_SECRETLIST_107";
+        let s8 = "SECRET_LEAK_LIST_WITH_SECRET_108";
+        let s9 = "SECRET_LEAK_TAGGED_BLOCK_109";
+
+        let raw = format!(
+            "\
+---
+# 1. Block scalar with trailing `# comment` (and YAML tags/anchors)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sec-block-comment
+  namespace: prod
+stringData:
+  cert: | # tls cert
+    -----BEGIN PRIVATE KEY-----
+    {s1}
+    WARNING: {s1}
+    type: {s1}
+    -----END PRIVATE KEY-----
+  tagged: &a !!str |- # anchored tagged scalar
+    {s9}
+    WARNING: {s9}
+---
+# 2. Mid-plain-scalar quote before `kind: Secret`
+apiVersion: v1
+metadata:
+  name: sec-plain-quote
+  namespace: prod
+  annotations:
+    note: hello \"world
+kind: Secret
+stringData:
+  token: \"{s2}\"
+WARNING: {s2}
+NOTES:
+  {s2}
+---
+# 3. `data:` before `kind: Secret` (single-line) with WARNING/NOTES before kind
+apiVersion: v1
+data:
+  api_key: \"{s3}\"
+WARNING: {s3}
+NOTES:
+  {s3}
+spec:
+  template:
+    spec:
+      containers:
+        - image: registry.evil/{s3}:1.0
+kind: Secret
+metadata:
+  name: sec-data-before-kind
+  namespace: prod
+---
+# 4. `data:` before `kind: Secret` (multiline flow)
+apiVersion: v1
+data: {{
+WARNING: {s4},
+NOTES: {s4},
+type: {s4}
+}}
+kind: Secret
+metadata:
+  name: sec-flow-before-kind
+  namespace: prod
+---
+# 5. Multiline flow `stringData` forging col-0 `type:`
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sec-flow-type
+  namespace: prod
+stringData: {{
+type: {s5}
+}}
+---
+# 6. `kind: Secret # managed` inline comment
+apiVersion: v1
+kind: Secret # managed
+metadata:
+  name: sec-kind-comment # name comment
+  namespace: prod # ns comment
+stringData:
+  pass: \"{s6}\"
+WARNING: {s6}
+NOTES:
+  {s6}
+---
+# 7a. `kind: SecretList`
+apiVersion: v1
+kind: SecretList
+items:
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: inner-secret
+  stringData:
+    pw: \"{s7}\"
+WARNING: {s7}
+NOTES:
+  {s7}
+---
+# 7b. `kind: List` containing a `Secret` (block & inline flow)
+apiVersion: v1
+kind: List
+items:
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: benign-cm
+- {{ apiVersion: v1, kind: Secret, metadata: {{ name: flow-sec }}, stringData: {{ pw: \"{s8}\" }} }}
+WARNING: {s8}
+NOTES:
+  {s8}
+---
+# Benign Deployment alongside all secrets must still render cleanly
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: prod
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/acme/api:3.0.0
+"
+        );
+
+        let view = format(&["helm", "template", "app", "./charts/app"], &raw, 8_192)
+            .expect("helm template compacted");
+
+        assert!(view.contains("Secret/sec-block-comment (2 keys)"), "{view}");
+        assert!(view.contains("Secret/sec-plain-quote (1 keys)"), "{view}");
+        assert!(
+            view.contains("Secret/sec-data-before-kind (1 keys)"),
+            "{view}"
+        );
+        assert!(
+            view.contains("Secret/sec-flow-before-kind (3 keys)"),
+            "{view}"
+        );
+        assert!(view.contains("Secret/sec-flow-type (1 keys)"), "{view}");
+        assert!(view.contains("Secret/sec-kind-comment (1 keys)"), "{view}");
+        assert!(view.contains("SecretList/(unnamed)"), "{view}");
+        assert!(view.contains("List/(unnamed)"), "{view}");
+        assert!(
+            view.contains("Deployment/api (2 replicas, image=ghcr.io/acme/api:3.0.0)"),
+            "{view}"
+        );
+
+        for forbidden in [s1, s2, s3, s4, s5, s6, s7, s8, s9, "WARNING:", "NOTES:"] {
             assert!(!view.contains(forbidden), "leaked {forbidden:?}:\n{view}");
         }
     }

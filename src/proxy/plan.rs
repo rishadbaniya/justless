@@ -5,11 +5,12 @@
 //! and `messages` are never rewritten: the only change is an added
 //! `context_management` edit, spliced into the body byte for byte.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io;
 
-use serde::de::{self, Deserializer, MapAccess, Visitor};
+use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
@@ -696,10 +697,102 @@ pub struct PrefixFingerprint {
     /// SHA-256 digest of the newest turn when `turns.len() <= MAX_PREFIX_MSGS`,
     /// verified only if a subsequent request grows past it and turns it into a prior turn.
     last_msg_hash: Option<Hash32>,
+    /// Stateful delta continuation (OpenAI Responses with `previous_response_id`):
+    /// only static `instructions` + `tools` are compared against prior requests.
+    stateful_delta: bool,
 }
 
 fn sha256_bytes(bytes: &[u8]) -> Hash32 {
     Sha256::digest(bytes).into()
+}
+
+/// Streams an Anthropic message JSON value directly into SHA-256 while omitting
+/// `"cache_control"` fields at any depth so sliding cache breakpoints across
+/// turns never produce false prefix-drift alerts.
+fn hash_anthropic_message_without_cache_control(raw: &RawValue) -> Hash32 {
+    struct HashSeed<'a>(&'a mut Sha256);
+
+    impl<'de> Visitor<'de> for HashSeed<'_> {
+        type Value = ();
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a JSON value")
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<(), E> {
+            self.0.update(b"N");
+            Ok(())
+        }
+
+        fn visit_bool<E: de::Error>(self, v: bool) -> Result<(), E> {
+            self.0.update(if v { b"T" } else { b"F" });
+            Ok(())
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<(), E> {
+            self.0.update(b"I");
+            self.0.update(v.to_le_bytes());
+            Ok(())
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<(), E> {
+            self.0.update(b"U");
+            self.0.update(v.to_le_bytes());
+            Ok(())
+        }
+
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<(), E> {
+            self.0.update(b"D");
+            self.0.update(v.to_bits().to_le_bytes());
+            Ok(())
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<(), E> {
+            self.0.update(b"S");
+            self.0.update((v.len() as u64).to_le_bytes());
+            self.0.update(v.as_bytes());
+            Ok(())
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            self.0.update(b"[");
+            while seq.next_element_seed(HashSeed(self.0))?.is_some() {}
+            self.0.update(b"]");
+            Ok(())
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            self.0.update(b"{");
+            while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                if key == "cache_control" {
+                    let _: IgnoredAny = map.next_value()?;
+                } else {
+                    self.0.update(b"K");
+                    self.0.update((key.len() as u64).to_le_bytes());
+                    self.0.update(key.as_bytes());
+                    map.next_value_seed(HashSeed(self.0))?;
+                }
+            }
+            self.0.update(b"}");
+            Ok(())
+        }
+    }
+
+    impl<'de> DeserializeSeed<'de> for HashSeed<'_> {
+        type Value = ();
+
+        fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+            deserializer.deserialize_any(self)
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    let mut de = serde_json::Deserializer::from_str(raw.get());
+    if HashSeed(&mut hasher).deserialize(&mut de).is_ok() && de.end().is_ok() {
+        hasher.finalize().into()
+    } else {
+        sha256_bytes(raw.get().as_bytes())
+    }
 }
 
 fn non_null_raw<'a>(body: &Body<'a>, key: &str) -> Option<&'a RawValue> {
@@ -745,6 +838,37 @@ fn hash_raw_section(raw: Option<&RawValue>) -> (Option<Hash32>, Option<Hash32>) 
     (Some(sha256_bytes(raw.get().as_bytes())), None)
 }
 
+/// Order-independent digest for a single Gemini `tools` object whose
+/// `functionDeclarations`/`function_declarations` array has 2+ functions.
+fn gemini_tool_entry_bag_hash(raw: &RawValue) -> Option<Hash32> {
+    let members = parse_members(raw.get())?;
+    let mut decl_bag = None;
+    let mut other_members: Vec<(String, Hash32)> = Vec::new();
+    for (key, value) in members {
+        if matches!(
+            key.as_str(),
+            "functionDeclarations" | "function_declarations"
+        ) && let Ok(decls) = serde_json::from_str::<Vec<&RawValue>>(value.get())
+            && decls.len() >= 2
+        {
+            decl_bag = hash_sequence(&decls).1;
+        } else {
+            other_members.push((key, sha256_bytes(value.get().as_bytes())));
+        }
+    }
+    let decl_bag = decl_bag?;
+    other_members.sort_unstable();
+    let mut bag = Sha256::new();
+    bag.update(b"gemini-fn-decls\0");
+    bag.update(decl_bag);
+    for (key, digest) in other_members {
+        bag.update((key.len() as u64).to_le_bytes());
+        bag.update(key.as_bytes());
+        bag.update(digest);
+    }
+    Some(bag.finalize().into())
+}
+
 fn hash_gemini_tools(raw: Option<&RawValue>) -> (Option<Hash32>, Option<Hash32>) {
     let Some(raw) = raw else {
         return (None, None);
@@ -755,39 +879,32 @@ fn hash_gemini_tools(raw: Option<&RawValue>) -> (Option<Hash32>, Option<Hash32>)
     if items.is_empty() {
         return (None, None);
     }
-    if items.len() >= 2 {
-        return hash_sequence(&items);
-    }
-    // Common Gemini shape: `tools: [{"functionDeclarations": [fnA, fnB, ...]}]`.
-    let ordered_hash = sha256_bytes(items[0].get().as_bytes());
-    let bag_hash = parse_members(items[0].get()).and_then(|members| {
-        let mut decl_bag = None;
-        let mut other_members: Vec<(String, Hash32)> = Vec::new();
-        for (key, value) in members {
-            if matches!(
-                key.as_str(),
-                "functionDeclarations" | "function_declarations"
-            ) && let Ok(decls) = serde_json::from_str::<Vec<&RawValue>>(value.get())
-                && decls.len() >= 2
-            {
-                decl_bag = hash_sequence(&decls).1;
+    let ordered_hash = hash_sequence(&items).0;
+    let mut any_decl_bag = false;
+    let mut entry_bags: Vec<Hash32> = items
+        .iter()
+        .map(|item| {
+            if let Some(bag) = gemini_tool_entry_bag_hash(item) {
+                any_decl_bag = true;
+                bag
             } else {
-                other_members.push((key, sha256_bytes(value.get().as_bytes())));
+                sha256_bytes(item.get().as_bytes())
             }
-        }
-        let decl_bag = decl_bag?;
-        other_members.sort_unstable();
+        })
+        .collect();
+    let bag_hash = if items.len() >= 2 || any_decl_bag {
+        entry_bags.sort_unstable();
         let mut bag = Sha256::new();
-        bag.update(b"gemini-fn-decls\0");
-        bag.update(decl_bag);
-        for (key, digest) in other_members {
-            bag.update((key.len() as u64).to_le_bytes());
-            bag.update(key.as_bytes());
+        bag.update(b"gemini-tools-bag\0");
+        bag.update((entry_bags.len() as u64).to_le_bytes());
+        for digest in &entry_bags {
             bag.update(digest);
         }
         Some(bag.finalize().into())
-    });
-    (Some(ordered_hash), bag_hash)
+    } else {
+        None
+    };
+    (ordered_hash, bag_hash)
 }
 
 fn message_role_is_system(raw: &RawValue) -> bool {
@@ -845,75 +962,91 @@ impl PrefixFingerprint {
     /// Extracts a strictly read-only SHA-256 prefix fingerprint from a parsed
     /// JSON request body. Returns `None` when the expected turns field is absent.
     pub fn extract(body: &Body, format: PrefixFormat) -> Option<Self> {
-        let ((system_hash, system_bag_hash), (tools_hash, tools_bag_hash), turns, msg_base_index) =
-            match format {
-                PrefixFormat::Anthropic => {
-                    let raw_messages = non_null_raw(body, "messages")?;
-                    let turns: Vec<&RawValue> = serde_json::from_str(raw_messages.get()).ok()?;
-                    (
-                        hash_raw_section(non_null_raw(body, "system")),
-                        hash_raw_section(non_null_raw(body, "tools")),
-                        turns,
-                        0,
-                    )
-                }
-                PrefixFormat::OpenAiChat => {
-                    let raw_messages = non_null_raw(body, "messages")?;
-                    let all: Vec<&RawValue> = serde_json::from_str(raw_messages.get()).ok()?;
+        let (
+            (system_hash, system_bag_hash),
+            (tools_hash, tools_bag_hash),
+            turns,
+            msg_base_index,
+            stateful_delta,
+        ) = match format {
+            PrefixFormat::Anthropic => {
+                let raw_messages = non_null_raw(body, "messages")?;
+                let turns: Vec<&RawValue> = serde_json::from_str(raw_messages.get()).ok()?;
+                (
+                    hash_raw_section(non_null_raw(body, "system")),
+                    hash_raw_section(non_null_raw(body, "tools")),
+                    turns,
+                    0,
+                    false,
+                )
+            }
+            PrefixFormat::OpenAiChat => {
+                let raw_messages = non_null_raw(body, "messages")?;
+                let all: Vec<&RawValue> = serde_json::from_str(raw_messages.get()).ok()?;
+                let leading = all
+                    .iter()
+                    .take_while(|msg| message_role_is_system(msg))
+                    .count();
+                let tools = non_null_raw(body, "tools").or_else(|| non_null_raw(body, "functions"));
+                (
+                    hash_sequence(&all[..leading]),
+                    hash_raw_section(tools),
+                    all[leading..].to_vec(),
+                    leading,
+                    false,
+                )
+            }
+            PrefixFormat::OpenAiResponses => {
+                let raw_input = non_null_raw(body, "input")?;
+                let instructions = non_null_raw(body, "instructions");
+                let tools = hash_raw_section(non_null_raw(body, "tools"));
+                if non_null_raw(body, "previous_response_id").is_some() {
+                    // Stateful chained delta calls carry only new items in `input`;
+                    // check only static `instructions` + `tools` across calls.
+                    (hash_raw_section(instructions), tools, Vec::new(), 0, true)
+                } else if let Ok(all) = serde_json::from_str::<Vec<&RawValue>>(raw_input.get()) {
                     let leading = all
                         .iter()
-                        .take_while(|msg| message_role_is_system(msg))
+                        .take_while(|item| message_role_is_system(item))
                         .count();
-                    let tools =
-                        non_null_raw(body, "tools").or_else(|| non_null_raw(body, "functions"));
                     (
-                        hash_sequence(&all[..leading]),
-                        hash_raw_section(tools),
+                        combine_responses_system(instructions, &all[..leading]),
+                        tools,
                         all[leading..].to_vec(),
                         leading,
+                        false,
                     )
+                } else {
+                    // Single-turn string `input`: instructions + tools are the static prefix.
+                    (hash_raw_section(instructions), tools, Vec::new(), 0, false)
                 }
-                PrefixFormat::OpenAiResponses => {
-                    let raw_input = non_null_raw(body, "input")?;
-                    let instructions = non_null_raw(body, "instructions");
-                    let tools = hash_raw_section(non_null_raw(body, "tools"));
-                    if let Ok(all) = serde_json::from_str::<Vec<&RawValue>>(raw_input.get()) {
-                        let leading = all
-                            .iter()
-                            .take_while(|item| message_role_is_system(item))
-                            .count();
-                        (
-                            combine_responses_system(instructions, &all[..leading]),
-                            tools,
-                            all[leading..].to_vec(),
-                            leading,
-                        )
-                    } else {
-                        // Single-turn string `input`: instructions + tools are the static prefix.
-                        (hash_raw_section(instructions), tools, Vec::new(), 0)
-                    }
-                }
-                PrefixFormat::Gemini => {
-                    let raw_contents = non_null_raw(body, "contents")?;
-                    let turns: Vec<&RawValue> = serde_json::from_str(raw_contents.get()).ok()?;
-                    let system = non_null_raw(body, "systemInstruction")
-                        .or_else(|| non_null_raw(body, "system_instruction"));
-                    (
-                        hash_raw_section(system),
-                        hash_gemini_tools(non_null_raw(body, "tools")),
-                        turns,
-                        0,
-                    )
-                }
-            };
+            }
+            PrefixFormat::Gemini => {
+                let raw_contents = non_null_raw(body, "contents")?;
+                let turns: Vec<&RawValue> = serde_json::from_str(raw_contents.get()).ok()?;
+                let system = non_null_raw(body, "systemInstruction")
+                    .or_else(|| non_null_raw(body, "system_instruction"));
+                (
+                    hash_raw_section(system),
+                    hash_gemini_tools(non_null_raw(body, "tools")),
+                    turns,
+                    0,
+                    false,
+                )
+            }
+        };
 
+        let hash_turn = |raw: &RawValue| match format {
+            PrefixFormat::Anthropic => hash_anthropic_message_without_cache_control(raw),
+            _ => sha256_bytes(raw.get().as_bytes()),
+        };
         let prior_len = turns.len().saturating_sub(1).min(MAX_PREFIX_MSGS);
         let prefix_msg_hashes = turns[..prior_len]
             .iter()
-            .map(|raw| sha256_bytes(raw.get().as_bytes()))
+            .map(|raw| hash_turn(raw))
             .collect();
         let last_msg_hash = (turns.len() <= MAX_PREFIX_MSGS)
-            .then(|| turns.last().map(|raw| sha256_bytes(raw.get().as_bytes())))
+            .then(|| turns.last().map(|raw| hash_turn(raw)))
             .flatten();
 
         Some(Self {
@@ -924,6 +1057,7 @@ impl PrefixFingerprint {
             msg_base_index,
             prefix_msg_hashes,
             last_msg_hash,
+            stateful_delta,
         })
     }
 
@@ -953,6 +1087,9 @@ impl PrefixFingerprint {
                 section: "tools".into(),
                 reason: reason.into(),
             });
+        }
+        if next.stateful_delta {
+            return None;
         }
         let prev_len = self.prefix_msg_hashes.len();
         let next_len = next.prefix_msg_hashes.len();
@@ -995,31 +1132,74 @@ impl PrefixFingerprint {
     }
 }
 
+/// Slot key for [`PrefixTracker`], isolating concurrent sessions and subagents.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PrefixSlotKey {
+    pub endpoint: &'static str,
+    pub model: String,
+    pub session: Option<String>,
+    pub agent: Option<String>,
+}
+
+impl PrefixSlotKey {
+    pub fn new(
+        endpoint: &'static str,
+        model: impl Into<String>,
+        session: Option<String>,
+        agent: Option<String>,
+    ) -> Self {
+        Self {
+            endpoint,
+            model: model.into(),
+            session,
+            agent,
+        }
+    }
+}
+
+fn is_fresh_turn1(prev: &PrefixFingerprint, next: &PrefixFingerprint) -> bool {
+    if !next.prefix_msg_hashes.is_empty() {
+        return false;
+    }
+    let Some(next_first) = next.last_msg_hash else {
+        return false;
+    };
+    match prev
+        .prefix_msg_hashes
+        .first()
+        .copied()
+        .or(prev.last_msg_hash)
+    {
+        Some(prev_first) => prev_first != next_first,
+        None => false,
+    }
+}
+
 struct PrefixSlot {
     last_used: u64,
     fingerprint: PrefixFingerprint,
 }
 
-/// Strictly bounded in-memory prefix tracker keyed by `(endpoint, model)`.
+/// Strictly bounded in-memory prefix tracker keyed by `(endpoint, model, session, agent)`.
 #[derive(Default)]
 pub struct PrefixTracker {
-    slots: HashMap<(&'static str, String), PrefixSlot>,
+    slots: HashMap<PrefixSlotKey, PrefixSlot>,
     tick: u64,
 }
 
 impl PrefixTracker {
-    /// Compares `next` against the prior fingerprint for `(endpoint, model)`,
-    /// updates the slot, and returns any detected [`PrefixDrift`].
-    pub fn observe(
-        &mut self,
-        endpoint: &'static str,
-        model: &str,
-        next: PrefixFingerprint,
-    ) -> Option<PrefixDrift> {
+    /// Compares `next` against the prior fingerprint for `key`, updates the slot,
+    /// and returns any detected [`PrefixDrift`]. Call only after upstream accepts
+    /// the request (2xx) so failed retries never corrupt the tracked prefix.
+    pub fn observe(&mut self, key: PrefixSlotKey, next: PrefixFingerprint) -> Option<PrefixDrift> {
         self.tick = self.tick.wrapping_add(1);
-        let key = (endpoint, model.to_owned());
+        let unkeyed = key.session.is_none() && key.agent.is_none();
         if let Some(slot) = self.slots.get_mut(&key) {
-            let drift = slot.fingerprint.diff(&next);
+            let drift = if unkeyed && is_fresh_turn1(&slot.fingerprint, &next) {
+                None
+            } else {
+                slot.fingerprint.diff(&next)
+            };
             slot.fingerprint = next;
             slot.last_used = self.tick;
             return drift;
@@ -1470,10 +1650,30 @@ mod tests {
         format: PrefixFormat,
         body: &Value,
     ) -> Option<PrefixDrift> {
+        observe_scoped(tracker, endpoint, model, None, None, format, body)
+    }
+
+    fn observe_scoped(
+        tracker: &mut PrefixTracker,
+        endpoint: &'static str,
+        model: &str,
+        session: Option<&str>,
+        agent: Option<&str>,
+        format: PrefixFormat,
+        body: &Value,
+    ) -> Option<PrefixDrift> {
         let bytes = serde_json::to_vec(body).unwrap();
         let parsed = Body::parse(&bytes).unwrap();
         let fp = PrefixFingerprint::extract(&parsed, format).unwrap();
-        tracker.observe(endpoint, model, fp)
+        tracker.observe(
+            PrefixSlotKey::new(
+                endpoint,
+                model,
+                session.map(str::to_owned),
+                agent.map(str::to_owned),
+            ),
+            fp,
+        )
     }
 
     #[test]
@@ -1836,5 +2036,345 @@ mod tests {
             assert!(!serialized.contains("2026-11-26"), "{serialized}");
             assert!(!serialized.contains("Mutated"), "{serialized}");
         }
+    }
+
+    #[test]
+    fn prefix_tracker_eliminates_sliding_cache_control_subagent_turn1_responses_and_gemini_fps() {
+        let mut tracker = PrefixTracker::default();
+        let tools = json!([
+            {"name": "Read", "description": "Read a file"},
+            {"name": "Bash", "description": "Run a shell command"}
+        ]);
+
+        // 1. Anthropic sliding `cache_control` from messages[0] to messages[2] on Turn 3+:
+        //    0 prefix drift, even when spacing varies, while editing message text still fires.
+        let t1 = json!({
+            "model": OPUS,
+            "system": "You are a coding agent.",
+            "tools": tools,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Inspect lib.rs", "cache_control": {"type": "ephemeral"}}]}
+            ]
+        });
+        let t2 = json!({
+            "model": OPUS,
+            "system": "You are a coding agent.",
+            "tools": tools,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Inspect lib.rs", "cache_control": {"type": "ephemeral"}}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Reading."}]},
+                {"role": "user", "content": [{"type": "text", "text": "Found bug", "cache_control": {"type": "ephemeral"}}]}
+            ]
+        });
+        let t3_slid = json!({
+            "model": OPUS,
+            "system": "You are a coding agent.",
+            "tools": tools,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Inspect lib.rs"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Reading."}]},
+                {"role": "user", "content": [{"type": "text", "text": "Found bug", "cache_control": {"type": "ephemeral"}}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Patching."}]},
+                {"role": "user", "content": [{"type": "text", "text": "Run tests", "cache_control": {"type": "ephemeral"}}]}
+            ]
+        });
+        for body in [&t1, &t2, &t3_slid] {
+            assert_eq!(
+                observe_scoped(
+                    &mut tracker,
+                    "messages",
+                    OPUS,
+                    Some("sess-1"),
+                    None,
+                    PrefixFormat::Anthropic,
+                    body,
+                ),
+                None
+            );
+        }
+        let mut t4_real_edit = t3_slid.clone();
+        t4_real_edit["messages"][0]["content"][0]["text"] = json!("Inspect main.rs");
+        assert_eq!(
+            observe_scoped(
+                &mut tracker,
+                "messages",
+                OPUS,
+                Some("sess-1"),
+                None,
+                PrefixFormat::Anthropic,
+                &t4_real_edit,
+            ),
+            Some(PrefixDrift {
+                section: "message[0]".into(),
+                reason: "changed".into(),
+            })
+        );
+
+        // 2. Concurrent main + Explore + Task subagents on the same model/endpoint
+        //    with distinct `(session, agent)` headers never thrash each other.
+        let explore_t1 = json!({
+            "model": OPUS,
+            "system": "You are an Explore subagent.",
+            "messages": [{"role": "user", "content": "Find all lockfile parsers"}]
+        });
+        let explore_t2 = json!({
+            "model": OPUS,
+            "system": "You are an Explore subagent.",
+            "messages": [
+                {"role": "user", "content": "Find all lockfile parsers"},
+                {"role": "assistant", "content": "Found src/lockdiff.rs"},
+                {"role": "user", "content": "List supported formats"}
+            ]
+        });
+        let main_t5 = json!({
+            "model": OPUS,
+            "system": "You are a coding agent.",
+            "tools": tools,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "Inspect main.rs"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Reading."}]},
+                {"role": "user", "content": [{"type": "text", "text": "Found bug"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Patching."}]},
+                {"role": "user", "content": [{"type": "text", "text": "Run tests"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Green."}]},
+                {"role": "user", "content": [{"type": "text", "text": "Commit."}]}
+            ]
+        });
+        assert_eq!(
+            observe_scoped(
+                &mut tracker,
+                "messages",
+                OPUS,
+                Some("sess-1"),
+                Some("agent-explore"),
+                PrefixFormat::Anthropic,
+                &explore_t1,
+            ),
+            None
+        );
+        assert_eq!(
+            observe_scoped(
+                &mut tracker,
+                "messages",
+                OPUS,
+                Some("sess-1"),
+                None,
+                PrefixFormat::Anthropic,
+                &main_t5,
+            ),
+            None
+        );
+        assert_eq!(
+            observe_scoped(
+                &mut tracker,
+                "messages",
+                OPUS,
+                Some("sess-1"),
+                Some("agent-explore"),
+                PrefixFormat::Anthropic,
+                &explore_t2,
+            ),
+            None
+        );
+
+        // 3. Without session headers, a fresh Turn-1 conversation resets cleanly (`None`),
+        //    whereas truncating the SAME conversation back to Turn 1 still reports `"truncated"`.
+        let conv_a_t2 = json!({
+            "model": SONNET,
+            "system": "Sys A",
+            "messages": [
+                {"role": "user", "content": "Conv A turn 1"},
+                {"role": "assistant", "content": "Ack A"},
+                {"role": "user", "content": "Conv A turn 2"}
+            ]
+        });
+        let conv_b_t1 = json!({
+            "model": SONNET,
+            "system": "Sys B",
+            "messages": [{"role": "user", "content": "Conv B brand new turn 1"}]
+        });
+        let conv_b_t2 = json!({
+            "model": SONNET,
+            "system": "Sys B",
+            "messages": [
+                {"role": "user", "content": "Conv B brand new turn 1"},
+                {"role": "assistant", "content": "Ack B"},
+                {"role": "user", "content": "Conv B turn 2"}
+            ]
+        });
+        let conv_b_truncated_to_t1 = json!({
+            "model": SONNET,
+            "system": "Sys B",
+            "messages": [{"role": "user", "content": "Conv B brand new turn 1"}]
+        });
+        assert_eq!(
+            observe(
+                &mut tracker,
+                "messages",
+                SONNET,
+                PrefixFormat::Anthropic,
+                &conv_a_t2
+            ),
+            None
+        );
+        assert_eq!(
+            observe(
+                &mut tracker,
+                "messages",
+                SONNET,
+                PrefixFormat::Anthropic,
+                &conv_b_t1
+            ),
+            None
+        );
+        assert_eq!(
+            observe(
+                &mut tracker,
+                "messages",
+                SONNET,
+                PrefixFormat::Anthropic,
+                &conv_b_t2
+            ),
+            None
+        );
+        assert_eq!(
+            observe(
+                &mut tracker,
+                "messages",
+                SONNET,
+                PrefixFormat::Anthropic,
+                &conv_b_truncated_to_t1
+            ),
+            Some(PrefixDrift {
+                section: "message[0]".into(),
+                reason: "truncated".into(),
+            })
+        );
+
+        // 4. OpenAI `/v1/responses` stateful `previous_response_id` delta chain:
+        //    0 false message drift across delta calls, while `instructions`/`tools` drift still fires.
+        let r1 = json!({
+            "model": "gpt-5.4",
+            "instructions": "You are Codex.",
+            "tools": tools,
+            "input": [
+                {"type": "message", "role": "user", "content": "Inspect billing.rs"},
+                {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+            ]
+        });
+        let r2_delta = json!({
+            "model": "gpt-5.4",
+            "previous_response_id": "resp_001",
+            "instructions": "You are Codex.",
+            "tools": tools,
+            "input": [
+                {"type": "function_call_output", "call_id": "c2", "output": "done"}
+            ]
+        });
+        let r3_delta_sys_drift = json!({
+            "model": "gpt-5.4",
+            "previous_response_id": "resp_002",
+            "instructions": "You are Codex v2.",
+            "tools": tools,
+            "input": [{"type": "message", "role": "user", "content": "Next"}]
+        });
+        assert_eq!(
+            observe(
+                &mut tracker,
+                "responses",
+                "gpt-5.4",
+                PrefixFormat::OpenAiResponses,
+                &r1
+            ),
+            None
+        );
+        assert_eq!(
+            observe(
+                &mut tracker,
+                "responses",
+                "gpt-5.4",
+                PrefixFormat::OpenAiResponses,
+                &r2_delta
+            ),
+            None
+        );
+        assert_eq!(
+            observe(
+                &mut tracker,
+                "responses",
+                "gpt-5.4",
+                PrefixFormat::OpenAiResponses,
+                &r3_delta_sys_drift
+            ),
+            Some(PrefixDrift {
+                section: "system".into(),
+                reason: "changed".into(),
+            })
+        );
+
+        // 5. Multi-element Gemini `tools` (`functionDeclarations` + `googleSearch`):
+        //    reordering functions inside `functionDeclarations` still reports `"reordered"`,
+        //    while editing a function reports `"changed"`.
+        let gem_multi_a = json!({
+            "systemInstruction": {"parts": [{"text": "Sys"}]},
+            "tools": [
+                {"functionDeclarations": [{"name": "a"}, {"name": "b"}]},
+                {"googleSearch": {}}
+            ],
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+        });
+        let gem_multi_reordered = json!({
+            "systemInstruction": {"parts": [{"text": "Sys"}]},
+            "tools": [
+                {"functionDeclarations": [{"name": "b"}, {"name": "a"}]},
+                {"googleSearch": {}}
+            ],
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+        });
+        let gem_multi_edited = json!({
+            "systemInstruction": {"parts": [{"text": "Sys"}]},
+            "tools": [
+                {"functionDeclarations": [{"name": "b"}, {"name": "c"}]},
+                {"googleSearch": {}}
+            ],
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+        });
+        assert_eq!(
+            observe(
+                &mut tracker,
+                "gemini",
+                "gemini-2.5-pro",
+                PrefixFormat::Gemini,
+                &gem_multi_a
+            ),
+            None
+        );
+        assert_eq!(
+            observe(
+                &mut tracker,
+                "gemini",
+                "gemini-2.5-pro",
+                PrefixFormat::Gemini,
+                &gem_multi_reordered
+            ),
+            Some(PrefixDrift {
+                section: "tools".into(),
+                reason: "reordered".into(),
+            })
+        );
+        assert_eq!(
+            observe(
+                &mut tracker,
+                "gemini",
+                "gemini-2.5-pro",
+                PrefixFormat::Gemini,
+                &gem_multi_edited
+            ),
+            Some(PrefixDrift {
+                section: "tools".into(),
+                reason: "changed".into(),
+            })
+        );
     }
 }

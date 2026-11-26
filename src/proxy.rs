@@ -35,7 +35,7 @@ use crate::history::{human_bytes, now_ms};
 use crate::workspace::{Workspace, private_dir};
 use http::{Framing, Head};
 pub(crate) use ledger::report;
-use ledger::{Job, LiveCompacted, Log, PrefixDrift, Record, Totals, short};
+use ledger::{Job, LiveCompacted, Log, Record, Totals, short};
 use observe::{Observed, Observer};
 use plan::{Body, Request, Role};
 use upstream::{Outbound, SendError, Upstream};
@@ -581,8 +581,8 @@ struct Planned {
     clearing_added: bool,
     /// Live-zone compaction stats when newest uncached `tool_result` blocks were compacted.
     live_compacted: Option<LiveCompacted>,
-    /// Read-only prompt-cache prefix drift detected on this request.
-    prefix_drift: Option<PrefixDrift>,
+    /// Pending prefix-tracker slot key + fingerprint committed only after upstream returns 2xx.
+    pending_prefix: Option<(plan::PrefixSlotKey, plan::PrefixFingerprint)>,
     request: Option<Request>,
     model: Option<String>,
     mode: &'static str,
@@ -680,15 +680,22 @@ fn count_repeats(calls: &mut state::Calls, req: &Request, boundary: usize) -> u6
 }
 
 impl Shared {
-    fn observe_prefix(
+    fn extract_prefix(
         &self,
+        head: &Head,
         endpoint: Endpoint,
         model: Option<&str>,
         parsed: &Body,
-    ) -> Option<PrefixDrift> {
+    ) -> Option<(plan::PrefixSlotKey, plan::PrefixFingerprint)> {
         let format = endpoint.prefix_format()?;
         let fingerprint = plan::PrefixFingerprint::extract(parsed, format)?;
-        lock(&self.prefixes).observe(endpoint.name(), model.unwrap_or_default(), fingerprint)
+        let key = plan::PrefixSlotKey::new(
+            endpoint.name(),
+            model.unwrap_or_default(),
+            hint(head, "x-claude-code-session-id"),
+            hint(head, "x-claude-code-agent-id"),
+        );
+        Some((key, fingerprint))
     }
 
     fn plan(&self, head: &Head, body: &[u8], endpoint: Endpoint, now: u64) -> Planned {
@@ -702,12 +709,12 @@ impl Shared {
             Ok(req) => req,
             Err(reason) => return Planned::pass(reason),
         };
-        let prefix_drift = self.observe_prefix(endpoint, req.model.as_deref(), &parsed);
+        let pending_prefix = self.extract_prefix(head, endpoint, req.model.as_deref(), &parsed);
         let mut planned = Planned {
             model: req.model.clone(),
             uses: Some(req.uses.len()),
             mode: "pass",
-            prefix_drift,
+            pending_prefix,
             ..Default::default()
         };
         let live_body = if self.options.compact_live
@@ -769,18 +776,18 @@ impl Shared {
                 .value("model")
                 .and_then(|v| v.as_str().map(str::to_owned))
         });
-        let prefix_drift = self.observe_prefix(endpoint, model.as_deref(), &parsed);
+        let pending_prefix = self.extract_prefix(head, endpoint, model.as_deref(), &parsed);
         if !self.options.compact_live {
             return Planned {
                 model,
-                prefix_drift,
+                pending_prefix,
                 ..Planned::pass("compact-live-off")
             };
         }
         if !self.archive {
             return Planned {
                 model,
-                prefix_drift,
+                pending_prefix,
                 ..Planned::pass("no-archive")
             };
         }
@@ -800,14 +807,14 @@ impl Shared {
             Some(live) => Planned {
                 body: Some(live.body),
                 live_compacted: Some(live.stats),
-                prefix_drift,
+                pending_prefix,
                 model,
                 mode: "compact",
                 ..Default::default()
             },
             None => Planned {
                 model,
-                prefix_drift,
+                pending_prefix,
                 mode: "pass",
                 reason: Some("no-live-compact"),
                 ..Default::default()
@@ -1176,7 +1183,6 @@ fn finish(
     record.repeats = planned.repeats;
     record.client_managed_new = planned.client_new;
     record.live_compacted = planned.live_compacted.clone();
-    record.prefix_drift = planned.prefix_drift.clone();
     record.uses = planned.uses.map(|u| u as u64);
     let edited = planned.boundary.zip(planned.uses);
     if let Some((boundary, uses)) = edited {
@@ -1190,6 +1196,9 @@ fn finish(
         record.rewrite_est = Some(movement.rewrite);
     }
     let ok = (200..300).contains(&record.status);
+    if ok && let Some((key, fingerprint)) = planned.pending_prefix.take() {
+        record.prefix_drift = lock(&shared.prefixes).observe(key, fingerprint);
+    }
     if let Some(observed) = &observed {
         record.model = observed.model.clone().or(planned.model.clone());
         record.input = observed.input;

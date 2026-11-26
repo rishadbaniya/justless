@@ -2556,7 +2556,6 @@ fn podfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
     }
     let mut attached_ext: BTreeSet<String> = BTreeSet::new();
     let mut attached_checksums: BTreeSet<String> = BTreeSet::new();
-    let mut attached_root_checksum: BTreeSet<String> = BTreeSet::new();
     let mut packages = BTreeMap::new();
     for (name, version, deps) in pods {
         let root = name.split('/').next().unwrap_or(&name);
@@ -2576,25 +2575,18 @@ fn podfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
         } else {
             repos.get(root).cloned()
         };
-        let attach_root = name == root
-            || (!exact_names.contains(root) && attached_root_checksum.insert(root.to_owned()));
         let spec_hash = if let Some(hash) = normalized_checksums.get(&name) {
             attached_checksums.insert(name.clone());
             Some(hash.clone())
-        } else if attach_root {
+        } else {
             normalized_checksums.get(root).map(|h| {
                 attached_checksums.insert(root.to_owned());
                 h.clone()
             })
-        } else {
-            None
         };
-        let ext_pins = if normalized_ext.contains_key(&name) || attach_root {
-            ext.filter(|e| !e.pins.is_empty())
-                .map(|e| e.pins.values().cloned().collect::<Vec<_>>().join(", "))
-        } else {
-            None
-        };
+        let ext_pins = ext
+            .filter(|e| !e.pins.is_empty())
+            .map(|e| e.pins.values().cloned().collect::<Vec<_>>().join(", "));
         let checksum = match (spec_hash, ext_pins) {
             (Some(h), Some(pins)) => Some(format!("{h} ({pins})")),
             (Some(h), None) => Some(h),
@@ -3678,15 +3670,24 @@ fn compare_json_map_hunks(
                         && let PipfileSection::Meta(meta_depth) = pipfile_section
                     {
                         let delta = json_brace_delta(trimmed);
-                        if meta_depth == 1
-                            && !changed
-                            && trimmed.starts_with("\"hash\":")
-                            && delta > 0
-                        {
+                        if meta_depth == 1 && !changed && trimmed == "\"hash\": {" {
                             in_meta_hash = true;
                         }
-                        if changed && !(in_meta_hash && trimmed.starts_with("\"sha256\":")) {
-                            return None;
+                        if changed {
+                            if !in_meta_hash || delta != 0 {
+                                return None;
+                            }
+                            let obj: serde_json::Map<String, serde_json::Value> =
+                                serde_json::from_str(&format!(
+                                    "{{{}}}",
+                                    trimmed.strip_suffix(',').unwrap_or(trimmed)
+                                ))
+                                .ok()?;
+                            if obj.len() != 1
+                                || !obj.get("sha256").is_some_and(serde_json::Value::is_string)
+                            {
+                                return None;
+                            }
                         }
                         let next_depth = meta_depth + delta;
                         if next_depth <= 0 {
@@ -3710,19 +3711,21 @@ fn compare_json_map_hunks(
                                         if pipfile_section != PipfileSection::Unknown || changed {
                                             return None;
                                         }
-                                        let delta = json_brace_delta(rest_t);
-                                        if delta > 0 {
-                                            pipfile_section = PipfileSection::Meta(delta);
+                                        if rest_t == "{" {
+                                            pipfile_section = PipfileSection::Meta(1);
                                             in_meta_hash = false;
+                                            continue;
                                         }
-                                        continue;
+                                        if rest_t.strip_suffix(',').unwrap_or(rest_t) == "{}" {
+                                            continue;
+                                        }
+                                        return None;
                                     }
                                     "default" | "develop" => {
                                         if pipfile_section != PipfileSection::Unknown {
                                             return None;
                                         }
-                                        let delta = json_brace_delta(rest_t);
-                                        if delta > 0 {
+                                        if rest_t == "{" {
                                             pipfile_section = if name == "default" {
                                                 PipfileSection::Default
                                             } else {
@@ -3730,7 +3733,7 @@ fn compare_json_map_hunks(
                                             };
                                             continue;
                                         }
-                                        if rest_t.trim_end_matches(',') == "{}" {
+                                        if rest_t.strip_suffix(',').unwrap_or(rest_t) == "{}" {
                                             continue;
                                         }
                                         return None;
@@ -6573,5 +6576,197 @@ packages:
                 "must fail closed on malformed inline map: {bad_desc}"
             );
         }
+    }
+
+    #[test]
+    fn q7_pipfile_hunk_single_line_injection_fails_closed_and_podfile_subspecs_keep_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // (a) Pipfile.lock hunk injection vector 1: sneaking extra keys or brace-balanced
+        //     objects onto `_meta.hash.sha256` or `"hash":` entry MUST fail closed.
+        let sha256_brace_smuggle = concat!(
+            "diff --git a/Pipfile.lock b/Pipfile.lock\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/Pipfile.lock\n",
+            "+++ b/Pipfile.lock\n",
+            "@@ -2,5 +2,5 @@\n",
+            "   \"_meta\": {\n",
+            "     \"hash\": {\n",
+            "-      \"sha256\": \"aaa\"\n",
+            "+      \"sha256\": \"bbb\" }, \"sources\": [{\"url\": \"https://evil.example\", \"verify_ssl\": false}], \"x\": {\n",
+            "     },\n",
+        );
+        assert!(
+            sections(sha256_brace_smuggle, dir.path()).is_empty(),
+            "brace-balanced smuggling inside _meta.hash.sha256 must fail closed"
+        );
+
+        let sha256_extra_key = concat!(
+            "diff --git a/Pipfile.lock b/Pipfile.lock\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/Pipfile.lock\n",
+            "+++ b/Pipfile.lock\n",
+            "@@ -2,5 +2,5 @@\n",
+            "   \"_meta\": {\n",
+            "     \"hash\": {\n",
+            "-      \"sha256\": \"aaa\"\n",
+            "+      \"sha256\": \"bbb\", \"evil\": \"injected\"\n",
+            "     },\n",
+        );
+        assert!(
+            sections(sha256_extra_key, dir.path()).is_empty(),
+            "extra key on _meta.hash.sha256 line must fail closed"
+        );
+
+        let hash_header_smuggle = concat!(
+            "diff --git a/Pipfile.lock b/Pipfile.lock\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/Pipfile.lock\n",
+            "+++ b/Pipfile.lock\n",
+            "@@ -2,5 +2,5 @@\n",
+            "   \"_meta\": {\n",
+            "     \"hash\": { \"evil\": 1, \"nested\": {\n",
+            "-      \"sha256\": \"aaa\"\n",
+            "+      \"sha256\": \"bbb\"\n",
+            "     },\n",
+        );
+        assert!(
+            sections(hash_header_smuggle, dir.path()).is_empty(),
+            "non-exact `\"hash\": {{` header must fail closed"
+        );
+
+        // (b) Pipfile.lock hunk injection vector 2: inline payload on `"_meta"`, `"default"`,
+        //     or `"develop"` section opening line MUST fail closed.
+        for bad_section_patch in [
+            concat!(
+                "diff --git a/Pipfile.lock b/Pipfile.lock\n",
+                "index 1111111..2222222 100644\n",
+                "--- a/Pipfile.lock\n",
+                "+++ b/Pipfile.lock\n",
+                "@@ -2,4 +2,4 @@\n",
+                "   \"_meta\": { \"sources\": [{\"url\": \"https://evil.example\", \"verify_ssl\": false}], \"hash\": {\n",
+                "-      \"sha256\": \"aaa\"\n",
+                "+      \"sha256\": \"bbb\"\n",
+                "   },\n",
+            ),
+            concat!(
+                "diff --git a/Pipfile.lock b/Pipfile.lock\n",
+                "index 1111111..2222222 100644\n",
+                "--- a/Pipfile.lock\n",
+                "+++ b/Pipfile.lock\n",
+                "@@ -10,4 +10,4 @@\n",
+                "-  \"default\": {}\n",
+                "+  \"default\": { \"evil\": { \"version\": \"==1.0.0\" } }\n",
+            ),
+            concat!(
+                "diff --git a/Pipfile.lock b/Pipfile.lock\n",
+                "index 1111111..2222222 100644\n",
+                "--- a/Pipfile.lock\n",
+                "+++ b/Pipfile.lock\n",
+                "@@ -10,5 +10,5 @@\n",
+                "   \"develop\": { \"evil\": { \"version\": \"==1.0.0\" }, \"nested\": {\n",
+                "-    \"pytest\": {\"version\": \"==8.0.0\"}\n",
+                "+    \"pytest\": {\"version\": \"==8.1.0\"}\n",
+                "   }\n",
+            ),
+        ] {
+            assert!(
+                sections(bad_section_patch, dir.path()).is_empty(),
+                "inline section header smuggling must fail closed:\n{bad_section_patch}"
+            );
+        }
+
+        // (c) Podfile.lock sibling subspec addition (`Firebase/Auth` before `Firebase/Core`,
+        //     or root `Firebase` added next to `Firebase/Core`) MUST NOT emit a false checksum
+        //     tamper alert, while a genuine root checksum swap STILL fires a tamper alert.
+        let pod_one_subspec = "\
+PODS:
+  - Firebase/Core (10.24.0)
+
+EXTERNAL SOURCES:
+  Firebase:
+    :git: https://github.com/firebase/firebase-ios-sdk.git
+    :tag: 10.24.0
+
+CHECKOUT OPTIONS:
+  Firebase:
+    :git: https://github.com/firebase/firebase-ios-sdk.git
+    :tag: 10.24.0
+
+SPEC CHECKSUMS:
+  Firebase: 1111111111111111111111111111111111111111
+";
+        let pod_two_subspecs = "\
+PODS:
+  - Firebase/Auth (10.24.0)
+  - Firebase/Core (10.24.0)
+
+EXTERNAL SOURCES:
+  Firebase:
+    :git: https://github.com/firebase/firebase-ios-sdk.git
+    :tag: 10.24.0
+
+CHECKOUT OPTIONS:
+  Firebase:
+    :git: https://github.com/firebase/firebase-ios-sdk.git
+    :tag: 10.24.0
+
+SPEC CHECKSUMS:
+  Firebase: 1111111111111111111111111111111111111111
+";
+        let pod_with_root = "\
+PODS:
+  - Firebase (10.24.0)
+  - Firebase/Core (10.24.0)
+
+EXTERNAL SOURCES:
+  Firebase:
+    :git: https://github.com/firebase/firebase-ios-sdk.git
+    :tag: 10.24.0
+
+CHECKOUT OPTIONS:
+  Firebase:
+    :git: https://github.com/firebase/firebase-ios-sdk.git
+    :tag: 10.24.0
+
+SPEC CHECKSUMS:
+  Firebase: 1111111111111111111111111111111111111111
+";
+        let pod_tampered_checksum = pod_two_subspecs.replace(
+            "1111111111111111111111111111111111111111",
+            "9999999999999999999999999999999999999999",
+        );
+
+        let add_sibling =
+            compare_format(LockFormat::Podfile, pod_one_subspec, pod_two_subspecs).unwrap();
+        assert_eq!(add_sibling.added, vec!["Firebase/Auth 10.24.0"]);
+        assert!(
+            add_sibling.flags.is_empty(),
+            "adding sibling subspec must not trigger false checksum alert: {:?}",
+            add_sibling.flags
+        );
+
+        let add_root = compare_format(LockFormat::Podfile, pod_one_subspec, pod_with_root).unwrap();
+        assert_eq!(add_root.added, vec!["Firebase 10.24.0"]);
+        assert!(
+            add_root.flags.is_empty(),
+            "adding root pod next to subspec must not trigger false checksum alert: {:?}",
+            add_root.flags
+        );
+
+        let real_tamper = compare_format(
+            LockFormat::Podfile,
+            pod_two_subspecs,
+            &pod_tampered_checksum,
+        )
+        .unwrap();
+        assert!(
+            real_tamper
+                .flags
+                .iter()
+                .any(|f| f.contains("checksum changed on existing version Firebase/Core 10.24.0")),
+            "genuine root checksum tamper must still be flagged: {:?}",
+            real_tamper.flags
+        );
     }
 }

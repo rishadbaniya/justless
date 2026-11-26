@@ -955,6 +955,9 @@ fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
     if input["hook_event_name"] != "PostToolUse" || input["tool_name"] != "Read" {
         return None;
     }
+    if ws.settings().ok()?.lossless_only {
+        return None;
+    }
     let args = &input["tool_input"];
     let given = |key: &str| args.get(key).is_some_and(|value| !value.is_null());
     // `allow_large` asks for the lines as they are. Claude Code 2.1.327's Read
@@ -991,11 +994,12 @@ fn claude_read(ws: &Workspace, input: &Value) -> Option<Value> {
     };
     let ws = &ws;
     // The checkout that holds the file sets the threshold, as it sets the budget.
-    if lines <= outline_lines(ws)? {
+    let settings = ws.settings().ok()?;
+    if settings.lossless_only || lines <= settings.read_outline_lines {
         return None;
     }
     let mut source = crate::source::Snapshot::open(ws, &file).ok()?;
-    let budget = ws.settings().ok()?.context_budget;
+    let budget = settings.context_budget;
     let native = result["content"].as_str()?;
     if native.len() <= budget {
         return None;
@@ -1231,8 +1235,9 @@ fn claude_read_window(ws: &Workspace, args: &Value, response: &Value) -> Option<
     let native = result["content"].as_str()?;
     let (ws, file) = read_file(ws, path)?;
     let ws = &ws;
-    let budget = ws.settings().ok()?.context_budget;
-    if native.len() <= budget || count <= outline_lines(ws)? {
+    let settings = ws.settings().ok()?;
+    let budget = settings.context_budget;
+    if settings.lossless_only || native.len() <= budget || count <= settings.read_outline_lines {
         return None;
     }
     let mut source = crate::source::Snapshot::open(ws, &file).ok()?;
@@ -1944,7 +1949,7 @@ fn agy_before_read(
     let base_ws = Workspace::discover(Some(&root)).ok()?.working_in(&cwd);
     let (ws, file) = read_file(&base_ws, &path).or_else(|| read_file(&base_ws, &resolved))?;
     let settings = ws.settings().ok()?;
-    if !settings.agy_read_outline {
+    if !settings.agy_read_outline || settings.lossless_only {
         return None;
     }
     let source_path = ws.source_path(&file).ok()?;
@@ -2221,7 +2226,7 @@ fn agy_before_read_outside(
         .unwrap_or_else(|| ws_root.clone());
     let ws = Workspace::discover(Some(&ws_root)).ok()?.working_in(&cwd);
     let settings = ws.settings().ok()?;
-    if !settings.agy_read_outline {
+    if !settings.agy_read_outline || settings.lossless_only {
         return None;
     }
     if fs::symlink_metadata(path).ok()?.file_type().is_symlink()
@@ -5761,6 +5766,176 @@ mod tests {
                 .compact(&ws, &batch_after_input),
             None,
             "lossless_only must not outline read batches"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lossless_only_bypasses_native_agy_and_claude_read_hooks() {
+        use super::{Workspace, agy_hook, claude_read, json};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_path = outside_dir.path().canonicalize().unwrap().join("ext.py");
+
+        let mut py = String::new();
+        for i in 0..80 {
+            py.push_str(&format!(
+                "def handler_{i:02}(value: int) -> int:\n\
+                 \x20   \"\"\"Compute step {i:02} deterministically.\"\"\"\n\
+                 \x20   total = value + {i}\n\
+                 \x20   for step in range(4):\n\
+                 \x20       total += step * {i}\n\
+                 \x20   return total\n\n"
+            ));
+        }
+        let total_lines = py.lines().count() as u64;
+        let big_path = root.join("big.py");
+        fs::write(&big_path, &py).unwrap();
+        fs::write(&outside_path, &py).unwrap();
+        fs::write(root.join(".justless.toml"), "read_outline_lines = 40\n").unwrap();
+
+        let ws = Workspace::discover_from(&root).unwrap().working_in(&root);
+
+        let agy_in_ws = json!({
+            "conversationId": "conv-lossless-read",
+            "workspacePaths": [root],
+            "toolCall": {
+                "name": "read_file",
+                "args": {"Path": big_path}
+            }
+        });
+        let agy_outside = json!({
+            "conversationId": "conv-lossless-outside",
+            "workspacePaths": [root],
+            "toolCall": {
+                "name": "read_file",
+                "args": {"Path": outside_path}
+            }
+        });
+        let claude_whole = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read",
+            "cwd": root,
+            "tool_input": {"file_path": big_path},
+            "tool_response": {
+                "type": "text",
+                "file": {
+                    "filePath": big_path,
+                    "content": py,
+                    "startLine": 1,
+                    "numLines": total_lines,
+                    "totalLines": total_lines,
+                }
+            }
+        });
+        let window_lines: Vec<&str> = py.split('\n').collect();
+        let window_count = 200usize;
+        let window_content = window_lines[..window_count].join("\n");
+        let claude_ranged = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read",
+            "cwd": root,
+            "tool_input": {"file_path": big_path, "offset": 1, "limit": window_count},
+            "tool_response": {
+                "type": "text",
+                "file": {
+                    "filePath": big_path,
+                    "content": window_content,
+                    "startLine": 1,
+                    "numLines": window_count,
+                    "totalLines": window_lines.len(),
+                }
+            }
+        });
+        let claude_outside = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read",
+            "cwd": root,
+            "tool_input": {"file_path": outside_path},
+            "tool_response": {
+                "type": "text",
+                "file": {
+                    "filePath": outside_path,
+                    "content": py,
+                    "startLine": 1,
+                    "numLines": total_lines,
+                    "totalLines": total_lines,
+                }
+            }
+        });
+
+        // Baseline: without `lossless_only`, all five native read outline paths trigger.
+        assert!(
+            agy_hook(&ws, "before-read", &agy_in_ws).is_some(),
+            "baseline agy before-read should outline workspace file"
+        );
+        assert!(
+            agy_hook(&ws, "before-read", &agy_outside).is_some(),
+            "baseline agy before-read should outline outside file"
+        );
+        assert!(
+            claude_read(&ws, &claude_whole).is_some(),
+            "baseline claude after-read should outline whole workspace file"
+        );
+        assert!(
+            claude_read(&ws, &claude_ranged).is_some(),
+            "baseline claude after-read should outline ranged workspace file"
+        );
+        assert!(
+            claude_read(&ws, &claude_outside).is_some(),
+            "baseline claude after-read should outline outside file"
+        );
+
+        // With `lossless_only = true`, every native read hook returns None (passthrough).
+        fs::write(
+            root.join(".justless.toml"),
+            "read_outline_lines = 40\nlossless_only = true\n",
+        )
+        .unwrap();
+        let ws = Workspace::discover_from(&root).unwrap().working_in(&root);
+        let agy_in_ws_fresh = json!({
+            "conversationId": "conv-lossless-read-2",
+            "workspacePaths": [root],
+            "toolCall": {
+                "name": "read_file",
+                "args": {"Path": big_path}
+            }
+        });
+        let agy_outside_fresh = json!({
+            "conversationId": "conv-lossless-outside-2",
+            "workspacePaths": [root],
+            "toolCall": {
+                "name": "read_file",
+                "args": {"Path": outside_path}
+            }
+        });
+        assert_eq!(
+            agy_hook(&ws, "before-read", &agy_in_ws_fresh),
+            None,
+            "lossless_only must bypass hook-agy before-read in workspace"
+        );
+        assert_eq!(
+            agy_hook(&ws, "before-read", &agy_outside_fresh),
+            None,
+            "lossless_only must bypass hook-agy before-read outside workspace"
+        );
+        assert_eq!(
+            claude_read(&ws, &claude_whole),
+            None,
+            "lossless_only must bypass hook-claude after-read (whole)"
+        );
+        assert_eq!(
+            claude_read(&ws, &claude_ranged),
+            None,
+            "lossless_only must bypass hook-claude after-read (window)"
+        );
+        assert_eq!(
+            claude_read(&ws, &claude_outside),
+            None,
+            "lossless_only must bypass hook-claude after-read (outside)"
         );
     }
 }

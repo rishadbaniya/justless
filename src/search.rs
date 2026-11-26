@@ -3021,6 +3021,10 @@ pub fn claude_tool_output(ws: &Workspace, input: &Value) -> Option<Value> {
     if input["hook_event_name"] != "PostToolUse" {
         return None;
     }
+    let settings = ws.settings().ok()?;
+    if settings.lossless_only {
+        return None;
+    }
     let tool = input["tool_name"].as_str()?;
     let mut response = input["tool_response"].clone();
     let content = match (tool, response.get("mode").map(|m| m.as_str())) {
@@ -3029,7 +3033,7 @@ pub fn claude_tool_output(ws: &Workspace, input: &Value) -> Option<Value> {
         _ => return None,
     };
     response["numFiles"].as_u64()?;
-    let budget = ws.settings().ok()?.context_budget;
+    let budget = settings.context_budget;
     // Grep prints paths relative to the session directory, and Glob absolute paths.
     let base = input["cwd"]
         .as_str()
@@ -4236,5 +4240,73 @@ mod tests {
             "{m_report}"
         );
         assert_valid_stdout_pointers(&m_report, multi.len());
+    }
+
+    #[test]
+    fn lossless_only_bypasses_claude_after_search_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let mut grep_lines = Vec::new();
+        let mut glob_files = Vec::new();
+        for i in 0..160 {
+            let rel = format!("src/mod_{i:03}.rs");
+            std::fs::write(root.join(&rel), "").unwrap();
+            grep_lines.push(format!(
+                "{rel}:10:    let invoice_total = compute_invoice_amount({i});"
+            ));
+            glob_files.push(root.join(&rel).to_string_lossy().into_owned());
+        }
+        let grep_content = grep_lines.join("\n");
+        let grep_input = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Grep",
+            "cwd": root,
+            "tool_input": {"pattern": "invoice", "path": "src"},
+            "tool_response": {
+                "mode": "content",
+                "numFiles": 160,
+                "numLines": grep_lines.len(),
+                "content": grep_content,
+            }
+        });
+        let glob_input = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Glob",
+            "cwd": root,
+            "tool_input": {"pattern": "src/*.rs"},
+            "tool_response": {
+                "numFiles": glob_files.len(),
+                "filenames": glob_files,
+                "truncated": false,
+            }
+        });
+
+        let ws = crate::workspace::Workspace::discover_from(&root)
+            .unwrap()
+            .working_in(&root);
+        assert!(
+            super::claude_tool_output(&ws, &grep_input).is_some(),
+            "baseline hook-claude after-search should group large Grep output"
+        );
+        assert!(
+            super::claude_tool_output(&ws, &glob_input).is_some(),
+            "baseline hook-claude after-search should group large Glob output"
+        );
+
+        std::fs::write(root.join(".justless.toml"), "lossless_only = true\n").unwrap();
+        let ws = crate::workspace::Workspace::discover_from(&root)
+            .unwrap()
+            .working_in(&root);
+        assert_eq!(
+            super::claude_tool_output(&ws, &grep_input),
+            None,
+            "lossless_only must bypass hook-claude after-search for Grep"
+        );
+        assert_eq!(
+            super::claude_tool_output(&ws, &glob_input),
+            None,
+            "lossless_only must bypass hook-claude after-search for Glob"
+        );
     }
 }

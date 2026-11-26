@@ -2712,3 +2712,180 @@ fn prefix_drift_detection_leaves_wire_bytes_untouched_and_reports_in_ledger_and_
         "3 prefix drifts detected (prompt cache prefix diverged: message[1] changed (1), system changed (1), tools reordered (1))",
     );
 }
+
+#[test]
+fn prefix_tracker_ignores_sliding_cache_control_interleaved_subagents_and_failed_retries() {
+    let mut call_num = 0usize;
+    let (dir, _mock, proxy) = session(
+        move |_| {
+            call_num += 1;
+            // Call 3 simulates an upstream 429/500 failure with a corrupted/mutated body:
+            // it must NEVER overwrite the tracked prefix slot.
+            if call_num == 3 {
+                Reply::Json(
+                    429,
+                    json!({"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}}),
+                )
+            } else {
+                ok_json()
+            }
+        },
+        "",
+    );
+    let root = dir.path();
+    let main_headers = [
+        ("content-type", "application/json"),
+        ("x-api-key", "sk-ant-test"),
+        ("x-claude-code-session-id", "sess-main"),
+    ];
+    let subagent_headers = [
+        ("content-type", "application/json"),
+        ("x-api-key", "sk-ant-test"),
+        ("x-claude-code-session-id", "sess-main"),
+        ("x-claude-code-agent-id", "explore-01"),
+    ];
+    let openai_headers = [
+        ("content-type", "application/json"),
+        ("authorization", "Bearer sk-openai-test"),
+    ];
+    let tools =
+        json!([{"name": "Read", "description": "Read a file", "input_schema": {"type": "object"}}]);
+
+    // 1. Main Turn 1 (200) with cache_control on messages[0].
+    let main_t1 = json!({
+        "model": "claude-opus-5-5",
+        "max_tokens": 1024,
+        "system": "Main agent instructions.",
+        "tools": tools,
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Fix parser", "cache_control": {"type": "ephemeral"}}]}
+        ]
+    });
+    assert_eq!(
+        proxy
+            .send(
+                "POST",
+                "/v1/messages",
+                &main_headers,
+                &serde_json::to_vec(&main_t1).unwrap()
+            )
+            .status(),
+        200
+    );
+
+    // 2. Explore subagent Turn 1 (200) on the SAME model/session with distinct agent header.
+    let sub_t1 = json!({
+        "model": "claude-opus-5-5",
+        "max_tokens": 1024,
+        "system": "Explore subagent instructions.",
+        "messages": [{"role": "user", "content": "Search for lockfiles"}]
+    });
+    assert_eq!(
+        proxy
+            .send(
+                "POST",
+                "/v1/messages",
+                &subagent_headers,
+                &serde_json::to_vec(&sub_t1).unwrap()
+            )
+            .status(),
+        200
+    );
+
+    // 3. Failed 429 retry on main slot with mutated system prompt: must NOT corrupt main's slot!
+    let main_failed_429 = json!({
+        "model": "claude-opus-5-5",
+        "max_tokens": 1024,
+        "system": "CORRUPTED_FAILED_REQUEST_SYSTEM",
+        "tools": tools,
+        "messages": [{"role": "user", "content": "Transient bad request"}]
+    });
+    assert_eq!(
+        proxy
+            .send(
+                "POST",
+                "/v1/messages",
+                &main_headers,
+                &serde_json::to_vec(&main_failed_429).unwrap(),
+            )
+            .status(),
+        429
+    );
+
+    // 4. Main Turn 2 (200) sliding `cache_control` from messages[0] -> messages[2]: 0 drift!
+    let main_t2_slid = json!({
+        "model": "claude-opus-5-5",
+        "max_tokens": 1024,
+        "system": "Main agent instructions.",
+        "tools": tools,
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Fix parser"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Checking."}]},
+            {"role": "user", "content": [{"type": "text", "text": "Apply patch", "cache_control": {"type": "ephemeral"}}]}
+        ]
+    });
+    assert_eq!(
+        proxy
+            .send(
+                "POST",
+                "/v1/messages",
+                &main_headers,
+                &serde_json::to_vec(&main_t2_slid).unwrap(),
+            )
+            .status(),
+        200
+    );
+
+    // 5. OpenAI `/v1/responses` stateful `previous_response_id` delta chain: 0 drift!
+    let resp_t1 = json!({
+        "model": "gpt-5.4",
+        "instructions": "You are Codex.",
+        "tools": tools,
+        "input": [{"type": "message", "role": "user", "content": "Run tests"}]
+    });
+    let resp_t2 = json!({
+        "model": "gpt-5.4",
+        "previous_response_id": "resp_1",
+        "instructions": "You are Codex.",
+        "tools": tools,
+        "input": [{"type": "function_call_output", "call_id": "c1", "output": "ok"}]
+    });
+    assert_eq!(
+        proxy
+            .send(
+                "POST",
+                "/v1/responses",
+                &openai_headers,
+                &serde_json::to_vec(&resp_t1).unwrap()
+            )
+            .status(),
+        200
+    );
+    assert_eq!(
+        proxy
+            .send(
+                "POST",
+                "/v1/responses",
+                &openai_headers,
+                &serde_json::to_vec(&resp_t2).unwrap()
+            )
+            .status(),
+        200
+    );
+
+    proxy.stop();
+
+    let records = ledger(root);
+    assert_eq!(records.len(), 6);
+    for (idx, rec) in records.iter().enumerate() {
+        assert!(
+            rec.get("prefix_drift").is_none(),
+            "record {idx} had unexpected prefix_drift: {rec}"
+        );
+    }
+    let report = stats(root);
+    assert!(
+        report["proxy"].get("prefix_drifts").is_none() || report["proxy"]["prefix_drifts"] == 0,
+        "{report}"
+    );
+}
