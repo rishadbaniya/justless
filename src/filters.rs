@@ -1,5 +1,6 @@
 //! Command selection and line filters shared by explicit runs and agent hooks.
-use crate::wrappers::effective;
+use crate::wrappers::{EffectiveWords, effective_words};
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -382,19 +383,94 @@ fn runners<'a, 'b>(mut words: &'a [&'b str]) -> (&'a [&'b str], bool) {
                 }
                 None => return (words, true),
             },
-            // `hatch run` and friends sync the environment first or can be
-            // configured to.
-            ["pdm" | "hatch" | "rye", "run", rest @ ..] => (rest, true),
+            // `hatch run`, `rye run`, `pdm run`, `pixi run`, `volta run`, `fnm exec`,
+            // `fvm`, `corepack`, and `pyenv`/`rbenv exec` sync or switch toolchains.
+            ["pdm", "run", rest @ ..] => match crate::wrappers::pdm_run_rest(rest) {
+                Some(inner) => {
+                    fetches = true;
+                    words = inner;
+                    continue;
+                }
+                None => return (words, true),
+            },
+            ["hatch" | "rye", "run", rest @ ..] => (rest, true),
             ["mise", "exec" | "x", "--", rest @ ..] => (rest, true),
             ["direnv", "exec", dir, rest @ ..] if is_local_dir(dir) => (rest, true),
-            ["pixi", "run", rest @ ..] => (rest, true),
-            // These run a tool the project already installed.
-            ["pnpm" | "yarn" | "bun", "exec", rest @ ..]
-            | ["poetry" | "pipenv", "run", rest @ ..]
-            | ["bundle", "exec", rest @ ..] => (rest, false),
-            ["asdf", "exec", cmd, ..] if !cmd.starts_with('-') && !cmd.contains('/') => {
-                (&words[2..], false)
+            ["pixi", "run", rest @ ..] => match crate::wrappers::pixi_run_rest(rest) {
+                Some(inner) => {
+                    fetches = true;
+                    words = inner;
+                    continue;
+                }
+                None => return (words, true),
+            },
+            ["fvm", "flutter" | "dart", ..] => match crate::wrappers::fvm_rest(words) {
+                Some(inner) => {
+                    fetches = true;
+                    words = inner;
+                    continue;
+                }
+                None => return (words, true),
+            },
+            ["corepack", "pnpm" | "yarn" | "npm", ..] => {
+                match crate::wrappers::corepack_rest(words) {
+                    Some(inner) => {
+                        fetches = true;
+                        words = inner;
+                        continue;
+                    }
+                    None => return (words, true),
+                }
             }
+            ["volta", "run", rest @ ..] => match crate::wrappers::volta_run_rest(rest) {
+                Some(inner) => {
+                    fetches = true;
+                    words = inner;
+                    continue;
+                }
+                None => return (words, true),
+            },
+            ["fnm", "exec", rest @ ..] => match crate::wrappers::fnm_exec_rest(rest) {
+                Some(inner) => {
+                    fetches = true;
+                    words = inner;
+                    continue;
+                }
+                None => return (words, true),
+            },
+            ["pyenv" | "rbenv", "exec", rest @ ..] => match crate::wrappers::shim_exec_rest(rest) {
+                Some(inner) => {
+                    fetches = true;
+                    words = inner;
+                    continue;
+                }
+                None => return (words, true),
+            },
+            ["poetry", "run", rest @ ..] => match crate::wrappers::poetry_run_rest(rest) {
+                Some(inner) => {
+                    words = inner;
+                    continue;
+                }
+                None => return (words, true),
+            },
+            ["pipenv", "run", rest @ ..] => match crate::wrappers::pipenv_run_rest(rest) {
+                Some(inner) => {
+                    words = inner;
+                    continue;
+                }
+                None => return (words, true),
+            },
+            // These run a tool the project already installed.
+            ["pnpm" | "yarn" | "bun", "exec", rest @ ..] | ["bundle", "exec", rest @ ..] => {
+                (rest, false)
+            }
+            ["asdf", "exec", rest @ ..] => match crate::wrappers::shim_exec_rest(rest) {
+                Some(inner) => {
+                    words = inner;
+                    continue;
+                }
+                None => return (words, true),
+            },
             ["pnpm" | "yarn", rest @ ..] => match js_workspace_args(words[0], rest) {
                 Some(["exec", tail @ ..]) => (tail, false),
                 _ => return (words, fetches),
@@ -424,12 +500,18 @@ pub fn tool_label(args: &[OsString]) -> String {
 }
 
 pub fn tool_label_words(words: &[&str]) -> String {
-    let owned = effective(words);
-    let refs: Vec<&str> = match &owned {
-        Some(words) => words.iter().map(String::as_str).collect(),
-        None => words.to_vec(),
+    let owned_vec;
+    let refs_vec;
+    let slice: &[&str] = match effective_words(words) {
+        Some(EffectiveWords::Borrowed(slice)) => slice,
+        Some(EffectiveWords::Owned(owned)) => {
+            owned_vec = owned;
+            refs_vec = owned_vec.iter().map(String::as_str).collect::<Vec<_>>();
+            &refs_vec
+        }
+        None => words,
     };
-    let words = unwrap_tool(&refs);
+    let words = unwrap_tool(slice);
     let Some((program, rest)) = words.split_first() else {
         return "other".into();
     };
@@ -526,9 +608,13 @@ fn lint_tool(program: &str, args: &[&str]) -> bool {
 /// Whether a build target name runs tests or another non-compile action rather
 /// than compiling code.
 fn is_non_build_target(target: &str) -> bool {
-    let lower = target.to_ascii_lowercase();
+    let lower: Cow<'_, str> = if target.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(target.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(target)
+    };
     if matches!(
-        lower.as_str(),
+        lower.as_ref(),
         "test"
             | "tests"
             | "check"
@@ -896,9 +982,8 @@ fn mvn_build_args(args: &[&str]) -> bool {
 }
 
 pub fn profile(words: &[&str]) -> Option<Profile> {
-    let unwrapped = crate::wrappers::hook_effective(words)?;
-    let refs: Vec<&str> = unwrapped.iter().map(String::as_str).collect();
-    let words = unwrap_tool(&refs);
+    let unwrapped = crate::wrappers::hook_effective_slice(words)?;
+    let words = unwrap_tool(unwrapped);
     if let Some(profile) = crate::search::select(words) {
         return Some(profile);
     }
@@ -1125,11 +1210,10 @@ fn js_display(args: &[&str]) -> bool {
 /// read, so a request that writes, waits, filters the JSON or names a file
 /// elsewhere keeps its own form.
 pub fn json_output(words: &[&str]) -> bool {
-    let Some(unwrapped) = crate::wrappers::hook_effective(words) else {
+    let Some(unwrapped) = crate::wrappers::hook_effective_slice(words) else {
         return false;
     };
-    let refs: Vec<&str> = unwrapped.iter().map(String::as_str).collect();
-    let words = unwrap_tool(&refs);
+    let words = unwrap_tool(unwrapped);
     let Some((&program, args)) = words.split_first() else {
         return false;
     };
@@ -1253,8 +1337,9 @@ fn gh_api(args: &[&str]) -> bool {
         && option_values(args, &["-X", "--method"]).all(|method| method.eq_ignore_ascii_case("GET"))
         && option_values(args, &["-H", "--header"]).all(|header| {
             header.split_once(':').is_some_and(|(name, _)| {
-                ["accept", "x-github-api-version"]
-                    .contains(&name.trim().to_ascii_lowercase().as_str())
+                let name = name.trim();
+                name.eq_ignore_ascii_case("accept")
+                    || name.eq_ignore_ascii_case("x-github-api-version")
             })
         })
 }
@@ -1386,62 +1471,69 @@ fn is_safe_git_config(spec: &str) -> bool {
     let Some((key, value)) = spec.split_once('=') else {
         return false;
     };
-    let key = key.to_ascii_lowercase();
-    let value_lower = value.to_ascii_lowercase();
-    match key.as_str() {
-        "color.ui" | "color.status" | "color.diff" | "color.branch" => {
-            matches!(
-                value_lower.as_str(),
-                "always" | "auto" | "never" | "true" | "false"
-            )
-        }
-        "core.pager" => value == "cat",
-        "diff.algorithm" => matches!(
-            value_lower.as_str(),
-            "myers" | "default" | "minimal" | "patience" | "histogram"
-        ),
-        "diff.colormoved" => matches!(
-            value_lower.as_str(),
-            "no" | "default"
-                | "plain"
-                | "blocks"
-                | "zebra"
-                | "dimmed-zebra"
-                | "dimmed_zebra"
-                | "true"
-                | "false"
-        ),
-        "log.date" => matches!(
-            value_lower.as_str(),
-            "relative"
-                | "local"
-                | "iso"
-                | "iso8601"
-                | "iso-local"
-                | "iso-strict"
-                | "iso8601-strict"
-                | "iso-strict-local"
-                | "rfc"
-                | "rfc2822"
-                | "rfc-local"
-                | "short"
-                | "short-local"
-                | "raw"
-                | "raw-local"
-                | "human"
-                | "human-local"
-                | "unix"
-                | "default"
-                | "default-local"
-                | "auto:human"
-        ),
-        "status.short" | "status.branch" => {
-            matches!(
-                value_lower.as_str(),
-                "true" | "false" | "yes" | "no" | "on" | "off" | "1" | "0"
-            )
-        }
-        _ => false,
+    let eq_any =
+        |s: &str, candidates: &[&str]| candidates.iter().any(|c| s.eq_ignore_ascii_case(c));
+    if eq_any(
+        key,
+        &["color.ui", "color.status", "color.diff", "color.branch"],
+    ) {
+        eq_any(value, &["always", "auto", "never", "true", "false"])
+    } else if key.eq_ignore_ascii_case("core.pager") {
+        value == "cat"
+    } else if key.eq_ignore_ascii_case("diff.algorithm") {
+        eq_any(
+            value,
+            &["myers", "default", "minimal", "patience", "histogram"],
+        )
+    } else if key.eq_ignore_ascii_case("diff.colormoved") {
+        eq_any(
+            value,
+            &[
+                "no",
+                "default",
+                "plain",
+                "blocks",
+                "zebra",
+                "dimmed-zebra",
+                "dimmed_zebra",
+                "true",
+                "false",
+            ],
+        )
+    } else if key.eq_ignore_ascii_case("log.date") {
+        eq_any(
+            value,
+            &[
+                "relative",
+                "local",
+                "iso",
+                "iso8601",
+                "iso-local",
+                "iso-strict",
+                "iso8601-strict",
+                "iso-strict-local",
+                "rfc",
+                "rfc2822",
+                "rfc-local",
+                "short",
+                "short-local",
+                "raw",
+                "raw-local",
+                "human",
+                "human-local",
+                "unix",
+                "default",
+                "default-local",
+                "auto:human",
+            ],
+        )
+    } else if eq_any(key, &["status.short", "status.branch"]) {
+        eq_any(
+            value,
+            &["true", "false", "yes", "no", "on", "off", "1", "0"],
+        )
+    } else {
+        false
     }
 }
 
@@ -1553,11 +1645,10 @@ pub(crate) fn git_local_routed(words: &[&str]) -> bool {
 }
 
 pub fn legacy_hook(words: &[&str]) -> bool {
-    let Some(unwrapped) = crate::wrappers::hook_effective(words) else {
+    let Some(unwrapped) = crate::wrappers::hook_effective_slice(words) else {
         return false;
     };
-    let refs: Vec<&str> = unwrapped.iter().map(String::as_str).collect();
-    match unwrap_tool(&refs) {
+    match unwrap_tool(unwrapped) {
         ["cargo", rest @ ..] => match cargo_args(rest) {
             ["build" | "check" | "clippy" | "test" | "tree", ..] | ["nextest", "run", ..] => true,
             ["doc", doc_rest @ ..] => !doc_rest.contains(&"--open"),
@@ -2349,14 +2440,13 @@ fn cargo_fmt_check(words: &[&str]) -> bool {
 /// the command line, or load a plugin or module they name, also fail, such as
 /// `go vet -vettool`, `pylint --init-hook` or `node --test --import`.
 pub fn approvable(words: &[&str]) -> bool {
-    let Some(effective) = crate::wrappers::hook_effective_detail(words) else {
+    let Some(effective) = crate::wrappers::hook_effective_ref(words) else {
         return false;
     };
     if effective.env_clears || effective.runner_unapprovable {
         return false;
     }
-    let eff_refs: Vec<&str> = effective.words.iter().map(String::as_str).collect();
-    let (tool, fetches) = runners(&eff_refs);
+    let (tool, fetches) = runners(effective.words);
     if fetches {
         return false;
     }
@@ -2744,6 +2834,24 @@ const JS_LOADERS: &[&str] = &[
     "open",
 ];
 
+/// Whether `key` (ASCII) matches lowercase `target` after stripping `-`/`_` and
+/// ASCII-lowercasing, without allocating.
+#[inline]
+fn ascii_key_matches(key: &str, target: &str) -> bool {
+    let mut kb = key
+        .bytes()
+        .filter(|&b| !matches!(b, b'-' | b'_'))
+        .map(|b| b.to_ascii_lowercase());
+    let mut tb = target.bytes();
+    loop {
+        match (kb.next(), tb.next()) {
+            (Some(a), Some(b)) if a == b => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
 /// Whether JavaScript test runner arguments, including those a package manager
 /// passes to its `test` script after `--`, load code as `JS_LOADERS` lists, or
 /// give `--config` as inline JSON, which can name such modules.
@@ -2757,13 +2865,21 @@ fn js_runner_loads_code(args: &[&str]) -> bool {
             .map_or((option, None), |(key, value)| (key, Some(value)));
         // Vitest reads dotted names such as `--browser.enabled`.
         let key = key.split('.').next().unwrap_or(key);
-        let key: String = key
-            .chars()
-            .filter(|c| !matches!(c, '-' | '_'))
-            .flat_map(char::to_lowercase)
-            .collect();
-        JS_LOADERS.contains(&key.as_str())
-            || key == "config" && value.is_some_and(|value| value.trim_start().starts_with('{'))
+        if key.is_ascii() {
+            JS_LOADERS
+                .iter()
+                .any(|&loader| ascii_key_matches(key, loader))
+                || ascii_key_matches(key, "config")
+                    && value.is_some_and(|value| value.trim_start().starts_with('{'))
+        } else {
+            let key: String = key
+                .chars()
+                .filter(|c| !matches!(c, '-' | '_'))
+                .flat_map(char::to_lowercase)
+                .collect();
+            JS_LOADERS.contains(&key.as_str())
+                || key == "config" && value.is_some_and(|value| value.trim_start().starts_with('{'))
+        }
     }) || args
         .windows(2)
         .any(|pair| matches!(pair[0], "--config" | "-c") && pair[1].trim_start().starts_with('{'))
@@ -2779,8 +2895,12 @@ fn names_option(arg: &str, name: &str) -> bool {
             return false;
         };
         let key = key.split_once('=').map_or(key, |(key, _)| key);
-        let key = key.replace('_', "-");
-        !key.is_empty() && long.starts_with(&key)
+        !key.is_empty()
+            && key.len() <= long.len()
+            && key
+                .bytes()
+                .zip(long.bytes())
+                .all(|(a, b)| a == b || (a == b'_' && b == b'-'))
     } else {
         let letter = name.trim_start_matches('-');
         arg.strip_prefix('-')
@@ -2933,30 +3053,51 @@ fn build_args(
     true
 }
 
+#[inline]
+fn is_local_value(value: &str) -> bool {
+    if value.starts_with('~') {
+        return false;
+    }
+    if !value
+        .as_bytes()
+        .iter()
+        .any(|&b| b == b'/' || b == b'\\' || b == b':')
+        && value != ".."
+    {
+        return true;
+    }
+    let path = Path::new(value);
+    !path.has_root()
+        && !path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+}
+
 /// Whether an argument, and every value inside it, stays inside the working tree:
 /// not absolute, not under `~`, and with no `..` component. A value follows any `=`
 /// or `:`, a leading `@` or a blank, so nested settings such as
 /// `--override-ini=log_file=/abs`, `--cov-report=html:/abs` and `@/abs/args.rsp`
 /// are checked too.
 fn local_argument(arg: &str) -> bool {
-    let mut values = vec![arg];
-    values.extend(
-        arg.match_indices(['=', ':', '@', ' ', '\t'])
-            .map(|(index, separator)| &arg[index + separator.len()..]),
-    );
+    if !is_local_value(arg) {
+        return false;
+    }
+    for (index, ch) in arg.char_indices() {
+        if matches!(ch, '=' | ':' | '@' | ' ' | '\t')
+            && !is_local_value(&arg[index + ch.len_utf8()..])
+        {
+            return false;
+        }
+    }
     // An attached short option value, such as `-o/tmp/out` or `-I/opt/include`.
     let mut chars = arg.chars();
-    if chars.next() == Some('-') && chars.next().is_some_and(|c| c != '-') {
-        values.push(chars.as_str());
+    if chars.next() == Some('-')
+        && chars.next().is_some_and(|c| c != '-')
+        && !is_local_value(chars.as_str())
+    {
+        return false;
     }
-    values.into_iter().all(|value| {
-        let path = Path::new(value);
-        !value.starts_with('~')
-            && !path.has_root()
-            && !path
-                .components()
-                .any(|part| matches!(part, std::path::Component::ParentDir))
-    })
+    true
 }
 
 #[derive(Deserialize)]
@@ -2993,28 +3134,37 @@ pub struct Selection {
 impl Selection {
     pub fn for_run(args: &[OsString], rules: &[Rule]) -> Result<Self> {
         let raw: Vec<_> = args.iter().map(|a| a.to_str().unwrap_or("")).collect();
-        let unwrapped = crate::wrappers::hook_effective(&raw);
-        let mut words: Vec<_> = match &unwrapped {
-            Some(words) => words.iter().map(String::as_str).collect(),
-            None => raw,
+        let slice = crate::wrappers::hook_effective_slice(&raw).unwrap_or(&raw);
+        let normalized_vec;
+        let words: &[&str] = match slice.first() {
+            Some(&first)
+                if first == ".." || first.as_bytes().iter().any(|&b| b == b'/' || b == b'\\') =>
+            {
+                let mut v = slice.to_vec();
+                v[0] = Path::new(first)
+                    .file_name()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("");
+                normalized_vec = v;
+                &normalized_vec
+            }
+            _ => slice,
         };
-        if let Some(program) = words.first_mut() {
-            *program = Path::new(*program)
-                .file_name()
-                .and_then(|p| p.to_str())
-                .unwrap_or("");
-        }
         let rule = rules
             .iter()
             .filter(|r| {
-                words.starts_with(&r.command.iter().map(String::as_str).collect::<Vec<_>>())
+                words.len() >= r.command.len()
+                    && words
+                        .iter()
+                        .zip(&r.command)
+                        .all(|(word, expected)| *word == expected.as_str())
             })
             .max_by_key(|r| r.command.len());
         // A rule from the settings replaces the tool's built-in progress lines.
         let (omit, built_in) = match rule {
             Some(rule) => (Some(rule.validate()?), false),
             None => {
-                let omit = crate::known::progress(&words)
+                let omit = crate::known::progress(words)
                     .map(Regex::new)
                     .transpose()
                     .context("invalid built-in progress rule")?;
@@ -3023,7 +3173,7 @@ impl Selection {
             }
         };
         Ok(Self {
-            profile: profile(&words),
+            profile: profile(words),
             omit,
             built_in,
         })
@@ -3118,7 +3268,7 @@ impl<'a> LineFilter<'a> {
         } else {
             self.clipped = true;
         }
-        if error || context {
+        if (error || context) && self.evidence.len() < self.limit / 2 {
             let detail = format!("L{n} {}\n", line);
             append(&mut self.evidence, &detail, self.limit / 2);
         }
@@ -3161,6 +3311,38 @@ impl<'a> LineFilter<'a> {
 /// / `kubectl logs`), ignoring a leading timestamp so identical periodic lines
 /// (such as health checks) fold even when each line carries a fresh timestamp.
 pub(crate) fn log_dedup_key(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    if bytes.len() < 9 {
+        return line;
+    }
+    let start = usize::from(bytes[0] == b'[');
+    let head = &bytes[start..];
+    if head.len() < 8 {
+        return line;
+    }
+    if head[0].is_ascii() {
+        let starts_like_ts = (head[0].is_ascii_digit()
+            && head[1].is_ascii_digit()
+            && (head[2] == b':' || (head[2].is_ascii_digit() && head[3].is_ascii_digit())))
+            || matches!(
+                &head[..3],
+                b"Jan"
+                    | b"Feb"
+                    | b"Mar"
+                    | b"Apr"
+                    | b"May"
+                    | b"Jun"
+                    | b"Jul"
+                    | b"Aug"
+                    | b"Sep"
+                    | b"Oct"
+                    | b"Nov"
+                    | b"Dec"
+            );
+        if !starts_like_ts {
+            return line;
+        }
+    }
     static LEADING_TIMESTAMP: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
         Regex::new(
             r"^(?:\[?(?:\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}|\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\]?\s+)+",
@@ -3177,24 +3359,33 @@ pub(crate) fn log_dedup_key(line: &str) -> &str {
 }
 
 pub(crate) fn diagnostic(line: &str) -> bool {
-    let text = line.to_ascii_lowercase();
-    [
-        "fail",
-        "error",
-        "panic",
-        "warn",
-        "exception",
-        "expected:",
-        "received:",
-        "not ok",
-        "assert",
-        "fatal",
-        "✗",
-        "×",
-        "❯",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
+    let bytes = line.as_bytes();
+    for i in 0..bytes.len() {
+        let rem = &bytes[i..];
+        let matched = match bytes[i] {
+            b'f' | b'F' => {
+                rem.len() >= 4 && rem[..4].eq_ignore_ascii_case(b"fail")
+                    || rem.len() >= 5 && rem[..5].eq_ignore_ascii_case(b"fatal")
+            }
+            b'e' | b'E' => {
+                rem.len() >= 5 && rem[..5].eq_ignore_ascii_case(b"error")
+                    || rem.len() >= 9 && rem[..9].eq_ignore_ascii_case(b"exception")
+                    || rem.len() >= 9 && rem[..9].eq_ignore_ascii_case(b"expected:")
+            }
+            b'p' | b'P' => rem.len() >= 5 && rem[..5].eq_ignore_ascii_case(b"panic"),
+            b'w' | b'W' => rem.len() >= 4 && rem[..4].eq_ignore_ascii_case(b"warn"),
+            b'r' | b'R' => rem.len() >= 9 && rem[..9].eq_ignore_ascii_case(b"received:"),
+            b'n' | b'N' => rem.len() >= 6 && rem[..6].eq_ignore_ascii_case(b"not ok"),
+            b'a' | b'A' => rem.len() >= 6 && rem[..6].eq_ignore_ascii_case(b"assert"),
+            0xC3 => rem.starts_with("×".as_bytes()),
+            0xE2 => rem.starts_with("✗".as_bytes()) || rem.starts_with("❯".as_bytes()),
+            _ => false,
+        };
+        if matched {
+            return true;
+        }
+    }
+    false
 }
 
 /// Append whole lines that fit. A single line that does not fit is cut and ends
@@ -3931,5 +4122,92 @@ mod tests {
             assert_eq!(legacy_hook(&words), expected_legacy, "legacy: {cmd}");
             assert_eq!(approvable(&words), expected_approvable, "approvable: {cmd}");
         }
+    }
+
+    #[test]
+    fn modern_wrappers_and_zero_alloc_hot_path_preserve_security_and_matching() {
+        for (cmd, expected_profile, expected_legacy, expected_approvable) in [
+            (
+                "volta run --node 20 jest",
+                Some(Profile::JsTests),
+                false,
+                false,
+            ),
+            (
+                "fnm exec --using=20 -- npm test",
+                Some(Profile::JsTests),
+                false,
+                false,
+            ),
+            (
+                "corepack pnpm -F web test",
+                Some(Profile::JsTests),
+                false,
+                false,
+            ),
+            ("pyenv exec pytest -q", None, true, false),
+            (
+                "rbenv exec bundle exec rubocop",
+                Some(Profile::Lint),
+                false,
+                false,
+            ),
+            (
+                "pdm run -p packages/api ruff check .",
+                Some(Profile::Lint),
+                false,
+                false,
+            ),
+            ("poetry run -q mypy src", Some(Profile::Lint), false, true),
+            ("pipenv run pytest", None, true, true),
+            ("volta run --help", None, false, false),
+            ("fnm exec npm test", None, false, false),
+            ("sudo cargo test", None, false, true),
+        ] {
+            let words: Vec<&str> = cmd.split(' ').collect();
+            assert_eq!(profile(&words), expected_profile, "profile: {cmd}");
+            assert_eq!(legacy_hook(&words), expected_legacy, "legacy: {cmd}");
+            if !cmd.starts_with("sudo ") {
+                assert_eq!(approvable(&words), expected_approvable, "approvable: {cmd}");
+            }
+        }
+        assert_eq!(
+            tool_label_words(&["fvm", "flutter", "test"]),
+            "flutter test"
+        );
+        assert_eq!(
+            tool_label_words(&["fvm", "dart", "analyze"]),
+            "dart analyze"
+        );
+        assert!(!approvable(&["fvm", "flutter", "test"]));
+
+        // Zero-alloc `diagnostic` matches all 13 needles case-insensitively plus symbols.
+        for hit in [
+            "FAIL test_a",
+            "Fatal: crash",
+            "ERROR in main",
+            "Unhandled Exception",
+            "Expected: 1",
+            "Received: 2",
+            "Panic at line 4",
+            "WARNING: deprecated",
+            "not ok 3 - fails",
+            "AssertionError",
+            "✗ failed",
+            "× broken",
+            "❯ test",
+        ] {
+            assert!(diagnostic(hit), "diagnostic miss: {hit}");
+        }
+        for clean in ["", "ok 1 - passes", "PASS src/app.test.ts", "all 42 green"] {
+            assert!(!diagnostic(clean), "diagnostic false positive: {clean}");
+        }
+
+        // Prefix-guarded `log_dedup_key` strips timestamps and keeps non-timestamped lines intact.
+        assert_eq!(log_dedup_key("2026-11-26T12:00:01Z INFO ok"), "INFO ok");
+        assert_eq!(log_dedup_key("[12:00:01.25] ping"), "ping");
+        assert_eq!(log_dedup_key("Nov 26 12:00:01 worker ok"), "worker ok");
+        assert_eq!(log_dedup_key("INFO plain log line"), "INFO plain log line");
+        assert_eq!(log_dedup_key("short"), "short");
     }
 }

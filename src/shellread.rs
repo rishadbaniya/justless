@@ -93,30 +93,36 @@ impl LineRange {
         }
     }
 
-    /// A `sed -n` script of `A,Bp` or `A,$p` addresses, one or several joined by `;`,
-    /// such as `12,107p;209,260p` or `10,$p`.
+    /// A `sed -n` script of `A,Bp`, `A,$p`, or single-line `Ap` addresses, one
+    /// or several joined by `;`, such as `12,107p;209,260p`, `10,$p`, or `42p`.
     fn sed(script: &str) -> Option<Self> {
-        let parts: Vec<&str> = script.split(';').collect();
-        let last_index = parts.len().checked_sub(1)?;
-        let spans = parts
-            .into_iter()
-            .enumerate()
-            .map(|(index, part)| {
-                let body = part.strip_suffix('p')?;
-                if let Some(first) = body.strip_suffix(",$") {
-                    (index == last_index).then(|| {
-                        Some(Span {
-                            first: decimal(first)?,
-                            last: None,
-                            from_end: false,
-                        })
-                    })?
-                } else {
-                    Span::closed(body, ',')
+        let mut iter = script.split(';').peekable();
+        let mut spans = Vec::new();
+        while let Some(part) = iter.next() {
+            let is_last = iter.peek().is_none();
+            let body = part.strip_suffix('p')?;
+            let span = if let Some(first) = body.strip_suffix(",$") {
+                if !is_last {
+                    return None;
                 }
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(Self::new(spans))
+                Span {
+                    first: decimal(first)?,
+                    last: None,
+                    from_end: false,
+                }
+            } else if body.contains(',') {
+                Span::closed(body, ',')?
+            } else {
+                let line = decimal(body)?;
+                Span {
+                    first: line,
+                    last: Some(line),
+                    from_end: false,
+                }
+            };
+            spans.push(span);
+        }
+        (!spans.is_empty()).then(|| Self::new(spans))
     }
 
     /// The `read --shell-range` argument: `A-B` and `+N` windows joined by commas.
@@ -127,14 +133,49 @@ impl LineRange {
             .collect::<Option<Vec<_>>>()?;
         Some(Self::new(spans))
     }
+
+    /// A `bat`/`batcat` `-r`/`--line-range` argument: `A:B`, `A:`, or `:B`.
+    fn bat_range(text: &str) -> Option<Self> {
+        let (start, end) = text.split_once(':')?;
+        let span = match (start.is_empty(), end.is_empty()) {
+            (true, true) => return None,
+            (true, false) => Span {
+                first: 1,
+                last: Some(decimal(end)?),
+                from_end: false,
+            },
+            (false, true) => Span {
+                first: decimal(start)?,
+                last: None,
+                from_end: false,
+            },
+            (false, false) => {
+                let first = decimal(start)?;
+                let last = decimal(end)?;
+                (first <= last).then_some(Span {
+                    first,
+                    last: Some(last),
+                    from_end: false,
+                })?
+            }
+        };
+        Some(Self::new(vec![span]))
+    }
 }
 
 /// The object name in `git show REV:path`, `git show REV:./path` or
 /// `git show :path` (the index), also after safe Git display global flags such
 /// as `--no-pager`, `-P` or `--no-optional-locks`.
 pub(crate) fn show(words: &[String]) -> Option<&str> {
+    if words.first().map(String::as_str) != Some("git") {
+        return None;
+    }
     let refs: Vec<&str> = words.iter().map(String::as_str).collect();
-    let ["git", rest @ ..] = refs.as_slice() else {
+    show_refs(&refs)
+}
+
+fn show_refs<'a>(words: &[&'a str]) -> Option<&'a str> {
+    let ["git", rest @ ..] = words else {
         return None;
     };
     let ["show", spec] = crate::filters::git_display_subcommand(rest) else {
@@ -227,43 +268,121 @@ pub(crate) fn object(dir: &Path, spec: &str, cap: u64) -> Option<(String, String
     Some((id, text))
 }
 
-/// A standalone single-file read: `sed -n 'A,Bp[;C,Dp…]' FILE`,
-/// `head -n N FILE`, `tail -n N FILE`, `tail -n +N FILE`, `cat FILE` or
-/// `git show REV:path`, whose operand is then the object name.
+/// A plain, undecorated `bat`/`batcat` single-file read (`--plain`/`-p`/`-pp`/
+/// `--style=plain`, optional `--paging=never`/`--color=never`/`--decorations=never`
+/// and optional single `-r`/`--line-range`). Any other flag, bare `bat`, or
+/// multiple operands return `None`.
+fn bat_plain_command<'a>(words: &[&'a str]) -> Option<(&'a str, LineRange)> {
+    let [program, rest @ ..] = words else {
+        return None;
+    };
+    if !matches!(*program, "bat" | "batcat") {
+        return None;
+    }
+    let mut plain = false;
+    let mut range: Option<LineRange> = None;
+    let mut file: Option<&'a str> = None;
+    let mut iter = rest.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "--plain" | "-p" | "-pp" | "--style=plain" => plain = true,
+            "--style" => {
+                if iter.next() != Some("plain") {
+                    return None;
+                }
+                plain = true;
+            }
+            "--paging=never" | "--color=never" | "--decorations=never" => {}
+            "--paging" | "--color" | "--decorations" => {
+                if iter.next() != Some("never") {
+                    return None;
+                }
+            }
+            "-r" | "--line-range" => {
+                if range.is_some() {
+                    return None;
+                }
+                range = Some(LineRange::bat_range(iter.next()?)?);
+            }
+            _ if arg.starts_with("--line-range=") => {
+                if range.is_some() {
+                    return None;
+                }
+                range = Some(LineRange::bat_range(&arg["--line-range=".len()..])?);
+            }
+            _ if arg.starts_with("-r") && arg.len() > 2 => {
+                if range.is_some() {
+                    return None;
+                }
+                range = Some(LineRange::bat_range(&arg[2..])?);
+            }
+            _ if arg.starts_with('-') => return None,
+            _ => {
+                if file.is_some() {
+                    return None;
+                }
+                file = Some(arg);
+            }
+        }
+    }
+    if !plain {
+        return None;
+    }
+    let file = file?;
+    let range = range.unwrap_or_else(|| LineRange {
+        whole: true,
+        ..LineRange::new(vec![Span::tail("+1").expect("line 1")])
+    });
+    Some((file, range))
+}
+
+/// A standalone single-file read: `sed -n 'A,Bp[;C,Dp…]' FILE` (or `sed -ne` /
+/// `sed -n -e`), `head -n N FILE`, `tail -n N FILE`, `tail -n +N FILE`,
+/// `cat FILE`, plain `bat`/`batcat`, or `git show REV:path`, whose operand is
+/// then the object name.
+#[cfg(test)]
 fn command(words: &[String]) -> Option<(&str, LineRange)> {
+    let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+    command_words(&refs)
+}
+
+fn command_words<'a>(words: &[&'a str]) -> Option<(&'a str, LineRange)> {
     let whole = || LineRange::new(vec![Span::tail("+1").expect("line 1")]);
-    if let Some(spec) = show(words) {
+    if let Some(spec) = show_refs(words) {
         let mut range = whole();
         range.object = true;
         return Some((spec, range));
     }
     let (file, range) = match words {
-        [cat, file] if cat == "cat" => (
-            file,
+        ["cat", file] => (
+            *file,
             LineRange {
                 whole: true,
                 ..whole()
             },
         ),
-        [program, flag, address, file] if flag == "-n" => (
-            file,
-            match program.as_str() {
-                "sed" => LineRange::sed(address)?,
-                "head" => LineRange::new(vec![Span {
-                    first: 1,
-                    last: Some(decimal(address)?),
-                    from_end: false,
-                }]),
-                "tail" => LineRange::new(vec![Span::tail(address).or_else(|| {
-                    Some(Span {
-                        first: decimal(address)?,
-                        last: None,
-                        from_end: true,
-                    })
-                })?]),
-                _ => return None,
-            },
+        ["sed", "-n" | "-ne", address, file] | ["sed", "-n", "-e", address, file] => {
+            (*file, LineRange::sed(address)?)
+        }
+        ["head", "-n", address, file] => (
+            *file,
+            LineRange::new(vec![Span {
+                first: 1,
+                last: Some(decimal(address)?),
+                from_end: false,
+            }]),
         ),
+        ["tail", "-n", address, file] => (
+            *file,
+            LineRange::new(vec![Span::tail(address).or_else(|| {
+                Some(Span {
+                    first: decimal(address)?,
+                    last: None,
+                    from_end: true,
+                })
+            })?]),
+        ),
+        ["bat" | "batcat", ..] => bat_plain_command(words)?,
         _ => return None,
     };
     if file.is_empty() || file.starts_with(['-', '=']) || file.chars().any(char::is_control) {
@@ -302,8 +421,37 @@ fn split(command: &str) -> Option<Vec<(Range<usize>, &'static str)>> {
             None => at += 1,
         }
     }
+    if quote.is_some() {
+        return None;
+    }
     parts.push((start..command.len(), ""));
     Some(parts)
+}
+
+/// Zero-allocation pre-check for [`parse`]: any recognized read must begin with
+/// one of its known command words (or a quote that may wrap one), and a `git`
+/// read must contain `:` for `REV:path`.
+fn may_start_read(line: &str) -> bool {
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    let bytes = trimmed.as_bytes();
+    let Some(&first) = bytes.first() else {
+        return false;
+    };
+    if matches!(first, b'\'' | b'"') {
+        return true;
+    }
+    let end = bytes
+        .iter()
+        .position(|&b| matches!(b, b' ' | b'\t' | b'|' | b'&' | b'\'' | b'"'))
+        .unwrap_or(bytes.len());
+    if end < bytes.len() && matches!(bytes[end], b'\'' | b'"') {
+        return true;
+    }
+    match &trimmed[..end] {
+        "cd" | "cat" | "head" | "tail" | "sed" | "nl" | "bat" | "batcat" => true,
+        "git" => bytes.contains(&b':'),
+        _ => false,
+    }
 }
 
 /// Normalize `head -N`, `head`/`tail` attached `-nN`, `-n+N`, `--lines=N`,
@@ -370,6 +518,9 @@ pub(crate) fn small(lines: usize, bytes: usize, whole: Option<u64>) -> bool {
 
 /// The read a command line runs, if it is one of the forms `ShellRead` describes.
 pub(crate) fn parse(line: &str) -> Option<ShellRead> {
+    if !may_start_read(line) {
+        return None;
+    }
     let mut parts = split(line)?;
     // A last `| cat` or `| cat -` prints the read's bytes unchanged.
     let mut unpiped = None;
@@ -397,18 +548,32 @@ pub(crate) fn parse(line: &str) -> Option<ShellRead> {
         _ => (String::new(), None, 0),
     };
     let read = head_count(words(first)?);
+    let read_refs: Vec<&str> = read.iter().map(String::as_str).collect();
     let (file, range) = match &parts[first..] {
-        [(_, "")] => command(&read)?,
+        [(_, "")] => command_words(&read_refs)?,
         [(_, "|"), (_, "")] => {
             let filter = head_count(words(first + 1)?);
-            let [program, flag, address] = filter.as_slice() else {
-                return None;
+            let (program, flag, address) = match filter.as_slice() {
+                [program, flag, address] => (program.as_str(), flag.as_str(), address.as_str()),
+                [program, flag, e_flag, address]
+                    if program == "sed" && flag == "-n" && e_flag == "-e" =>
+                {
+                    ("sed", "-n", address.as_str())
+                }
+                _ => return None,
             };
             // `cat -n` and `nl -ba` number every line, `nl` with sections.
-            let (file, numbered) = match read.as_slice() {
-                [cat, file] if cat == "cat" => (file, None),
-                [cat, n, file] if cat == "cat" && n == "-n" => (file, Some(Numbering::Cat)),
-                [nl, ba, file] if nl == "nl" && ba == "-ba" => (file, Some(Numbering::Nl)),
+            let (file, numbered) = match read_refs.as_slice() {
+                ["cat", file] => (*file, None),
+                ["cat", "-n", file] => (*file, Some(Numbering::Cat)),
+                ["nl", "-ba", file] => (*file, Some(Numbering::Nl)),
+                ["bat" | "batcat", ..] => {
+                    let (file, range) = bat_plain_command(&read_refs)?;
+                    if !range.whole {
+                        return None;
+                    }
+                    (file, None)
+                }
                 _ => return None,
             };
             let filters: &[&str] = if numbered.is_some() {
@@ -416,12 +581,12 @@ pub(crate) fn parse(line: &str) -> Option<ShellRead> {
             } else {
                 &["head", "tail", "sed"]
             };
-            if !filters.contains(&program.as_str()) {
+            if !filters.contains(&program) {
                 return None;
             }
-            let (_, mut range) = command(&[program, flag, address, file].map(String::clone))?;
+            let (_, mut range) = command_words(&[program, flag, address, file])?;
             range.numbered = numbered;
-            (file.as_str(), range)
+            (file, range)
         }
         _ => return None,
     };
@@ -1151,7 +1316,7 @@ mod tests {
                 format!(
                     "{}{}:{} {}{kind}",
                     read.prefix,
-                    read.dir.unwrap_or_default(),
+                    read.dir.as_deref().unwrap_or(""),
                     read.file,
                     spans.collect::<Vec<_>>().join(",")
                 )
@@ -1268,6 +1433,80 @@ mod tests {
             "| cat",
         ] {
             assert_eq!(shown(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn bat_plain_sed_flags_and_fail_closed_reads() {
+        let shown = |line: &str| {
+            parse(line).map(|read| {
+                let spans = read
+                    .range
+                    .spans
+                    .iter()
+                    .map(|span| match span {
+                        Span { from_end: true, .. } => format!("-{}", span.first),
+                        Span { last: None, .. } => format!("+{}", span.first),
+                        Span {
+                            last: Some(last), ..
+                        } => format!("{}-{last}", span.first),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "{}{}:{} {}{}",
+                    read.prefix,
+                    read.dir.as_deref().unwrap_or(""),
+                    read.file,
+                    spans,
+                    if read.whole() { " whole" } else { "" }
+                )
+            })
+        };
+        for (line, expected) in [
+            ("bat --plain src/a.rs", ":src/a.rs +1 whole"),
+            ("bat -p src/a.rs", ":src/a.rs +1 whole"),
+            (
+                "bat -pp --paging=never --color=never src/a.rs",
+                ":src/a.rs +1 whole",
+            ),
+            (
+                "batcat --style=plain 'my dir/a.rs'",
+                ":my dir/a.rs +1 whole",
+            ),
+            ("bat -p -r 10:50 a.rs", ":a.rs 10-50"),
+            ("bat --plain --line-range=10: a.rs", ":a.rs +10"),
+            ("batcat -p -r :25 a.rs", ":a.rs 1-25"),
+            ("bat --plain a.rs | head -n 40", ":a.rs 1-40"),
+            (
+                "cd src && bat -p \"a b.rs\" | cat",
+                "cd src && src:a b.rs +1 whole",
+            ),
+            ("sed -ne '1,20p' a.rs", ":a.rs 1-20"),
+            ("sed -n -e '42p' a.rs", ":a.rs 42-42"),
+            ("cat a.rs | sed -ne '5,10p'", ":a.rs 5-10"),
+        ] {
+            assert_eq!(shown(line).as_deref(), Some(expected), "{line}");
+        }
+        for rejected in [
+            "bat src/a.rs",
+            "bat -n src/a.rs",
+            "bat -p -n src/a.rs",
+            "bat -p --color=always src/a.rs",
+            "bat -p --style=full src/a.rs",
+            "bat -p a.rs b.rs",
+            "bat -p *.rs",
+            "bat -p a.rs > out.txt",
+            "bat -p a.rs | grep foo",
+            "bat -p -r 20:10 a.rs",
+            "bat -p -r 0:5 a.rs",
+            "bat -p -r 1:5 -r 10:20 a.rs",
+            "bat -p -r 1:5 a.rs | head -n 2",
+            "cat 'unclosed",
+            "cargo test --locked",
+            "git status",
+        ] {
+            assert_eq!(shown(rejected), None, "{rejected}");
         }
     }
 }

@@ -7,6 +7,7 @@
 //! streams in order to one archive, the way the original `2>&1` merged them.
 //! `RUST_BACKTRACE=1 cargo test 2>&1` becomes
 //! `RUST_BACKTRACE=1 justless run --hook --merge -- cargo test 2>&1`.
+use std::borrow::Cow;
 use std::ops::Range;
 
 /// The redirection that merges stderr into stdout.
@@ -77,8 +78,25 @@ enum Frame {
 
 /// Whether `name` is a valid POSIX shell variable identifier (`[A-Za-z_][A-Za-z0-9_]*`).
 fn is_ident(name: &str) -> bool {
-    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    let bytes = name.as_bytes();
+    bytes
+        .first()
+        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+        && bytes[1..]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
+/// Whether `bytes` contains no pipe, quote, escape, or nesting delimiter, so the
+/// segment is guaranteed to be a single balanced stage.
+#[inline]
+fn is_plain_single_stage(bytes: &[u8]) -> bool {
+    !bytes.iter().any(|&b| {
+        matches!(
+            b,
+            b'|' | b'\'' | b'"' | b'\\' | b'(' | b')' | b'{' | b'}' | b'[' | b']'
+        )
+    })
 }
 
 /// Split a shell command segment on top-level unquoted `|` and `|&` (never `||`),
@@ -87,6 +105,12 @@ fn is_ident(name: &str) -> bool {
 /// unbalanced quotes/brackets or empty pipe stages.
 pub(crate) fn pipe_stages(segment: &str) -> Option<Vec<Range<usize>>> {
     let bytes = segment.as_bytes();
+    if is_plain_single_stage(bytes) {
+        let lead = segment.len() - segment.trim_start_matches(BLANKS).len();
+        let trimmed = segment.trim_matches(BLANKS);
+        return (!trimmed.is_empty())
+            .then(|| std::iter::once(lead..lead + trimmed.len()).collect());
+    }
     let mut stack: Vec<Frame> = Vec::new();
     let mut stages = Vec::new();
     let mut start = 0usize;
@@ -318,6 +342,9 @@ pub(crate) fn is_subshell(stage: &str) -> bool {
 /// an assignment-capable `${...=...}` parameter expansion outside single quotes.
 pub(crate) fn mutates_via_expansion(stage: &str) -> bool {
     let bytes = stage.as_bytes();
+    if !bytes.iter().any(|&b| matches!(b, b'$' | b'(' | b'\\')) {
+        return false;
+    }
     let mut stack: Vec<Frame> = Vec::new();
     let mut i = 0usize;
     while i < bytes.len() {
@@ -417,6 +444,9 @@ pub(crate) fn mutates_via_expansion(stage: &str) -> bool {
 /// expansions/subshells), if any.
 fn first_unquoted_redirect(raw: &str) -> Option<usize> {
     let bytes = raw.as_bytes();
+    if !bytes.iter().any(|&b| b == b'<' || b == b'>') {
+        return None;
+    }
     let mut stack: Vec<Frame> = Vec::new();
     let mut i = 0usize;
     while i < bytes.len() {
@@ -668,11 +698,18 @@ fn first_unquoted_eq(raw: &str) -> Option<usize> {
     None
 }
 
-/// Unquote a single raw shell word via `shlex::split`, returning `None` if it
-/// does not parse into exactly one word.
-fn unquote_word(raw: &str) -> Option<String> {
+/// Unquote a single raw shell word, borrowing `raw` without allocation when it
+/// consists solely of plain unquoted ASCII characters that `shlex::split` keeps verbatim.
+fn unquote_word(raw: &str) -> Option<Cow<'_, str>> {
+    if !raw.is_empty()
+        && raw
+            .bytes()
+            .all(|b| matches!(b, b'!'..=b'~') && !matches!(b, b'\'' | b'"' | b'\\' | b'#'))
+    {
+        return Some(Cow::Borrowed(raw));
+    }
     match shlex::split(raw).as_deref() {
-        Some([word]) => Some(word.clone()),
+        Some([word]) => Some(Cow::Owned(word.clone())),
         _ => None,
     }
 }
@@ -695,7 +732,7 @@ fn declares_steering_var(raw: &str) -> bool {
     };
     let name = unquoted
         .split_once('=')
-        .map_or(unquoted.as_str(), |(n, _)| n);
+        .map_or(unquoted.as_ref(), |(n, _)| n);
     let name = name.strip_suffix('+').unwrap_or(name);
     steers(name)
 }
@@ -710,6 +747,10 @@ fn declares_steering_var(raw: &str) -> bool {
 /// variable-mutating expansion (`${...=...}`, `$((...))`, `((...))`). A hook then
 /// passes the whole list through, as for a change of directory.
 pub fn steers_justless(segment: &str) -> bool {
+    if is_plain_single_stage(segment.as_bytes()) {
+        let trimmed = segment.trim_matches(BLANKS);
+        return trimmed.is_empty() || steers_justless_stage(trimmed);
+    }
     let Some(stages) = pipe_stages(segment) else {
         return true;
     };
@@ -728,7 +769,12 @@ fn steers_justless_stage(stage: &str) -> bool {
     let Some(raw_words) = words(stage) else {
         return true;
     };
-    let raw_words = strip_stage_redirections(stage, &raw_words);
+    let raw_words: Cow<'_, [Range<usize>]> =
+        if stage.as_bytes().iter().any(|&b| b == b'<' || b == b'>') {
+            Cow::Owned(strip_stage_redirections(stage, &raw_words))
+        } else {
+            Cow::Borrowed(&raw_words)
+        };
     // Skip leading shell control-flow keywords before assignments/program.
     let start = raw_words
         .iter()
@@ -751,11 +797,13 @@ fn steers_justless_stage(stage: &str) -> bool {
     let Some(program_idx) = program_idx else {
         return assigned;
     };
-    let mut rest = raw_words[program_idx..].iter().map(|r| &stage[r.clone()]);
+    let mut idx = program_idx;
     let raw_program = loop {
-        let Some(word) = rest.next() else {
+        let Some(range) = raw_words.get(idx) else {
             return assigned;
         };
+        idx += 1;
+        let word = &stage[range.clone()];
         if !matches!(word, "builtin" | "command" | "noglob" | "nocorrect") {
             break word;
         }
@@ -766,30 +814,33 @@ fn steers_justless_stage(stage: &str) -> bool {
     let Some(program) = unquote_word(raw_program) else {
         return true;
     };
-    let rest: Vec<&str> = rest.collect();
-    if program.ends_with("()") || rest.first().copied() == Some("()") {
+    let rest = &raw_words[idx..];
+    if program.ends_with("()") || rest.first().is_some_and(|r| &stage[r.clone()] == "()") {
         return true;
     }
     if matches!(
-        program.as_str(),
+        program.as_ref(),
         "alias" | "unalias" | "function" | "exec" | "eval" | "source" | "."
     ) {
         return true;
     }
-    if assigned && SPECIAL.contains(&program.as_str()) {
+    if assigned && SPECIAL.contains(&program.as_ref()) {
         return true;
     }
-    match program.as_str() {
-        "export" | "declare" | "typeset" | "readonly" | "local" | "unset" => {
-            rest.into_iter().any(declares_steering_var)
-        }
-        "for" => rest.first().is_none_or(|var| declares_steering_var(var)),
+    match program.as_ref() {
+        "export" | "declare" | "typeset" | "readonly" | "local" | "unset" => rest
+            .iter()
+            .any(|r| declares_steering_var(&stage[r.clone()])),
+        "for" => rest
+            .first()
+            .is_none_or(|r| declares_steering_var(&stage[r.clone()])),
         "read" | "mapfile" | "readarray" | "getopts" | "vared" => rest
-            .into_iter()
+            .iter()
+            .map(|r| &stage[r.clone()])
             .filter(|arg| !arg.starts_with('-'))
             .any(declares_steering_var),
         "printf" => {
-            let mut iter = rest.into_iter();
+            let mut iter = rest.iter().map(|r| &stage[r.clone()]);
             while let Some(arg) = iter.next() {
                 if arg == "-v" {
                     if iter.next().is_none_or(declares_steering_var) {
@@ -874,25 +925,28 @@ impl Form {
     /// environment variable as a make variable, which a recipe may use, so it takes
     /// no assignment, as it takes no `NAME=value` argument.
     pub fn approvable(&self, segment: &str) -> bool {
-        let make = || {
-            shlex::split(&segment[self.command.clone()]).is_none_or(|words| {
-                let words: Vec<&str> = words.iter().map(String::as_str).collect();
-                let Some(unwrapped) = crate::wrappers::hook_effective(&words) else {
-                    return true;
-                };
-                let refs: Vec<&str> = unwrapped.iter().map(String::as_str).collect();
-                crate::filters::unwrap_tool(&refs)
-                    .first()
-                    .is_some_and(|program| {
-                        let name = std::path::Path::new(program).file_name();
-                        name.is_some_and(|name| name == "make" || name == "gmake")
-                    })
-            })
-        };
-        (self.assignments.is_empty() || !make())
-            && self
-                .variables(segment)
-                .all(|(name, value)| display_assignment(&name, &value))
+        if self.assignments.is_empty() {
+            return true;
+        }
+        if !self
+            .variables(segment)
+            .all(|(name, value)| display_assignment(&name, &value))
+        {
+            return false;
+        }
+        let make = shlex::split(&segment[self.command.clone()]).is_none_or(|words| {
+            let words: Vec<&str> = words.iter().map(String::as_str).collect();
+            let Some(unwrapped) = crate::wrappers::hook_effective_slice(&words) else {
+                return true;
+            };
+            crate::filters::unwrap_tool(unwrapped)
+                .first()
+                .is_some_and(|program| {
+                    let name = std::path::Path::new(program).file_name();
+                    name.is_some_and(|name| name == "make" || name == "gmake")
+                })
+        });
+        !make
     }
 
     /// Whether leading assignments are safe for a mixed, non-approving client
@@ -910,14 +964,24 @@ impl Form {
 
     /// Each assignment's name and its value after quote removal. An assignment the
     /// shell would not take literally yields an empty name, which no rule accepts.
-    fn variables<'a>(&'a self, segment: &'a str) -> impl Iterator<Item = (String, String)> + 'a {
+    fn variables<'a>(
+        &'a self,
+        segment: &'a str,
+    ) -> impl Iterator<Item = (Cow<'a, str>, Cow<'a, str>)> + 'a {
         self.assignments.iter().map(|range| {
-            match shlex::split(&segment[range.clone()]).as_deref() {
-                Some([word]) => word
+            let raw = &segment[range.clone()];
+            match unquote_word(raw) {
+                Some(Cow::Borrowed(word)) => word
                     .split_once('=')
-                    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                    .map(|(name, value)| (Cow::Borrowed(name), Cow::Borrowed(value)))
                     .unwrap_or_default(),
-                _ => Default::default(),
+                Some(Cow::Owned(word)) => word
+                    .split_once('=')
+                    .map(|(name, value)| {
+                        (Cow::Owned(name.to_owned()), Cow::Owned(value.to_owned()))
+                    })
+                    .unwrap_or_default(),
+                None => Default::default(),
             }
         })
     }
@@ -1037,10 +1101,7 @@ const DISPLAY: &[&str] = &[
 
 /// Whether a word assigns a variable: an unquoted shell name followed by `=`.
 fn assignment(word: &str) -> bool {
-    word.split_once('=').is_some_and(|(name, _)| {
-        name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
+    word.split_once('=').is_some_and(|(name, _)| is_ident(name))
 }
 
 /// The byte range of each word, split at blanks outside quotes and nested
@@ -1245,5 +1306,28 @@ mod tests {
         assert!(is_subshell("(cd /tmp && ls) 2>&1"));
         assert!(!is_subshell("(( x = 1 ))"));
         assert!(!is_subshell("(cd /tmp) extra"));
+    }
+
+    #[test]
+    fn fast_path_and_quoted_shell_form_preserve_parity() {
+        // Plain single-stage commands match quoted forms for `parse`, `approvable`, and `steers_justless`.
+        let plain = "RUST_BACKTRACE=1 cargo test";
+        let quoted = r#"RUST_BACKTRACE="1" cargo test"#;
+        for cmd in [plain, quoted] {
+            let form = parse(cmd).unwrap();
+            assert!(form.keeps_justless(cmd), "{cmd}");
+            assert!(form.approvable(cmd), "{cmd}");
+            assert!(!steers_justless(cmd), "{cmd}");
+        }
+        // Display assignments stay rejected before `make` even behind safe wrappers.
+        let wrapped_make = "RUST_BACKTRACE=1 timeout 30 make test";
+        assert!(!parse(wrapped_make).unwrap().approvable(wrapped_make));
+        // Bare empty/whitespace segments fail closed in both `pipe_stages` and `steers_justless`.
+        assert_eq!(pipe_stages("   "), None);
+        assert!(steers_justless("   "));
+        // Quoted steering variable names are still caught after unquote fast-path checks.
+        assert!(steers_justless(r#"export "PATH"=/tmp"#));
+        assert!(steers_justless("export 'LD_PRELOAD'=./x.so"));
+        assert!(!steers_justless("cargo clippy --all-targets"));
     }
 }

@@ -10,21 +10,23 @@ pub(crate) fn assignment(word: &str) -> bool {
     let Some((name, _)) = word.split_once('=') else {
         return false;
     };
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    let bytes = name.as_bytes();
+    bytes
+        .first()
+        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+        && bytes[1..]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
 }
 
-fn tail(words: &[&str], n: usize) -> Option<Vec<String>> {
-    (words.len() > n).then(|| words[n..].iter().map(|w| (*w).to_owned()).collect())
+fn slice_tail<'a, 'b>(words: &'a [&'b str], n: usize) -> Option<&'a [&'b str]> {
+    (words.len() > n).then(|| &words[n..])
 }
 
-fn env_rest(words: &[&str]) -> Option<Vec<String>> {
+fn env_rest_slice<'a, 'b>(words: &'a [&'b str]) -> Option<&'a [&'b str]> {
     let mut i = 1;
-    while let Some(word) = words.get(i) {
-        match *word {
+    while let Some(&word) = words.get(i) {
+        match word {
             "-i" | "--ignore-environment" | "-0" | "--null" => i += 1,
             "-u" | "--unset" => i += 2,
             "--" => {
@@ -36,13 +38,14 @@ fn env_rest(words: &[&str]) -> Option<Vec<String>> {
             _ => break,
         }
     }
-    tail(words, i)
+    slice_tail(words, i)
 }
 
 /// Information about safe wrappers unwrapped by [`hook_effective_detail`] so
 /// approval checks can enforce stricter rules on `env` flags and assignments,
 /// and prevent auto-approval behind toolchain runners that may sync packages
 /// or run environment hooks.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct HookEffective {
     pub words: Vec<String>,
     /// Whether an `env` wrapper passed `-i`/`--ignore-environment` or `-u`/`--unset`.
@@ -50,15 +53,44 @@ pub(crate) struct HookEffective {
     /// `NAME=VALUE` assignments carried by any unwrapped `env` wrapper.
     pub env_assignments: Vec<(String, String)>,
     /// Whether an unwrapped toolchain runner (`uv run`, `mise exec`/`x`,
-    /// `direnv exec`, `pixi run`) may sync tools, evaluate `.envrc`/hooks, or
-    /// run project tasks, so auto-approving clients must ask first.
+    /// `direnv exec`, `pixi run`, `fvm`, `volta run`, `fnm exec`,
+    /// `pyenv`/`rbenv exec`, `pdm run`, `corepack`) may sync tools, evaluate
+    /// `.envrc`/hooks, or switch toolchains, so auto-approving clients must ask first.
     pub runner_unapprovable: bool,
 }
 
+/// Zero-allocation borrowed counterpart of [`HookEffective`] for hot-path hook
+/// checks (`filters::approvable`, `filters::profile`, `shell_form::Form::approvable`).
+pub(crate) struct HookEffectiveRef<'a, 'b> {
+    pub words: &'a [&'b str],
+    pub env_clears: bool,
+    pub env_assignments: Vec<(&'b str, &'b str)>,
+    pub runner_unapprovable: bool,
+}
+
+/// Borrowed-or-owned result of [`effective_words`], avoiding `Vec<String>` clones
+/// on the common path where no `git` flag stripping or `bash -c` splitting occurs.
+pub(crate) enum EffectiveWords<'a, 'b> {
+    Borrowed(&'a [&'b str]),
+    Owned(Vec<String>),
+}
+
+impl EffectiveWords<'_, '_> {
+    fn into_owned(self) -> Vec<String> {
+        match self {
+            Self::Borrowed(slice) => slice.iter().map(|w| (*w).to_owned()).collect(),
+            Self::Owned(vec) => vec,
+        }
+    }
+}
+
 fn program_name(first: &str) -> &str {
-    if std::path::Path::new(first).is_absolute() || !first.contains('/') {
-        std::path::Path::new(first)
-            .file_name()
+    if !first.as_bytes().iter().any(|&b| b == b'/' || b == b'\\') {
+        return first;
+    }
+    let path = std::path::Path::new(first);
+    if path.is_absolute() {
+        path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or(first)
     } else {
@@ -188,7 +220,7 @@ pub(crate) fn uv_run_rest<'a, 'b>(mut args: &'a [&'b str]) -> Option<&'a [&'b st
 }
 
 /// Remaining command words after `pixi run` and safe read-only/env-selection flags.
-fn pixi_run_rest<'a, 'b>(mut args: &'a [&'b str]) -> Option<&'a [&'b str]> {
+pub(crate) fn pixi_run_rest<'a, 'b>(mut args: &'a [&'b str]) -> Option<&'a [&'b str]> {
     while let Some((&word, rest)) = args.split_first() {
         match word {
             "--" => {
@@ -219,26 +251,226 @@ fn pixi_run_rest<'a, 'b>(mut args: &'a [&'b str]) -> Option<&'a [&'b str]> {
     (!args.is_empty() && !args[0].starts_with('-')).then_some(args)
 }
 
+/// Remaining command words after `fvm` (`fvm flutter ...` / `fvm dart ...`),
+/// keeping `"flutter"` or `"dart"` as the unwrapped program and rejecting bare
+/// or `--help`/`-h`/`--version`/`-V` invocations.
+pub(crate) fn fvm_rest<'a, 'b>(words: &'a [&'b str]) -> Option<&'a [&'b str]> {
+    match words {
+        [_, "flutter" | "dart", arg, ..]
+            if !matches!(*arg, "-h" | "--help" | "-V" | "--version") =>
+        {
+            Some(&words[1..])
+        }
+        _ => None,
+    }
+}
+
+/// Remaining command words after `corepack` (`corepack pnpm|yarn|npm ...`),
+/// keeping the package manager as the unwrapped program and rejecting bare or
+/// `--help`/`-h`/`--version`/`-V` invocations.
+pub(crate) fn corepack_rest<'a, 'b>(words: &'a [&'b str]) -> Option<&'a [&'b str]> {
+    match words {
+        [_, "pnpm" | "yarn" | "npm", arg, ..]
+            if !matches!(*arg, "-h" | "--help" | "-V" | "--version") =>
+        {
+            Some(&words[1..])
+        }
+        _ => None,
+    }
+}
+
+/// Remaining command words after `volta run` and safe toolchain version selectors
+/// (`--node`, `--npm`, `--yarn`, `--pnpm`, `--bundled-npm`, `--no-yarn`, `--quiet`,
+/// `--verbose`). Rejects `--env`, `--help`/`-h`, and unknown flags.
+pub(crate) fn volta_run_rest<'a, 'b>(mut args: &'a [&'b str]) -> Option<&'a [&'b str]> {
+    while let Some((&word, rest)) = args.split_first() {
+        match word {
+            "--" => {
+                args = rest;
+                break;
+            }
+            "--bundled-npm" | "--no-yarn" | "--quiet" | "--verbose" => args = rest,
+            "--node" | "--npm" | "--yarn" | "--pnpm" => {
+                let (&value, tail) = rest.split_first()?;
+                if !is_safe_runner_name(value) {
+                    return None;
+                }
+                args = tail;
+            }
+            _ if word.starts_with("--node=")
+                || word.starts_with("--npm=")
+                || word.starts_with("--yarn=")
+                || word.starts_with("--pnpm=") =>
+            {
+                let (_, value) = word.split_once('=')?;
+                if !is_safe_runner_name(value) {
+                    return None;
+                }
+                args = rest;
+            }
+            _ if word.starts_with('-') => return None,
+            _ => break,
+        }
+    }
+    (!args.is_empty() && !args[0].starts_with('-')).then_some(args)
+}
+
+/// Remaining command words after `fnm exec [--using=X | --using X] -- CMD...`.
+/// Requires `--` before the command and rejects `--help`/`-h` and unknown flags.
+pub(crate) fn fnm_exec_rest<'a, 'b>(mut args: &'a [&'b str]) -> Option<&'a [&'b str]> {
+    let mut saw_sep = false;
+    while let Some((&word, rest)) = args.split_first() {
+        match word {
+            "--" => {
+                args = rest;
+                saw_sep = true;
+                break;
+            }
+            "--using" => {
+                let (&value, tail) = rest.split_first()?;
+                if !is_safe_runner_name(value) {
+                    return None;
+                }
+                args = tail;
+            }
+            _ if word.starts_with("--using=") => {
+                let (_, value) = word.split_once('=')?;
+                if !is_safe_runner_name(value) {
+                    return None;
+                }
+                args = rest;
+            }
+            _ => return None,
+        }
+    }
+    (saw_sep && !args.is_empty() && !args[0].starts_with('-')).then_some(args)
+}
+
+/// Remaining command words after shim-exec wrappers (`asdf exec`, `pyenv exec`,
+/// `rbenv exec`), requiring a bare command name with no leading `-` or `/`.
+pub(crate) fn shim_exec_rest<'a, 'b>(args: &'a [&'b str]) -> Option<&'a [&'b str]> {
+    args.first()
+        .is_some_and(|cmd| !cmd.starts_with('-') && !cmd.contains('/'))
+        .then_some(args)
+}
+
+/// Remaining command words after `pdm run` and safe quiet/local-project/venv flags.
+/// Rejects `--list`/`-l`, `--help`/`-h`, non-local `-p`/`--project`, and unknown flags.
+pub(crate) fn pdm_run_rest<'a, 'b>(mut args: &'a [&'b str]) -> Option<&'a [&'b str]> {
+    while let Some((&word, rest)) = args.split_first() {
+        match word {
+            "--" => {
+                args = rest;
+                break;
+            }
+            "-q" | "--quiet" => args = rest,
+            "-p" | "--project" => {
+                let (&value, tail) = rest.split_first()?;
+                if !crate::filters::is_local_dir(value) {
+                    return None;
+                }
+                args = tail;
+            }
+            "--venv" => {
+                let (&value, tail) = rest.split_first()?;
+                if !is_safe_runner_name(value) {
+                    return None;
+                }
+                args = tail;
+            }
+            _ if word.starts_with("--project=") => {
+                let (_, value) = word.split_once('=')?;
+                if !crate::filters::is_local_dir(value) {
+                    return None;
+                }
+                args = rest;
+            }
+            _ if word.starts_with("--venv=") => {
+                let (_, value) = word.split_once('=')?;
+                if !is_safe_runner_name(value) {
+                    return None;
+                }
+                args = rest;
+            }
+            _ if word.starts_with('-') => return None,
+            _ => break,
+        }
+    }
+    (!args.is_empty() && !args[0].starts_with('-')).then_some(args)
+}
+
+/// Remaining command words after `poetry run` or `pipenv run`, skipping only
+/// `-q`/`--quiet` and `--` while rejecting `-h`/`--help` and unknown flags.
+pub(crate) fn poetry_run_rest<'a, 'b>(mut args: &'a [&'b str]) -> Option<&'a [&'b str]> {
+    while let Some((&word, rest)) = args.split_first() {
+        match word {
+            "--" => {
+                args = rest;
+                break;
+            }
+            "-q" | "--quiet" => args = rest,
+            _ if word.starts_with('-') => return None,
+            _ => break,
+        }
+    }
+    (!args.is_empty() && !args[0].starts_with('-')).then_some(args)
+}
+
+/// Remaining command words after `pipenv run`, skipping only `-q`/`--quiet`
+/// and `--` while rejecting `-h`/`--help` and unknown flags.
+pub(crate) fn pipenv_run_rest<'a, 'b>(args: &'a [&'b str]) -> Option<&'a [&'b str]> {
+    poetry_run_rest(args)
+}
+
 /// Strictly unwrap ONLY `timeout`, `nice`, `stdbuf`, `env`, and validated
 /// toolchain runner wrappers (`uv run`, `mise exec`/`x`, `asdf exec`,
-/// `direnv exec`, `pixi run`) for command-hook routing and profile selection.
-/// Never unwraps `bash -c`, `sh -c`, `time`, `nohup`, `command`, or relative scripts.
+/// `direnv exec`, `pixi run`, `fvm flutter`/`dart`, `volta run`, `fnm exec`,
+/// `pyenv`/`rbenv exec`, `pdm run`, `poetry run`, `pipenv run`, `corepack`)
+/// for command-hook routing and profile selection.
+/// Never unwraps `bash -c`, `sh -c`, `time`, `nohup`, `command`, `sudo`, `su`,
+/// `eval`, `exec`, `make`, `just`, `task`, or relative scripts.
 pub(crate) fn hook_effective(words: &[&str]) -> Option<Vec<String>> {
-    hook_effective_detail(words).map(|detail| detail.words)
+    hook_effective_slice(words).map(|slice| slice.iter().map(|w| (*w).to_owned()).collect())
+}
+
+/// Zero-allocation borrowed counterpart of [`hook_effective`].
+pub(crate) fn hook_effective_slice<'a, 'b>(words: &'a [&'b str]) -> Option<&'a [&'b str]> {
+    unwrap_hook_slice(words, false).map(|detail| detail.words)
+}
+
+/// Zero-allocation borrowed counterpart of [`hook_effective_detail`].
+pub(crate) fn hook_effective_ref<'a, 'b>(words: &'a [&'b str]) -> Option<HookEffectiveRef<'a, 'b>> {
+    unwrap_hook_slice(words, true)
 }
 
 /// Like [`hook_effective`], also reporting `env` options/assignments and
 /// whether an unwrapped toolchain runner requires client approval so
 /// `filters::approvable` can keep auto-approved clients strictly safe.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn hook_effective_detail(words: &[&str]) -> Option<HookEffective> {
-    let mut words: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+    let detail = hook_effective_ref(words)?;
+    Some(HookEffective {
+        words: detail.words.iter().map(|w| (*w).to_owned()).collect(),
+        env_clears: detail.env_clears,
+        env_assignments: detail
+            .env_assignments
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+        runner_unapprovable: detail.runner_unapprovable,
+    })
+}
+
+fn unwrap_hook_slice<'a, 'b>(
+    mut refs: &'a [&'b str],
+    collect_env: bool,
+) -> Option<HookEffectiveRef<'a, 'b>> {
     let mut env_clears = false;
     let mut env_assignments = Vec::new();
     let mut runner_unapprovable = false;
     loop {
-        let first = words.first()?.clone();
-        let program = program_name(&first);
-        let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+        let &first = refs.first()?;
+        let program = program_name(first);
         let rest = match program {
             "timeout" => {
                 let mut i = 1;
@@ -293,7 +525,7 @@ pub(crate) fn hook_effective_detail(words: &[&str]) -> Option<HookEffective> {
                 if !is_timeout_duration(duration) {
                     return None;
                 }
-                tail(&refs, i + 1)?
+                slice_tail(refs, i + 1)?
             }
             "nice" => {
                 let mut i = 1;
@@ -331,7 +563,7 @@ pub(crate) fn hook_effective_detail(words: &[&str]) -> Option<HookEffective> {
                         _ => break,
                     }
                 }
-                tail(&refs, i)?
+                slice_tail(refs, i)?
             }
             "stdbuf" => {
                 let mut i = 1;
@@ -375,7 +607,7 @@ pub(crate) fn hook_effective_detail(words: &[&str]) -> Option<HookEffective> {
                 if !saw_mode {
                     return None;
                 }
-                tail(&refs, i)?
+                slice_tail(refs, i)?
             }
             "env" => {
                 let mut i = 1;
@@ -424,19 +656,20 @@ pub(crate) fn hook_effective_detail(words: &[&str]) -> Option<HookEffective> {
                             if crate::shell_form::steers(name) {
                                 return None;
                             }
-                            env_assignments.push((name.to_owned(), value.to_owned()));
+                            if collect_env {
+                                env_assignments.push((name, value));
+                            }
                             i += 1;
                         }
                         _ if word.starts_with('-') => return None,
                         _ => break,
                     }
                 }
-                tail(&refs, i)?
+                slice_tail(refs, i)?
             }
             "uv" if refs.get(1) == Some(&"run") => {
-                let inner = uv_run_rest(&refs[2..])?;
                 runner_unapprovable = true;
-                inner.iter().map(|w| (*w).to_owned()).collect()
+                uv_run_rest(&refs[2..])?
             }
             "mise" if matches!(refs.get(1), Some(&"exec" | &"x")) => {
                 // Only `mise exec -- <cmd>` / `mise x -- <cmd>` without tool@version
@@ -445,16 +678,12 @@ pub(crate) fn hook_effective_detail(words: &[&str]) -> Option<HookEffective> {
                     return None;
                 }
                 runner_unapprovable = true;
-                tail(&refs, 3)?
+                slice_tail(refs, 3)?
             }
-            "asdf" if refs.get(1) == Some(&"exec") => {
-                if !refs
-                    .get(2)
-                    .is_some_and(|cmd| !cmd.starts_with('-') && !cmd.contains('/'))
-                {
-                    return None;
-                }
-                tail(&refs, 2)?
+            "asdf" if refs.get(1) == Some(&"exec") => shim_exec_rest(&refs[2..])?,
+            "pyenv" | "rbenv" if refs.get(1) == Some(&"exec") => {
+                runner_unapprovable = true;
+                shim_exec_rest(&refs[2..])?
             }
             "direnv" if refs.get(1) == Some(&"exec") => {
                 if !refs
@@ -465,19 +694,40 @@ pub(crate) fn hook_effective_detail(words: &[&str]) -> Option<HookEffective> {
                     return None;
                 }
                 runner_unapprovable = true;
-                tail(&refs, 3)?
+                slice_tail(refs, 3)?
             }
             "pixi" if refs.get(1) == Some(&"run") => {
-                let inner = pixi_run_rest(&refs[2..])?;
                 runner_unapprovable = true;
-                inner.iter().map(|w| (*w).to_owned()).collect()
+                pixi_run_rest(&refs[2..])?
+            }
+            "fvm" if matches!(refs.get(1), Some(&"flutter" | &"dart")) => {
+                runner_unapprovable = true;
+                fvm_rest(refs)?
+            }
+            "volta" if refs.get(1) == Some(&"run") => {
+                runner_unapprovable = true;
+                volta_run_rest(&refs[2..])?
+            }
+            "fnm" if refs.get(1) == Some(&"exec") => {
+                runner_unapprovable = true;
+                fnm_exec_rest(&refs[2..])?
+            }
+            "pdm" if refs.get(1) == Some(&"run") => {
+                runner_unapprovable = true;
+                pdm_run_rest(&refs[2..])?
+            }
+            "poetry" if refs.get(1) == Some(&"run") => poetry_run_rest(&refs[2..])?,
+            "pipenv" if refs.get(1) == Some(&"run") => pipenv_run_rest(&refs[2..])?,
+            "corepack" if matches!(refs.get(1), Some(&"pnpm" | &"yarn" | &"npm")) => {
+                runner_unapprovable = true;
+                corepack_rest(refs)?
             }
             _ => break,
         };
-        words = rest;
+        refs = rest;
     }
-    Some(HookEffective {
-        words,
+    Some(HookEffectiveRef {
+        words: refs,
         env_clears,
         env_assignments,
         runner_unapprovable,
@@ -487,41 +737,39 @@ pub(crate) fn hook_effective_detail(words: &[&str]) -> Option<HookEffective> {
 /// The command a wrapper actually runs, or `None` for a wrapper option this
 /// does not know.
 pub(crate) fn effective(words: &[&str]) -> Option<Vec<String>> {
-    let mut words: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+    effective_words(words).map(EffectiveWords::into_owned)
+}
+
+/// Zero-allocation fast-path counterpart of [`effective`], returning a borrowed
+/// subslice whenever no `git` flag stripping or `bash -c` splitting occurs.
+pub(crate) fn effective_words<'a, 'b>(mut refs: &'a [&'b str]) -> Option<EffectiveWords<'a, 'b>> {
     loop {
-        while words.first().is_some_and(|w| assignment(w)) {
-            words.remove(0);
+        while let Some((&first, rest)) = refs.split_first() {
+            if assignment(first) {
+                refs = rest;
+            } else {
+                break;
+            }
         }
-        let first = words.first()?.clone();
-        let program = if std::path::Path::new(&first).is_absolute() || !first.contains('/') {
-            std::path::Path::new(&first)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(first.as_str())
-        } else {
-            first.as_str()
-        };
-        let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+        let &first = refs.first()?;
+        let program = program_name(first);
         let rest = match program {
-            "env" => env_rest(&refs)?,
+            "env" => env_rest_slice(refs)?,
             "time" | "nohup" | "command" => match refs.get(1).copied() {
-                Some("-p") | Some("--") => tail(&refs, 2)?,
+                Some("-p") | Some("--") => slice_tail(refs, 2)?,
                 Some(word) if word.starts_with('-') => return None,
-                _ => tail(&refs, 1)?,
+                _ => slice_tail(refs, 1)?,
             },
             "nice" => match refs.get(1).copied() {
-                Some("-n") | Some("--adjustment") => tail(&refs, 3)?,
-                Some(word) if word.starts_with("--adjustment=") => tail(&refs, 2)?,
-                Some(word) if word.starts_with('-') => tail(&refs, 2)?,
-                _ => tail(&refs, 1)?,
+                Some("-n") | Some("--adjustment") => slice_tail(refs, 3)?,
+                Some(word) if word.starts_with("--adjustment=") => slice_tail(refs, 2)?,
+                Some(word) if word.starts_with('-') => slice_tail(refs, 2)?,
+                _ => slice_tail(refs, 1)?,
             },
             "timeout" => {
                 let mut i = 1;
-                while let Some(word) = refs.get(i) {
-                    if *word == "-s"
-                        || *word == "--signal"
-                        || *word == "-k"
-                        || *word == "--kill-after"
+                while let Some(&word) = refs.get(i) {
+                    if word == "-s" || word == "--signal" || word == "-k" || word == "--kill-after"
                     {
                         i += 2;
                     } else if word.starts_with("--signal=")
@@ -534,20 +782,20 @@ pub(crate) fn effective(words: &[&str]) -> Option<Vec<String>> {
                     }
                 }
                 let duration = refs.get(i)?;
-                if !duration.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                if !duration.as_bytes().first().is_some_and(u8::is_ascii_digit) {
                     return None;
                 }
-                tail(&refs, i + 1)?
+                slice_tail(refs, i + 1)?
             }
             "stdbuf" => {
                 let mut i = 1;
-                while let Some(word) = refs.get(i) {
-                    if *word == "--" {
+                while let Some(&word) = refs.get(i) {
+                    if word == "--" {
                         i += 1;
                         break;
                     }
                     if matches!(
-                        *word,
+                        word,
                         "-i" | "-o" | "-e" | "--input" | "--output" | "--error"
                     ) {
                         i += 2;
@@ -557,13 +805,13 @@ pub(crate) fn effective(words: &[&str]) -> Option<Vec<String>> {
                         break;
                     }
                 }
-                tail(&refs, i)?
+                slice_tail(refs, i)?
             }
             "bash" | "sh" | "zsh" | "dash" => {
                 let mut i = 1;
                 let mut found = false;
-                while let Some(word) = refs.get(i) {
-                    if *word == "-c" {
+                while let Some(&word) = refs.get(i) {
+                    if word == "-c" {
                         found = true;
                         i += 1;
                         break;
@@ -592,12 +840,12 @@ pub(crate) fn effective(words: &[&str]) -> Option<Vec<String>> {
                     return None;
                 }
                 let inner_refs: Vec<&str> = inner.iter().map(String::as_str).collect();
-                effective(&inner_refs)?
+                return Some(EffectiveWords::Owned(effective(&inner_refs)?));
             }
             "git" => {
                 let mut i = 1;
-                while let Some(word) = refs.get(i) {
-                    match *word {
+                while let Some(&word) = refs.get(i) {
+                    match word {
                         "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace"
                         | "--exec-path" | "--config-env" => i += 2,
                         "--no-pager"
@@ -624,28 +872,23 @@ pub(crate) fn effective(words: &[&str]) -> Option<Vec<String>> {
                         _ => break,
                     }
                 }
-                let mut out = vec!["git".to_owned()];
+                if i == 1 && first == "git" {
+                    return Some(EffectiveWords::Borrowed(refs));
+                }
+                let mut out = Vec::with_capacity(1 + refs.len().saturating_sub(i));
+                out.push("git".to_owned());
                 out.extend(refs[i..].iter().map(|w| (*w).to_owned()));
-                return Some(out);
+                return Some(EffectiveWords::Owned(out));
             }
-            "uv" if refs.get(1) == Some(&"run") => uv_run_rest(&refs[2..])?
-                .iter()
-                .map(|w| (*w).to_owned())
-                .collect(),
+            "uv" if refs.get(1) == Some(&"run") => uv_run_rest(&refs[2..])?,
             "mise" if matches!(refs.get(1), Some(&"exec" | &"x")) => {
                 if refs.get(2) != Some(&"--") || !refs.get(3).is_some_and(|w| !w.starts_with('-')) {
                     return None;
                 }
-                tail(&refs, 3)?
+                slice_tail(refs, 3)?
             }
-            "asdf" if refs.get(1) == Some(&"exec") => {
-                if !refs
-                    .get(2)
-                    .is_some_and(|cmd| !cmd.starts_with('-') && !cmd.contains('/'))
-                {
-                    return None;
-                }
-                tail(&refs, 2)?
+            "asdf" | "pyenv" | "rbenv" if refs.get(1) == Some(&"exec") => {
+                shim_exec_rest(&refs[2..])?
             }
             "direnv" if refs.get(1) == Some(&"exec") => {
                 if !refs
@@ -655,17 +898,23 @@ pub(crate) fn effective(words: &[&str]) -> Option<Vec<String>> {
                 {
                     return None;
                 }
-                tail(&refs, 3)?
+                slice_tail(refs, 3)?
             }
-            "pixi" if refs.get(1) == Some(&"run") => pixi_run_rest(&refs[2..])?
-                .iter()
-                .map(|w| (*w).to_owned())
-                .collect(),
+            "pixi" if refs.get(1) == Some(&"run") => pixi_run_rest(&refs[2..])?,
+            "fvm" if matches!(refs.get(1), Some(&"flutter" | &"dart")) => fvm_rest(refs)?,
+            "volta" if refs.get(1) == Some(&"run") => volta_run_rest(&refs[2..])?,
+            "fnm" if refs.get(1) == Some(&"exec") => fnm_exec_rest(&refs[2..])?,
+            "pdm" if refs.get(1) == Some(&"run") => pdm_run_rest(&refs[2..])?,
+            "poetry" if refs.get(1) == Some(&"run") => poetry_run_rest(&refs[2..])?,
+            "pipenv" if refs.get(1) == Some(&"run") => pipenv_run_rest(&refs[2..])?,
+            "corepack" if matches!(refs.get(1), Some(&"pnpm" | &"yarn" | &"npm")) => {
+                corepack_rest(refs)?
+            }
             _ => break,
         };
-        words = rest;
+        refs = rest;
     }
-    Some(words)
+    Some(EffectiveWords::Borrowed(refs))
 }
 
 #[cfg(test)]
@@ -957,6 +1206,170 @@ mod tests {
         ] {
             let words = shlex::split(untouched).unwrap();
             assert_eq!(hook_effective_words(untouched), Some(words), "{untouched}");
+        }
+    }
+
+    #[test]
+    fn modern_toolchain_wrappers_unwrap_safely_and_reject_unsafe_wrappers() {
+        for (command, expected, unapprovable) in [
+            ("fvm flutter test", &["flutter", "test"][..], true),
+            (
+                "fvm dart pub deps --no-dev",
+                &["dart", "pub", "deps", "--no-dev"][..],
+                true,
+            ),
+            (
+                "fvm dart analyze lib/",
+                &["dart", "analyze", "lib/"][..],
+                true,
+            ),
+            ("volta run jest", &["jest"][..], true),
+            (
+                "volta run --node 20 --npm 10 --yarn=4 --pnpm=9 npm test",
+                &["npm", "test"][..],
+                true,
+            ),
+            (
+                "volta run --bundled-npm --no-yarn -- vitest run",
+                &["vitest", "run"][..],
+                true,
+            ),
+            ("fnm exec -- npm test", &["npm", "test"][..], true),
+            ("fnm exec --using=20 -- jest", &["jest"][..], true),
+            (
+                "fnm exec --using v20.11.0 -- pnpm test",
+                &["pnpm", "test"][..],
+                true,
+            ),
+            ("pyenv exec pytest -q", &["pytest", "-q"][..], true),
+            ("rbenv exec rspec", &["rspec"][..], true),
+            (
+                "rbenv exec bundle exec rubocop",
+                &["bundle", "exec", "rubocop"][..],
+                true,
+            ),
+            ("pdm run pytest", &["pytest"][..], true),
+            (
+                "pdm run -q -p packages/api --venv test ruff check .",
+                &["ruff", "check", "."][..],
+                true,
+            ),
+            ("poetry run pytest", &["pytest"][..], false),
+            ("poetry run -q -- mypy src", &["mypy", "src"][..], false),
+            ("pipenv run pytest", &["pytest"][..], false),
+            ("corepack pnpm test", &["pnpm", "test"][..], true),
+            ("corepack yarn build", &["yarn", "build"][..], true),
+            ("corepack npm test", &["npm", "test"][..], true),
+            (
+                "timeout 60 volta run --node 20 corepack pnpm test",
+                &["pnpm", "test"][..],
+                true,
+            ),
+        ] {
+            let words = shlex::split(command).unwrap();
+            let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+            let detail = super::hook_effective_detail(&refs).expect(command);
+            assert_eq!(detail.words, expected, "{command}");
+            assert_eq!(detail.runner_unapprovable, unapprovable, "{command}");
+            assert_eq!(effective_words(command).unwrap(), expected, "{command}");
+        }
+
+        let env_detail = super::hook_effective_detail(&[
+            "env",
+            "-i",
+            "RUST_BACKTRACE=1",
+            "volta",
+            "run",
+            "jest",
+        ])
+        .expect("env + volta");
+        assert!(env_detail.env_clears);
+        assert_eq!(
+            env_detail.env_assignments,
+            vec![("RUST_BACKTRACE".to_owned(), "1".to_owned())]
+        );
+        assert_eq!(env_detail.words, ["jest"]);
+        assert!(env_detail.runner_unapprovable);
+
+        // Wrapper --help/-h, invalid flags, missing targets, and escaping paths fail closed.
+        for rejected in [
+            "fvm flutter",
+            "fvm flutter --help",
+            "fvm dart -h",
+            "fvm flutter --version",
+            "volta run",
+            "volta run --help",
+            "volta run -h",
+            "volta run --env PATH=/tmp jest",
+            "volta run --node ../bad jest",
+            "fnm exec npm test",
+            "fnm exec --help",
+            "fnm exec --using=../bad -- npm test",
+            "fnm exec --",
+            "pyenv exec",
+            "pyenv exec --help",
+            "pyenv exec ./evil.sh",
+            "rbenv exec -h",
+            "rbenv exec /tmp/evil",
+            "pdm run",
+            "pdm run --help",
+            "pdm run --list",
+            "pdm run -p ../outside pytest",
+            "pdm run --project=/tmp pytest",
+            "poetry run",
+            "poetry run --help",
+            "poetry run --unknown pytest",
+            "pipenv run -h",
+            "corepack pnpm",
+            "corepack pnpm --help",
+            "corepack npm -V",
+        ] {
+            assert_eq!(hook_effective_words(rejected), None, "{rejected}");
+            assert_eq!(effective_words(rejected), None, "effective: {rejected}");
+        }
+
+        // Unsafe eval/escalation wrappers, task runners, non-wrapper subcommands, and
+        // relative paths are never unwrapped in hook mode.
+        for untouched in [
+            "sudo cargo test",
+            "su -c 'cargo test'",
+            "eval 'cargo test'",
+            "exec cargo test",
+            "bash -c 'cargo test'",
+            "sh -c 'cargo test'",
+            "make test",
+            "just test",
+            "task build",
+            "fvm list",
+            "fvm --help",
+            "volta install node",
+            "fnm use 20",
+            "pyenv versions",
+            "rbenv versions",
+            "pdm install",
+            "poetry install",
+            "pipenv lock",
+            "corepack enable",
+            "./fvm flutter test",
+            "./volta run jest",
+            "./fnm exec -- npm test",
+            "./pyenv exec pytest",
+            "./corepack pnpm test",
+        ] {
+            let words = shlex::split(untouched).unwrap();
+            assert_eq!(hook_effective_words(untouched), Some(words), "{untouched}");
+        }
+        // `sudo`, `eval`, `exec`, `make`, `just`, `task` also stay untouched in `effective`.
+        for untouched in [
+            "sudo cargo test",
+            "eval 'cargo test'",
+            "exec cargo test",
+            "make test",
+            "just test",
+            "task build",
+        ] {
+            let words = shlex::split(untouched).unwrap();
+            assert_eq!(effective_words(untouched), Some(words), "{untouched}");
         }
     }
 }
