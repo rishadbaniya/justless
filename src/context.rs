@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::sync::LazyLock;
@@ -7,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use regex::Regex;
 
 use crate::capture;
-use crate::index::{Definition, Index, Removed, is_call, nul_paths};
+use crate::index::{Definition, Edge, Index, Removed, is_call, nul_paths};
 use crate::rust_syntax::Kind;
 use crate::seen::{Memory, Symbol};
 use crate::workspace::{Location, Workspace, display_path};
@@ -15,6 +16,124 @@ use crate::workspace::{Location, Workspace, display_path};
 static HUNK: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@").expect("Git hunk pattern")
 });
+
+/// Cached file text, O(1) 1-based line lookup, and lazily-computed digests for
+/// a single `context` / `pack` invocation so multi-hit files are never read or
+/// hashed from disk more than once.
+pub(crate) struct CachedSource {
+    pub(crate) text: String,
+    line_starts: Vec<usize>,
+    digest: Option<String>,
+    revision: Option<String>,
+}
+
+impl CachedSource {
+    fn new(text: String) -> Self {
+        let line_starts = build_line_starts(&text);
+        Self {
+            text,
+            line_starts,
+            digest: None,
+            revision: None,
+        }
+    }
+
+    pub(crate) fn line_count(&self) -> usize {
+        self.line_starts.len()
+    }
+
+    /// 1-based line slice matching `str::lines()` semantics (strips `\n` and `\r\n`).
+    pub(crate) fn line(&self, line_no: usize) -> Option<&str> {
+        let idx = line_no.checked_sub(1)?;
+        let start = *self.line_starts.get(idx)?;
+        let end = self
+            .line_starts
+            .get(idx + 1)
+            .copied()
+            .unwrap_or(self.text.len());
+        let raw = &self.text[start..end];
+        Some(match raw.strip_suffix('\n') {
+            Some(stripped) => stripped.strip_suffix('\r').unwrap_or(stripped),
+            None => raw,
+        })
+    }
+
+    pub(crate) fn digest(&mut self) -> &str {
+        let text = &self.text;
+        self.digest
+            .get_or_insert_with(|| capture::source_digest(text.as_bytes()))
+            .as_str()
+    }
+
+    pub(crate) fn revision(&mut self, file: &str) -> &str {
+        let text = &self.text;
+        self.revision
+            .get_or_insert_with(|| crate::source::revision_for(file, text.as_bytes()))
+            .as_str()
+    }
+}
+
+fn build_line_starts(text: &str) -> Vec<usize> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let bytes = text.as_bytes();
+    let mut starts = Vec::with_capacity(bytes.len() / 40 + 1);
+    starts.push(0);
+    for (i, &byte) in bytes.iter().enumerate() {
+        if byte == b'\n' && i + 1 < bytes.len() {
+            starts.push(i + 1);
+        }
+    }
+    starts
+}
+
+#[derive(Default)]
+pub(crate) struct SourceCache {
+    entries: HashMap<String, Option<CachedSource>>,
+    reads: usize,
+}
+
+impl SourceCache {
+    pub(crate) fn get_or_read(
+        &mut self,
+        workspace: &Workspace,
+        file: &str,
+    ) -> Result<&mut CachedSource> {
+        if !matches!(self.entries.get(file), Some(Some(_))) {
+            let path = workspace.source_path(file)?;
+            self.reads += 1;
+            let text = fs::read_to_string(path)?;
+            self.entries
+                .insert(file.to_owned(), Some(CachedSource::new(text)));
+        }
+        Ok(self
+            .entries
+            .get_mut(file)
+            .and_then(Option::as_mut)
+            .expect("cached source just inserted"))
+    }
+
+    pub(crate) fn get_or_try_read(
+        &mut self,
+        workspace: &Workspace,
+        file: &str,
+    ) -> Option<&mut CachedSource> {
+        if !self.entries.contains_key(file) {
+            let loaded = workspace.source_path(file).ok().and_then(|path| {
+                self.reads += 1;
+                fs::read_to_string(path).ok().map(CachedSource::new)
+            });
+            self.entries.insert(file.to_owned(), loaded);
+        }
+        self.entries.get_mut(file).and_then(Option::as_mut)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reads(&self) -> usize {
+        self.reads
+    }
+}
 
 pub(crate) struct Report {
     output: String,
@@ -27,7 +146,7 @@ impl Report {
 
     pub(crate) fn new(cap: usize) -> Self {
         Self {
-            output: String::new(),
+            output: String::with_capacity(cap.min(8192)),
             cap,
             clipped: false,
         }
@@ -75,7 +194,83 @@ impl Report {
     }
 }
 
+/// Longest common directory prefix (ending in `/`) shared by all `paths`.
+pub(crate) fn common_dir_prefix(paths: &[&str]) -> String {
+    fn dir_of(path: &str) -> &str {
+        path.rfind('/').map_or("", |i| &path[..=i])
+    }
+    let Some((first, rest)) = paths.split_first() else {
+        return String::new();
+    };
+    let mut common = dir_of(first);
+    for path in rest {
+        let dir = dir_of(path);
+        let shared = common
+            .bytes()
+            .zip(dir.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let cut = common[..common.floor_char_boundary(shared)]
+            .rfind('/')
+            .map_or(0, |i| i + 1);
+        common = &common[..cut];
+        if common.is_empty() {
+            break;
+        }
+    }
+    common.to_owned()
+}
+
+/// Returns a hoistable directory prefix (ending in `/`) when `paths` share a
+/// deep directory prefix (`>= 3` segments, or `>= 2` segments across at least
+/// 3 path occurrences), no path needs control-char quoting, and emitting
+/// `{line_prefix}{prefix}\n` saves at least 8 bytes over repeating `prefix`.
+pub(crate) fn hoistable_dir_prefix(paths: &[&str], line_prefix: &str) -> Option<String> {
+    if paths.len() < 2 {
+        return None;
+    }
+    if paths.iter().any(|path| display_path(path) != *path) {
+        return None;
+    }
+    let common = common_dir_prefix(paths);
+    let depth = common
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .count();
+    if depth < 2 || (depth == 2 && paths.len() < 3) {
+        return None;
+    }
+    let base_line_bytes = line_prefix.len() + common.len() + 1;
+    let repeated_bytes = paths.len() * common.len();
+    (repeated_bytes >= base_line_bytes + 8).then_some(common)
+}
+
+pub(crate) fn display_with_base<'a>(
+    file: &'a str,
+    base: Option<&str>,
+) -> std::borrow::Cow<'a, str> {
+    if let Some(prefix) = base
+        && let Some(rel) = file.strip_prefix(prefix)
+    {
+        return display_path(rel);
+    }
+    display_path(file)
+}
+
+pub(crate) fn format_location_with_base(location: &Location, base: Option<&str>) -> String {
+    let file = display_with_base(&location.file, base);
+    if location.start == location.end {
+        format!("{file}:{}", location.start)
+    } else {
+        format!("{file}:{}-{}", location.start, location.end)
+    }
+}
+
 fn describe(definition: &Definition) -> String {
+    describe_with_base(definition, None)
+}
+
+fn describe_with_base(definition: &Definition, base: Option<&str>) -> String {
     let kind = if definition.test {
         "test"
     } else {
@@ -83,40 +278,76 @@ fn describe(definition: &Definition) -> String {
     };
     format!(
         "{} [{kind}] at {}",
-        definition.qualified, definition.location
+        definition.qualified,
+        format_location_with_base(&definition.location, base)
     )
 }
 
 fn format_span_list(spans: &BTreeSet<(usize, usize)>) -> String {
-    spans
-        .iter()
-        .map(|&(start, end)| {
-            if start == end {
-                start.to_string()
-            } else {
-                format!("{start}-{end}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(",")
+    let mut out = String::with_capacity(spans.len() * 4);
+    for (i, &(start, end)) in spans.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        use std::fmt::Write as _;
+        if start == end {
+            let _ = write!(out, "{start}");
+        } else {
+            let _ = write!(out, "{start}-{end}");
+        }
+    }
+    out
 }
 
-fn format_line_spans(file: &str, spans: &BTreeSet<(usize, usize)>) -> String {
-    format!("{}:{}", display_path(file), format_span_list(spans))
+pub(crate) fn format_line_spans_with_base(
+    file: &str,
+    spans: &BTreeSet<(usize, usize)>,
+    base: Option<&str>,
+) -> String {
+    format!(
+        "{}:{}",
+        display_with_base(file, base),
+        format_span_list(spans)
+    )
 }
 
-fn format_same_file_spans(spans: &BTreeSet<(usize, usize)>) -> String {
+pub(crate) fn format_same_file_spans(spans: &BTreeSet<(usize, usize)>) -> String {
     format!(":{}", format_span_list(spans))
 }
 
 struct QuerySection {
     lines: Vec<String>,
+    /// Cumulative byte lengths (including `\n`) for `lines[..shown]` so
+    /// `body_bytes(shown)` is O(1) without resumming inside budget loops.
+    prefix_bytes: Vec<usize>,
     empty: Option<&'static str>,
     singular: &'static str,
     plural: &'static str,
 }
 
 impl QuerySection {
+    fn new(
+        lines: Vec<String>,
+        empty: Option<&'static str>,
+        singular: &'static str,
+        plural: &'static str,
+    ) -> Self {
+        let mut prefix_bytes = Vec::with_capacity(lines.len() + 1);
+        prefix_bytes.push(0);
+        let mut total = 0usize;
+        for line in &lines {
+            total += line.len() + 1;
+            prefix_bytes.push(total);
+        }
+        Self {
+            lines,
+            prefix_bytes,
+            empty,
+            singular,
+            plural,
+        }
+    }
+
     fn clip_note(&self, shown: usize) -> Option<String> {
         let missing = self.lines.len().saturating_sub(shown);
         (missing > 0).then(|| {
@@ -129,22 +360,35 @@ impl QuerySection {
         })
     }
 
+    fn clip_note_bytes(&self, shown: usize) -> usize {
+        let missing = self.lines.len().saturating_sub(shown);
+        if missing == 0 {
+            return 0;
+        }
+        let label = if missing == 1 {
+            self.singular
+        } else {
+            self.plural
+        };
+        let digits = (missing.ilog10() as usize) + 1;
+        // `"  … +"` (7 UTF-8 bytes) + digits + `" more "` (6) + label + `'\n'` (1)
+        "  … +".len() + digits + " more ".len() + label.len() + 1
+    }
+
     fn body_bytes(&self, shown: usize) -> usize {
-        self.lines[..shown].iter().map(|line| line.len() + 1).sum()
+        self.prefix_bytes[shown]
     }
 
     fn rendered_bytes(&self, shown: usize) -> usize {
         if self.lines.is_empty() {
             return self.empty.map_or(0, |line| line.len() + 1);
         }
-        let note = self.clip_note(shown).map_or(0, |line| line.len() + 1);
-        self.body_bytes(shown) + note
+        self.body_bytes(shown) + self.clip_note_bytes(shown)
     }
 }
 
-fn total_query_bytes(header: &str, sections: &[QuerySection], shown: &[usize]) -> usize {
-    header.len()
-        + 1
+fn total_query_bytes(header_bytes: usize, sections: &[QuerySection], shown: &[usize]) -> usize {
+    header_bytes
         + sections
             .iter()
             .zip(shown)
@@ -155,10 +399,10 @@ fn total_query_bytes(header: &str, sections: &[QuerySection], shown: &[usize]) -
 /// Allocates `cap` across non-empty query sections so no single hub section
 /// starves the others: Pass 1 gives each non-empty section up to an equal byte
 /// share, and Pass 2 water-fills any leftover bytes across incomplete sections.
-fn fit_query_sections(header: &str, sections: &[QuerySection], cap: usize) -> Vec<usize> {
+fn fit_query_sections(header_bytes: usize, sections: &[QuerySection], cap: usize) -> Vec<usize> {
     let usable = cap.saturating_sub(Report::CLIPPED.len());
     let all: Vec<usize> = sections.iter().map(|section| section.lines.len()).collect();
-    if total_query_bytes(header, sections, &all) <= usable {
+    if total_query_bytes(header_bytes, sections, &all) <= usable {
         return all;
     }
     let mut shown = vec![0usize; sections.len()];
@@ -170,34 +414,36 @@ fn fit_query_sections(header: &str, sections: &[QuerySection], cap: usize) -> Ve
     if non_empty.is_empty() {
         return shown;
     }
-    let fixed: usize = header.len()
-        + 1
+    let fixed: usize = header_bytes
         + sections
             .iter()
             .filter(|section| section.lines.is_empty())
             .map(|section| section.rendered_bytes(0))
             .sum::<usize>();
     let fair_share = usable.saturating_sub(fixed) / non_empty.len();
-    let can_grow = |i: usize, shown: &[usize], limit: Option<usize>| -> bool {
-        if shown[i] >= sections[i].lines.len() {
-            return false;
-        }
-        let before = sections[i].rendered_bytes(shown[i]);
-        let after = sections[i].rendered_bytes(shown[i] + 1);
-        if let Some(limit) = limit
-            && after > limit
-        {
-            return false;
-        }
-        let next_total = total_query_bytes(header, sections, shown) - before + after;
-        next_total <= usable
-    };
+    let mut current_total = total_query_bytes(header_bytes, sections, &shown);
+    let can_grow =
+        |i: usize, shown: &[usize], current: usize, limit: Option<usize>| -> Option<usize> {
+            if shown[i] >= sections[i].lines.len() {
+                return None;
+            }
+            let before = sections[i].rendered_bytes(shown[i]);
+            let after = sections[i].rendered_bytes(shown[i] + 1);
+            if let Some(limit) = limit
+                && after > limit
+            {
+                return None;
+            }
+            let next_total = current - before + after;
+            (next_total <= usable).then_some(next_total)
+        };
     // Pass 1: fair byte share per non-empty section.
     loop {
         let mut progress = false;
         for &i in &non_empty {
-            if can_grow(i, &shown, Some(fair_share)) {
+            if let Some(next_total) = can_grow(i, &shown, current_total, Some(fair_share)) {
                 shown[i] += 1;
+                current_total = next_total;
                 progress = true;
             }
         }
@@ -211,12 +457,15 @@ fn fit_query_sections(header: &str, sections: &[QuerySection], cap: usize) -> Ve
         let next = non_empty
             .iter()
             .copied()
-            .filter(|&i| can_grow(i, &shown, None))
-            .min_by_key(|&i| (sections[i].body_bytes(shown[i]), shown[i], i));
-        let Some(i) = next else {
+            .filter_map(|i| {
+                can_grow(i, &shown, current_total, None).map(|next_total| (i, next_total))
+            })
+            .min_by_key(|&(i, _)| (sections[i].body_bytes(shown[i]), shown[i], i));
+        let Some((i, next_total)) = next else {
             break;
         };
         shown[i] += 1;
+        current_total = next_total;
     }
     shown
 }
@@ -233,11 +482,12 @@ fn query_report(index: &Index, name: &str, view: &str, cap: usize) -> Result<Rep
         report.line(&header);
         return Ok(report);
     }
-    let mut sections = Vec::new();
-    if matches!(view, "references" | "callers" | "all") {
-        type IncomingKey<'a> = (Option<usize>, &'static str, bool, &'a str);
+    type IncomingKey<'a> = (Option<usize>, &'static str, bool, &'a str);
+    type OutgoingKey<'a> = (usize, &'static str, bool, &'a str);
+
+    let incoming_groups = if matches!(view, "references" | "callers" | "all") {
         let mut groups: Vec<(IncomingKey<'_>, BTreeSet<(usize, usize)>)> = Vec::new();
-        let mut by_key: BTreeMap<IncomingKey<'_>, usize> = BTreeMap::new();
+        let mut by_key: HashMap<IncomingKey<'_>, usize> = HashMap::new();
         for edge in index
             .incoming(id)
             .filter(|edge| view != "callers" || is_call(edge.kind))
@@ -257,35 +507,15 @@ fn query_report(index: &Index, name: &str, view: &str, cap: usize) -> Result<Rep
                 .1
                 .insert((edge.location.start, edge.location.end));
         }
-        let lines = groups
-            .into_iter()
-            .map(|((from, kind, inferred, file), spans)| {
-                let owner = from
-                    .map(|owner_id| index.definitions[owner_id].qualified.as_str())
-                    .unwrap_or("file scope");
-                let confidence = if inferred { "possible " } else { "" };
-                format!(
-                    "  {confidence}{kind} from {owner} at {}",
-                    format_line_spans(file, &spans)
-                )
-            })
-            .collect();
-        let (singular, plural) = if view == "callers" {
-            ("caller", "callers")
-        } else {
-            ("reference", "references")
-        };
-        sections.push(QuerySection {
-            lines,
-            empty: Some("  No matching references found."),
-            singular,
-            plural,
-        });
-    }
-    if matches!(view, "dependencies" | "all") {
-        type OutgoingKey<'a> = (usize, &'static str, bool, &'a str);
+        Some(groups)
+    } else {
+        None
+    };
+
+    let def_file = index.definitions[id].location.file.as_str();
+    let outgoing_groups = if matches!(view, "dependencies" | "all") {
         let mut groups: Vec<(OutgoingKey<'_>, BTreeSet<(usize, usize)>)> = Vec::new();
-        let mut by_key: BTreeMap<OutgoingKey<'_>, usize> = BTreeMap::new();
+        let mut by_key: HashMap<OutgoingKey<'_>, usize> = HashMap::new();
         for edge in index.outgoing(id) {
             let key = (
                 edge.to,
@@ -302,50 +532,137 @@ fn query_report(index: &Index, name: &str, view: &str, cap: usize) -> Result<Rep
                 .1
                 .insert((edge.location.start, edge.location.end));
         }
-        let def_file = index.definitions[id].location.file.as_str();
-        let lines = groups
-            .into_iter()
-            .map(|((to, kind, inferred, file), spans)| {
-                let confidence = if inferred { "possible " } else { "" };
-                let origin = if file == def_file {
-                    format_same_file_spans(&spans)
-                } else {
-                    format_line_spans(file, &spans)
-                };
-                format!(
-                    "  {confidence}{kind} → {} (from {origin})",
-                    describe(&index.definitions[to]),
-                )
-            })
-            .collect();
-        sections.push(QuerySection {
-            lines,
-            empty: None,
-            singular: "dependency",
-            plural: "dependencies",
-        });
+        Some(groups)
+    } else {
+        None
+    };
+
+    let related_tests = if matches!(view, "tests" | "all") {
+        Some(index.related_tests(id, 16))
+    } else {
+        None
+    };
+
+    // Collect every rendered file path occurrence inside the body sections so we
+    // can hoist a deep `>= 2`-segment shared directory prefix when strictly smaller.
+    let mut section_paths: Vec<&str> = Vec::new();
+    if let Some(groups) = &incoming_groups {
+        for &((_, _, _, file), _) in groups {
+            section_paths.push(file);
+        }
     }
-    if matches!(view, "tests" | "all") {
-        let lines = index
-            .related_tests(id, 16)
-            .into_iter()
-            .map(|(test_id, hops, inferred)| {
-                let confidence = if inferred { "possible " } else { "" };
-                format!(
-                    "  {confidence}related test ({hops} call hops): {}",
-                    describe(&index.definitions[test_id])
-                )
-            })
-            .collect();
-        sections.push(QuerySection {
-            lines,
-            empty: Some("  No related tests found in indexed calls."),
-            singular: "related test",
-            plural: "related tests",
-        });
+    if let Some(groups) = &outgoing_groups {
+        for &((to, _, _, file), _) in groups {
+            section_paths.push(index.definitions[to].location.file.as_str());
+            if file != def_file {
+                section_paths.push(file);
+            }
+        }
     }
-    let shown = fit_query_sections(&header, &sections, cap);
+    if let Some(tests) = &related_tests {
+        for &(test_id, _, _) in tests {
+            section_paths.push(index.definitions[test_id].location.file.as_str());
+        }
+    }
+
+    let build_sections = |base: Option<&str>| -> Vec<QuerySection> {
+        let mut sections = Vec::with_capacity(3);
+        if let Some(groups) = &incoming_groups {
+            let lines = groups
+                .iter()
+                .map(|((from, kind, inferred, file), spans)| {
+                    let owner = from
+                        .map(|owner_id| index.definitions[owner_id].qualified.as_str())
+                        .unwrap_or("file scope");
+                    let confidence = if *inferred { "possible " } else { "" };
+                    format!(
+                        "  {confidence}{kind} from {owner} at {}",
+                        format_line_spans_with_base(file, spans, base)
+                    )
+                })
+                .collect();
+            let (singular, plural) = if view == "callers" {
+                ("caller", "callers")
+            } else {
+                ("reference", "references")
+            };
+            sections.push(QuerySection::new(
+                lines,
+                Some("  No matching references found."),
+                singular,
+                plural,
+            ));
+        }
+        if let Some(groups) = &outgoing_groups {
+            let lines = groups
+                .iter()
+                .map(|((to, kind, inferred, file), spans)| {
+                    let confidence = if *inferred { "possible " } else { "" };
+                    let origin = if *file == def_file {
+                        format_same_file_spans(spans)
+                    } else {
+                        format_line_spans_with_base(file, spans, base)
+                    };
+                    format!(
+                        "  {confidence}{kind} → {} (from {origin})",
+                        describe_with_base(&index.definitions[*to], base),
+                    )
+                })
+                .collect();
+            sections.push(QuerySection::new(lines, None, "dependency", "dependencies"));
+        }
+        if let Some(tests) = &related_tests {
+            let lines = tests
+                .iter()
+                .map(|&(test_id, hops, inferred)| {
+                    let confidence = if inferred { "possible " } else { "" };
+                    format!(
+                        "  {confidence}related test ({hops} call hops): {}",
+                        describe_with_base(&index.definitions[test_id], base)
+                    )
+                })
+                .collect();
+            sections.push(QuerySection::new(
+                lines,
+                Some("  No related tests found in indexed calls."),
+                "related test",
+                "related tests",
+            ));
+        }
+        sections
+    };
+
+    let mut base_line: Option<String> = None;
+    let mut sections = build_sections(None);
+    let header_bytes = header.len() + 1;
+    let mut shown = fit_query_sections(header_bytes, &sections, cap);
+
+    if let Some(prefix) = hoistable_dir_prefix(&section_paths, "  base: ") {
+        let candidate_base = format!("  base: {prefix}");
+        let candidate_sections = build_sections(Some(&prefix));
+        let candidate_header_bytes = header.len() + 1 + candidate_base.len() + 1;
+        let candidate_shown = fit_query_sections(candidate_header_bytes, &candidate_sections, cap);
+        let plain_total = total_query_bytes(header_bytes, &sections, &shown);
+        let hoisted_total = total_query_bytes(
+            candidate_header_bytes,
+            &candidate_sections,
+            &candidate_shown,
+        );
+        let plain_items: usize = shown.iter().sum();
+        let hoisted_items: usize = candidate_shown.iter().sum();
+        if hoisted_items > plain_items
+            || (hoisted_items == plain_items && hoisted_total < plain_total)
+        {
+            base_line = Some(candidate_base);
+            sections = candidate_sections;
+            shown = candidate_shown;
+        }
+    }
+
     report.line(&header);
+    if let Some(line) = &base_line {
+        report.line(line);
+    }
     for (section, &count) in sections.iter().zip(&shown) {
         if report.clipped {
             break;
@@ -382,28 +699,42 @@ pub(crate) fn relationship(kind: Kind) -> &'static str {
 }
 
 pub fn path(index: &Index, from: &str, to: &str, cap: usize) -> Result<()> {
+    path_report(index, from, to, cap)?.finish()
+}
+
+fn path_report(index: &Index, from: &str, to: &str, cap: usize) -> Result<Report> {
     let from = index.select(from)?;
     let to = index.select(to)?;
-    let path = index
+    let hops = index
         .path(from, to)
         .context("no indexed relationship path found")?;
+    let mut hop_paths = Vec::with_capacity(hops.len() * 2);
+    for &(edge, reverse) in &hops {
+        let other = if reverse { edge.from.unwrap() } else { edge.to };
+        hop_paths.push(edge.location.file.as_str());
+        hop_paths.push(index.definitions[other].location.file.as_str());
+    }
+    let base = hoistable_dir_prefix(&hop_paths, "  base: ");
     let mut report = Report::new(cap);
     report.line(describe(&index.definitions[from]));
-    for (edge, reverse) in path {
+    if let Some(prefix) = &base {
+        report.line(format!("  base: {prefix}"));
+    }
+    for (edge, reverse) in hops {
         let direction = if reverse { "←" } else { "→" };
         let other = if reverse { edge.from.unwrap() } else { edge.to };
         let confidence = if edge.inferred { "possible " } else { "" };
         report.line(format!(
             "  {direction} {confidence}{} at {} → {}",
             relationship(edge.kind),
-            edge.location,
-            describe(&index.definitions[other])
+            format_location_with_base(&edge.location, base.as_deref()),
+            describe_with_base(&index.definitions[other], base.as_deref())
         ));
         if report.clipped {
             break;
         }
     }
-    report.finish()
+    Ok(report)
 }
 
 pub fn code(workspace: &Workspace, file: &str, from: usize, to: usize, cap: usize) -> Result<()> {
@@ -418,19 +749,39 @@ fn code_with_indent(
     cap: usize,
     min_indent: usize,
 ) -> Result<()> {
+    let mut cache = SourceCache::default();
+    code_with_indent_cached(workspace, &mut cache, file, from, to, cap, min_indent)?.finish()
+}
+
+fn code_with_indent_cached(
+    workspace: &Workspace,
+    cache: &mut SourceCache,
+    file: &str,
+    from: usize,
+    to: usize,
+    cap: usize,
+    min_indent: usize,
+) -> Result<Report> {
     ensure!(
         from > 0 && from <= to,
         "expected a positive, ordered line range"
     );
-    let lines = ensure_line(workspace, file, from)?;
+    let lines = ensure_line_cached(workspace, cache, file, from)?;
     let shown = to.min(lines);
     let mut report = Report::new(cap);
     report.line(format!("{}:{from}-{shown}", display_path(file)));
-    snippets_trimmed(workspace, file, &[(from, shown)], min_indent, &mut report)?;
+    snippets_trimmed_cached(
+        workspace,
+        cache,
+        file,
+        &[(from, shown)],
+        min_indent,
+        &mut report,
+    )?;
     if shown < to && !report.clipped {
         report.line(format!("  (file ends at line {lines})"));
     }
-    report.finish()
+    Ok(report)
 }
 
 /// Minimum shared leading indentation width (in columns: `' '` = 1, `'\t'` = 4)
@@ -499,13 +850,13 @@ fn strip_leading_indent(line: &str, strip: usize) -> &str {
 
 /// Lines in a workspace file. A range that starts past the end is an error,
 /// so a stale line number never looks like an empty location.
-fn line_count(workspace: &Workspace, file: &str) -> Result<usize> {
-    let text = fs::read_to_string(workspace.source_path(file)?)?;
-    Ok(text.lines().count())
-}
-
-fn ensure_line(workspace: &Workspace, file: &str, line: usize) -> Result<usize> {
-    let lines = line_count(workspace, file)?;
+fn ensure_line_cached(
+    workspace: &Workspace,
+    cache: &mut SourceCache,
+    file: &str,
+    line: usize,
+) -> Result<usize> {
+    let lines = cache.get_or_read(workspace, file)?.line_count();
     ensure!(
         line <= lines,
         "{} has {lines} lines; line {line} is past the end",
@@ -514,18 +865,39 @@ fn ensure_line(workspace: &Workspace, file: &str, line: usize) -> Result<usize> 
     Ok(lines)
 }
 
-fn snippet(
+#[cfg(test)]
+fn snippets_trimmed(
     workspace: &Workspace,
+    file: &str,
+    windows: &[(usize, usize)],
+    min_indent: usize,
+    report: &mut Report,
+) -> Result<()> {
+    let mut cache = SourceCache::default();
+    snippets_trimmed_cached(workspace, &mut cache, file, windows, min_indent, report)
+}
+
+fn snippet_cached(
+    workspace: &Workspace,
+    cache: &mut SourceCache,
     file: &str,
     from: usize,
     to: usize,
     report: &mut Report,
 ) -> Result<()> {
-    snippets_trimmed(workspace, file, &[(from, to)], MIN_TRIM_INDENT, report)
+    snippets_trimmed_cached(
+        workspace,
+        cache,
+        file,
+        &[(from, to)],
+        MIN_TRIM_INDENT,
+        report,
+    )
 }
 
-fn snippets_trimmed(
+fn snippets_trimmed_cached(
     workspace: &Workspace,
+    cache: &mut SourceCache,
     file: &str,
     windows: &[(usize, usize)],
     min_indent: usize,
@@ -534,9 +906,9 @@ fn snippets_trimmed(
     if windows.is_empty() {
         return Ok(());
     }
-    let text = fs::read_to_string(workspace.source_path(file)?)?;
-    let lines: Vec<&str> = text.lines().collect();
-    let digest = capture::source_digest(text.as_bytes());
+    let source = cache.get_or_read(workspace, file)?;
+    let digest = source.digest().to_owned();
+    let total_lines = source.line_count();
     for (index, &(from, to)) in windows.iter().enumerate() {
         if report.clipped {
             break;
@@ -549,14 +921,19 @@ fn snippets_trimmed(
         }
         let before = report.left();
         let mut last = None;
-        let window_lines: Vec<(usize, &str)> = lines
-            .iter()
-            .enumerate()
-            .skip(from.saturating_sub(1))
-            .take(to.saturating_sub(from) + 1)
-            .map(|(offset, &content)| (offset + 1, content))
-            .collect();
-        let raw: Vec<&str> = window_lines.iter().map(|&(_, content)| content).collect();
+        let first = from.max(1);
+        let end = to.min(total_lines);
+        let count = end.saturating_sub(first) + usize::from(first <= end);
+        let mut window_lines: Vec<(usize, &str)> = Vec::with_capacity(count);
+        let mut raw: Vec<&str> = Vec::with_capacity(count);
+        if first <= end {
+            for line_no in first..=end {
+                if let Some(content) = source.line(line_no) {
+                    window_lines.push((line_no, content));
+                    raw.push(content);
+                }
+            }
+        }
         let strip = shared_indent_strip(&raw, min_indent);
         for (line_no, content) in window_lines {
             if report.clipped {
@@ -581,6 +958,18 @@ pub fn at(
     cap: usize,
     memory: Option<&mut Memory>,
 ) -> Result<()> {
+    let mut cache = SourceCache::default();
+    at_report_cached(workspace, &mut cache, index, input, cap, memory)?.finish()
+}
+
+fn at_report_cached(
+    workspace: &Workspace,
+    cache: &mut SourceCache,
+    index: &Index,
+    input: &str,
+    cap: usize,
+    memory: Option<&mut Memory>,
+) -> Result<Report> {
     let (file, range) = input
         .rsplit_once(':')
         .context("use a workspace-relative path and line, e.g. src/lib.rs:10")?;
@@ -591,20 +980,22 @@ pub fn at(
         start > 0 && start <= end,
         "expected a positive, ordered line range"
     );
-    let lines = ensure_line(workspace, file, start)?;
+    let lines = ensure_line_cached(workspace, cache, file, start)?;
     let mut report = Report::new(cap);
-    at_location(
+    at_location_cached(
         workspace,
+        cache,
         index,
         &Location {
             file: file.to_owned(),
             start,
             end: end.min(lines),
         },
+        None,
         &mut report,
         memory,
     )?;
-    report.finish()
+    Ok(report)
 }
 
 /// The symbol's source. In a session, a symbol read before prints only the
@@ -619,31 +1010,37 @@ pub fn symbol(
     let id = index.select(name)?;
     let definition = &index.definitions[id];
     let location = &definition.location;
+    let mut cache = SourceCache::default();
     let Some(memory) = memory else {
-        return code_with_indent(
+        return code_with_indent_cached(
             workspace,
+            &mut cache,
             &location.file,
             location.start,
             location.end,
             cap,
             SESSION_MIN_TRIM_INDENT,
-        );
+        )?
+        .finish();
     };
-    let text = fs::read_to_string(workspace.source_path(&location.file)?)?;
-    if location.start == 0 || location.start > text.lines().count() {
-        return code_with_indent(
+    let line_count = cache.get_or_read(workspace, &location.file)?.line_count();
+    if location.start == 0 || location.start > line_count {
+        return code_with_indent_cached(
             workspace,
+            &mut cache,
             &location.file,
             location.start,
             location.end,
             cap,
             SESSION_MIN_TRIM_INDENT,
-        );
+        )?
+        .finish();
     }
+    let text = &cache.get_or_read(workspace, &location.file)?.text;
     let mut report = Report::new(cap);
     memory.show(
         workspace,
-        &text,
+        text,
         &Symbol {
             file: &location.file,
             name: &seen_name(index, id),
@@ -663,15 +1060,24 @@ pub fn symbol(
 /// cfg-gated twin, so one twin's view is never compared with another's.
 fn seen_name(index: &Index, id: usize) -> String {
     let definition = &index.definitions[id];
-    let earlier = index
-        .definitions
-        .iter()
-        .filter(|other| {
-            other.qualified == definition.qualified
-                && other.location.file == definition.location.file
-                && other.location.start < definition.location.start
-        })
-        .count();
+    let earlier = if definition.location.start <= 1 {
+        0
+    } else {
+        let before = Location {
+            file: definition.location.file.clone(),
+            start: 1,
+            end: definition.location.start - 1,
+        };
+        index
+            .at(&before)
+            .into_iter()
+            .filter(|&other_id| {
+                let other = &index.definitions[other_id];
+                other.qualified == definition.qualified
+                    && other.location.start < definition.location.start
+            })
+            .count()
+    };
     if earlier == 0 {
         definition.qualified.clone()
     } else {
@@ -682,14 +1088,42 @@ fn seen_name(index: &Index, id: usize) -> String {
 /// The names a session remembers the definitions of `file` by that share any
 /// of lines `from..=to`, such as a method and the block around it.
 pub(crate) fn seen_names(index: &Index, file: &str, from: usize, to: usize) -> Vec<String> {
-    index
-        .definitions
-        .iter()
-        .enumerate()
-        .filter(|(_, other)| {
-            other.location.file == file && other.location.start <= to && from <= other.location.end
+    let all_in_file = index.at(&Location {
+        file: file.to_owned(),
+        start: 1,
+        end: usize::MAX,
+    });
+    if all_in_file.is_empty() {
+        return Vec::new();
+    }
+    let mut starts_by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut overlapping: Vec<usize> = Vec::new();
+    for &id in &all_in_file {
+        let def = &index.definitions[id];
+        starts_by_name
+            .entry(def.qualified.as_str())
+            .or_default()
+            .push(def.location.start);
+        if def.location.start <= to && from <= def.location.end {
+            overlapping.push(id);
+        }
+    }
+    overlapping.sort_unstable();
+    overlapping
+        .into_iter()
+        .map(|id| {
+            let def = &index.definitions[id];
+            let earlier = starts_by_name
+                .get(def.qualified.as_str())
+                .map_or(0, |starts| {
+                    starts.iter().filter(|&&s| s < def.location.start).count()
+                });
+            if earlier == 0 {
+                def.qualified.clone()
+            } else {
+                format!("{}#{}", def.qualified, earlier + 1)
+            }
         })
-        .map(|(id, _)| seen_name(index, id))
         .collect()
 }
 
@@ -779,16 +1213,17 @@ fn emit_diagnostics(
     id: &str,
     location: &Location,
     diagnostics: &[&capture::Diagnostic],
+    base: Option<&str>,
     report: &mut Report,
 ) -> Result<()> {
     let shown = diagnostics.len().min(MAX_DIAGNOSTICS_PER_LOCATION);
+    let display_loc = format_location_with_base(location, base);
     for diagnostic in &diagnostics[..shown] {
         if report.clipped {
             break;
         }
         report.line(format!(
-            "{} · log {}:{}",
-            location,
+            "{display_loc} · log {}:{}",
             diagnostic.stream.name(),
             diagnostic.log_line
         ));
@@ -833,6 +1268,7 @@ fn from_run_report(
 ) -> Result<(std::path::PathBuf, String, usize)> {
     let (directory, run) = capture::load(workspace, id)?;
     let mut report = Report::new(cap);
+    let mut cache = SourceCache::default();
     let justless = workspace.justless();
     // Bytes of source shown around the locations.
     let mut source = 0;
@@ -843,20 +1279,25 @@ fn from_run_report(
     if run.diagnostics.is_empty() {
         report.line(format!("No indexed source location found. Inspect {justless} search {id} <text> or {justless} log {id}."));
     }
-    // Group by source location but keep every distinct log line: progress output and
-    // the real error often name the same line, and the error must survive.
-    let mut groups: Vec<(&Location, Vec<&capture::Diagnostic>)> = Vec::new();
+    // Group by source location in O(D) while keeping every distinct log line:
+    // progress output and the real error often name the same line, and the
+    // error must survive.
+    let mut groups: Vec<(&Location, Vec<&capture::Diagnostic>)> =
+        Vec::with_capacity(run.diagnostics.len());
+    let mut by_loc: HashMap<(&str, usize, usize), usize> =
+        HashMap::with_capacity(run.diagnostics.len());
+    let mut seen_diag: HashSet<(usize, &str, usize)> =
+        HashSet::with_capacity(run.diagnostics.len());
     for diagnostic in &run.diagnostics {
         let location = &diagnostic.location;
-        match groups.iter_mut().find(|(seen, _)| *seen == location) {
-            Some((_, list)) => {
-                if !list.iter().any(|d| {
-                    d.stream.name() == diagnostic.stream.name() && d.log_line == diagnostic.log_line
-                }) {
-                    list.push(diagnostic);
-                }
-            }
-            None => groups.push((location, vec![diagnostic])),
+        let loc_key = (location.file.as_str(), location.start, location.end);
+        let slot = *by_loc.entry(loc_key).or_insert_with(|| {
+            let pos = groups.len();
+            groups.push((location, Vec::new()));
+            pos
+        });
+        if seen_diag.insert((slot, diagnostic.stream.name(), diagnostic.log_line)) {
+            groups[slot].1.push(diagnostic);
         }
     }
     // A failed command usually reports its error on stderr; list those first, both
@@ -874,6 +1315,7 @@ fn from_run_report(
         Symbol {
             best: usize,
             overlapping: Vec<usize>,
+            overlapping_seen: HashSet<usize>,
             items: Vec<(&'a Location, Vec<&'a capture::Diagnostic>)>,
         },
         Standalone {
@@ -882,8 +1324,8 @@ fn from_run_report(
             stale: bool,
         },
     }
-    let mut entries: Vec<RunEntry<'_>> = Vec::new();
-    let mut by_symbol: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut entries: Vec<RunEntry<'_>> = Vec::with_capacity(groups.len());
+    let mut by_symbol: HashMap<usize, usize> = HashMap::new();
     for (location, diagnostics) in groups {
         let stale = run
             .source_digests
@@ -895,13 +1337,14 @@ fn from_run_report(
             if let Some(&slot) = by_symbol.get(&best) {
                 if let RunEntry::Symbol {
                     overlapping: existing,
+                    overlapping_seen,
                     items,
                     ..
                 } = &mut entries[slot]
                 {
                     if location.end > location.start {
                         for id in overlapping {
-                            if !existing.contains(&id) {
+                            if overlapping_seen.insert(id) {
                                 existing.push(id);
                             }
                         }
@@ -915,9 +1358,11 @@ fn from_run_report(
                 } else {
                     Vec::new()
                 };
+                let overlapping_seen: HashSet<usize> = keep_overlap.iter().copied().collect();
                 entries.push(RunEntry::Symbol {
                     best,
                     overlapping: keep_overlap,
+                    overlapping_seen,
                     items: vec![(location, diagnostics)],
                 });
                 by_symbol.insert(best, slot);
@@ -930,6 +1375,24 @@ fn from_run_report(
             });
         }
     }
+    let mut run_paths: Vec<&str> = Vec::new();
+    for entry in &entries {
+        match entry {
+            RunEntry::Symbol { best, items, .. } => {
+                for (loc, _) in items {
+                    run_paths.push(loc.file.as_str());
+                }
+                run_paths.push(index.definitions[*best].location.file.as_str());
+            }
+            RunEntry::Standalone { location, .. } => {
+                run_paths.push(location.file.as_str());
+            }
+        }
+    }
+    let base = hoistable_dir_prefix(&run_paths, "  base: ");
+    if let Some(prefix) = &base {
+        report.line(format!("  base: {prefix}"));
+    }
     for entry in entries {
         if report.clipped {
             break;
@@ -939,6 +1402,7 @@ fn from_run_report(
                 best,
                 overlapping,
                 items,
+                ..
             } => {
                 for (location, diagnostics) in &items {
                     emit_diagnostics(
@@ -947,6 +1411,7 @@ fn from_run_report(
                         id,
                         location,
                         diagnostics,
+                        base.as_deref(),
                         &mut report,
                     )?;
                     if report.clipped {
@@ -954,15 +1419,16 @@ fn from_run_report(
                     }
                 }
                 if !report.clipped {
-                    let locations: Vec<Location> =
-                        items.iter().map(|(loc, _)| (*loc).clone()).collect();
+                    let locations: Vec<&Location> = items.iter().map(|(loc, _)| *loc).collect();
                     let room = report.left();
-                    detail_multi(
+                    detail_multi_cached(
                         workspace,
+                        &mut cache,
                         index,
                         best,
                         &locations,
                         &overlapping,
+                        base.as_deref(),
                         &mut report,
                         SnippetView::Report,
                     )?;
@@ -980,6 +1446,7 @@ fn from_run_report(
                     id,
                     location,
                     &diagnostics,
+                    base.as_deref(),
                     &mut report,
                 )?;
                 if report.clipped {
@@ -989,7 +1456,15 @@ fn from_run_report(
                     report.line("  Source changed or disappeared after this run. Re-run the command for current locations.");
                 } else {
                     let room = report.left();
-                    at_location(workspace, index, location, &mut report, None)?;
+                    at_location_cached(
+                        workspace,
+                        &mut cache,
+                        index,
+                        location,
+                        base.as_deref(),
+                        &mut report,
+                        None,
+                    )?;
                     source += room.saturating_sub(report.left());
                 }
             }
@@ -998,35 +1473,63 @@ fn from_run_report(
     Ok((directory, report.into_string(), source))
 }
 
+#[cfg(test)]
 fn at_location(
     workspace: &Workspace,
     index: &Index,
     location: &Location,
     report: &mut Report,
+    memory: Option<&mut Memory>,
+) -> Result<()> {
+    let mut cache = SourceCache::default();
+    at_location_cached(workspace, &mut cache, index, location, None, report, memory)
+}
+
+fn at_location_cached(
+    workspace: &Workspace,
+    cache: &mut SourceCache,
+    index: &Index,
+    location: &Location,
+    base: Option<&str>,
+    report: &mut Report,
     mut memory: Option<&mut Memory>,
 ) -> Result<()> {
     match resolve_location(index, location) {
-        Resolution::Single { best, overlapping } => detail(
+        Resolution::Single { best, overlapping } => detail_cached(
             workspace,
+            cache,
             index,
             best,
             location,
             &overlapping,
+            base,
             report,
             memory,
         ),
         Resolution::Multiple { members } => {
-            let mut outermost: Vec<usize> = members
-                .iter()
-                .copied()
-                .filter(|&id| {
-                    let span = &index.definitions[id].location;
-                    !members.iter().any(|&other| {
-                        let outer = &index.definitions[other].location;
-                        outer != span && outer.start <= span.start && span.end <= outer.end
-                    })
-                })
-                .collect();
+            // Find outermost spans in O(M log M) while keeping identical-span twins.
+            let mut sorted = members.clone();
+            sorted.sort_by_key(|&id| {
+                let span = &index.definitions[id].location;
+                (span.start, Reverse(span.end), id)
+            });
+            let mut outermost: Vec<usize> = Vec::with_capacity(sorted.len());
+            let mut enclosing: Option<(usize, usize)> = None;
+            for &id in &sorted {
+                let span = &index.definitions[id].location;
+                let pair = (span.start, span.end);
+                if let Some((es, ee)) = enclosing
+                    && (es, ee) != pair
+                    && es <= pair.0
+                    && pair.1 <= ee
+                {
+                    continue;
+                }
+                outermost.push(id);
+                if enclosing.is_none_or(|(_, ee)| pair.1 > ee) {
+                    enclosing = Some(pair);
+                }
+            }
             outermost.sort_by_key(|&id| (index.definitions[id].location.start, id));
             let mut names: Vec<_> = outermost
                 .iter()
@@ -1042,7 +1545,8 @@ fn at_location(
                 names.push(&rest);
             }
             report.line(format!(
-                "{location} · {} symbols: {}",
+                "{} · {} symbols: {}",
+                format_location_with_base(location, base),
                 outermost.len(),
                 names.join(", ")
             ));
@@ -1066,12 +1570,14 @@ fn at_location(
                     })
                     .collect();
                 inner.sort_by_key(|&other| (index.definitions[other].location.start, other));
-                detail(
+                detail_cached(
                     workspace,
+                    cache,
                     index,
                     id,
                     &part,
                     &inner,
+                    base,
                     report,
                     memory.as_deref_mut(),
                 )?;
@@ -1079,12 +1585,16 @@ fn at_location(
             Ok(())
         }
         Resolution::None => {
-            report.line(format!("{} · no enclosing indexed symbol", location));
+            report.line(format!(
+                "{} · no enclosing indexed symbol",
+                format_location_with_base(location, base)
+            ));
             if let Some(error) = index.errors.get(&location.file) {
                 report.line(format!("  Parse error: {error}"));
             }
-            snippet(
+            snippet_cached(
                 workspace,
+                cache,
                 &location.file,
                 location.start.saturating_sub(2).max(1),
                 location.end.min(location.start.saturating_add(8)),
@@ -1106,12 +1616,15 @@ enum SnippetView<'a> {
 
 /// One symbol around a location: its calls, related tests, the other symbols
 /// the range overlaps, and source from the location.
-fn detail(
+#[allow(clippy::too_many_arguments)]
+fn detail_cached(
     workspace: &Workspace,
+    cache: &mut SourceCache,
     index: &Index,
     best: usize,
     location: &Location,
     overlapping: &[usize],
+    base: Option<&str>,
     report: &mut Report,
     memory: Option<&mut Memory>,
 ) -> Result<()> {
@@ -1124,76 +1637,95 @@ fn detail(
         Some(mem) => SnippetView::Session(mem),
         None => SnippetView::AtPlain,
     };
-    detail_multi(
-        workspace,
-        index,
-        best,
-        std::slice::from_ref(location),
-        keep,
-        report,
-        view,
+    let locations = [location];
+    detail_multi_cached(
+        workspace, cache, index, best, &locations, keep, base, report, view,
     )
 }
 
 /// One symbol around one or more locations: prints its metadata once and merges
 /// overlapping ±3-line source windows into disjoint sorted windows.
-fn detail_multi(
+#[allow(clippy::too_many_arguments)]
+fn detail_multi_cached(
     workspace: &Workspace,
+    cache: &mut SourceCache,
     index: &Index,
     best: usize,
-    locations: &[Location],
+    locations: &[&Location],
     overlapping: &[usize],
+    base: Option<&str>,
     report: &mut Report,
     view: SnippetView<'_>,
 ) -> Result<()> {
     let definition = &index.definitions[best];
-    report.line(describe(definition));
-    let mut referenced = BTreeSet::new();
-    let mut edges: Vec<_> = index
+    report.line(describe_with_base(definition, base));
+    // Sort outgoing call/bridge/import edges once by (inferred, nearest distance, line),
+    // then group repeated call sites to the same target into one line so all line
+    // numbers survive without duplicating the target summary.
+    let mut ranked_edges: Vec<(bool, usize, usize, &Edge)> = index
         .outgoing(best)
         .filter(|edge| {
             is_call(edge.kind) || matches!(edge.kind, Kind::Route | Kind::Data | Kind::Import)
         })
+        .map(|edge| {
+            let distance = locations
+                .iter()
+                .map(|location| edge.location.start.abs_diff(location.start))
+                .min()
+                .unwrap_or(usize::MAX);
+            (edge.inferred, distance, edge.location.start, edge)
+        })
         .collect();
-    edges.sort_by_key(|edge| {
-        let distance = locations
-            .iter()
-            .map(|location| edge.location.start.abs_diff(location.start))
-            .min()
-            .unwrap_or(usize::MAX);
-        (edge.inferred, distance, edge.location.start)
-    });
-    for edge in edges {
-        if referenced.insert(edge.to) {
-            let description = match edge.kind {
-                Kind::Call | Kind::Method => "calls",
-                Kind::Import => "imports",
-                Kind::Route => "HTTP route to",
-                Kind::Data => "SQL relation to",
-                Kind::Reference => "references",
-            };
-            let confidence = if edge.inferred {
-                "possible relationship · "
-            } else {
-                ""
-            };
-            let origin = if edge.location.file == definition.location.file {
-                if edge.location.start == edge.location.end {
-                    format!(":{}", edge.location.start)
-                } else {
-                    format!(":{}-{}", edge.location.start, edge.location.end)
-                }
-            } else {
-                edge.location.to_string()
-            };
-            report.line(format!(
-                "  {confidence}{description} {} (from {origin})",
-                describe(&index.definitions[edge.to]),
-            ));
-            if referenced.len() >= 4 {
-                break;
+    ranked_edges.sort_by_key(|&(inferred, distance, start, _)| (inferred, distance, start));
+
+    type DetailEdgeKey<'a> = (usize, Kind, bool, &'a str);
+    let mut edge_groups: Vec<(DetailEdgeKey<'_>, BTreeSet<(usize, usize)>)> = Vec::new();
+    let mut edge_by_target: HashMap<usize, usize> = HashMap::new();
+    for (_, _, _, edge) in ranked_edges {
+        if let Some(&slot) = edge_by_target.get(&edge.to) {
+            let (key, spans) = &mut edge_groups[slot];
+            if key.1 == edge.kind && key.2 == edge.inferred && key.3 == edge.location.file.as_str()
+            {
+                spans.insert((edge.location.start, edge.location.end));
             }
+        } else if edge_groups.len() < 4 {
+            let slot = edge_groups.len();
+            let mut spans = BTreeSet::new();
+            spans.insert((edge.location.start, edge.location.end));
+            edge_groups.push((
+                (
+                    edge.to,
+                    edge.kind,
+                    edge.inferred,
+                    edge.location.file.as_str(),
+                ),
+                spans,
+            ));
+            edge_by_target.insert(edge.to, slot);
         }
+    }
+    for ((to, kind, inferred, origin_file), spans) in edge_groups {
+        let description = match kind {
+            Kind::Call | Kind::Method => "calls",
+            Kind::Import => "imports",
+            Kind::Route => "HTTP route to",
+            Kind::Data => "SQL relation to",
+            Kind::Reference => "references",
+        };
+        let confidence = if inferred {
+            "possible relationship · "
+        } else {
+            ""
+        };
+        let origin = if origin_file == definition.location.file {
+            format_same_file_spans(&spans)
+        } else {
+            format_line_spans_with_base(origin_file, &spans, base)
+        };
+        report.line(format!(
+            "  {confidence}{description} {} (from {origin})",
+            describe_with_base(&index.definitions[to], base),
+        ));
     }
     if !definition.test {
         for (id, _, inferred) in index.related_tests(best, 3) {
@@ -1204,7 +1736,7 @@ fn detail_multi(
             };
             report.line(format!(
                 "  {confidence}: {}",
-                describe(&index.definitions[id])
+                describe_with_base(&index.definitions[id], base)
             ));
         }
     }
@@ -1214,7 +1746,10 @@ fn detail_multi(
             .filter(|&&id| id != best && index.definitions[id].location != definition.location)
             .collect();
         for &&id in others.iter().take(4) {
-            report.line(format!("  overlaps {}", describe(&index.definitions[id])));
+            report.line(format!(
+                "  overlaps {}",
+                describe_with_base(&index.definitions[id], base)
+            ));
         }
         if others.len() > 4 {
             report.line(format!(
@@ -1234,10 +1769,10 @@ fn detail_multi(
         .map_or(definition.location.file.as_str(), |loc| loc.file.as_str());
     match (view, windows.as_slice()) {
         (SnippetView::Session(memory), &[(from, to)]) => {
-            let text = fs::read_to_string(workspace.source_path(file)?)?;
+            let text = &cache.get_or_read(workspace, file)?.text;
             memory.show(
                 workspace,
-                &text,
+                text,
                 &Symbol {
                     file,
                     name: &seen_name(index, best),
@@ -1250,11 +1785,16 @@ fn detail_multi(
                 report,
             );
         }
-        (SnippetView::AtPlain | SnippetView::Session(_), _) => {
-            snippets_trimmed(workspace, file, &windows, SESSION_MIN_TRIM_INDENT, report)?
-        }
+        (SnippetView::AtPlain | SnippetView::Session(_), _) => snippets_trimmed_cached(
+            workspace,
+            cache,
+            file,
+            &windows,
+            SESSION_MIN_TRIM_INDENT,
+            report,
+        )?,
         (SnippetView::Report, _) => {
-            snippets_trimmed(workspace, file, &windows, MIN_TRIM_INDENT, report)?
+            snippets_trimmed_cached(workspace, cache, file, &windows, MIN_TRIM_INDENT, report)?
         }
     }
     if let Some(&(first_from, _)) = windows.first()
@@ -1263,7 +1803,7 @@ fn detail_multi(
     {
         report.line(format!(
             "  Declaration starts at {}:{}",
-            display_path(file),
+            display_with_base(file, base),
             definition.declaration
         ));
     }
@@ -1524,11 +2064,33 @@ fn changed_report(
     since: &Since,
     cap: usize,
 ) -> Result<Report> {
+    let mut cache = SourceCache::default();
+    changed_report_cached(workspace, &mut cache, index, since, cap)
+}
+
+fn changed_report_cached(
+    workspace: &Workspace,
+    cache: &mut SourceCache,
+    index: &Index,
+    since: &Since,
+    cap: usize,
+) -> Result<Report> {
     let mut report = Report::new(cap);
-    let changes = changes(workspace, index, since)?;
-    let mut deferred: BTreeMap<(String, usize), Vec<Location>> = BTreeMap::new();
+    let changes = changes_with_cache(workspace, index, since, cache)?;
+    let mut unique_files: Vec<&str> = Vec::new();
+    let mut seen_files: HashSet<&str> = HashSet::new();
+    for (file, _) in &changes {
+        if seen_files.insert(file.as_str()) {
+            unique_files.push(file.as_str());
+        }
+    }
+    let base = hoistable_dir_prefix(&unique_files, "base: ");
+    if let Some(prefix) = &base {
+        report.line(format!("base: {prefix}"));
+    }
+    let mut deferred: HashMap<(String, usize), Vec<Location>> = HashMap::new();
     for (pos, (file, change)) in changes.iter().enumerate() {
-        let name = display_path(file);
+        let name = display_with_base(file, base.as_deref());
         match change {
             Change::Unindexed if fs::symlink_metadata(workspace.root.join(file)).is_err() => {
                 report.line(format!("{name} · deleted"))
@@ -1543,7 +2105,7 @@ fn changed_report(
                 // If this file also has changed ranges right after, defer symbol
                 // detail for any surviving symbol touched by both so its metadata
                 // prints once and its snippets merge.
-                let next_range_symbols: BTreeSet<usize> = changes
+                let next_range_symbols: HashSet<usize> = changes
                     .get(pos + 1)
                     .and_then(|(next_file, next_change)| {
                         (next_file == file)
@@ -1569,11 +2131,13 @@ fn changed_report(
                     .collect();
                 emit_deletions(
                     workspace,
+                    cache,
                     index,
                     file,
                     deletions,
                     &next_range_symbols,
                     &mut deferred,
+                    base.as_deref(),
                     &mut report,
                 )?;
             }
@@ -1581,10 +2145,12 @@ fn changed_report(
                 report.line(format!("{name} · {} changed ranges", locations.len()));
                 emit_changed_ranges(
                     workspace,
+                    cache,
                     index,
                     file,
                     locations,
                     &mut deferred,
+                    base.as_deref(),
                     &mut report,
                 )?;
             }
@@ -1626,9 +2192,9 @@ fn surviving_symbol(index: &Index, file: &str, deletion: &Deletion) -> Option<(u
     Some((id, location))
 }
 
-fn emit_deletion_header(file: &str, deletion: &Deletion, report: &mut Report) {
+fn emit_deletion_header(file: &str, deletion: &Deletion, base: Option<&str>, report: &mut Report) {
     const SHOWN: usize = 8;
-    let name = display_path(file);
+    let name = display_with_base(file, base);
     let (first, last) = deletion.old;
     let (lines, previously) = if first == last {
         ("1 line".to_owned(), format!("previously line {first}"))
@@ -1675,13 +2241,16 @@ fn emit_deletion_header(file: &str, deletion: &Deletion, report: &mut Report) {
 
 /// Deletions in one file for `context --changes`, grouped by surviving enclosing
 /// symbol so its metadata prints once and overlapping snippets merge.
+#[allow(clippy::too_many_arguments)]
 fn emit_deletions(
     workspace: &Workspace,
+    cache: &mut SourceCache,
     index: &Index,
     file: &str,
     deletions: &[Deletion],
-    deferred_symbols: &BTreeSet<usize>,
-    deferred: &mut BTreeMap<(String, usize), Vec<Location>>,
+    deferred_symbols: &HashSet<usize>,
+    deferred: &mut HashMap<(String, usize), Vec<Location>>,
+    base: Option<&str>,
     report: &mut Report,
 ) -> Result<()> {
     enum Entry<'a> {
@@ -1691,8 +2260,8 @@ fn emit_deletions(
             items: Vec<(&'a Deletion, Location)>,
         },
     }
-    let mut entries: Vec<Entry<'_>> = Vec::new();
-    let mut by_symbol: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut entries: Vec<Entry<'_>> = Vec::with_capacity(deletions.len());
+    let mut by_symbol: HashMap<usize, usize> = HashMap::new();
     for deletion in deletions {
         match surviving_symbol(index, file, deletion) {
             Some((id, location)) if deferred_symbols.contains(&id) => {
@@ -1724,23 +2293,24 @@ fn emit_deletions(
             break;
         }
         match entry {
-            Entry::HeaderOnly(deletion) => emit_deletion_header(file, deletion, report),
+            Entry::HeaderOnly(deletion) => emit_deletion_header(file, deletion, base, report),
             Entry::Symbol { id, items } => {
                 for (deletion, _) in &items {
-                    emit_deletion_header(file, deletion, report);
+                    emit_deletion_header(file, deletion, base, report);
                     if report.clipped {
                         break;
                     }
                 }
                 if !report.clipped {
-                    let locations: Vec<Location> =
-                        items.into_iter().map(|(_, location)| location).collect();
-                    detail_multi(
+                    let locations: Vec<&Location> = items.iter().map(|(_, loc)| loc).collect();
+                    detail_multi_cached(
                         workspace,
+                        cache,
                         index,
                         id,
                         &locations,
                         &[],
+                        base,
                         report,
                         SnippetView::Report,
                     )?;
@@ -1753,12 +2323,15 @@ fn emit_deletions(
 
 /// Changed ranges in one file for `context --changes`, grouped by enclosing
 /// symbol so each symbol's metadata prints once and overlapping snippets merge.
+#[allow(clippy::too_many_arguments)]
 fn emit_changed_ranges(
     workspace: &Workspace,
+    cache: &mut SourceCache,
     index: &Index,
     file: &str,
     locations: &[(usize, usize)],
-    deferred: &mut BTreeMap<(String, usize), Vec<Location>>,
+    deferred: &mut HashMap<(String, usize), Vec<Location>>,
+    base: Option<&str>,
     report: &mut Report,
 ) -> Result<()> {
     enum RangeEntry {
@@ -1767,12 +2340,13 @@ fn emit_changed_ranges(
             ranges: Vec<(usize, usize)>,
             locations: Vec<Location>,
             overlapping: Vec<usize>,
+            overlapping_seen: HashSet<usize>,
         },
         Standalone(Location),
     }
-    let name = display_path(file);
-    let mut entries: Vec<RangeEntry> = Vec::new();
-    let mut by_symbol: BTreeMap<usize, usize> = BTreeMap::new();
+    let name = display_with_base(file, base);
+    let mut entries: Vec<RangeEntry> = Vec::with_capacity(locations.len());
+    let mut by_symbol: HashMap<usize, usize> = HashMap::new();
     for &(start, end) in locations {
         let location = Location {
             file: file.to_owned(),
@@ -1786,6 +2360,7 @@ fn emit_changed_ranges(
                         ranges,
                         locations: group_locs,
                         overlapping: existing,
+                        overlapping_seen,
                         ..
                     } = &mut entries[slot]
                     {
@@ -1793,7 +2368,7 @@ fn emit_changed_ranges(
                         group_locs.push(location);
                         if end > start {
                             for id in overlapping {
-                                if !existing.contains(&id) {
+                                if overlapping_seen.insert(id) {
                                     existing.push(id);
                                 }
                             }
@@ -1806,11 +2381,13 @@ fn emit_changed_ranges(
                         .unwrap_or_default();
                     group_locs.push(location);
                     let keep_overlap = if end > start { overlapping } else { Vec::new() };
+                    let overlapping_seen: HashSet<usize> = keep_overlap.iter().copied().collect();
                     entries.push(RangeEntry::Symbol {
                         best,
                         ranges: vec![(start, end)],
                         locations: group_locs,
                         overlapping: keep_overlap,
+                        overlapping_seen,
                     });
                     by_symbol.insert(best, slot);
                 }
@@ -1830,6 +2407,7 @@ fn emit_changed_ranges(
                 ranges,
                 locations,
                 overlapping,
+                ..
             } => {
                 let list: Vec<String> = ranges
                     .iter()
@@ -1837,12 +2415,15 @@ fn emit_changed_ranges(
                     .collect();
                 report.line(format!("Changed {name}:{}", list.join(", ")));
                 if !report.clipped {
-                    detail_multi(
+                    let loc_refs: Vec<&Location> = locations.iter().collect();
+                    detail_multi_cached(
                         workspace,
+                        cache,
                         index,
                         best,
-                        &locations,
+                        &loc_refs,
                         &overlapping,
+                        base,
                         report,
                         SnippetView::Report,
                     )?;
@@ -1854,7 +2435,7 @@ fn emit_changed_ranges(
                     location.start, location.end
                 ));
                 if !report.clipped {
-                    at_location(workspace, index, &location, report, None)?;
+                    at_location_cached(workspace, cache, index, &location, base, report, None)?;
                 }
             }
         }
@@ -1881,6 +2462,16 @@ pub(crate) fn changes(
     workspace: &Workspace,
     index: &Index,
     since: &Since,
+) -> Result<Vec<(String, Change)>> {
+    let mut cache = SourceCache::default();
+    changes_with_cache(workspace, index, since, &mut cache)
+}
+
+fn changes_with_cache(
+    workspace: &Workspace,
+    index: &Index,
+    since: &Since,
+    cache: &mut SourceCache,
 ) -> Result<Vec<(String, Change)>> {
     let staged = matches!(since, Since::Staged);
     let inside = workspace.git(&["rev-parse", "--is-inside-work-tree"])?;
@@ -1988,8 +2579,7 @@ pub(crate) fn changes(
                 continue;
             }
         }
-        let text = fs::read_to_string(workspace.source_path(file)?)?;
-        let file_lines = text.lines().count();
+        let file_lines = cache.get_or_read(workspace, file)?.line_count();
         if file_lines == 0 {
             changes.push((file.clone(), Change::Empty));
             continue;
@@ -2814,6 +3404,102 @@ mod tests {
         assert!(
             !deps.contains("(from src/deep/nested/sub.rs:"),
             "same-file origin must not repeat long path:\n{deps}"
+        );
+    }
+
+    #[test]
+    fn source_cache_reads_multi_symbol_file_once_and_hoists_deep_query_prefix() {
+        // 1. Multi-symbol `context --at` across one file reads disk exactly once.
+        let mut py = String::new();
+        for i in 0..8 {
+            py.push_str(&format!("def step_{i}(x):\n    return x + {i}\n\n"));
+        }
+        let (_dir1, ws1) = temp_workspace(&[("multi.py", &py)]);
+        let idx1 = Index::open(&ws1).unwrap();
+        let mut cache = SourceCache::default();
+        let first = at_report_cached(&ws1, &mut cache, &idx1, "multi.py:1-24", 8000, None)
+            .unwrap()
+            .into_string();
+        assert_eq!(
+            cache.reads(),
+            1,
+            "multi-symbol context --at must read file once"
+        );
+        let second = at_report_cached(&ws1, &mut cache, &idx1, "multi.py:1-24", 8000, None)
+            .unwrap()
+            .into_string();
+        assert_eq!(cache.reads(), 1, "repeat lookup must stay cached");
+        assert_eq!(first, second);
+
+        // 2. Deep `>= 2`-segment paths in `query` and `path` hoist `  base: <dir>/`
+        // while preserving every filename, line number, and edge kind.
+        let (_dir2, ws2) = temp_workspace(&[
+            (
+                "packages/billing/src/core.py",
+                "def compute_fee(amount):\n    return amount * 2\n",
+            ),
+            (
+                "packages/billing/src/api.py",
+                "from core import compute_fee\n\ndef handle_invoice(amount):\n    return compute_fee(amount)\n",
+            ),
+            (
+                "packages/billing/src/cli.py",
+                "from core import compute_fee\n\ndef run_billing(amount):\n    return compute_fee(amount)\n",
+            ),
+            (
+                "packages/billing/src/batch.py",
+                "from api import handle_invoice\n\ndef run_batch(amount):\n    return handle_invoice(amount)\n",
+            ),
+        ]);
+        let idx2 = Index::open(&ws2).unwrap();
+        let refs = query_report(&idx2, "compute_fee", "callers", 8000)
+            .unwrap()
+            .into_string();
+        assert!(
+            refs.contains("  base: packages/billing/src/\n"),
+            "expected hoisted base prefix:\n{refs}"
+        );
+        assert!(refs.contains("at api.py:4\n"), "{refs}");
+        assert!(refs.contains("at cli.py:4\n"), "{refs}");
+        assert!(
+            !refs.contains("at packages/billing/src/api.py:4"),
+            "hoisted location must not repeat prefix:\n{refs}"
+        );
+
+        let route = path_report(&idx2, "run_batch", "compute_fee", 8000)
+            .unwrap()
+            .into_string();
+        assert!(
+            route.contains("  base: packages/billing/src/\n"),
+            "expected hoisted base prefix in path:\n{route}"
+        );
+        assert!(route.contains("at batch.py:4 →"), "{route}");
+        assert!(route.contains("at api.py:4 →"), "{route}");
+        assert!(route.contains("at core.py:1-2\n"), "{route}");
+    }
+
+    #[test]
+    fn detail_multi_groups_repeated_call_sites_without_losing_lines() {
+        let manifest = "[package]\nname = \"callsites\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        let src = concat!(
+            "pub fn helper(v: u32) -> u32 { v + 1 }\n\n",
+            "pub fn pipeline(x: u32) -> u32 {\n",
+            "    let a = helper(x);\n",
+            "    let b = helper(a);\n",
+            "    helper(b)\n",
+            "}\n",
+        );
+        let (_dir, workspace) = temp_workspace(&[("Cargo.toml", manifest), ("src/lib.rs", src)]);
+        let index = Index::open(&workspace).unwrap();
+        let mut cache = SourceCache::default();
+        let out = at_report_cached(&workspace, &mut cache, &index, "src/lib.rs:5", 8000, None)
+            .unwrap()
+            .into_string();
+        assert_eq!(cache.reads(), 1);
+        assert_eq!(out.matches("  calls callsites::helper").count(), 1, "{out}");
+        assert!(
+            out.contains("(from :4,5,6)\n"),
+            "all repeated call-site line numbers must survive on one line:\n{out}"
         );
     }
 }

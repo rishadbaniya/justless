@@ -1,92 +1,101 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use anyhow::{Result, ensure};
 
-use crate::context::{Report, relationship};
+use crate::context::{
+    Report, SourceCache, format_line_spans_with_base, format_location_with_base,
+    format_same_file_spans, hoistable_dir_prefix, relationship,
+};
 use crate::history;
-use crate::index::{Fingerprint, Index, nul_paths};
+use crate::index::{Definition, Edge, Fingerprint, Index, is_call, nul_paths};
+use crate::rust_syntax::Kind;
 use crate::seen::Memory;
 use crate::summary::short;
 use crate::workspace::{Location, Workspace, display_path};
 
-fn terms(text: &str) -> BTreeSet<String> {
+fn is_stopword(lower: &str) -> bool {
+    lower.len() < 2
+        || matches!(
+            lower,
+            "the"
+                | "what"
+                | "which"
+                | "when"
+                | "where"
+                | "why"
+                | "how"
+                | "does"
+                | "from"
+                | "with"
+                | "that"
+                | "this"
+                | "will"
+                | "would"
+                | "can"
+                | "and"
+                | "for"
+                | "into"
+                | "rename"
+                | "breaks"
+                | "change"
+                | "changed"
+                | "fix"
+                | "are"
+                | "our"
+                | "was"
+                | "did"
+                | "after"
+                | "before"
+                | "understand"
+                | "please"
+                | "test"
+                | "tests"
+                | "failing"
+                | "failed"
+                | "failure"
+                | "is"
+                | "it"
+                | "in"
+                | "on"
+                | "of"
+                | "to"
+                | "by"
+                | "be"
+                | "do"
+                | "an"
+                | "as"
+                | "at"
+                | "or"
+                | "if"
+                | "we"
+                | "my"
+                | "me"
+                | "has"
+                | "have"
+                | "been"
+                | "there"
+                | "they"
+                | "its"
+                | "who"
+                | "should"
+                | "could"
+        )
+}
+
+fn task_terms(text: &str) -> (BTreeSet<String>, HashSet<String>) {
     let mut result = BTreeSet::new();
+    let mut explicit = HashSet::new();
+    let mut part = String::new();
     for word in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
         let lower = word.to_lowercase();
-        if lower.len() < 2
-            || matches!(
-                lower.as_str(),
-                "the"
-                    | "what"
-                    | "which"
-                    | "when"
-                    | "where"
-                    | "why"
-                    | "how"
-                    | "does"
-                    | "from"
-                    | "with"
-                    | "that"
-                    | "this"
-                    | "will"
-                    | "would"
-                    | "can"
-                    | "and"
-                    | "for"
-                    | "into"
-                    | "rename"
-                    | "breaks"
-                    | "change"
-                    | "changed"
-                    | "fix"
-                    | "are"
-                    | "our"
-                    | "was"
-                    | "did"
-                    | "after"
-                    | "before"
-                    | "understand"
-                    | "please"
-                    | "test"
-                    | "tests"
-                    | "failing"
-                    | "failed"
-                    | "failure"
-                    | "is"
-                    | "it"
-                    | "in"
-                    | "on"
-                    | "of"
-                    | "to"
-                    | "by"
-                    | "be"
-                    | "do"
-                    | "an"
-                    | "as"
-                    | "at"
-                    | "or"
-                    | "if"
-                    | "we"
-                    | "my"
-                    | "me"
-                    | "has"
-                    | "have"
-                    | "been"
-                    | "there"
-                    | "they"
-                    | "its"
-                    | "who"
-                    | "should"
-                    | "could"
-            )
-        {
+        if is_stopword(&lower) {
             continue;
         }
+        explicit.insert(lower.clone());
         result.insert(lower);
-        let mut part = String::new();
+        part.clear();
         let mut prev_lower = false;
         for letter in word.chars() {
             if letter == '_' || (letter.is_uppercase() && prev_lower) {
@@ -104,7 +113,11 @@ fn terms(text: &str) -> BTreeSet<String> {
             result.insert(part.to_lowercase());
         }
     }
-    result
+    (result, explicit)
+}
+
+fn terms(text: &str) -> BTreeSet<String> {
+    task_terms(text).0
 }
 
 /// A light stem so that `updated`, `updates` and `update` meet, as do
@@ -205,40 +218,39 @@ fn changed_files(workspace: &Workspace) -> BTreeSet<String> {
 fn excerpt(
     workspace: &Workspace,
     index: &Index,
-    cache: &mut BTreeMap<String, String>,
+    cache: &mut SourceCache,
+    shown_files: &mut BTreeSet<String>,
     file: &str,
     from: usize,
     to: usize,
     report: &mut Report,
     memory: Option<&mut Memory>,
 ) {
-    let text = cache.entry(file.to_owned()).or_insert_with(|| {
-        workspace
-            .source_path(file)
-            .ok()
-            .and_then(|p| fs::read_to_string(p).ok())
-            .unwrap_or_default()
-    });
-    let lines: Vec<String> = text
-        .lines()
-        .enumerate()
-        .skip(from.saturating_sub(1))
-        .take(to.saturating_sub(from) + 1)
-        .take(3)
-        .map(|(offset, line)| format!("    {} | {}", offset + 1, short(line.trim(), 150)))
-        .collect();
+    shown_files.insert(file.to_owned());
+    let Some(source) = cache.get_or_try_read(workspace, file) else {
+        return;
+    };
+    let first = from.max(1);
+    let max_end = to.max(first).min(first.saturating_add(2));
+    let mut lines: Vec<String> = Vec::with_capacity(3);
+    for line_no in first..=max_end {
+        let Some(line) = source.line(line_no) else {
+            break;
+        };
+        lines.push(format!("    {line_no} | {}", short(line.trim(), 150)));
+    }
     let Some(memory) = memory else {
         for line in &lines {
             report.line(line);
         }
         return;
     };
-    let revision = crate::source::revision_for(file, text.as_bytes());
-    let last = from + lines.len().saturating_sub(1);
+    let revision = source.revision(file).to_owned();
+    let last = first + lines.len().saturating_sub(1);
     let note = if lines.len() > 1 {
-        format!("    {from}-{last} | unchanged since you read them")
+        format!("    {first}-{last} | unchanged since you read them")
     } else {
-        format!("    {from} | unchanged since you read it")
+        format!("    {first} | unchanged since you read it")
     };
     // A short declaration says more than the note, so it stays.
     let bytes: usize = lines.iter().map(|line| line.len() + 1).sum();
@@ -259,7 +271,7 @@ fn excerpt(
         memory.showed(
             file,
             &revision,
-            &crate::context::seen_names(index, file, from, last),
+            &crate::context::seen_names(index, file, first, last),
         );
     }
     if !report.clipped && !lines.is_empty() {
@@ -355,10 +367,13 @@ struct Needle {
     /// What every form that matches starts with, to skip a line cheaply.
     prefix: String,
     prints: [Fingerprint; 2],
+    /// Whether this term was typed directly by the user (or as a path/hyphen
+    /// fragment), rather than synthesized only by splitting a code identifier.
+    explicit: bool,
 }
 
 impl Needle {
-    fn new(word: String, inflected: bool) -> Self {
+    fn new(word: String, inflected: bool, explicit: bool) -> Self {
         let base = inflected.then(|| base(&word));
         let prefix = match &base {
             Some((base, _)) if base.ends_with(['e', 'y']) || ends_doubled(base) => {
@@ -372,6 +387,7 @@ impl Needle {
             word,
             base,
             prefix,
+            explicit,
         }
     }
 
@@ -425,6 +441,18 @@ fn words(text: &str) -> impl Iterator<Item = &str> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .flat_map(|word| {
+            let mut has_upper = false;
+            let mut has_lower = false;
+            for ch in word.chars() {
+                has_upper |= ch.is_uppercase();
+                has_lower |= ch.is_lowercase();
+                if has_upper && has_lower {
+                    break;
+                }
+            }
+            if !(has_upper && has_lower) {
+                return std::iter::once(word).chain(Vec::new());
+            }
             let mut parts = Vec::new();
             let mut start = 0;
             let letters: Vec<(usize, char)> = word.char_indices().collect();
@@ -478,6 +506,9 @@ struct Passage {
     focus: usize,
     /// The weight of the rarest term on the best line.
     rarest: usize,
+    /// Whether this passage matched at least one explicit user task term (or
+    /// full code identifier) rather than only a split sub-word of an identifier.
+    matched_explicit: bool,
     /// The line that best matches the question.
     location: Location,
     /// Up to three distinct matching lines, in file order.
@@ -491,6 +522,22 @@ impl Passage {
     }
 }
 
+fn fold_lowercase_into(src: &str, dst: &mut String) {
+    dst.clear();
+    if src.is_ascii() {
+        dst.reserve(src.len());
+        for byte in src.bytes() {
+            dst.push(byte.to_ascii_lowercase() as char);
+        }
+    } else {
+        for ch in src.chars() {
+            for lower in ch.to_lowercase() {
+                dst.push(lower);
+            }
+        }
+    }
+}
+
 // Trigram fingerprints cheaply eliminate impossible files, but a large file's
 // fingerprint admits almost any short word, so term rarity is estimated from the
 // lines actually read. Files whose name holds a question term are read first.
@@ -501,13 +548,16 @@ impl Passage {
 // by the stem that definition names are matched by.
 fn passages(
     workspace: &Workspace,
+    cache: &mut SourceCache,
     index: &Index,
+    defined_files: &HashSet<&str>,
     words: &BTreeSet<String>,
+    explicit_words: &HashSet<String>,
     question: &str,
 ) -> (Vec<Passage>, BTreeMap<String, usize>) {
     let mut needles: Vec<Needle> = words
         .iter()
-        .map(|word| Needle::new(word.clone(), true))
+        .map(|word| Needle::new(word.clone(), true, explicit_words.contains(word)))
         .collect();
     for fragment in question
         .split_whitespace()
@@ -517,7 +567,7 @@ fn passages(
             && fragment.contains(['/', '-', ':'])
             && !needles.iter().any(|needle| needle.word == fragment)
         {
-            needles.push(Needle::new(fragment.to_owned(), false));
+            needles.push(Needle::new(fragment.to_owned(), false, true));
         }
     }
     let total = index.fingerprints.len().max(1);
@@ -553,21 +603,16 @@ fn passages(
     let mut read = Vec::new();
     let mut checked = vec![0; needles.len()];
     let mut found = vec![0; needles.len()];
+    let mut folded = String::with_capacity(256);
+    let mut covered: Vec<usize> = Vec::with_capacity(needles.len());
     for (_, _, file) in files.into_iter().take(96) {
-        let Ok(path) = workspace.source_path(file) else {
+        let Some(cached) = cache.get_or_try_read(workspace, file) else {
             continue;
         };
-        let Ok(text) = fs::read_to_string(path) else {
-            continue;
-        };
+        let text = cached.text.as_str();
         // Definitions carry the names in source files, including a file entry
         // for most languages, so only a file without any is ranked by its name.
-        let whole = Location {
-            file: file.clone(),
-            start: 1,
-            end: usize::MAX,
-        };
-        let bare = index.at(&whole).is_empty();
+        let bare = !defined_files.contains(file.as_str());
         let named: Vec<usize> = if bare {
             (0..needles.len())
                 .filter(|&n| needles[n].names(file))
@@ -577,16 +622,19 @@ fn passages(
         };
         let mut counts = vec![0; needles.len()];
         let mut lines = Vec::new();
+        let mut length = 0usize;
         for (i, line) in text.lines().enumerate() {
-            let folded = line.to_lowercase();
-            let covered: Vec<usize> = (0..needles.len())
-                .filter(|&n| needles[n].occurs(&folded, line))
-                .collect();
-            for &n in &covered {
-                counts[n] += 1;
+            length += 1;
+            fold_lowercase_into(line, &mut folded);
+            covered.clear();
+            for (n, needle) in needles.iter().enumerate() {
+                if needle.occurs(&folded, line) {
+                    covered.push(n);
+                    counts[n] += 1;
+                }
             }
             if !covered.is_empty() {
-                lines.push((i + 1, covered, line.trim().to_owned()));
+                lines.push((i + 1, covered.clone(), line.trim().to_owned()));
             }
         }
         let print = index.fingerprints[file];
@@ -599,18 +647,22 @@ fn passages(
         // A word in the file's directory is shared by every file there, as
         // `ctrlc` is by ctrlc/Cargo.toml and ctrlc/README.md, so recurring does
         // not make it what one of them is about.
-        let length = text.lines().count();
         let directory = Path::new(file)
             .parent()
             .and_then(|path| path.to_str())
             .unwrap_or("");
+        let directory_lower = if bare {
+            directory.to_lowercase()
+        } else {
+            String::new()
+        };
         let about: Vec<usize> = if bare {
             (0..needles.len())
                 .filter(|&n| {
                     named.contains(&n)
                         || (counts[n] >= RECURS
                             && counts[n] * 16 >= length
-                            && !needles[n].occurs(&directory.to_lowercase(), directory))
+                            && !needles[n].occurs(&directory_lower, directory))
                 })
                 .collect()
         } else {
@@ -633,17 +685,19 @@ fn passages(
     let mut ranked = Vec::new();
     for (file, named, about, lines) in read {
         let path_score: usize = named.iter().map(|&n| weights[n]).sum();
+        let path_explicit = named.iter().any(|&n| needles[n].explicit);
         let focus = about.iter().map(|&n| weights[n]).max().unwrap_or(0);
         let mut scored: Vec<_> = lines
             .into_iter()
             .map(|(line, covered, text)| {
                 let score = covered.iter().map(|&n| weights[n]).sum::<usize>() + path_score;
                 let rarest = covered.iter().map(|&n| weights[n]).max().unwrap_or(0);
+                let explicit = path_explicit || covered.iter().any(|&n| needles[n].explicit);
                 let words = text
                     .split(|c: char| !c.is_alphanumeric())
                     .filter(|word| !word.is_empty())
                     .count();
-                (score, words, line, rarest, text)
+                (score, words, line, rarest, explicit, text)
             })
             .collect();
         let Some(best) = scored.iter().map(|&(score, ..)| score).max() else {
@@ -658,13 +712,14 @@ fn passages(
                 .then_with(|| b.1.cmp(&a.1))
                 .then_with(|| a.2.cmp(&b.2))
         });
-        let mut distinct = BTreeSet::new();
+        let mut distinct: HashSet<String> = HashSet::with_capacity(scored.len());
         scored.retain(|(.., text)| distinct.insert(text.clone()));
         scored.truncate(3);
         let (primary, rarest) = (scored[0].2, scored[0].3);
+        let matched_explicit = path_explicit || scored.iter().any(|&(_, _, _, _, exp, _)| exp);
         let mut lines: Vec<_> = scored
             .into_iter()
-            .map(|(_, _, line, _, text)| (line, short(&text, 160)))
+            .map(|(_, _, line, _, _, text)| (line, short(&text, 160)))
             .collect();
         lines.sort();
         ranked.push(Passage {
@@ -672,6 +727,7 @@ fn passages(
             named: path_score,
             focus,
             rarest,
+            matched_explicit,
             location: Location {
                 file: file.clone(),
                 start: primary,
@@ -704,11 +760,13 @@ fn passages(
 fn show_text(
     workspace: &Workspace,
     index: &Index,
-    cache: &mut BTreeMap<String, String>,
+    cache: &mut SourceCache,
+    shown_files: &mut BTreeSet<String>,
     hit: &Passage,
     report: &mut Report,
     memory: Option<&mut Memory>,
 ) {
+    shown_files.insert(hit.location.file.clone());
     let file = display_path(&hit.location.file);
     let primary = hit.location.start;
     let mut lines = Vec::with_capacity(hit.lines.len());
@@ -724,14 +782,10 @@ fn show_text(
         }
         return;
     };
-    let text = cache.entry(hit.location.file.clone()).or_insert_with(|| {
-        workspace
-            .source_path(&hit.location.file)
-            .ok()
-            .and_then(|p| fs::read_to_string(p).ok())
-            .unwrap_or_default()
-    });
-    let revision = crate::source::revision_for(&hit.location.file, text.as_bytes());
+    let revision = cache
+        .get_or_try_read(workspace, &hit.location.file)
+        .map(|source| source.revision(&hit.location.file).to_owned())
+        .unwrap_or_else(|| crate::source::revision_for(&hit.location.file, &[]));
     let first = hit.lines.first().map_or(primary, |(line, _)| *line);
     let last = hit.lines.last().map_or(primary, |(line, _)| *line);
     let line_list = hit
@@ -777,6 +831,63 @@ fn show_text(
     }
 }
 
+/// True when `def.qualified` already starts with `"{file}::"` (or equals
+/// `file`), as Tree-sitter polyglot definitions do, so repeating `file` before
+/// `:start-end` on the same line is redundant.
+fn qualified_includes_file(def: &Definition) -> bool {
+    let file = def.location.file.as_str();
+    display_path(file) == file
+        && (def.qualified == file
+            || (def.qualified.starts_with(file) && def.qualified[file.len()..].starts_with("::")))
+}
+
+fn format_pack_location(def: &Definition, base: Option<&str>) -> String {
+    if qualified_includes_file(def) {
+        if def.location.start == def.location.end {
+            format!(":{}", def.location.start)
+        } else {
+            format!(":{}-{}", def.location.start, def.location.end)
+        }
+    } else {
+        format_location_with_base(&def.location, base)
+    }
+}
+
+fn is_support_definition(def: &Definition) -> bool {
+    def.test
+        || def.qualified.contains("::tests::")
+        || def.qualified.contains("::test::")
+        || def.qualified.ends_with("::tests")
+        || def.qualified.ends_with("::test")
+        || crate::map::is_support_file(&def.location.file)
+}
+
+fn is_cross_language(index: &Index, left_file: &str, right_file: &str) -> bool {
+    if left_file == right_file {
+        return false;
+    }
+    (left_file.ends_with(".rs"), index.grammar(left_file))
+        != (right_file.ends_with(".rs"), index.grammar(right_file))
+}
+
+/// Priority tier for dependency-cone BFS edges so direct structural calls and
+/// cross-language HTTP/SQL/polyglot bridges outrank weak imports/references.
+fn cone_edge_tier(index: &Index, parent: &Definition, target: &Definition, edge: &Edge) -> usize {
+    if is_call(edge.kind) && !edge.inferred {
+        0
+    } else if matches!(edge.kind, Kind::Route | Kind::Data)
+        || is_cross_language(index, &parent.location.file, &target.location.file)
+    {
+        1
+    } else if is_call(edge.kind) {
+        2
+    } else if !edge.inferred {
+        3
+    } else {
+        4
+    }
+}
+
 pub fn pack(
     workspace: &Workspace,
     index: &Index,
@@ -797,10 +908,22 @@ fn pack_report(
     index: &Index,
     task: &str,
     cap: usize,
+    memory: Option<&mut Memory>,
+) -> Result<(Report, Option<(String, u64)>)> {
+    let mut cache = SourceCache::default();
+    pack_report_with_cache(workspace, &mut cache, index, task, cap, memory)
+}
+
+fn pack_report_with_cache(
+    workspace: &Workspace,
+    cache: &mut SourceCache,
+    index: &Index,
+    task: &str,
+    cap: usize,
     mut memory: Option<&mut Memory>,
 ) -> Result<(Report, Option<(String, u64)>)> {
     ensure!(!task.trim().is_empty(), "provide a task or symbol");
-    let words = terms(task);
+    let (words, explicit_words) = task_terms(task);
     let question = task.to_lowercase();
     let changes = changed_files(workspace);
     let failure_task = ["fail", "error", "panic", "diagnos", "regress"]
@@ -809,7 +932,7 @@ fn pack_report(
     // A definition ranks by the task words its name covers, weighted by how few
     // names share each word, so `update_order_book` outranks `Order` for "where
     // is the order book updated?". A name the task spells as code ranks first.
-    let stems: BTreeSet<String> = words.iter().map(|word| stem(word)).collect();
+    let stems: HashSet<String> = words.iter().map(|word| stem(word)).collect();
     let (code_names, all_caps) = identifiers(task);
     let is_code_name =
         |name: &str, lower: &str| code_names.contains(lower) || all_caps.contains(name);
@@ -830,58 +953,89 @@ fn pack_report(
                 | "examples"
         )
     });
-    let names: Vec<(&str, BTreeSet<String>)> = index
-        .definitions
-        .iter()
-        .map(|def| {
-            let name = def.qualified.rsplit("::").next().unwrap_or(&def.qualified);
-            let parts = terms(name)
-                .iter()
-                .map(|part| stem(part))
-                .filter(|part| stems.contains(part))
-                .collect();
-            (name, parts)
-        })
-        .collect();
-    let mut frequency = BTreeMap::<&str, usize>::new();
-    for (_, parts) in &names {
-        for part in parts {
-            *frequency.entry(part.as_str()).or_default() += 1;
+
+    struct DefMeta {
+        lower: String,
+        is_code: bool,
+        single_term: bool,
+        parts: Vec<String>,
+    }
+
+    let mut defined_files: HashSet<&str> = HashSet::with_capacity(index.files.len());
+    let mut names: Vec<DefMeta> = Vec::with_capacity(index.definitions.len());
+    let mut frequency: HashMap<String, usize> = HashMap::new();
+    for def in &index.definitions {
+        defined_files.insert(def.location.file.as_str());
+        let name = def.qualified.rsplit("::").next().unwrap_or(&def.qualified);
+        let lower = name.to_lowercase();
+        let is_code = is_code_name(name, &lower);
+        let name_terms = terms(name);
+        let single_term = name_terms.len() == 1;
+        let mut parts_set = BTreeSet::new();
+        for part in &name_terms {
+            let stemmed = stem(part);
+            if stems.contains(&stemmed) {
+                parts_set.insert(stemmed);
+            }
         }
+        let parts: Vec<String> = parts_set.into_iter().collect();
+        for part in &parts {
+            *frequency.entry(part.clone()).or_default() += 1;
+        }
+        names.push(DefMeta {
+            lower,
+            is_code,
+            single_term,
+            parts,
+        });
     }
     let total = index.definitions.len().max(1);
     let weight = |part: &str| rarity(total, frequency.get(part).copied().unwrap_or(0) + 1);
-    let mut ranks = BTreeMap::new();
-    for (id, (def, (name, parts))) in index.definitions.iter().zip(&names).enumerate() {
-        let lower = name.to_lowercase();
+    let mut file_hits_cache: HashMap<&str, usize> = HashMap::new();
+    let mut ranks: HashMap<usize, usize> = HashMap::new();
+    let mut name_scores: HashMap<usize, usize> = HashMap::new();
+    for (id, (def, meta)) in index.definitions.iter().zip(&names).enumerate() {
         let container = matches!(def.kind.as_str(), "module" | "file");
-        let name_stem = stem(&lower);
-        let exact = if is_code_name(name, &lower) {
+        let name_stem = stem(&meta.lower);
+        let exact = if meta.is_code {
             400
-        } else if words.contains(&lower) || (terms(name).len() == 1 && stems.contains(&name_stem)) {
+        } else if words.contains(&meta.lower) || (meta.single_term && stems.contains(&name_stem)) {
             16 * weight(&name_stem)
         } else {
             0
         } / if container { 2 } else { 1 };
-        let covered: usize = parts.iter().map(|part| 16 * weight(part)).sum();
-        let breadth = 40 * parts.len().saturating_sub(1);
-        let file_hits = terms(&def.location.file)
-            .iter()
-            .filter(|part| stems.contains(&stem(part)))
-            .count();
+        let covered: usize = meta.parts.iter().map(|part| 16 * weight(part)).sum();
+        let breadth = 40 * meta.parts.len().saturating_sub(1);
+        let file_hits = *file_hits_cache
+            .entry(def.location.file.as_str())
+            .or_insert_with(|| {
+                terms(&def.location.file)
+                    .iter()
+                    .filter(|part| stems.contains(&stem(part)))
+                    .count()
+            });
         let mut score = exact + covered + breadth + file_hits * 3;
         if score > 0 || (changes.contains(&def.location.file) && question.contains("chang")) {
             score += usize::from(changes.contains(&def.location.file)) * 4;
             ranks.insert(id, score);
+            name_scores.insert(id, score);
         }
     }
-    let (passages, term_weights) = passages(workspace, index, &words, &question);
+    let (passages, term_weights) = passages(
+        workspace,
+        cache,
+        index,
+        &defined_files,
+        &words,
+        &explicit_words,
+        &question,
+    );
     // A matching line promotes the definitions around it, except the one it
     // declares, whose name has already been scored. Text that no definition
     // encloses, such as configuration or prose, ranks on the same scale as
     // definitions and leads when it ranks higher.
     let mut standalone = Vec::new();
-    let mut text_covers = BTreeMap::<usize, usize>::new();
+    let mut text_covers: HashMap<usize, usize> = HashMap::new();
     for (at, hit) in passages.iter().enumerate() {
         let enclosing = index.at(&hit.location);
         if enclosing
@@ -901,12 +1055,12 @@ fn pack_report(
     // A file about a task word comes before a line that only mentions some.
     standalone.sort_by_key(|&at| Reverse(passages[at].rank() + passages[at].focus));
     let mut report = Report::new(cap);
-    let mut diagnosed = BTreeSet::new();
+    let mut diagnosed: HashSet<usize> = HashSet::new();
     let mut found_run = false;
     // The recorded failure shown, and the bytes printed about it.
     let mut failure = None;
-    let mut latest = BTreeSet::new();
-    let mut sources = BTreeMap::new();
+    let mut latest: HashSet<String> = HashSet::new();
+    let mut shown_files: BTreeSet<String> = BTreeSet::new();
     for run in history::records(workspace, false)?.take(25) {
         let run = run?;
         // A search that found nothing exits 1, and its matches are not diagnostics.
@@ -953,7 +1107,8 @@ fn pack_report(
                 excerpt(
                     workspace,
                     index,
-                    &mut sources,
+                    cache,
+                    &mut shown_files,
                     &d.location.file,
                     d.location.start,
                     d.location.start,
@@ -976,11 +1131,11 @@ fn pack_report(
     // name or the text that promoted it covers. A name the task spells as code
     // and the code a recorded failure points at are what was asked for.
     let covers = |id: usize| {
-        let (name, parts) = &names[id];
-        if is_code_name(name, &name.to_lowercase()) || diagnosed.contains(&id) {
+        let meta = &names[id];
+        if meta.is_code || diagnosed.contains(&id) {
             return usize::MAX;
         }
-        parts
+        meta.parts
             .iter()
             .filter_map(|part| term_weights.get(part))
             .chain(text_covers.get(&id))
@@ -990,74 +1145,88 @@ fn pack_report(
     };
     // Keep production definitions ahead of tests, scripts, benchmarks and
     // fixtures unless the task asks about them or names them directly.
-    let support_rank = |id: usize| {
+    let is_support = |id: usize| {
         if wants_support || failure_task || diagnosed.contains(&id) {
             return false;
         }
-        let def = &index.definitions[id];
-        let name = names[id].0;
-        let lower = name.to_lowercase();
-        !is_code_name(name, &lower)
-            && (def.test
-                || def.qualified.contains("::tests::")
-                || def.qualified.contains("::test::")
-                || def.qualified.ends_with("::tests")
-                || def.qualified.ends_with("::test")
-                || crate::map::is_support_file(&def.location.file))
+        !names[id].is_code && is_support_definition(&index.definitions[id])
     };
-    let mut ranked: Vec<_> = ranks.into_iter().collect();
-    ranked.sort_by_key(|(id, score)| {
-        (
-            support_rank(*id),
-            Reverse(*score),
-            &index.definitions[*id].location,
-            *id,
-        )
+    let mut ranked: Vec<(bool, usize, usize)> = ranks
+        .iter()
+        .map(|(&id, &score)| (is_support(id), score, id))
+        .collect();
+    ranked.sort_by(|&(sup_a, score_a, id_a), &(sup_b, score_b, id_b)| {
+        sup_a
+            .cmp(&sup_b)
+            .then_with(|| score_b.cmp(&score_a))
+            .then_with(|| {
+                index.definitions[id_a]
+                    .location
+                    .cmp(&index.definitions[id_b].location)
+            })
+            .then_with(|| id_a.cmp(&id_b))
     });
-    let best_tier = ranked.first().is_some_and(|(id, _)| support_rank(*id));
-    let best = ranked.first().map_or(0, |(_, s)| *s);
+    let best_tier = ranked.first().is_some_and(|&(sup, _, _)| sup);
+    let best = ranked.first().map_or(0, |&(_, score, _)| score);
+    let best_has_name = ranked
+        .first()
+        .is_some_and(|&(_, _, id)| name_scores.contains_key(&id) || diagnosed.contains(&id));
     let mut queue = VecDeque::new();
-    let mut seen = BTreeSet::new();
-    let mut shown_text = BTreeSet::new();
-    let mut text_files = BTreeSet::new();
-    for (id, score) in ranked.into_iter().take(4) {
-        if support_rank(id) != best_tier || score < best / 2 || report.clipped {
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut shown_text: HashSet<usize> = HashSet::new();
+    let mut found_exact_code_seed = false;
+
+    // Text leads definitions when it outranks the top definition, or when its
+    // file is about a task word rarer than any the top definition covers.
+    // Once a strong definition leads, inferior standalone text waits until after
+    // the structural dependency cone so tight budgets pack architectural signal.
+    let top_covered = ranked.first().map_or(0, |&(_, _, id)| covers(id));
+    for &at in &standalone {
+        let hit = &passages[at];
+        if shown_text.len() >= 5 || report.clipped {
             break;
         }
-        // Text leads a definition when it ranks higher, or when its file is
-        // about a task word rarer than any the definition's name or promoting
-        // text covers. A test whose name holds `running`, which most files
-        // say, does not outrank the one file that registers hooks for "what
-        // hooks are configured and running", whatever that file is called.
-        let covered = covers(id);
-        for &at in &standalone {
-            let hit = &passages[at];
-            if shown_text.len() >= 5 || report.clipped {
-                break;
-            }
-            if !shown_text.contains(&at)
-                && (hit.rank() > score
-                    || (covered < usize::MAX
-                        && (hit.rank() + hit.focus > score || hit.focus > covered)))
-            {
-                show_text(
-                    workspace,
-                    index,
-                    &mut sources,
-                    hit,
-                    &mut report,
-                    memory.as_deref_mut(),
-                );
-                shown_text.insert(at);
-                text_files.insert(hit.location.file.clone());
-            }
+        let leads_top = ranked.is_empty()
+            || hit.rank() > best
+            || (top_covered < usize::MAX
+                && (hit.rank() + hit.focus > best || hit.focus > top_covered));
+        if leads_top && !shown_text.contains(&at) {
+            show_text(
+                workspace,
+                index,
+                cache,
+                &mut shown_files,
+                hit,
+                &mut report,
+                memory.as_deref_mut(),
+            );
+            shown_text.insert(at);
+        }
+    }
+
+    let mut seed_neighbors: HashSet<usize> = HashSet::new();
+    let mut seeds_shown = 0usize;
+    for (sup, score, id) in ranked {
+        if seeds_shown >= 4 || sup != best_tier || score < best / 2 || report.clipped {
+            break;
+        }
+        // When the primary seed is a structural name match, do not let an
+        // incidental text-only non-neighbor function steal seed budget ahead of
+        // the primary seed's direct callers/callees and cross-language bridges.
+        if best_has_name
+            && seeds_shown > 0
+            && !name_scores.contains_key(&id)
+            && !diagnosed.contains(&id)
+            && !seed_neighbors.contains(&id)
+        {
+            continue;
         }
         let def = &index.definitions[id];
         report.line(format!(
             "{} [{}] {}{}",
             def.qualified,
             def.kind,
-            def.location,
+            format_pack_location(def, None),
             if changes.contains(&def.location.file) {
                 " [working tree change]"
             } else {
@@ -1067,7 +1236,8 @@ fn pack_report(
         excerpt(
             workspace,
             index,
-            &mut sources,
+            cache,
+            &mut shown_files,
             &def.location.file,
             def.declaration,
             def.declaration,
@@ -1075,82 +1245,264 @@ fn pack_report(
             memory.as_deref_mut(),
         );
         seen.insert(id);
-        queue.push_back((id, 0));
-    }
-    let mut shown_links = BTreeSet::new();
-    while let Some((id, depth)) = queue.pop_front() {
-        if depth >= 3 || seen.len() >= 24 || report.clipped {
-            continue;
-        }
-        let mut neighbors = Vec::new();
+        found_exact_code_seed |= names[id].is_code;
         for edge in index.incoming(id) {
             if let Some(from) = edge.from {
-                neighbors.push((from, edge, "from"));
+                seed_neighbors.insert(from);
             }
         }
         for edge in index.outgoing(id) {
-            neighbors.push((edge.to, edge, "to"));
+            seed_neighbors.insert(edge.to);
         }
-        neighbors.sort_by_key(|(other, edge, _)| {
-            (
-                !index.definitions[*other].test,
-                edge.inferred,
-                &edge.location,
-                *other,
-            )
-        });
-        let mut header_shown = false;
-        for (other, edge, direction) in neighbors {
-            if seen.len() >= 24 || report.clipped {
-                break;
-            }
-            if shown_links.len() >= 32 || !shown_links.insert((edge.from, edge.to, edge.kind)) {
+        queue.push_back((id, 0));
+        seeds_shown += 1;
+    }
+
+    // Plan the BFS dependency cone in memory (capped at 24 symbols / 32 unique
+    // links), prioritizing direct structural callers/callees and cross-language
+    // bridges ahead of weak imports/references, collapsing duplicate edge labels
+    // between the same pair, and hoisting deep `>= 2`-segment shared paths.
+    struct PlannedEdgeLabel<'a> {
+        kind_label: &'static str,
+        inferred: bool,
+        file: &'a str,
+        spans: BTreeSet<(usize, usize)>,
+    }
+    struct PlannedLink<'a> {
+        other: usize,
+        direction: &'static str,
+        discovered: bool,
+        labels: Vec<PlannedEdgeLabel<'a>>,
+    }
+    struct PlannedParent<'a> {
+        parent_id: usize,
+        links: Vec<PlannedLink<'a>>,
+    }
+
+    let mut shown_links: BTreeSet<(Option<usize>, usize, Kind)> = BTreeSet::new();
+    let mut planned_parents: Vec<PlannedParent<'_>> = Vec::new();
+    let mut cone_paths: Vec<&str> = Vec::new();
+
+    while let Some((id, depth)) = queue.pop_front() {
+        if depth >= 3 || seen.len() >= 24 {
+            continue;
+        }
+        let parent_def = &index.definitions[id];
+
+        type LabelKey<'a> = (&'static str, bool, &'a str);
+        struct NeighborAcc<'a> {
+            other: usize,
+            direction: &'static str,
+            best_key: (bool, usize, Reverse<usize>, &'a Location, usize),
+            raw_keys: Vec<(Option<usize>, usize, Kind)>,
+            labels: Vec<(LabelKey<'a>, BTreeSet<(usize, usize)>)>,
+            label_idx: HashMap<LabelKey<'a>, usize>,
+        }
+
+        let mut grouped: Vec<NeighborAcc<'_>> = Vec::new();
+        let mut by_neighbor: HashMap<(usize, &'static str), usize> = HashMap::new();
+
+        let adjacent = index
+            .incoming(id)
+            .filter_map(|edge| edge.from.map(|from| (from, edge, "from")))
+            .chain(index.outgoing(id).map(|edge| (edge.to, edge, "to")));
+
+        for (other, edge, direction) in adjacent {
+            let raw_key = (edge.from, edge.to, edge.kind);
+            if shown_links.contains(&raw_key) {
                 continue;
             }
-            if !header_shown {
-                report.line(format!("  {} links:", index.definitions[id].qualified));
-                header_shown = true;
-                if report.clipped {
-                    break;
+            let other_def = &index.definitions[other];
+            let support_tier = if wants_support || failure_task {
+                !other_def.test
+            } else {
+                is_support_definition(other_def)
+            };
+            let edge_tier = cone_edge_tier(index, parent_def, other_def, edge);
+            let affinity = ranks.get(&other).copied().unwrap_or(0);
+            let sort_key = (
+                support_tier,
+                edge_tier,
+                Reverse(affinity),
+                &edge.location,
+                other,
+            );
+            let label_key = (
+                relationship(edge.kind),
+                edge.inferred,
+                edge.location.file.as_str(),
+            );
+            let slot = *by_neighbor.entry((other, direction)).or_insert_with(|| {
+                let pos = grouped.len();
+                grouped.push(NeighborAcc {
+                    other,
+                    direction,
+                    best_key: sort_key,
+                    raw_keys: Vec::new(),
+                    labels: Vec::new(),
+                    label_idx: HashMap::new(),
+                });
+                pos
+            });
+            let acc = &mut grouped[slot];
+            if sort_key < acc.best_key {
+                acc.best_key = sort_key;
+            }
+            if !acc.raw_keys.contains(&raw_key) {
+                acc.raw_keys.push(raw_key);
+            }
+            let lslot = *acc.label_idx.entry(label_key).or_insert_with(|| {
+                let pos = acc.labels.len();
+                acc.labels.push((label_key, BTreeSet::new()));
+                pos
+            });
+            acc.labels[lslot]
+                .1
+                .insert((edge.location.start, edge.location.end));
+        }
+
+        grouped.sort_by(|a, b| a.best_key.cmp(&b.best_key));
+
+        let mut parent_links: Vec<PlannedLink<'_>> = Vec::new();
+        for acc in grouped {
+            if seen.len() >= 24 || shown_links.len() >= 32 {
+                break;
+            }
+            let mut added_any = false;
+            for raw_key in acc.raw_keys {
+                if shown_links.len() < 32 && shown_links.insert(raw_key) {
+                    added_any = true;
                 }
             }
-            let discovered = seen.insert(other);
-            let target = &index.definitions[other];
-            let link = if edge.location.file == target.location.file {
-                if edge.location.start == edge.location.end {
-                    format!(":{}", edge.location.start)
-                } else {
-                    format!(":{}-{}", edge.location.start, edge.location.end)
-                }
-            } else {
-                edge.location.to_string()
-            };
-            report.line(format!(
-                "    {}{} {direction} {} [{}] {} (link {link})",
-                if edge.inferred { "possible " } else { "" },
-                relationship(edge.kind),
-                target.qualified,
-                if target.test { "test" } else { &target.kind },
-                target.location,
-            ));
+            if !added_any {
+                continue;
+            }
+            let discovered = seen.insert(acc.other);
+            let target = &index.definitions[acc.other];
+            if !qualified_includes_file(target) {
+                cone_paths.push(target.location.file.as_str());
+            }
+            let labels: Vec<PlannedEdgeLabel<'_>> = acc
+                .labels
+                .into_iter()
+                .map(|((kind_label, inferred, file), spans)| {
+                    if file != target.location.file.as_str() {
+                        cone_paths.push(file);
+                    }
+                    PlannedEdgeLabel {
+                        kind_label,
+                        inferred,
+                        file,
+                        spans,
+                    }
+                })
+                .collect();
             if discovered {
+                queue.push_back((acc.other, depth + 1));
+            }
+            parent_links.push(PlannedLink {
+                other: acc.other,
+                direction: acc.direction,
+                discovered,
+                labels,
+            });
+        }
+        if !parent_links.is_empty() {
+            planned_parents.push(PlannedParent {
+                parent_id: id,
+                links: parent_links,
+            });
+        }
+    }
+
+    let cone_base = hoistable_dir_prefix(&cone_paths, "  base: ");
+    if let Some(prefix) = &cone_base
+        && !planned_parents.is_empty()
+        && !report.clipped
+    {
+        report.line(format!("  base: {prefix}"));
+    }
+
+    for parent in planned_parents {
+        if report.clipped {
+            break;
+        }
+        report.line(format!(
+            "  {} links:",
+            index.definitions[parent.parent_id].qualified
+        ));
+        if report.clipped {
+            break;
+        }
+        for link in parent.links {
+            if report.clipped {
+                break;
+            }
+            let target = &index.definitions[link.other];
+            let target_kind = if target.test { "test" } else { &target.kind };
+            let target_loc = format_pack_location(target, cone_base.as_deref());
+            let format_link_span = |label: &PlannedEdgeLabel<'_>| {
+                if label.file == target.location.file {
+                    format_same_file_spans(&label.spans)
+                } else {
+                    format_line_spans_with_base(label.file, &label.spans, cone_base.as_deref())
+                }
+            };
+            if link.labels.len() == 1 {
+                let label = &link.labels[0];
+                let confidence = if label.inferred { "possible " } else { "" };
+                report.line(format!(
+                    "    {confidence}{} {} {} [{target_kind}] {target_loc} (link {})",
+                    label.kind_label,
+                    link.direction,
+                    target.qualified,
+                    format_link_span(label),
+                ));
+            } else {
+                let parts: Vec<String> = link
+                    .labels
+                    .iter()
+                    .map(|label| {
+                        let confidence = if label.inferred { "possible " } else { "" };
+                        format!(
+                            "{confidence}{} ({})",
+                            label.kind_label,
+                            format_link_span(label)
+                        )
+                    })
+                    .collect();
+                report.line(format!(
+                    "    {} {} {} [{target_kind}] {target_loc}",
+                    parts.join(", "),
+                    link.direction,
+                    target.qualified,
+                ));
+            }
+            if link.discovered && !report.clipped {
                 excerpt(
                     workspace,
                     index,
-                    &mut sources,
+                    cache,
+                    &mut shown_files,
                     &target.location.file,
                     target.declaration,
                     target.location.end.min(target.declaration + 2),
                     &mut report,
                     memory.as_deref_mut(),
                 );
-                queue.push_back((other, depth + 1));
             }
         }
     }
+
     for (at, hit) in passages.iter().enumerate() {
         if report.clipped || shown_text.len() >= 5 {
             break;
+        }
+        // When the task explicitly named a code identifier that resolved to a
+        // symbol in the dependency cone, skip incidental plain-text matches that
+        // only hit a split sub-word (e.g. "order" from "purchase_orders").
+        if found_exact_code_seed && !hit.matched_explicit {
+            continue;
         }
         let file = &hit.location.file;
         if shown_text.contains(&at)
@@ -1165,17 +1517,16 @@ fn pack_report(
         show_text(
             workspace,
             index,
-            &mut sources,
+            cache,
+            &mut shown_files,
             hit,
             &mut report,
             memory.as_deref_mut(),
         );
         shown_text.insert(at);
-        text_files.insert(file.clone());
     }
-    let inspected: BTreeMap<_, _> = sources
-        .keys()
-        .chain(&text_files)
+    let inspected: BTreeMap<_, _> = shown_files
+        .iter()
         .filter_map(|file| {
             index
                 .files
@@ -1192,6 +1543,8 @@ fn pack_report(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     fn temp_workspace(files: &[(&str, &str)]) -> (tempfile::TempDir, Workspace) {
@@ -1454,5 +1807,122 @@ mod tests {
             !out.contains("    3 |         pub fn"),
             "deep leading indent should be trimmed:\n{out}"
         );
+    }
+
+    #[test]
+    fn pack_caches_file_reads_across_passages_and_multi_symbol_excerpts() {
+        let manifest = "[package]\nname = \"cachedemo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        let lib = concat!(
+            "pub fn core_settlement(v: u64) -> u64 {\n    v + 1\n}\n\n",
+            "pub fn settle_card(v: u64) -> u64 {\n    core_settlement(v)\n}\n\n",
+            "pub fn settle_wire(v: u64) -> u64 {\n    core_settlement(v) + core_settlement(v + 1)\n}\n\n",
+            "pub fn settle_batch(v: u64) -> u64 {\n    let a = settle_card(v);\n    settle_wire(a)\n}\n",
+        );
+        let (_dir, workspace) = temp_workspace(&[("Cargo.toml", manifest), ("src/lib.rs", lib)]);
+        let index = Index::open(&workspace).unwrap();
+
+        let mut cache = SourceCache::default();
+        let first = pack_report_with_cache(
+            &workspace,
+            &mut cache,
+            &index,
+            "core_settlement",
+            8000,
+            None,
+        )
+        .unwrap()
+        .0
+        .into_string();
+        assert_eq!(
+            cache.reads(),
+            1,
+            "multi-symbol pack touching src/lib.rs across passages + 4 excerpts must read disk once"
+        );
+        let second = pack_report_with_cache(
+            &workspace,
+            &mut cache,
+            &index,
+            "core_settlement",
+            8000,
+            None,
+        )
+        .unwrap()
+        .0
+        .into_string();
+        assert_eq!(
+            cache.reads(),
+            1,
+            "second pack on warm cache must do 0 reads"
+        );
+        assert_eq!(first, second, "cached pack output must stay deterministic");
+        assert!(first.contains("core_settlement"), "{first}");
+        assert!(first.contains("settle_card"), "{first}");
+        assert!(first.contains("settle_wire"), "{first}");
+    }
+
+    #[test]
+    fn cross_language_dependency_cone_outranks_incidental_text_under_tight_budget() {
+        let (_dir, workspace) = temp_workspace(&[
+            (
+                "db/schema.sql",
+                "CREATE TABLE purchase_orders (\n  order_id INTEGER PRIMARY KEY\n);\n",
+            ),
+            (
+                "backend/orders.py",
+                "from fastapi import APIRouter\n\nrouter = APIRouter()\n\n@router.get(\"/api/orders\")\ndef list_orders():\n    return database.execute(\"SELECT order_id FROM purchase_orders\")\n",
+            ),
+            (
+                "frontend/orders.ts",
+                "export async function fetchOrders() {\n  const response = await fetch('/api/orders');\n  return response.json();\n}\n",
+            ),
+            (
+                "docs/glossary.md",
+                "# Order glossary\n\nEvery order has an order status and order history.\nAn order is created by an order form.\n",
+            ),
+            (
+                "docs/incidental.md",
+                "# Release checklist\n\nVerify purchase_orders metrics in dashboard after deploy.\n",
+            ),
+        ]);
+        let index = Index::open(&workspace).unwrap();
+
+        // Tight budget must pack the cross-language SQL + HTTP dependency cone
+        // (`purchase_orders` <- `list_orders` <- `fetchOrders`) ahead of
+        // incidental plain-text mentions (`docs/incidental.md`).
+        let tight = pack_report(&workspace, &index, "purchase_orders", 640, None)
+            .unwrap()
+            .0
+            .into_string();
+        assert!(tight.len() <= 640, "len={} > 640\n{tight}", tight.len());
+        assert!(
+            tight.contains("db/schema.sql::purchase_orders [table] :1-3\n"),
+            "polyglot header must drop redundant file repetition:\n{tight}"
+        );
+        assert!(
+            tight.contains("possible SQL relation from backend/orders.py::list_orders [function] :5-7 (link :7)\n"),
+            "direct SQL bridge must appear:\n{tight}"
+        );
+        assert!(
+            tight.contains("possible HTTP route from frontend/orders.ts::fetchOrders [function] :1-4 (link :2)\n"),
+            "cross-language HTTP bridge must appear before incidental text:\n{tight}"
+        );
+        assert!(
+            !tight.contains("docs/glossary.md"),
+            "split sub-token 'order' noise must not displace code cone:\n{tight}"
+        );
+
+        // With generous budget, an explicit mention of `purchase_orders` in docs
+        // still appears AFTER the dependency cone, while split-only `glossary.md` stays excluded.
+        let full = pack_report(&workspace, &index, "purchase_orders", 8000, None)
+            .unwrap()
+            .0
+            .into_string();
+        let http_pos = full.find("fetchOrders").unwrap();
+        let doc_pos = full.find("docs/incidental.md").unwrap();
+        assert!(
+            http_pos < doc_pos,
+            "cross-language cone must precede incidental text:\n{full}"
+        );
+        assert!(!full.contains("docs/glossary.md"), "{full}");
     }
 }
