@@ -1877,3 +1877,115 @@ fn rename_cli_fails_closed_on_ambiguous_invalid_keyword_and_collision() {
     assert_eq!(read(root, "src/b.rs"), b_src);
     assert_eq!(read(root, "worker.py"), py_src);
 }
+
+#[test]
+fn rename_cli_hardened_ast_roles_reexports_vue_and_file_scoping() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src/sub")).unwrap();
+    fs::create_dir_all(root.join("web")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub mod foo;\npub mod sub;\npub use foo::foo;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/foo.rs"),
+        "#[inline]\npub fn foo(x: i32) -> i32 { x + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/sub/a.rs"),
+        concat!(
+            "use crate::foo;\n",
+            "pub struct Boxed { pub foo: i32 }\n",
+            "pub fn run(b: Boxed) -> i32 {\n",
+            "    let r = crate::foo::foo(1) + foo(2);\n",
+            "    let foo = 5;\n",
+            "    r + foo + b.foo\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    fs::write(root.join("src/sub/mod.rs"), "pub mod a;\n").unwrap();
+    let py_orig = "def foo(x):\n    return x\n";
+    fs::write(root.join("unrelated.py"), py_orig).unwrap();
+    fs::write(
+        root.join("web/math.ts"),
+        "export function calcTotal(a: number): number { return a + 1; }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("web/App.vue"),
+        "<script setup lang=\"ts\">\nimport { calcTotal } from \"./math\";\nconst n = calcTotal(1);\n</script>\n<template><span>{{ calcTotal(2) }}</span></template>\n",
+    )
+    .unwrap();
+
+    // 1. Cross-language `--file unrelated.py` fails closed.
+    let bad_file = run(
+        root,
+        &["rename", "demo::foo::foo", "bar", "--file", "unrelated.py"],
+        b"",
+    );
+    assert!(!bad_file.status.success());
+    contains(&stderr(&bad_file), "not in the same language family");
+    assert_eq!(read(root, "unrelated.py"), py_orig);
+
+    // 2. Vue template reference fails closed without modifying any file.
+    let vue_fail = run(root, &["rename", "calcTotal", "sumValues"], b"");
+    assert!(!vue_fail.status.success());
+    contains(
+        &stderr(&vue_fail),
+        "template in web/App.vue references 'calcTotal' outside <script>; update manually to avoid desync",
+    );
+
+    // 3. Running from subdirectory `src/sub` without `--root` resolves `--file a.rs` cleanly.
+    let sub_dry = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .current_dir(root.join("src/sub"))
+        .args([
+            "rename",
+            "demo::foo::foo",
+            "bar",
+            "--file",
+            "a.rs",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        sub_dry.status.success(),
+        "subdir --file failed: {}",
+        stderr(&sub_dry)
+    );
+    let sub_out = String::from_utf8(sub_dry.stdout).unwrap();
+    contains(&sub_out, "src/sub/a.rs");
+
+    // 4. `--file .` matches the whole workspace cleanly and updates `pub use` re-export + consumer
+    //    while preserving `crate::foo::`, struct field `foo`, and shadowed local `let foo = 5;`.
+    let applied = json(
+        root,
+        &["rename", "demo::foo::foo", "bar", "--file", ".", "--json"],
+    );
+    assert_eq!(applied["dry_run"], false);
+    assert!(
+        applied["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "src/sub/a.rs"),
+        "{applied}"
+    );
+    contains(&read(root, "src/lib.rs"), "pub use foo::bar;");
+    let a_after = read(root, "src/sub/a.rs");
+    contains(&a_after, "use crate::bar;");
+    contains(&a_after, "pub struct Boxed { pub foo: i32 }");
+    contains(&a_after, "let r = crate::foo::bar(1) + bar(2);");
+    contains(&a_after, "let foo = 5;");
+    contains(&a_after, "r + foo + b.foo");
+    assert_eq!(read(root, "unrelated.py"), py_orig);
+}

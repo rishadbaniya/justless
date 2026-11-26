@@ -257,7 +257,10 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     let command = call["command"].as_str()?;
     // While `.justless.toml` fails to load, the output stays as the command left it.
     let exclusions = crate::rewrite::Exclusions::of(ws).ok()?;
-    if call["run_in_background"] == true || excluded(&exclusions, command) {
+    if call["run_in_background"] == true
+        || command_disables_justless(command)
+        || excluded(&exclusions, command)
+    {
         return None;
     }
     let response = input["tool_response"].as_object()?;
@@ -458,11 +461,14 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     let was_clipped = text.contains("[output clipped. Full log retained.]");
     let cmd_refs: Vec<&str> = plan.source_words().iter().map(String::as_str).collect();
     let is_log_cmd = is_log_command(&cmd_refs);
+    let lossless_only = ws.settings().is_ok_and(|s| s.lossless_only)
+        || run_ws.settings().is_ok_and(|s| s.lossless_only);
     let mut replaced = false;
     let mut used_logview =
         is_log_cmd && shown.report && shown.run.summary.kind.is_empty() && !is_json_view;
-    let will_try_replace = archive_complete && !shown.report && !is_json_view && !clipped_columns;
-    let will_try_floor = plan.strict() && !shown.report;
+    let will_try_replace =
+        !lossless_only && archive_complete && !shown.report && !is_json_view && !clipped_columns;
+    let will_try_floor = !lossless_only && plan.strict() && !shown.report;
     let will_scan_errors =
         !(shown.footer.is_empty() || shown.run.summary.kind == "lint" || used_logview);
     // Redact the full output once lazily only when post-run formatters, floor
@@ -531,7 +537,7 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         //     `yarn list`, `pipdeptree`, `go mod graph`, `mvn`, `gradle`,
         //     `dart pub deps`, `flutter pub deps`).
         if replacement.is_none()
-            && let Some(view) = crate::deptree::format_words(&cmd_refs, &redacted_text, budget)
+            && let Some(view) = format_deptree(&cmd_refs, &redacted_text, budget)
             && view.len() <= budget
             && view.len() < output.len()
             && (was_clipped || view.len() + 64 < text.len())
@@ -655,6 +661,9 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     // otherwise left as it is.
     if plan.strict() && !shown.report {
         let _ = fs::remove_dir_all(&archive);
+        if lossless_only {
+            return None;
+        }
         let floor = crate::floor::compact(&redacted_text)?;
         if output.len().saturating_sub(floor.len()) < (output.len() / 4).max(512) {
             return None;
@@ -951,7 +960,11 @@ pub(crate) fn after_run(
     persisted: Option<u64>,
     (context_budget, outline_lines): (usize, u64),
 ) -> Option<AfterRun> {
-    if !cwd.starts_with(root) || excluded(exclusions, command) || has_run_marker(output) {
+    if !cwd.starts_with(root)
+        || command_disables_justless(command)
+        || excluded(exclusions, command)
+        || has_run_marker(output)
+    {
         return None;
     }
     let size = persisted.unwrap_or(output.len() as u64);
@@ -1911,6 +1924,21 @@ fn polyglot_test_runner(words: &[&str]) -> Option<crate::polyglot_tests::Runner>
     crate::polyglot_tests::runner_for_words(&normalized)
 }
 
+fn format_deptree(words: &[&str], text: &str, budget: usize) -> Option<String> {
+    let owned = crate::wrappers::effective(words);
+    let refs: Vec<&str> = match &owned {
+        Some(w) => w.iter().map(String::as_str).collect(),
+        None => words.to_vec(),
+    };
+    if let Some((base, args)) = dart_flutter_subcommand(&refs) {
+        let mut normalized = Vec::with_capacity(args.len() + 1);
+        normalized.push(base);
+        normalized.extend_from_slice(args);
+        return crate::deptree::format_words(&normalized, text, budget);
+    }
+    crate::deptree::format_words(words, text, budget)
+}
+
 /// Recognize display-oriented `dart`/`flutter` `analyze`, `test`, and `pub deps`
 /// commands so `plan` routes them cleanly with full words, `cd`, and pipes.
 fn dart_flutter_kind(words: &[&str]) -> Option<&'static str> {
@@ -1925,8 +1953,13 @@ fn dart_flutter_kind(words: &[&str]) -> Option<&'static str> {
         Some(w) => w.iter().map(String::as_str).collect(),
         None => words.to_vec(),
     };
-    if dart_flutter_subcommand(&refs).is_some() && crate::deptree::is_supported(&refs) {
-        return Some("pub-deps");
+    if let Some((base, args)) = dart_flutter_subcommand(&refs) {
+        let mut normalized = Vec::with_capacity(args.len() + 1);
+        normalized.push(base);
+        normalized.extend_from_slice(args);
+        if crate::deptree::is_supported(&normalized) {
+            return Some("pub-deps");
+        }
     }
     None
 }
@@ -2212,6 +2245,66 @@ fn home(directory: &str) -> Option<PathBuf> {
     Some(home.join(rest.trim_start_matches('/')))
 }
 
+fn disables_justless_assignment(word: &str) -> bool {
+    word.strip_prefix("JUSTLESS_DISABLE=")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+fn stage_disables_justless(words: &[String]) -> bool {
+    let mut rest = words;
+    loop {
+        let Some(first) = rest.first() else {
+            return false;
+        };
+        if disables_justless_assignment(first) {
+            return true;
+        }
+        rest = match first.as_str() {
+            word if assignment(word) => &rest[1..],
+            "env" => {
+                let mut i = 1;
+                while let Some(arg) = rest.get(i) {
+                    if arg == "--" {
+                        i += 1;
+                        break;
+                    } else if matches!(arg.as_str(), "-u" | "--unset" | "-C" | "--chdir") {
+                        i += 2;
+                    } else if arg.starts_with('-') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                rest.get(i..).unwrap_or(&[])
+            }
+            "export" | "time" | "nohup" => &rest[1..],
+            "command" if rest.get(1).is_some_and(|w| !w.starts_with('-')) => &rest[1..],
+            "nice" => match rest.get(1).map(String::as_str) {
+                Some("-n") => rest.get(3..).unwrap_or(&[]),
+                Some(w) if w.starts_with('-') => rest.get(2..).unwrap_or(&[]),
+                _ => &rest[1..],
+            },
+            "timeout" => {
+                let mut i = 1;
+                while rest.get(i).is_some_and(|w| w.starts_with('-')) {
+                    i += 1;
+                }
+                rest.get(i + 1..).unwrap_or(&[])
+            }
+            _ => return false,
+        };
+    }
+}
+
+fn command_disables_justless(command: &str) -> bool {
+    parse(command).is_some_and(|segments| {
+        segments
+            .iter()
+            .flatten()
+            .any(|stage| stage_disables_justless(&stage.words))
+    })
+}
+
 /// Skip leading assignments and wrappers that run the next word unchanged.
 fn strip(words: &[String]) -> Option<&[String]> {
     let mut rest = words;
@@ -2219,6 +2312,9 @@ fn strip(words: &[String]) -> Option<&[String]> {
         let Some(first) = rest.first() else {
             return Some(rest);
         };
+        if disables_justless_assignment(first) {
+            return None;
+        }
         rest = match first.as_str() {
             word if assignment(word) => &rest[1..],
             "env" => {
@@ -3805,7 +3901,13 @@ data:
         }
         pub_deps.push_str("'-- logger 2.5.0\n");
         assert!(pub_deps.len() > 4_096);
-        for cmd in ["dart pub deps", "flutter pub deps | head -n 500"] {
+        for cmd in [
+            "dart pub deps",
+            "flutter pub deps | head -n 500",
+            "flutter --no-color pub deps",
+            "flutter --no-color pub deps | head -n 500",
+            "dart --suppress-analytics pub deps",
+        ] {
             let shown =
                 post_bash(&ws, cmd, &pub_deps).unwrap_or_else(|| panic!("{cmd} should compact"));
             assert!(shown.contains("shared_core 2.1.0"), "{cmd}: {shown}");
@@ -3813,6 +3915,10 @@ data:
             assert!(shown.len() * 2 < pub_deps.len(), "{cmd}: {shown}");
             assert_archive_exact_and_accounted(&ws, &shown, &pub_deps);
         }
+        assert_eq!(
+            dart_flutter_kind(&["flutter", "--no-color", "pub", "deps"]),
+            Some("pub-deps")
+        );
 
         // 4. Machine formats stay rejected from dart/flutter planning.
         for rejected in [
@@ -3822,8 +3928,40 @@ data:
             &["flutter", "test", "--reporter=json"][..],
             &["dart", "pub", "deps", "--json"][..],
             &["flutter", "pub", "deps", "--json"][..],
+            &["flutter", "--no-color", "pub", "deps", "--json"][..],
         ] {
             assert_eq!(dart_flutter_kind(rejected), None, "{rejected:?}");
         }
+
+        // 5. Leading `JUSTLESS_DISABLE=<non-empty, non-0>` (direct or after `env`)
+        //    passes through `claude_bash` untouched; `JUSTLESS_DISABLE=0` still compacts.
+        for disabled_cmd in [
+            "JUSTLESS_DISABLE=1 flutter pub deps",
+            "FOO=1 JUSTLESS_DISABLE=true flutter pub deps",
+            "env JUSTLESS_DISABLE=1 flutter pub deps",
+            "env -i JUSTLESS_DISABLE=1 flutter pub deps",
+            "export JUSTLESS_DISABLE=1 && flutter pub deps",
+        ] {
+            assert!(
+                post_bash(&ws, disabled_cmd, &pub_deps).is_none(),
+                "{disabled_cmd} should pass through untouched"
+            );
+        }
+        assert!(
+            post_bash(&ws, "JUSTLESS_DISABLE=0 flutter pub deps", &pub_deps).is_some(),
+            "JUSTLESS_DISABLE=0 should still compact"
+        );
+
+        // 6. `lossless_only = true` suppresses lossy post-formatters (deptree,
+        //    logview, helm/cli views, and strict-pipe `floor::compact`).
+        fs::write(ws.root.join(".justless.toml"), "lossless_only = true\n").unwrap();
+        assert!(
+            post_bash(&ws, "flutter pub deps", &pub_deps).is_none(),
+            "lossless_only must skip lossy deptree post-formatter"
+        );
+        assert!(
+            post_bash(&ws, "flutter pub deps | head -n 500", &pub_deps).is_none(),
+            "lossless_only must skip floor::compact on strict pipes"
+        );
     }
 }

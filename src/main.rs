@@ -645,7 +645,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         (name @ ("read" | "expand" | "edit"), sub) => {
             source::run(&workspace, name, sub, matches.is_present("root"))?
         }
-        ("rename", sub) => run_rename(&workspace, sub)?,
+        ("rename", sub) => run_rename(&workspace, sub, matches.is_present("root"))?,
         (name @ ("mask" | "recall"), sub) => observations::run(&workspace, name, sub)?,
         ("mcp", sub) => mcp::run(&workspace, sub)?,
         ("doctor", sub) => return doctor::run(&workspace, sub, matches.is_present("root")),
@@ -909,7 +909,7 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
     Ok(0)
 }
 
-fn run_rename(workspace: &Workspace, sub: &ArgMatches) -> Result<()> {
+fn run_rename(workspace: &Workspace, sub: &ArgMatches, root_given: bool) -> Result<()> {
     let symbol = sub.value_of("symbol").unwrap();
     let new_name = sub.value_of("new-name").unwrap();
     let dry_run = sub.is_present("dry-run");
@@ -925,6 +925,7 @@ fn run_rename(workspace: &Workspace, sub: &ArgMatches) -> Result<()> {
         symbol,
         new_name,
         include_files.as_deref(),
+        root_given,
     )?;
 
     if dry_run {

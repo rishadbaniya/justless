@@ -39,7 +39,7 @@ use sha2::{Digest, Sha256};
 use crate::workspace::Workspace;
 
 /// Bump whenever a built-in rule changes, so archives scanned clean are scanned again.
-const RULES_VERSION: &str = "2";
+const RULES_VERSION: &str = "3";
 const READ_SIZE: usize = 64 * 1024;
 /// Lines longer than this are redacted in windows instead of being held whole.
 const WINDOW: usize = 1024 * 1024;
@@ -98,15 +98,19 @@ const KEYWORDS: &[&str] = &[
     "apikey",
     "access_key",
     "access-key",
+    "access.key",
     "accesskey",
     "private_key",
     "private-key",
+    "private.key",
     "privatekey",
     "credential",
     "authorization",
     "bearer",
     "passphrase",
     "pass_phrase",
+    "pass-phrase",
+    "pass.phrase",
 ];
 
 #[derive(Clone, Copy)]
@@ -2848,7 +2852,7 @@ mod tests {
         assert_eq!(redact(&allowed, line.as_bytes()).1, 0);
         assert_eq!(redact(&redactor(), line.as_bytes()).1, 1);
         assert_ne!(allowed.fingerprint(), redactor().fingerprint());
-        assert!(redactor().fingerprint().starts_with("r2-"));
+        assert!(redactor().fingerprint().starts_with("r3-"));
 
         let error = Redactor::build(&["[".to_owned()], KeySource::Fixed(None))
             .err()
@@ -3033,6 +3037,71 @@ mod tests {
             assert!(
                 matches!(redactor.text(&rendered), Cow::Borrowed(_)),
                 "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn dotted_and_hyphenated_keyword_spellings_redact_across_all_paths() {
+        let redactor = redactor();
+        let sample = format!("{}{}", "K9xM2pQ7", "rS4tV8wZ");
+        let generated = base62("dotted-hyphenated-keywords", 20);
+        let cases = [
+            (
+                "pass-phrase-assign",
+                &sample,
+                format!("pass-phrase={sample}"),
+            ),
+            (
+                "pass-dot-phrase-assign",
+                &generated,
+                format!("pass.phrase={generated}"),
+            ),
+            (
+                "cli-pass-phrase",
+                &sample,
+                format!("tool --pass-phrase {sample} --verbose"),
+            ),
+            (
+                "access-dot-key",
+                &generated,
+                format!("access.key={generated}"),
+            ),
+            (
+                "private-dot-key",
+                &generated,
+                format!("private.key={generated}"),
+            ),
+            (
+                "uppercase-pass-phrase",
+                &sample,
+                format!("PASS-PHRASE={sample}"),
+            ),
+        ];
+
+        for (label, secret, line) in cases {
+            assert!(
+                PREFILTER.is_match(line.as_bytes()),
+                "{label}: PREFILTER missed `{line}`"
+            );
+            assert_ne!(
+                candidate_rules(line.as_bytes()),
+                0,
+                "{label}: candidate_rules returned 0 for `{line}`"
+            );
+            let payload = format!("clean prelude\n{line}\nclean epilogue\n");
+            let via_bytes = redactor.bytes(payload.as_bytes());
+            let (via_engine, count) = redact(&redactor, payload.as_bytes());
+            assert_eq!(count, 1, "{label}: expected 1 redaction");
+            assert_eq!(via_bytes.as_ref(), via_engine.as_slice(), "{label}");
+            let rendered = String::from_utf8(via_engine).unwrap();
+            assert!(
+                !rendered.contains(secret.as_str()),
+                "{label}: secret leaked in `{rendered}`"
+            );
+            assert!(
+                rendered.contains("[redacted:secret:"),
+                "{label}: expected secret marker in `{rendered}`"
             );
         }
     }
