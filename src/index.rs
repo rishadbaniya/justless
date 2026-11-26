@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -254,7 +255,8 @@ impl Index {
         let mut found = BTreeSet::new();
         let mut changed = rebuild || migrated;
         let mut parsers = Parsers::default();
-        let helm_charts = polyglot::helm_chart_roots(&candidates);
+        let helm_manifests = eligible_helm_manifests(workspace, &candidates, max_bytes);
+        let helm_charts = polyglot::helm_chart_roots(&helm_manifests);
         for file in candidates {
             let Ok(path) = workspace.source_path(&file) else {
                 continue;
@@ -665,7 +667,7 @@ impl Index {
         let mut routes = BTreeMap::<&str, Vec<usize>>::new();
         let mut tables = BTreeMap::<&str, Vec<usize>>::new();
         let mut families = BTreeMap::<(Grammar, &str), Vec<usize>>::new();
-        let mut hcl_by_dir = BTreeMap::<(&str, &str), Vec<usize>>::new();
+        let mut hcl_by_dir = BTreeMap::<(Cow<'_, str>, &str), Vec<usize>>::new();
         let mut units_by_family = BTreeMap::<Grammar, Vec<&str>>::new();
         for file in cache.files.keys() {
             let Some(facts) = &overlay.parsed(cache, file).foreign else {
@@ -709,8 +711,11 @@ impl Index {
                     },
                 );
                 families.entry((family, &tag.name)).or_default().push(id);
-                if let Some(dir) = hcl_dir {
-                    hcl_by_dir.entry((dir, &tag.name)).or_default().push(id);
+                if let Some(ref dir) = hcl_dir {
+                    hcl_by_dir
+                        .entry((dir.clone(), &tag.name))
+                        .or_default()
+                        .push(id);
                 }
                 if matches!(tag.kind.as_str(), "table" | "view") {
                     tables.entry(&tag.name).or_default().push(id);
@@ -722,6 +727,9 @@ impl Index {
                 }
             }
             for (route, handler) in &facts.routes {
+                if *handler >= facts.definitions.len() {
+                    continue;
+                }
                 let id = origin + handler;
                 routes.entry(route).or_default().push(id);
                 self.by_name.entry(route.clone()).or_default().push(id);
@@ -783,7 +791,11 @@ impl Index {
             }
             let hcl_dir = (family == Grammar::Hcl).then(|| parent_dir_key(file));
             for reference in &facts.references {
-                let from = reference.from.map_or(module, |id| origin + id);
+                let from = match reference.from {
+                    Some(id) if id < facts.definitions.len() => origin + id,
+                    Some(_) => continue,
+                    None => module,
+                };
                 let name = reference.name.as_str();
                 let resolution = match reference.kind {
                     Kind::Route => only(routes.get(name)).map(|id| (id, true)),
@@ -793,7 +805,9 @@ impl Index {
                         .copied()
                         .flatten()
                         .map(|id| (id, false))
-                        .or_else(|| only(hcl_by_dir.get(&(hcl_dir?, name))).map(|id| (id, true))),
+                        .or_else(|| {
+                            only(hcl_by_dir.get(&(hcl_dir.clone()?, name))).map(|id| (id, true))
+                        }),
                     _ => locals
                         .get(name)
                         .copied()
@@ -889,7 +903,11 @@ impl Index {
                 }
             };
             for reference in &facts.references {
-                let from = reference.from.map_or(module, |id| origin + id);
+                let from = match reference.from {
+                    Some(id) if id < facts.definitions.len() => origin + id,
+                    Some(_) => continue,
+                    None => module,
+                };
                 let name = reference.name.as_str();
                 match reference.kind {
                     Kind::Reference => {
@@ -1170,8 +1188,60 @@ pub fn is_call(kind: Kind) -> bool {
     matches!(kind, Kind::Call | Kind::Method)
 }
 
-fn parent_dir_key(file: &str) -> &str {
-    file.rsplit_once(['/', '\\']).map_or("", |(dir, _)| dir)
+fn parent_dir_key(file: &str) -> Cow<'_, str> {
+    let dir = file.rsplit_once(['/', '\\']).map_or("", |(dir, _)| dir);
+    if dir.contains('\\') {
+        Cow::Owned(dir.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(dir)
+    }
+}
+
+fn normalize_rel_dir(file: &str, source: &str) -> Option<String> {
+    let parent = parent_dir_key(file);
+    let mut parts = Vec::new();
+    for part in parent.split('/').chain(source.split(['/', '\\'])) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            normal => parts.push(normal),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+fn is_helm_chart_manifest(file: &str) -> bool {
+    let name = file.rsplit_once(['/', '\\']).map_or(file, |(_, name)| name);
+    name == "Chart.yaml" || name == "Chart.yml"
+}
+
+fn eligible_helm_manifests(
+    workspace: &Workspace,
+    candidates: &BTreeSet<String>,
+    max_bytes: u64,
+) -> BTreeSet<String> {
+    candidates
+        .iter()
+        .filter(|file| is_helm_chart_manifest(file))
+        .filter(|file| {
+            let Ok(path) = workspace.source_path(file) else {
+                return false;
+            };
+            let Ok(metadata) = path.metadata() else {
+                return false;
+            };
+            if metadata.len() > max_bytes {
+                return false;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                return false;
+            };
+            std::str::from_utf8(&bytes).is_ok() && !bytes.contains(&0)
+        })
+        .cloned()
+        .collect()
 }
 
 fn only(matches: Option<&Vec<usize>>) -> Option<usize> {
@@ -1234,25 +1304,33 @@ fn import_target<'a>(
         // `#include "x.h"` and Julia's `include("x.jl")` name a path from the file.
         Grammar::C | Grammar::Julia => exact(&normalize(&parent.join(source))?),
         Grammar::Hcl if source.starts_with('.') => {
-            let dir = normalize(&parent.join(source))?;
-            let prefix = if dir.is_empty() {
+            let dir = normalize_rel_dir(file, source)?;
+            let slash_prefix = if dir.is_empty() {
                 String::new()
             } else {
                 format!("{dir}/")
             };
+            let backslash_prefix =
+                (!dir.is_empty()).then(|| format!("{}\\", dir.replace('/', "\\")));
             for preferred in ["main.tf", "main.tofu"] {
-                if let Some(file) = exact(&format!("{prefix}{preferred}")) {
-                    return Some(file);
+                if let Some(target) = exact(&format!("{slash_prefix}{preferred}")) {
+                    return Some(target);
+                }
+                if let Some(ref prefix) = backslash_prefix
+                    && let Some(target) = exact(&format!("{prefix}{preferred}"))
+                {
+                    return Some(target);
                 }
             }
             by_family.get(&family)?.iter().copied().find(|candidate| {
-                parent_dir_key(candidate) == dir
-                    && Path::new(candidate)
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| {
-                            ext.eq_ignore_ascii_case("tf") || ext.eq_ignore_ascii_case("tofu")
-                        })
+                let name = candidate
+                    .rsplit_once(['/', '\\'])
+                    .map_or(*candidate, |(_, name)| name);
+                parent_dir_key(candidate) == dir.as_str()
+                    && name.rsplit_once('.').is_some_and(|(stem, ext)| {
+                        !stem.is_empty()
+                            && (ext.eq_ignore_ascii_case("tf") || ext.eq_ignore_ascii_case("tofu"))
+                    })
             })
         }
         _ => None,
@@ -3483,7 +3561,7 @@ mod binary {
         let lines = reader.read_usize()?;
 
         let def_count = reader.read_usize()?;
-        let mut definitions = Vec::with_capacity(def_count.min(reader.remaining()));
+        let mut definitions = Vec::with_capacity(def_count.min(reader.remaining() / 7));
         for _ in 0..def_count {
             let name = reader.read_interned(strings)?;
             let kind = reader.read_interned(strings)?;
@@ -3511,12 +3589,18 @@ mod binary {
         }
 
         let ref_count = reader.read_usize()?;
-        let mut references = Vec::with_capacity(ref_count.min(reader.remaining()));
+        let mut references = Vec::with_capacity(ref_count.min(reader.remaining() / 4));
         let mut prev_line: u64 = 0;
         for _ in 0..ref_count {
             let kind = decode_kind(reader.read_u8()?)?;
             let name = reader.read_interned(strings)?;
             let from = reader.read_opt_usize()?;
+            if let Some(id) = from {
+                ensure!(
+                    id < definitions.len(),
+                    "invalid foreign reference owner {id}"
+                );
+            }
             let delta = reader.read_zigzag()?;
             let line_u64 = prev_line.wrapping_add(delta as u64);
             prev_line = line_u64;
@@ -3530,7 +3614,7 @@ mod binary {
         }
 
         let import_count = reader.read_usize()?;
-        let mut imports = Vec::with_capacity(import_count.min(reader.remaining()));
+        let mut imports = Vec::with_capacity(import_count.min(reader.remaining() / 3));
         for _ in 0..import_count {
             let path = reader.read_interned(strings)?;
             let line = reader.read_usize()?;
@@ -3549,10 +3633,14 @@ mod binary {
         }
 
         let route_count = reader.read_usize()?;
-        let mut routes = Vec::with_capacity(route_count.min(reader.remaining()));
+        let mut routes = Vec::with_capacity(route_count.min(reader.remaining() / 2));
         for _ in 0..route_count {
             let route = reader.read_interned(strings)?;
             let handler = reader.read_usize()?;
+            ensure!(
+                handler < definitions.len(),
+                "invalid foreign route handler {handler}"
+            );
             routes.push((route, handler));
         }
 
@@ -3603,7 +3691,7 @@ mod binary {
         let lines = reader.read_usize()?;
 
         let def_count = reader.read_usize()?;
-        let mut definitions = Vec::with_capacity(def_count.min(reader.remaining()));
+        let mut definitions = Vec::with_capacity(def_count.min(reader.remaining() / 7));
         for _ in 0..def_count {
             let name = reader.read_interned(strings)?;
             let kind = reader.read_interned(strings)?;
@@ -3631,12 +3719,15 @@ mod binary {
         }
 
         let ref_count = reader.read_usize()?;
-        let mut references = Vec::with_capacity(ref_count.min(reader.remaining()));
+        let mut references = Vec::with_capacity(ref_count.min(reader.remaining() / 4));
         let mut prev_line: u64 = 0;
         for _ in 0..ref_count {
             let kind = decode_kind(reader.read_u8()?)?;
             let name = reader.read_interned(strings)?;
             let from = reader.read_opt_usize()?;
+            if let Some(id) = from {
+                ensure!(id < definitions.len(), "invalid helm reference owner {id}");
+            }
             let delta = reader.read_zigzag()?;
             let line_u64 = prev_line.wrapping_add(delta as u64);
             prev_line = line_u64;
@@ -4733,5 +4824,347 @@ mod tests {
         assert!(rebuilt.select("web.name").is_ok());
         assert!(rebuilt.select("var.region").is_ok());
         assert!(rebuilt.select("aws_s3_bucket.logs").is_ok());
+    }
+
+    #[test]
+    fn corrupt_helm_and_foreign_ref_owners_are_rejected_and_guarded() {
+        let mut helm_cache = Cache {
+            version: VERSION,
+            files: BTreeMap::new(),
+        };
+        helm_cache.files.insert(
+            "chart/values.yaml".into(),
+            Parsed {
+                digest: "d1".into(),
+                syntax: Syntax::default(),
+                error: None,
+                foreign: None,
+                helm: Some(polyglot::parse_helm(
+                    "chart".into(),
+                    polyglot::HelmRole::Values,
+                    "replicaCount: 2\n",
+                )),
+                fingerprint: Fingerprint::default(),
+                stamp: None,
+            },
+        );
+        helm_cache.files.insert(
+            "chart/templates/deploy.yaml".into(),
+            Parsed {
+                digest: "d2".into(),
+                syntax: Syntax::default(),
+                error: None,
+                foreign: None,
+                helm: Some(polyglot::HelmFacts {
+                    chart_root: "chart".into(),
+                    lines: 1,
+                    definitions: Vec::new(),
+                    references: vec![polyglot::Reference {
+                        name: "values.replicaCount".into(),
+                        from: Some(9999),
+                        line: 1,
+                        kind: Kind::Reference,
+                    }],
+                }),
+                fingerprint: Fingerprint::default(),
+                stamp: None,
+            },
+        );
+
+        // Corrupt JSON/in-memory cache must never panic `Index::assemble`.
+        let (assembled, _) = Index::assemble(
+            &helm_cache,
+            &BTreeMap::new(),
+            Refresh::default(),
+            &Overlay::default(),
+        );
+        assert!(
+            assembled.edges.is_empty(),
+            "out-of-bounds helm ref owner must be skipped"
+        );
+        // Corrupt binary cache must be cleanly rejected during decode.
+        let encoded = binary::encode(&helm_cache, &BTreeMap::new(), &assembled);
+        let sections = binary::split_sections(&encoded).unwrap();
+        let err = binary::decode_raw_cache(sections.raw)
+            .err()
+            .expect("corrupt helm cache must be rejected");
+        assert!(
+            err.to_string().contains("invalid helm reference owner"),
+            "unexpected error: {err:#}"
+        );
+
+        // Same bounds check for foreign `from` owners.
+        let mut foreign_ref_cache = Cache {
+            version: VERSION,
+            files: BTreeMap::new(),
+        };
+        foreign_ref_cache.files.insert(
+            "app.py".into(),
+            Parsed {
+                digest: "f1".into(),
+                syntax: Syntax::default(),
+                error: None,
+                foreign: Some(polyglot::Facts {
+                    import_ranges: Vec::new(),
+                    grammar: Grammar::Python,
+                    lines: 2,
+                    definitions: vec![polyglot::Definition {
+                        bytes: 0..0,
+                        signature_start: 0,
+                        header_end: 0,
+                        name: "target".into(),
+                        kind: "function".into(),
+                        path: "target".into(),
+                        start: 1,
+                        end: 1,
+                        declaration: 1,
+                        test: false,
+                    }],
+                    references: vec![polyglot::Reference {
+                        name: "target".into(),
+                        from: Some(9999),
+                        line: 2,
+                        kind: Kind::Call,
+                    }],
+                    imports: Vec::new(),
+                    routes: Vec::new(),
+                }),
+                helm: None,
+                fingerprint: Fingerprint::default(),
+                stamp: None,
+            },
+        );
+        let (assembled_ref, _) = Index::assemble(
+            &foreign_ref_cache,
+            &BTreeMap::new(),
+            Refresh::default(),
+            &Overlay::default(),
+        );
+        assert!(assembled_ref.edges.is_empty());
+        let enc_ref = binary::encode(&foreign_ref_cache, &BTreeMap::new(), &assembled_ref);
+        let sec_ref = binary::split_sections(&enc_ref).unwrap();
+        let err_ref = binary::decode_raw_cache(sec_ref.raw)
+            .err()
+            .expect("corrupt foreign reference cache must be rejected");
+        assert!(
+            err_ref
+                .to_string()
+                .contains("invalid foreign reference owner"),
+            "unexpected error: {err_ref:#}"
+        );
+
+        // Same bounds check for foreign route `handler` indices.
+        let mut foreign_route_cache = Cache {
+            version: VERSION,
+            files: BTreeMap::new(),
+        };
+        foreign_route_cache.files.insert(
+            "routes.py".into(),
+            Parsed {
+                digest: "r1".into(),
+                syntax: Syntax::default(),
+                error: None,
+                foreign: Some(polyglot::Facts {
+                    import_ranges: Vec::new(),
+                    grammar: Grammar::Python,
+                    lines: 2,
+                    definitions: Vec::new(),
+                    references: vec![polyglot::Reference {
+                        name: "/boom".into(),
+                        from: None,
+                        line: 2,
+                        kind: Kind::Route,
+                    }],
+                    imports: Vec::new(),
+                    routes: vec![("/boom".into(), 9999)],
+                }),
+                helm: None,
+                fingerprint: Fingerprint::default(),
+                stamp: None,
+            },
+        );
+        let (assembled_route, _) = Index::assemble(
+            &foreign_route_cache,
+            &BTreeMap::new(),
+            Refresh::default(),
+            &Overlay::default(),
+        );
+        assert!(assembled_route.edges.is_empty());
+        assert!(!assembled_route.by_name.contains_key("/boom"));
+        let enc_route = binary::encode(&foreign_route_cache, &BTreeMap::new(), &assembled_route);
+        let sec_route = binary::split_sections(&enc_route).unwrap();
+        let err_route = binary::decode_raw_cache(sec_route.raw)
+            .err()
+            .expect("corrupt foreign route cache must be rejected");
+        assert!(
+            err_route
+                .to_string()
+                .contains("invalid foreign route handler"),
+            "unexpected error: {err_route:#}"
+        );
+    }
+
+    #[test]
+    fn oversized_and_binary_chart_yaml_keep_warm_and_cold_cache_coherent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("charts/big/templates")).unwrap();
+        fs::create_dir_all(root.join("charts/bin/templates")).unwrap();
+        fs::write(root.join(".justless.toml"), "max_file_bytes = 64\n").unwrap();
+
+        // Oversized Chart.yaml (> 64 bytes) and binary NUL-byte Chart.yaml.
+        fs::write(
+            root.join("charts/big/Chart.yaml"),
+            format!(
+                "apiVersion: v2\nname: big\ndescription: {}\n",
+                "x".repeat(80)
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("charts/big/values.yaml"), "replicaCount: 2\n").unwrap();
+        fs::write(
+            root.join("charts/big/templates/deploy.yaml"),
+            "replicas: {{ .Values.replicaCount }}\n",
+        )
+        .unwrap();
+
+        fs::write(
+            root.join("charts/bin/Chart.yaml"),
+            b"apiVersion: v2\0name: bin\n",
+        )
+        .unwrap();
+        fs::write(root.join("charts/bin/values.yaml"), "binVal: 1\n").unwrap();
+        fs::write(
+            root.join("charts/bin/templates/deploy.yaml"),
+            "val: {{ .Values.binVal }}\n",
+        )
+        .unwrap();
+
+        let ws = test_workspace(root);
+        let cold = Index::open(&ws).unwrap();
+        assert!(cold.select("values.replicaCount").is_err());
+        assert!(cold.select("values.binVal").is_err());
+
+        let warm = Index::open(&ws).unwrap();
+        assert_eq!(warm.refresh.parsed, 0);
+        assert!(warm.select("values.replicaCount").is_err());
+        assert!(warm.select("values.binVal").is_err());
+
+        // Removing ineligible manifests preserves warm == cold parity.
+        fs::remove_file(root.join("charts/big/Chart.yaml")).unwrap();
+        fs::remove_file(root.join("charts/bin/Chart.yaml")).unwrap();
+        let after_remove = Index::open(&ws).unwrap();
+        assert!(after_remove.select("values.replicaCount").is_err());
+        assert!(after_remove.select("values.binVal").is_err());
+
+        // Writing valid eligible Chart.yaml files activates both charts cleanly.
+        fs::write(
+            root.join("charts/big/Chart.yaml"),
+            "apiVersion: v2\nname: big\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("charts/bin/Chart.yaml"),
+            "apiVersion: v2\nname: bin\n",
+        )
+        .unwrap();
+        let active = Index::open(&ws).unwrap();
+        let rep_id = active.select("values.replicaCount").unwrap();
+        let bin_id = active.select("values.binVal").unwrap();
+        assert!(active.incoming(rep_id).next().is_some());
+        assert!(active.incoming(bin_id).next().is_some());
+
+        // Warm open matches active cold build, and making Chart.yaml oversized again deactivates it.
+        let active_warm = Index::open(&ws).unwrap();
+        assert_eq!(active_warm.refresh.parsed, 0);
+        assert!(active_warm.select("values.replicaCount").is_ok());
+
+        fs::write(
+            root.join("charts/big/Chart.yaml"),
+            format!(
+                "apiVersion: v2\nname: big\ndescription: {}\n",
+                "y".repeat(80)
+            ),
+        )
+        .unwrap();
+        let deactivated = Index::open(&ws).unwrap();
+        assert!(deactivated.select("values.replicaCount").is_err());
+        assert!(deactivated.select("values.binVal").is_ok());
+    }
+
+    #[test]
+    fn hcl_import_target_resolves_relative_modules_with_windows_separators() {
+        let empty = polyglot::Facts {
+            import_ranges: Vec::new(),
+            grammar: Grammar::Hcl,
+            lines: 1,
+            definitions: Vec::new(),
+            references: Vec::new(),
+            imports: Vec::new(),
+            routes: Vec::new(),
+        };
+        let files = [
+            "envs\\prod\\main.tf",
+            "modules\\vpc\\main.tf",
+            "envs/prod/modules/vpc/main.tf",
+            "shared\\network.tf",
+        ];
+        let mut units = BTreeMap::new();
+        for (idx, file) in files.iter().enumerate() {
+            units.insert(*file, (idx, idx, &empty));
+        }
+        let mut by_family = BTreeMap::new();
+        by_family.insert(Grammar::Hcl, files.to_vec());
+
+        assert_eq!(
+            import_target(
+                "envs\\prod\\main.tf",
+                Grammar::Hcl,
+                "../../modules/vpc",
+                &units,
+                &by_family
+            ),
+            Some("modules\\vpc\\main.tf")
+        );
+        assert_eq!(
+            import_target(
+                "envs/prod/main.tf",
+                Grammar::Hcl,
+                "../../modules/vpc",
+                &units,
+                &by_family
+            ),
+            Some("modules\\vpc\\main.tf")
+        );
+        assert_eq!(
+            import_target(
+                "envs\\prod\\main.tf",
+                Grammar::Hcl,
+                "./modules/vpc",
+                &units,
+                &by_family
+            ),
+            Some("envs/prod/modules/vpc/main.tf")
+        );
+        assert_eq!(
+            import_target(
+                "envs\\main.tf",
+                Grammar::Hcl,
+                "../shared",
+                &units,
+                &by_family
+            ),
+            Some("shared\\network.tf")
+        );
+        assert_eq!(
+            import_target(
+                "envs\\main.tf",
+                Grammar::Hcl,
+                "../../../outside",
+                &units,
+                &by_family
+            ),
+            None
+        );
     }
 }

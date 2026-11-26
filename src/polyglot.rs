@@ -1701,6 +1701,7 @@ fn hcl_block_name(node: Node<'_>, kind: &str, source: &str) -> String {
     let mut cursor = node.walk();
     for child in node
         .named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment")
         .skip(1)
         .take_while(|child| matches!(child.kind(), "string_lit" | "identifier"))
     {
@@ -1739,7 +1740,11 @@ fn hcl_reference(node: Node<'_>, source: &str) -> Option<String> {
         let Some(attribute) = next.filter(|next| next.kind() == "get_attr") else {
             break;
         };
-        parts[count] = text(attribute.named_child(0)?, source);
+        let mut attr_cursor = attribute.walk();
+        let ident = attribute
+            .named_children(&mut attr_cursor)
+            .find(|child| child.kind() == "identifier")?;
+        parts[count] = text(ident, source);
         count += 1;
         next = attribute.next_named_sibling();
     }
@@ -1759,7 +1764,9 @@ fn hcl_reference(node: Node<'_>, source: &str) -> Option<String> {
 
 fn hcl_module_source<'a>(node: Node<'_>, source: &'a str) -> Option<(&'a str, usize)> {
     let mut cursor = node.walk();
-    let mut children = node.named_children(&mut cursor);
+    let mut children = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment");
     let kind_node = children.next()?;
     if kind_node.kind() != "identifier" || text(kind_node, source) != "module" {
         return None;
@@ -1770,11 +1777,26 @@ fn hcl_module_source<'a>(node: Node<'_>, source: &'a str) -> Option<(&'a str, us
         .named_children(&mut body_cursor)
         .filter(|child| child.kind() == "attribute")
     {
-        let key = attr.named_child(0)?;
-        if key.kind() != "identifier" || text(key, source) != "source" {
+        let mut attr_cursor = attr.walk();
+        let mut key = None;
+        let mut expr = None;
+        for child in attr.named_children(&mut attr_cursor) {
+            if key.is_none() && child.kind() == "identifier" {
+                key = Some(child);
+            } else if expr.is_none() && child.kind() == "expression" {
+                expr = Some(child);
+                break;
+            }
+        }
+        let Some(key) = key else {
+            continue;
+        };
+        if text(key, source) != "source" {
             continue;
         }
-        let expr = attr.named_child(1)?;
+        let Some(expr) = expr else {
+            continue;
+        };
         let raw = text(expr, source).trim();
         let inner = raw.strip_prefix('"')?.strip_suffix('"')?;
         if (inner.starts_with("./") || inner.starts_with("../"))
@@ -3430,8 +3452,7 @@ pub fn helm_chart_roots(files: &BTreeSet<String>) -> BTreeSet<String> {
         let norm = normalized_rel_path(file);
         let (dir, name) = norm.rsplit_once('/').unwrap_or(("", norm.as_ref()));
         if (name == "Chart.yaml" || name == "Chart.yml")
-            && dir != "templates"
-            && !dir.ends_with("/templates")
+            && !dir.split('/').any(|seg| seg == "templates")
         {
             roots.insert(dir.to_owned());
         }
@@ -3582,10 +3603,15 @@ fn is_yaml_block_scalar(after_colon: &str) -> bool {
     header.chars().all(|ch| matches!(ch, '-' | '+' | '1'..='9'))
 }
 
+fn is_yaml_empty_or_comment(after_colon: &str) -> bool {
+    let val = after_colon.trim_start_matches([' ', '\t']);
+    val.is_empty() || val.starts_with('#')
+}
+
 fn parse_helm_values(chart_root: String, source: &str) -> HelmFacts {
     let lines = source.lines().count().max(1);
     let mut definitions: Vec<Definition> = Vec::new();
-    let mut active_l0: Option<(usize, String)> = None;
+    let mut active_l0: Option<(usize, String, bool)> = None;
     let mut active_l1: Option<(usize, usize)> = None;
     let mut section_child_indent: Option<usize> = None;
     let mut block_scalar_indent: Option<usize> = None;
@@ -3606,7 +3632,7 @@ fn parse_helm_values(chart_root: String, source: &str) -> HelmFacts {
 
         if let Some(parent_indent) = block_scalar_indent {
             if indent > parent_indent {
-                if let Some((l0_idx, _)) = active_l0 {
+                if let Some((l0_idx, _, _)) = active_l0 {
                     definitions[l0_idx].end = line_no;
                     definitions[l0_idx].bytes.end = line_end;
                 }
@@ -3635,17 +3661,15 @@ fn parse_helm_values(chart_root: String, source: &str) -> HelmFacts {
         let is_seq_item = rest == "-" || rest.starts_with("- ") || rest.starts_with("-\t");
         if let Some(seq_indent) = sequence_indent {
             if indent > seq_indent || (indent == seq_indent && is_seq_item) {
-                if indent > 0 {
-                    if let Some((l0_idx, _)) = active_l0 {
-                        definitions[l0_idx].end = line_no;
-                        definitions[l0_idx].bytes.end = line_end;
-                    }
-                    if let Some((l1_idx, l1_indent)) = active_l1
-                        && seq_indent > l1_indent
-                    {
-                        definitions[l1_idx].end = line_no;
-                        definitions[l1_idx].bytes.end = line_end;
-                    }
+                if let Some((l0_idx, _, _)) = active_l0 {
+                    definitions[l0_idx].end = line_no;
+                    definitions[l0_idx].bytes.end = line_end;
+                }
+                if let Some((l1_idx, l1_indent)) = active_l1
+                    && seq_indent >= l1_indent
+                {
+                    definitions[l1_idx].end = line_no;
+                    definitions[l1_idx].bytes.end = line_end;
                 }
                 continue;
             }
@@ -3653,17 +3677,23 @@ fn parse_helm_values(chart_root: String, source: &str) -> HelmFacts {
         }
         if is_seq_item {
             if indent > 0 {
-                if let Some((l0_idx, _)) = active_l0 {
+                if let Some((l0_idx, _, _)) = active_l0 {
                     definitions[l0_idx].end = line_no;
                     definitions[l0_idx].bytes.end = line_end;
                 }
                 if let Some((l1_idx, l1_indent)) = active_l1
-                    && indent > l1_indent
+                    && indent >= l1_indent
                 {
                     definitions[l1_idx].end = line_no;
                     definitions[l1_idx].bytes.end = line_end;
                 }
                 sequence_indent = Some(indent);
+            } else if let Some((l0_idx, _, true)) = active_l0
+                && section_child_indent.is_none()
+            {
+                definitions[l0_idx].end = line_no;
+                definitions[l0_idx].bytes.end = line_end;
+                sequence_indent = Some(0);
             } else {
                 active_l0 = None;
                 active_l1 = None;
@@ -3691,7 +3721,8 @@ fn parse_helm_values(chart_root: String, source: &str) -> HelmFacts {
                     declaration: line_no,
                     test: false,
                 });
-                active_l0 = Some((def_idx, key.to_owned()));
+                let accepts_children = is_yaml_empty_or_comment(after_colon);
+                active_l0 = Some((def_idx, key.to_owned(), accepts_children));
                 if is_yaml_block_scalar(after_colon) {
                     block_scalar_indent = Some(0);
                 }
@@ -3699,9 +3730,12 @@ fn parse_helm_values(chart_root: String, source: &str) -> HelmFacts {
             continue;
         }
 
-        if let Some((l0_idx, ref l0_key)) = active_l0 {
+        if let Some((l0_idx, ref l0_key, accepts_children)) = active_l0 {
             definitions[l0_idx].end = line_no;
             definitions[l0_idx].bytes.end = line_end;
+            if !accepts_children {
+                continue;
+            }
             match section_child_indent {
                 None => {
                     if let Some((key, after_colon)) = parse_yaml_mapping_key(rest) {
@@ -3855,7 +3889,7 @@ fn tokenize_helm_action(body: &str, start_line: usize) -> Vec<HelmToken<'_>> {
             ));
             continue;
         }
-        if matches!(ch, '(' | ')' | '|' | ',' | ';') {
+        if matches!(ch, '(' | ')' | '|' | ',' | ';' | ':' | '=') {
             chars.next();
             tokens.push(HelmToken::Punct);
             continue;
@@ -3865,7 +3899,7 @@ fn tokenize_helm_action(body: &str, start_line: usize) -> Vec<HelmToken<'_>> {
         let mut word_end = body.len();
         while let Some(&(c_idx, c)) = chars.peek() {
             if c.is_whitespace()
-                || matches!(c, '(' | ')' | '|' | ',' | ';' | '"' | '`')
+                || matches!(c, '(' | ')' | '|' | ',' | ';' | ':' | '=' | '"' | '`')
                 || (c == '/' && body[c_idx..].starts_with("/*"))
             {
                 word_end = c_idx;
@@ -3896,6 +3930,19 @@ fn helm_values_ref_target(word: &str) -> Option<String> {
         return None;
     }
     Some(format!("values.{clean}"))
+}
+
+fn strip_helm_action_trim(mut body: &str) -> &str {
+    if body.starts_with('-') && body[1..].starts_with(|ch: char| ch.is_whitespace() || ch == '/') {
+        body = &body[1..];
+    }
+    if body.ends_with('-')
+        && (body.len() == 1
+            || body[..body.len() - 1].ends_with(|ch: char| ch.is_whitespace() || ch == '/'))
+    {
+        body = &body[..body.len() - 1];
+    }
+    body
 }
 
 fn parse_helm_template(chart_root: String, source: &str) -> HelmFacts {
@@ -3992,18 +4039,7 @@ fn parse_helm_template(chart_root: String, source: &str) -> HelmFacts {
             let action_end_byte = inner_end + 2;
             let action_end_line = end_line;
 
-            let mut body = &source[inner_start..inner_end];
-            if body.starts_with('-')
-                && body[1..].starts_with(|ch: char| ch.is_whitespace() || ch == '/')
-            {
-                body = &body[1..];
-            }
-            if body.ends_with('-')
-                && (body.len() == 1
-                    || body[..body.len() - 1].ends_with(|ch: char| ch.is_whitespace() || ch == '*'))
-            {
-                body = &body[..body.len() - 1];
-            }
+            let body = strip_helm_action_trim(&source[inner_start..inner_end]);
 
             let tokens = tokenize_helm_action(body, action_start_line);
             if !tokens.is_empty() {
@@ -4877,5 +4913,118 @@ mod tests {
             .collect();
         assert!(tables.contains(&"app.orders"), "{tables:?}");
         assert!(tables.contains(&"app.audit_log"), "{tables:?}");
+    }
+
+    #[test]
+    fn helm_chart_roots_ignores_nested_templates_chart_yaml() {
+        let files: BTreeSet<String> = [
+            "mychart/Chart.yaml",
+            "mychart/templates/Chart.yaml",
+            "mychart/templates/sub/Chart.yaml",
+            "mychart\\templates\\deep\\sub\\Chart.yml",
+            "templates/sub/Chart.yaml",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        let roots = helm_chart_roots(&files);
+        assert_eq!(roots, BTreeSet::from(["mychart".to_owned()]));
+        assert_eq!(
+            helm_file_role("mychart/templates/sub/deploy.yaml", &roots),
+            Some(("mychart".to_owned(), HelmRole::Template))
+        );
+    }
+
+    #[test]
+    fn hcl_inline_comments_in_references_and_module_sources() {
+        let mut parsers = Parsers::default();
+        let hcl = concat!(
+            "module /* c0 */ \"vpc\" {\n",
+            "  source /* c1 */ = /* c2 */ \"./modules/vpc\"\n",
+            "  region = var . /* c3 */ region\n",
+            "  ami    = data . /* c4 */ aws_ami . /* c5 */ ubuntu.id\n",
+            "}\n",
+        );
+        let facts = parsers.parse(Grammar::Hcl, hcl).unwrap();
+        assert!(
+            facts.definitions.iter().any(|d| d.name == "module.vpc"),
+            "defs: {:?}",
+            facts.definitions
+        );
+        let imports: Vec<_> = facts.imports.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(imports, vec!["./modules/vpc"]);
+        let refs: Vec<_> = facts.references.iter().map(|r| r.name.as_str()).collect();
+        assert!(refs.contains(&"var.region"), "refs: {refs:?}");
+        assert!(refs.contains(&"data.aws_ami.ubuntu"), "refs: {refs:?}");
+    }
+
+    #[test]
+    fn helm_values_multiline_scalars_and_indentless_sequences() {
+        let yaml = concat!(
+            "description: \"hello\n",     // L1
+            "  fake: 1\"\n",              // L2
+            "summary: plain text\n",      // L3
+            "  fake_plain: 2\n",          // L4
+            "image: # container image\n", // L5
+            "  repo: nginx\n",            // L6
+            "env:\n",                     // L7
+            "- name: FOO\n",              // L8
+            "  value: bar\n",             // L9
+            "- name: BAZ\n",              // L10
+            "  value: qux\n",             // L11
+            "server:\n",                  // L12
+            "  args:\n",                  // L13
+            "  - \"--port\"\n",           // L14
+            "  - \"8080\"\n",             // L15
+            "  replicas: 2\n",            // L16
+        );
+        let facts = parse_helm("chart".into(), HelmRole::Values, yaml);
+        let spans: Vec<(&str, usize, usize)> = facts
+            .definitions
+            .iter()
+            .map(|d| (d.name.as_str(), d.start, d.end))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![
+                ("values.description", 1, 2),
+                ("values.summary", 3, 4),
+                ("values.image", 5, 6),
+                ("values.image.repo", 6, 6),
+                ("values.env", 7, 11),
+                ("values.server", 12, 16),
+                ("values.server.args", 13, 15),
+                ("values.server.replicas", 16, 16),
+            ]
+        );
+    }
+
+    #[test]
+    fn helm_template_glued_assignment_and_comment_trim_dash() {
+        let tpl = concat!(
+            "{{- $x:=.Values.nospace -}}\n",
+            "{{- $x=.Values.reassigned -}}\n",
+            "{{- $h:=include \"my.helper\" . -}}\n",
+            "{{- /* {{ .Values.commented }} */-}}\n",
+            "{{-/* {{ .Values.commented2 }} */-}}\n",
+        );
+        let facts = parse_helm("chart".into(), HelmRole::Template, tpl);
+        let refs: Vec<(Kind, &str, usize)> = facts
+            .references
+            .iter()
+            .map(|r| (r.kind, r.name.as_str(), r.line))
+            .collect();
+        assert_eq!(
+            refs,
+            vec![
+                (Kind::Reference, "values.nospace", 1),
+                (Kind::Reference, "values.reassigned", 2),
+                (Kind::Call, "my.helper", 3),
+            ]
+        );
+        // Verify stripping `*/-}}` leaves zero stray `-` tokens.
+        assert!(tokenize_helm_action(strip_helm_action_trim("- /* comment */-"), 1).is_empty());
+        assert!(tokenize_helm_action(strip_helm_action_trim("-/* comment */-"), 1).is_empty());
     }
 }
