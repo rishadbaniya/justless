@@ -4694,6 +4694,32 @@ pub fn plan_symbol_rename(
         &files_importing_target,
     )?;
 
+    let owner_name = matches!(
+        def.kind.as_str(),
+        "method" | "associated constant" | "associated type"
+    )
+    .then(|| scope.and_then(|s| s.rsplit("::").next()))
+    .flatten();
+    let has_competing_method = def_is_rust
+        && def.kind == "method"
+        && index
+            .definitions
+            .iter()
+            .enumerate()
+            .any(|(other_id, other)| {
+                if other_id == target_id
+                    || other.kind != "method"
+                    || !other.location.file.ends_with(".rs")
+                {
+                    return false;
+                }
+                let (other_short, other_scope) = symbol_short_and_scope(&other.qualified);
+                if other_short != old_name {
+                    return false;
+                }
+                other_scope.and_then(|s| s.rsplit("::").next()) != owner_name
+            });
+
     let mut ts_parser: Option<tree_sitter::Parser> = None;
     let mut ts_lang: Option<Grammar> = None;
     let mut files = Vec::new();
@@ -4719,11 +4745,15 @@ pub fn plan_symbol_rename(
         }
 
         let raw_spans: Vec<(Range<usize>, Option<String>)> = if is_rust {
-            find_rust_identifier_spans(&snap.text, old_name, &def.kind)
-                .with_context(|| format!("failed to parse Rust AST in {file}"))?
-                .into_iter()
-                .map(|bytes| (bytes, None))
-                .collect()
+            find_rust_identifier_spans(
+                file,
+                &snap.text,
+                old_name,
+                new_name,
+                &def.kind,
+                owner_name,
+                has_competing_method,
+            )?
         } else if let Some(grammar) = grammar {
             find_treesitter_identifier_spans(
                 &mut ts_parser,
@@ -6143,9 +6173,9 @@ fn polyglot_file_import_status(
                         )
                     });
                     if matches_source {
-                        let stmt = node_text(node, parse_input);
                         let mut has_ns_or_default = false;
                         let mut has_named_old = false;
+                        let mut has_unaliased_old = false;
                         for i in 0..node.child_count() {
                             if let Some(child) = node.child(i as u32)
                                 && child.kind() == "import_clause"
@@ -6156,13 +6186,29 @@ fn polyglot_file_import_status(
                                             "namespace_import" | "identifier" => {
                                                 has_ns_or_default = true;
                                             }
-                                            "named_imports"
-                                                if contains_ident_word(
-                                                    node_text(cc, parse_input),
-                                                    old_name,
-                                                ) =>
-                                            {
-                                                has_named_old = true;
+                                            "named_imports" => {
+                                                for k in 0..cc.named_child_count() {
+                                                    if let Some(spec) = cc.named_child(k as u32)
+                                                        && spec.kind() == "import_specifier"
+                                                        && spec
+                                                            .child_by_field_name("name")
+                                                            .is_some_and(|n| {
+                                                                node_text(n, parse_input)
+                                                                    == old_name
+                                                            })
+                                                    {
+                                                        has_named_old = true;
+                                                        let aliased_other = spec
+                                                            .child_by_field_name("alias")
+                                                            .is_some_and(|a| {
+                                                                node_text(a, parse_input)
+                                                                    != old_name
+                                                            });
+                                                        if !aliased_other {
+                                                            has_unaliased_old = true;
+                                                        }
+                                                    }
+                                                }
                                             }
                                             _ => {}
                                         }
@@ -6170,9 +6216,9 @@ fn polyglot_file_import_status(
                                 }
                             }
                         }
-                        if has_ns_or_default || has_named_old || stmt.contains('*') {
+                        if has_ns_or_default || has_named_old {
                             relevant = true;
-                            if has_named_old {
+                            if has_unaliased_old {
                                 direct_import = true;
                             }
                         }
@@ -6188,12 +6234,31 @@ fn polyglot_file_import_status(
                         )
                     });
                     if matches_source {
-                        let stmt = node_text(node, parse_input);
-                        let is_star = stmt.contains('*');
-                        let mentions_old = contains_ident_word(stmt, old_name);
-                        if is_star || mentions_old {
-                            relevant = true;
-                            reexports = true;
+                        for i in 0..node.child_count() {
+                            let Some(child) = node.child(i as u32) else {
+                                continue;
+                            };
+                            if child.kind() == "*" {
+                                relevant = true;
+                                reexports = true;
+                            } else if child.kind() == "export_clause" {
+                                for k in 0..child.named_child_count() {
+                                    if let Some(spec) = child.named_child(k as u32)
+                                        && spec.kind() == "export_specifier"
+                                        && spec
+                                            .child_by_field_name("name")
+                                            .is_some_and(|n| node_text(n, parse_input) == old_name)
+                                    {
+                                        relevant = true;
+                                        let aliased_other = spec
+                                            .child_by_field_name("alias")
+                                            .is_some_and(|a| node_text(a, parse_input) != old_name);
+                                        if !aliased_other {
+                                            reexports = true;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -6218,9 +6283,33 @@ fn polyglot_file_import_status(
                     {
                         if lhs.kind() == "identifier" {
                             relevant = true;
-                        } else if contains_ident_word(node_text(lhs, parse_input), old_name) {
-                            relevant = true;
-                            direct_import = true;
+                        } else if lhs.kind() == "object_pattern" {
+                            for k in 0..lhs.named_child_count() {
+                                let Some(item) = lhs.named_child(k as u32) else {
+                                    continue;
+                                };
+                                match item.kind() {
+                                    "shorthand_property_identifier_pattern"
+                                        if node_text(item, parse_input) == old_name =>
+                                    {
+                                        relevant = true;
+                                        direct_import = true;
+                                    }
+                                    "pair_pattern"
+                                        if item.child_by_field_name("key").is_some_and(|key| {
+                                            node_text(key, parse_input) == old_name
+                                        }) =>
+                                    {
+                                        relevant = true;
+                                        if item.child_by_field_name("value").is_some_and(
+                                            |val_node| node_text(val_node, parse_input) == old_name,
+                                        ) {
+                                            direct_import = true;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
                     }
                 }
@@ -6228,7 +6317,6 @@ fn polyglot_file_import_status(
             },
             Grammar::Python => match kind {
                 "import_statement" => {
-                    let stmt = node_text(node, parse_input);
                     // Any `import pkg.util` or `import pkg.util as u` targeting `source_file`
                     // is a namespace import.
                     for i in 0..node.named_child_count() {
@@ -6244,9 +6332,6 @@ fn polyglot_file_import_status(
                                 relevant = true;
                             }
                         }
-                    }
-                    if !relevant && contains_ident_word(stmt, old_name) {
-                        relevant = true;
                     }
                 }
                 "import_from_statement" => {
@@ -6326,6 +6411,207 @@ fn polyglot_file_import_status(
     (relevant, reexports, direct_import)
 }
 
+/// Returns `true` if a JS/TS or Python file explicitly imports `old_name` as a
+/// local binding from a module that is NOT in `allowed_sources` (e.g. a barrel
+/// that aliased `export { other as calcTotal }`), so name-fallback call edges
+/// in the index do not corrupt unrelated consumers.
+#[allow(clippy::too_many_arguments)]
+fn polyglot_imports_name_from_unrelated_source(
+    parser_slot: &mut Option<tree_sitter::Parser>,
+    cached_lang: &mut Option<Grammar>,
+    workspace: &Workspace,
+    index: &Index,
+    file: &str,
+    allowed_sources: &BTreeSet<String>,
+    old_name: &str,
+) -> bool {
+    let Ok(snap) = Snapshot::open(workspace, file) else {
+        return false;
+    };
+    let Some(grammar) = index
+        .grammar(file)
+        .or_else(|| Grammar::detect(file, &snap.text))
+    else {
+        return false;
+    };
+    let family = grammar.family();
+    if !matches!(family, Grammar::JavaScript | Grammar::Python) {
+        return false;
+    }
+    let (parse_grammar, masked) = match grammar {
+        Grammar::Vue | Grammar::Svelte | Grammar::Astro => {
+            let (script_text, jsx) =
+                crate::components::scripts(&snap.text, grammar == Grammar::Astro);
+            let lang = if jsx {
+                Grammar::Tsx
+            } else {
+                Grammar::TypeScript
+            };
+            (lang, Some(script_text))
+        }
+        _ => (grammar, None),
+    };
+    let parser = parser_slot.get_or_insert_with(tree_sitter::Parser::new);
+    if *cached_lang != Some(parse_grammar) {
+        *cached_lang = None;
+        if parser.set_language(&parse_grammar.language()).is_err() {
+            return false;
+        }
+        *cached_lang = Some(parse_grammar);
+    }
+    let parse_input = masked.as_deref().unwrap_or(&snap.text);
+    let Some(tree) = parser.parse(parse_input, None) else {
+        return false;
+    };
+
+    let mut binds_from_other = false;
+    let mut imports_allowed = false;
+    let mut cursor = tree.walk();
+    'walk: loop {
+        let node = cursor.node();
+        let kind = node.kind();
+        match family {
+            Grammar::JavaScript if kind == "import_statement" => {
+                let src_text = node
+                    .child_by_field_name("source")
+                    .map_or("", |s| node_text(s, parse_input));
+                let matches_allowed = allowed_sources
+                    .iter()
+                    .any(|src| import_spec_matches_def_file(file, family, src_text, src));
+                if matches_allowed {
+                    imports_allowed = true;
+                } else {
+                    for i in 0..node.child_count() {
+                        if let Some(clause) = node.child(i as u32)
+                            && clause.kind() == "import_clause"
+                        {
+                            for j in 0..clause.child_count() {
+                                let Some(cc) = clause.child(j as u32) else {
+                                    continue;
+                                };
+                                match cc.kind() {
+                                    "identifier" if node_text(cc, parse_input) == old_name => {
+                                        binds_from_other = true;
+                                    }
+                                    "namespace_import" => {
+                                        for k in 0..cc.named_child_count() {
+                                            if cc.named_child(k as u32).is_some_and(|id| {
+                                                id.kind() == "identifier"
+                                                    && node_text(id, parse_input) == old_name
+                                            }) {
+                                                binds_from_other = true;
+                                            }
+                                        }
+                                    }
+                                    "named_imports" => {
+                                        for k in 0..cc.named_child_count() {
+                                            if let Some(spec) = cc.named_child(k as u32)
+                                                && spec.kind() == "import_specifier"
+                                            {
+                                                let local = spec
+                                                    .child_by_field_name("alias")
+                                                    .or_else(|| spec.child_by_field_name("name"));
+                                                if local.is_some_and(|n| {
+                                                    node_text(n, parse_input) == old_name
+                                                }) {
+                                                    binds_from_other = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Grammar::Python if kind == "import_statement" => {
+                for i in 0..node.named_child_count() {
+                    let Some(child) = node.named_child(i as u32) else {
+                        continue;
+                    };
+                    let spec = if child.kind() == "aliased_import" {
+                        child
+                            .child_by_field_name("name")
+                            .map_or("", |n| node_text(n, parse_input))
+                    } else {
+                        node_text(child, parse_input)
+                    };
+                    if allowed_sources
+                        .iter()
+                        .any(|src| import_spec_matches_def_file(file, family, spec, src))
+                    {
+                        imports_allowed = true;
+                    } else if child.kind() == "aliased_import"
+                        && child
+                            .child_by_field_name("alias")
+                            .is_some_and(|a| node_text(a, parse_input) == old_name)
+                    {
+                        binds_from_other = true;
+                    }
+                }
+            }
+            Grammar::Python if kind == "import_from_statement" => {
+                let mod_text = node
+                    .child_by_field_name("module_name")
+                    .map_or("", |m| node_text(m, parse_input));
+                let matches_allowed = allowed_sources
+                    .iter()
+                    .any(|src| import_spec_matches_def_file(file, family, mod_text, src));
+                if matches_allowed {
+                    imports_allowed = true;
+                } else {
+                    for i in 0..node.named_child_count() {
+                        let Some(child) = node.named_child(i as u32) else {
+                            continue;
+                        };
+                        if node.child_by_field_name("module_name") == Some(child) {
+                            continue;
+                        }
+                        let (imported, local) = if child.kind() == "aliased_import" {
+                            (
+                                child
+                                    .child_by_field_name("name")
+                                    .map_or("", |n| node_text(n, parse_input)),
+                                child
+                                    .child_by_field_name("alias")
+                                    .map_or("", |n| node_text(n, parse_input)),
+                            )
+                        } else {
+                            let name = node_text(child, parse_input);
+                            (name, name)
+                        };
+                        let combined = if mod_text.ends_with('.') || mod_text.is_empty() {
+                            format!("{mod_text}{imported}")
+                        } else {
+                            format!("{mod_text}.{imported}")
+                        };
+                        if allowed_sources
+                            .iter()
+                            .any(|src| import_spec_matches_def_file(file, family, &combined, src))
+                        {
+                            imports_allowed = true;
+                        } else if local == old_name {
+                            binds_from_other = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+        }
+    }
+    binds_from_other && !imports_allowed
+}
+
 fn rust_file_module_path(file: &str) -> Vec<String> {
     let slashed = file.replace('\\', "/");
     let without_ext = slashed.strip_suffix(".rs").unwrap_or(&slashed);
@@ -6384,6 +6670,7 @@ fn resolve_rust_use_prefix(
 
 struct RustUseEntry {
     is_pub: bool,
+    is_renamed: bool,
     current_mod: Vec<String>,
     prefix: Vec<String>,
     leaf: Option<String>, // None for glob `*`
@@ -6418,6 +6705,7 @@ fn collect_rust_uses_in_items(
             syn::UseTree::Glob(_) => {
                 out.push(RustUseEntry {
                     is_pub,
+                    is_renamed: false,
                     current_mod: current_mod.to_vec(),
                     prefix: prefix.clone(),
                     leaf: None,
@@ -6429,6 +6717,7 @@ fn collect_rust_uses_in_items(
                 if clean != "self" {
                     out.push(RustUseEntry {
                         is_pub,
+                        is_renamed: false,
                         current_mod: current_mod.to_vec(),
                         prefix: prefix.clone(),
                         leaf: Some(clean),
@@ -6438,9 +6727,12 @@ fn collect_rust_uses_in_items(
             syn::UseTree::Rename(rename) => {
                 let ident = rename.ident.to_string();
                 let clean = ident.strip_prefix("r#").unwrap_or(&ident).to_owned();
+                let alias = rename.rename.to_string();
+                let alias_clean = alias.strip_prefix("r#").unwrap_or(&alias);
                 if clean != "self" {
                     out.push(RustUseEntry {
                         is_pub,
+                        is_renamed: alias_clean != clean,
                         current_mod: current_mod.to_vec(),
                         prefix: prefix.clone(),
                         leaf: Some(clean),
@@ -6608,6 +6900,7 @@ fn discover_rust_reexport_files(
                 continue;
             };
             let mut file_reexports_named = false;
+            let mut file_reexports_unrenamed = false;
             for entry in uses {
                 if !entry.is_pub {
                     continue;
@@ -6624,18 +6917,25 @@ fn discover_rust_reexport_files(
                 if matches_target {
                     if entry.leaf.is_some() {
                         file_reexports_named = true;
+                        if !entry.is_renamed {
+                            file_reexports_unrenamed = true;
+                        }
                     }
-                    if available_mods.insert(entry.current_mod.clone()) {
-                        grew = true;
-                    }
-                    if reexported_mods.insert(entry.current_mod.clone()) {
-                        grew = true;
+                    if !entry.is_renamed {
+                        if available_mods.insert(entry.current_mod.clone()) {
+                            grew = true;
+                        }
+                        if reexported_mods.insert(entry.current_mod.clone()) {
+                            grew = true;
+                        }
                     }
                 }
             }
             if file_reexports_named {
                 candidates.insert(rs_file.clone());
-                importing_target.insert(rs_file.clone());
+                if file_reexports_unrenamed {
+                    importing_target.insert(rs_file.clone());
+                }
             }
         }
         if !grew {
@@ -6643,12 +6943,13 @@ fn discover_rust_reexport_files(
         }
     }
 
-    if reexported_mods.is_empty() {
+    if reexported_mods.is_empty() && def.kind != "enum" {
         return;
     }
 
     // Pass 2: Find every Rust file importing or referencing `old_name` through
-    // any discovered re-exporting module.
+    // any discovered re-exporting module (and, for enums, files importing
+    // variants via `use ...::Enum::{...}` / `use ...::Enum::*`).
     for rs_file in &rs_files {
         if candidates.contains(rs_file) {
             continue;
@@ -6666,34 +6967,53 @@ fn discover_rust_reexport_files(
             continue;
         };
         let mut imports_via_reexport = false;
+        let mut imports_unrenamed = false;
         let mut uses_reexport_glob = false;
+        let mut uses_enum_variants = false;
         for entry in uses {
-            let Some(resolved) =
-                resolve_rust_use_prefix(&entry.current_mod, crate_name, &entry.prefix)
-            else {
-                continue;
-            };
-            if !reexported_mods.contains(&resolved) {
-                continue;
+            if !reexported_mods.is_empty()
+                && let Some(resolved) =
+                    resolve_rust_use_prefix(&entry.current_mod, crate_name, &entry.prefix)
+                && reexported_mods.contains(&resolved)
+            {
+                match &entry.leaf {
+                    Some(leaf) if leaf == old_name => {
+                        imports_via_reexport = true;
+                        if !entry.is_renamed {
+                            imports_unrenamed = true;
+                        }
+                    }
+                    None => uses_reexport_glob = true,
+                    _ => {}
+                }
             }
-            match &entry.leaf {
-                Some(leaf) if leaf == old_name => imports_via_reexport = true,
-                None => uses_reexport_glob = true,
-                _ => {}
+            if def.kind == "enum" && entry.prefix.last().is_some_and(|last| last == old_name) {
+                let parent_prefix = &entry.prefix[..entry.prefix.len() - 1];
+                let parent_matches = if parent_prefix.is_empty() {
+                    available_mods.contains(&entry.current_mod)
+                } else {
+                    resolve_rust_use_prefix(&entry.current_mod, crate_name, parent_prefix)
+                        .is_some_and(|m| available_mods.contains(&m))
+                };
+                if parent_matches {
+                    uses_enum_variants = true;
+                }
             }
         }
         if imports_via_reexport
             || uses_reexport_glob
-            || rust_file_has_qualified_reexport_path(
-                ast,
-                file_mod,
-                crate_name,
-                old_name,
-                &reexported_mods,
-            )
+            || uses_enum_variants
+            || (!reexported_mods.is_empty()
+                && rust_file_has_qualified_reexport_path(
+                    ast,
+                    file_mod,
+                    crate_name,
+                    old_name,
+                    &reexported_mods,
+                ))
         {
             candidates.insert(rs_file.clone());
-            if imports_via_reexport {
+            if imports_unrenamed {
                 importing_target.insert(rs_file.clone());
             }
         }
@@ -6753,6 +7073,8 @@ fn discover_rename_files(
         let mut queue = vec![def.location.file.clone()];
         let mut visited_sources = BTreeSet::new();
         visited_sources.insert(def.location.file.clone());
+        let mut verified_importers = BTreeSet::new();
+        verified_importers.insert(def.location.file.clone());
 
         while let Some(source_file) = queue.pop() {
             let Some(file_def_id) = index
@@ -6779,6 +7101,7 @@ fn discover_rename_files(
                 );
                 if relevant {
                     candidates.insert(edge.location.file.clone());
+                    verified_importers.insert(edge.location.file.clone());
                     if direct_import {
                         importing_target.insert(edge.location.file.clone());
                     }
@@ -6786,6 +7109,26 @@ fn discover_rename_files(
                 if reexports && visited_sources.insert(edge.location.file.clone()) {
                     queue.push(edge.location.file.clone());
                 }
+            }
+        }
+
+        let unverified: Vec<String> = candidates
+            .iter()
+            .filter(|file| !verified_importers.contains(file.as_str()))
+            .cloned()
+            .collect();
+        for file in unverified {
+            if polyglot_imports_name_from_unrelated_source(
+                &mut ts_parser,
+                &mut ts_lang,
+                workspace,
+                index,
+                &file,
+                &visited_sources,
+                old_name,
+            ) {
+                candidates.remove(&file);
+                importing_target.remove(&file);
             }
         }
     }
@@ -6927,21 +7270,179 @@ enum RustPathRole {
     Value,
     Type,
     Trait,
+    Struct,
     Macro,
     Module,
 }
 
+#[derive(Clone)]
+enum RustLocalType {
+    Named(String),
+    BoundToOwner,
+    UnknownGenericOrWrapper,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReceiverMatch {
+    ConfirmedMatch,
+    ConfirmedOther,
+    Unknown,
+}
+
+fn rust_type_tail_ident(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Path(tp) if tp.qself.is_none() => tp
+            .path
+            .segments
+            .last()
+            .map(|seg| RustRenameVisitor::clean_ident(&seg.ident)),
+        syn::Type::Reference(r) => rust_type_tail_ident(&r.elem),
+        syn::Type::Paren(p) => rust_type_tail_ident(&p.elem),
+        syn::Type::Group(g) => rust_type_tail_ident(&g.elem),
+        _ => None,
+    }
+}
+
+fn rust_type_mentions_ident(ty: &syn::Type, target: &str) -> bool {
+    match ty {
+        syn::Type::Path(tp) => {
+            tp.path.segments.iter().any(|seg| {
+                RustRenameVisitor::clean_ident(&seg.ident) == target
+                    || match &seg.arguments {
+                        syn::PathArguments::AngleBracketed(ab) => ab.args.iter().any(|arg| {
+                            matches!(arg, syn::GenericArgument::Type(inner) if rust_type_mentions_ident(inner, target))
+                        }),
+                        syn::PathArguments::Parenthesized(p) => {
+                            p.inputs.iter().any(|inner| rust_type_mentions_ident(inner, target))
+                                || matches!(&p.output, syn::ReturnType::Type(_, ret) if rust_type_mentions_ident(ret, target))
+                        }
+                        syn::PathArguments::None => false,
+                    }
+            })
+        }
+        syn::Type::Reference(r) => rust_type_mentions_ident(&r.elem, target),
+        syn::Type::Paren(p) => rust_type_mentions_ident(&p.elem, target),
+        syn::Type::Group(g) => rust_type_mentions_ident(&g.elem, target),
+        syn::Type::Slice(s) => rust_type_mentions_ident(&s.elem, target),
+        syn::Type::Array(a) => rust_type_mentions_ident(&a.elem, target),
+        syn::Type::Tuple(t) => t
+            .elems
+            .iter()
+            .any(|inner| rust_type_mentions_ident(inner, target)),
+        _ => false,
+    }
+}
+
+fn use_tree_aliases_to_name(
+    tree: &syn::UseTree,
+    old_name: &str,
+    parent_ident: Option<&str>,
+) -> bool {
+    match tree {
+        syn::UseTree::Path(part) => {
+            let seg = RustRenameVisitor::clean_ident(&part.ident);
+            use_tree_aliases_to_name(&part.tree, old_name, Some(seg.as_str()))
+        }
+        syn::UseTree::Group(group) => group
+            .items
+            .iter()
+            .any(|item| use_tree_aliases_to_name(item, old_name, parent_ident)),
+        syn::UseTree::Rename(rename) => {
+            let orig = RustRenameVisitor::clean_ident(&rename.ident);
+            let alias = RustRenameVisitor::clean_ident(&rename.rename);
+            if alias != old_name {
+                return false;
+            }
+            if orig == "self" {
+                parent_ident != Some(old_name)
+            } else {
+                orig != old_name
+            }
+        }
+        syn::UseTree::Name(_) | syn::UseTree::Glob(_) => false,
+    }
+}
+
+fn items_have_alias_shadow(items: &[syn::Item], old_name: &str) -> bool {
+    items.iter().any(|item| {
+        matches!(item, syn::Item::Use(u) if use_tree_aliases_to_name(&u.tree, old_name, None))
+    })
+}
+
+fn stmts_have_item_shadow(stmts: &[syn::Stmt], old_name: &str) -> (bool, bool) {
+    let mut alias = false;
+    let mut value_item = false;
+    for stmt in stmts {
+        let syn::Stmt::Item(item) = stmt else {
+            continue;
+        };
+        match item {
+            syn::Item::Use(u) if use_tree_aliases_to_name(&u.tree, old_name, None) => {
+                alias = true;
+            }
+            syn::Item::Fn(f) if RustRenameVisitor::clean_ident(&f.sig.ident) == old_name => {
+                value_item = true;
+            }
+            syn::Item::Const(c) if RustRenameVisitor::clean_ident(&c.ident) == old_name => {
+                value_item = true;
+            }
+            syn::Item::Static(s) if RustRenameVisitor::clean_ident(&s.ident) == old_name => {
+                value_item = true;
+            }
+            _ => {}
+        }
+    }
+    (alias, value_item)
+}
+
+fn collect_trait_impl_types(items: &[syn::Item], owner: &str, out: &mut BTreeSet<String>) {
+    for item in items {
+        match item {
+            syn::Item::Impl(imp) => {
+                if let Some((_, trait_path, _)) = &imp.trait_
+                    && trait_path
+                        .segments
+                        .last()
+                        .is_some_and(|seg| RustRenameVisitor::clean_ident(&seg.ident) == owner)
+                    && let Some(ty_name) = rust_type_tail_ident(&imp.self_ty)
+                {
+                    out.insert(ty_name);
+                }
+            }
+            syn::Item::Mod(m) => {
+                if let Some((_, inner)) = &m.content {
+                    collect_trait_impl_types(inner, owner, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 struct RustRenameVisitor<'a> {
+    file: &'a str,
     text: &'a str,
     offset: usize,
     old_name: &'a str,
+    new_name: &'a str,
     def_kind: &'a str,
+    owner_name: Option<&'a str>,
+    has_competing_method: bool,
     require_raw: bool,
-    locals: Vec<String>,
+    locals: Vec<(String, Option<RustLocalType>)>,
     scope_starts: Vec<usize>,
     locals_floor: usize,
+    pending_pat_type: Option<RustLocalType>,
+    type_params: Vec<(String, bool)>,
+    type_param_starts: Vec<usize>,
+    trait_impl_types: BTreeSet<String>,
+    item_shadows: Vec<(bool, bool)>,
+    in_block: bool,
+    in_matching_owner: bool,
+    assoc_owner_matches: bool,
     in_match_pat: bool,
-    spans: Vec<Range<usize>>,
+    spans: Vec<(Range<usize>, Option<String>)>,
+    error: Option<anyhow::Error>,
 }
 
 impl<'a> RustRenameVisitor<'a> {
@@ -6955,6 +7456,13 @@ impl<'a> RustRenameVisitor<'a> {
 
     fn is_field(&self) -> bool {
         self.def_kind == "field"
+    }
+
+    fn is_associated_item(&self) -> bool {
+        matches!(
+            self.def_kind,
+            "method" | "associated constant" | "associated type"
+        )
     }
 
     fn is_type_like(&self) -> bool {
@@ -6979,17 +7487,274 @@ impl<'a> RustRenameVisitor<'a> {
         }
     }
 
-    fn bind_local(&mut self, ident: &syn::Ident) {
-        self.locals.push(Self::clean_ident(ident));
+    fn push_type_params(&mut self, generics: &syn::Generics) {
+        self.type_param_starts.push(self.type_params.len());
+        let Some(owner) = self.owner_name else {
+            return;
+        };
+        let bounds_match = |bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, _>| {
+            bounds.iter().any(|b| {
+                matches!(b, syn::TypeParamBound::Trait(tb) if tb
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|seg| Self::clean_ident(&seg.ident) == owner))
+            })
+        };
+        let start = self.type_params.len();
+        for param in &generics.params {
+            if let syn::GenericParam::Type(tp) = param {
+                self.type_params
+                    .push((Self::clean_ident(&tp.ident), bounds_match(&tp.bounds)));
+            }
+        }
+        if let Some(where_clause) = &generics.where_clause {
+            for pred in &where_clause.predicates {
+                if let syn::WherePredicate::Type(pt) = pred
+                    && bounds_match(&pt.bounds)
+                    && let Some(name) = rust_type_tail_ident(&pt.bounded_ty)
+                {
+                    for (tp_name, matches) in &mut self.type_params[start..] {
+                        if *tp_name == name {
+                            *matches = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn pop_type_params(&mut self) {
+        if let Some(start) = self.type_param_starts.pop() {
+            self.type_params.truncate(start);
+        }
+    }
+
+    fn bind_local(&mut self, ident: &syn::Ident, ty: Option<RustLocalType>) {
+        self.locals.push((Self::clean_ident(ident), ty));
     }
 
     fn is_shadowed_local(&self) -> bool {
         self.locals[self.locals_floor..]
             .iter()
-            .any(|name| name == self.old_name)
+            .any(|(name, _)| name == self.old_name)
     }
 
-    fn record_ident(&mut self, ident: &syn::Ident) {
+    fn is_alias_shadowed(&self) -> bool {
+        self.item_shadows.last().is_some_and(|(alias, _)| *alias)
+    }
+
+    fn is_value_shadowed(&self) -> bool {
+        self.is_shadowed_local()
+            || self
+                .item_shadows
+                .last()
+                .is_some_and(|(alias, value_item)| *alias || *value_item)
+    }
+
+    fn preceding_segment_matches_owner(&self, prev: &syn::PathSegment) -> bool {
+        self.owner_name.is_none_or(|owner| {
+            let name = Self::clean_ident(&prev.ident);
+            name == owner || (name == "Self" && self.in_matching_owner)
+        })
+    }
+
+    fn qself_ty_matches_owner(&self, ty: &syn::Type) -> bool {
+        self.owner_name.is_none_or(|owner| {
+            rust_type_tail_ident(ty).is_some_and(|name| {
+                name == owner
+                    || (name == "Self" && self.in_matching_owner)
+                    || self.trait_impl_types.contains(&name)
+            })
+        })
+    }
+
+    fn classify_type(&self, ty: &syn::Type) -> Option<RustLocalType> {
+        let owner = self.owner_name?;
+        match ty {
+            syn::Type::Reference(r) => self.classify_type(&r.elem),
+            syn::Type::Paren(p) => self.classify_type(&p.elem),
+            syn::Type::Group(g) => self.classify_type(&g.elem),
+            syn::Type::TraitObject(obj) => {
+                let has_owner = obj.bounds.iter().any(|b| {
+                    matches!(b, syn::TypeParamBound::Trait(tb) if tb
+                        .path
+                        .segments
+                        .last()
+                        .is_some_and(|seg| Self::clean_ident(&seg.ident) == owner))
+                });
+                Some(if has_owner {
+                    RustLocalType::BoundToOwner
+                } else {
+                    RustLocalType::Named("<dyn>".to_owned())
+                })
+            }
+            syn::Type::ImplTrait(imp) => {
+                let has_owner = imp.bounds.iter().any(|b| {
+                    matches!(b, syn::TypeParamBound::Trait(tb) if tb
+                        .path
+                        .segments
+                        .last()
+                        .is_some_and(|seg| Self::clean_ident(&seg.ident) == owner))
+                });
+                Some(if has_owner {
+                    RustLocalType::BoundToOwner
+                } else {
+                    RustLocalType::Named("<impl>".to_owned())
+                })
+            }
+            syn::Type::Path(tp) if tp.qself.is_none() => {
+                let last = tp.path.segments.last()?;
+                let name = Self::clean_ident(&last.ident);
+                if let Some((_, bounded)) = self
+                    .type_params
+                    .iter()
+                    .rev()
+                    .find(|(tp_name, _)| *tp_name == name)
+                {
+                    return Some(if *bounded {
+                        RustLocalType::BoundToOwner
+                    } else {
+                        RustLocalType::UnknownGenericOrWrapper
+                    });
+                }
+                if matches!(
+                    name.as_str(),
+                    "Box"
+                        | "Arc"
+                        | "Rc"
+                        | "Pin"
+                        | "Cow"
+                        | "MutexGuard"
+                        | "RwLockReadGuard"
+                        | "RwLockWriteGuard"
+                        | "Ref"
+                        | "RefMut"
+                ) && let syn::PathArguments::AngleBracketed(ab) = &last.arguments
+                    && let Some(inner) = ab.args.iter().find_map(|arg| match arg {
+                        syn::GenericArgument::Type(t) => Some(t),
+                        _ => None,
+                    })
+                {
+                    return self.classify_type(inner);
+                }
+                if name == owner
+                    || (name == "Self" && self.in_matching_owner)
+                    || self.trait_impl_types.contains(&name)
+                {
+                    return Some(RustLocalType::Named(owner.to_owned()));
+                }
+                if let syn::PathArguments::AngleBracketed(ab) = &last.arguments
+                    && ab.args.iter().any(|arg| {
+                        matches!(arg, syn::GenericArgument::Type(inner) if rust_type_mentions_ident(inner, owner))
+                    })
+                {
+                    return Some(RustLocalType::UnknownGenericOrWrapper);
+                }
+                Some(RustLocalType::Named(name))
+            }
+            _ => None,
+        }
+    }
+
+    fn classify_expr(&self, expr: &syn::Expr) -> Option<RustLocalType> {
+        let owner = self.owner_name?;
+        match expr {
+            syn::Expr::Reference(r) => self.classify_expr(&r.expr),
+            syn::Expr::Paren(p) => self.classify_expr(&p.expr),
+            syn::Expr::Group(g) => self.classify_expr(&g.expr),
+            syn::Expr::Cast(c) => self.classify_type(&c.ty),
+            syn::Expr::Struct(s) => {
+                let name = s
+                    .path
+                    .segments
+                    .last()
+                    .map(|seg| Self::clean_ident(&seg.ident))?;
+                if name == "Self" {
+                    Some(RustLocalType::Named(if self.in_matching_owner {
+                        owner.to_owned()
+                    } else {
+                        "<other-self>".to_owned()
+                    }))
+                } else {
+                    Some(RustLocalType::Named(name))
+                }
+            }
+            syn::Expr::Call(call) => {
+                let syn::Expr::Path(ep) = call.func.as_ref() else {
+                    return None;
+                };
+                if ep.qself.is_some() || ep.path.segments.len() < 2 {
+                    return None;
+                }
+                let n = ep.path.segments.len();
+                let fn_name = Self::clean_ident(&ep.path.segments[n - 1].ident);
+                if !matches!(fn_name.as_str(), "new" | "default") {
+                    return None;
+                }
+                let owner_seg = Self::clean_ident(&ep.path.segments[n - 2].ident);
+                if owner_seg == "Self" {
+                    Some(RustLocalType::Named(if self.in_matching_owner {
+                        owner.to_owned()
+                    } else {
+                        "<other-self>".to_owned()
+                    }))
+                } else {
+                    Some(RustLocalType::Named(owner_seg))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn classify_receiver(&self, receiver: &syn::Expr) -> ReceiverMatch {
+        let Some(owner) = self.owner_name else {
+            return ReceiverMatch::ConfirmedMatch;
+        };
+        let mut expr = receiver;
+        loop {
+            match expr {
+                syn::Expr::Paren(p) => expr = &p.expr,
+                syn::Expr::Group(g) => expr = &g.expr,
+                syn::Expr::Reference(r) => expr = &r.expr,
+                _ => break,
+            }
+        }
+        let local_ty = match expr {
+            syn::Expr::Path(ep) if ep.qself.is_none() && ep.path.is_ident("self") => {
+                return if self.in_matching_owner {
+                    ReceiverMatch::ConfirmedMatch
+                } else {
+                    ReceiverMatch::ConfirmedOther
+                };
+            }
+            syn::Expr::Path(ep) if ep.qself.is_none() => {
+                let Some(ident) = ep.path.get_ident() else {
+                    return ReceiverMatch::Unknown;
+                };
+                let name = Self::clean_ident(ident);
+                self.locals[self.locals_floor..]
+                    .iter()
+                    .rev()
+                    .find(|(local, _)| *local == name)
+                    .and_then(|(_, ty)| ty.clone())
+            }
+            _ => self.classify_expr(expr),
+        };
+        match local_ty {
+            Some(RustLocalType::BoundToOwner) => ReceiverMatch::ConfirmedMatch,
+            Some(RustLocalType::Named(name)) => {
+                if name == owner || self.trait_impl_types.contains(&name) {
+                    ReceiverMatch::ConfirmedMatch
+                } else {
+                    ReceiverMatch::ConfirmedOther
+                }
+            }
+            Some(RustLocalType::UnknownGenericOrWrapper) | None => ReceiverMatch::Unknown,
+        }
+    }
+
+    fn record_ident_with(&mut self, ident: &syn::Ident, custom: Option<String>) {
         let ident_text = ident.to_string();
         let clean = ident_text.strip_prefix("r#").unwrap_or(&ident_text);
         if clean != self.old_name {
@@ -7011,8 +7776,27 @@ impl<'a> RustRenameVisitor<'a> {
                 slice == self.old_name || slice.strip_prefix("r#") == Some(self.old_name)
             };
             if matches {
-                self.spans.push(start..end);
+                self.spans.push((start..end, custom));
             }
+        }
+    }
+
+    fn record_ident(&mut self, ident: &syn::Ident) {
+        self.record_ident_with(ident, None);
+    }
+
+    fn record_shorthand_field_value(&mut self, ident: &syn::Ident) {
+        let ident_text = ident.to_string();
+        let clean = ident_text.strip_prefix("r#").unwrap_or(&ident_text);
+        if clean != self.old_name {
+            return;
+        }
+        let raw = ident.span().byte_range();
+        let start = raw.start + self.offset;
+        let end = raw.end + self.offset;
+        if let Some(slice) = self.text.get(start..end) {
+            let replacement = format!("{slice}: {}", self.new_name);
+            self.record_ident_with(ident, Some(replacement));
         }
     }
 
@@ -7026,71 +7810,108 @@ impl<'a> RustRenameVisitor<'a> {
             self.visit_type(&qs.ty);
         }
         for segment in &path.segments {
+            let seg_matches = self.owner_name.is_none_or(|owner| {
+                let seg_name = Self::clean_ident(&segment.ident);
+                seg_name == owner
+                    || (seg_name == "Self" && self.in_matching_owner)
+                    || self.trait_impl_types.contains(&seg_name)
+            });
+            let prev = std::mem::replace(&mut self.assoc_owner_matches, seg_matches);
             self.visit_path_arguments(&segment.arguments);
+            self.assoc_owner_matches = prev;
         }
         let n = path.segments.len();
         if n == 0 {
             return;
         }
-        if let Some(qs) = qself
-            && qs.position > 0
-            && qs.position <= n
-        {
-            for (idx, seg) in path.segments.iter().take(qs.position).enumerate() {
-                if idx + 1 < qs.position {
-                    if self.is_module() {
+        if let Some(qs) = qself {
+            if qs.position > 0 && qs.position <= n {
+                for (idx, seg) in path.segments.iter().take(qs.position).enumerate() {
+                    if idx + 1 < qs.position {
+                        if self.is_module() {
+                            self.record_ident(&seg.ident);
+                        }
+                    } else if matches!(self.def_kind, "trait" | "trait alias") {
                         self.record_ident(&seg.ident);
                     }
-                } else if matches!(self.def_kind, "trait" | "trait alias") {
-                    self.record_ident(&seg.ident);
                 }
-            }
-            if qs.position < n
-                && matches!(
-                    self.def_kind,
-                    "method" | "associated type" | "associated constant" | "function" | "constant"
-                )
+                if qs.position < n && self.is_associated_item() {
+                    let trait_seg = &path.segments[qs.position - 1];
+                    let owner_matches = self.preceding_segment_matches_owner(trait_seg)
+                        || self.qself_ty_matches_owner(&qs.ty);
+                    if owner_matches && (self.def_kind == "associated type" || qs.position + 1 == n)
+                    {
+                        self.record_ident(&path.segments[qs.position].ident);
+                    }
+                }
+            } else if qs.position == 0
+                && self.is_associated_item()
+                && self.qself_ty_matches_owner(&qs.ty)
+                && (self.def_kind == "associated type" || n == 1)
             {
-                self.record_ident(&path.segments[n - 1].ident);
+                self.record_ident(&path.segments[0].ident);
             }
             return;
         }
 
+        let last = &path.segments[n - 1];
         for (idx, seg) in path.segments.iter().take(n - 1).enumerate() {
+            if idx == 0 && path.leading_colon.is_none() && self.is_alias_shadowed() {
+                continue;
+            }
+            let enum_or_non_value_type =
+                matches!(self.def_kind, "enum" | "trait" | "trait alias" | "union");
             let match_non_terminal = self.is_module()
                 || (self.is_type_like()
                     && idx + 1 == n - 1
-                    && role != RustPathRole::Module
-                    && (!matches!(seg.arguments, syn::PathArguments::None)
-                        || (self.old_name.starts_with(char::is_uppercase)
-                            && Self::clean_ident(&path.segments[n - 1].ident) != self.old_name)));
+                    && !matches!(
+                        role,
+                        RustPathRole::Module | RustPathRole::Macro | RustPathRole::Trait
+                    )
+                    && ((enum_or_non_value_type
+                        && matches!(role, RustPathRole::Value | RustPathRole::Struct))
+                        || !matches!(seg.arguments, syn::PathArguments::None)
+                        || Self::clean_ident(&last.ident) != self.old_name))
+                || (self.def_kind == "associated type"
+                    && idx > 0
+                    && !matches!(
+                        role,
+                        RustPathRole::Module | RustPathRole::Macro | RustPathRole::Trait
+                    )
+                    && self.preceding_segment_matches_owner(&path.segments[idx - 1]));
             if match_non_terminal {
                 self.record_ident(&seg.ident);
             }
         }
 
-        let last = &path.segments[n - 1];
+        let bare = n == 1 && path.leading_colon.is_none();
         let match_terminal = match role {
-            RustPathRole::Module => self.is_module(),
-            RustPathRole::Macro => self.def_kind == "macro",
-            RustPathRole::Trait => matches!(self.def_kind, "trait" | "trait alias"),
+            RustPathRole::Module => self.is_module() && !(bare && self.is_alias_shadowed()),
+            RustPathRole::Macro => self.def_kind == "macro" && !(bare && self.is_alias_shadowed()),
+            RustPathRole::Trait => {
+                matches!(self.def_kind, "trait" | "trait alias")
+                    && !(bare && self.is_alias_shadowed())
+            }
             RustPathRole::Type => {
-                self.is_type_like()
-                    || (self.def_kind == "associated type" && (n >= 2 || qself.is_some()))
+                (self.is_type_like() && !(bare && self.is_alias_shadowed()))
+                    || (self.def_kind == "associated type"
+                        && n >= 2
+                        && self.preceding_segment_matches_owner(&path.segments[n - 2]))
+            }
+            RustPathRole::Struct => {
+                matches!(self.def_kind, "struct" | "type" | "variant")
+                    && !(bare && self.is_alias_shadowed())
             }
             RustPathRole::Value => {
-                if (n == 1
-                    && path.leading_colon.is_none()
-                    && qself.is_none()
-                    && self.is_shadowed_local())
-                    || self.is_field()
-                    || self.is_module()
-                {
+                if bare && self.is_value_shadowed() {
                     false
                 } else if self.is_method() || self.def_kind == "associated constant" {
-                    n >= 2 || qself.is_some()
+                    n >= 2 && self.preceding_segment_matches_owner(&path.segments[n - 2])
                 } else {
-                    true
+                    matches!(
+                        self.def_kind,
+                        "function" | "constant" | "static" | "struct" | "type" | "variant"
+                    )
                 }
             }
         };
@@ -7103,7 +7924,11 @@ impl<'a> RustRenameVisitor<'a> {
         match tree {
             syn::UseTree::Path(part) => {
                 let mut matched = matched_parent_mod;
-                if self.is_module() && Self::clean_ident(&part.ident) == self.old_name {
+                let is_enum_leaf_prefix =
+                    self.def_kind == "enum" && !matches!(&*part.tree, syn::UseTree::Path(_));
+                if (self.is_module() || is_enum_leaf_prefix)
+                    && Self::clean_ident(&part.ident) == self.old_name
+                {
                     self.record_ident(&part.ident);
                     matched = true;
                 }
@@ -7118,8 +7943,8 @@ impl<'a> RustRenameVisitor<'a> {
             syn::UseTree::Name(name) => {
                 if Self::clean_ident(&name.ident) != "self"
                     && !self.is_field()
-                    && !self.is_method()
-                    && (!self.is_module() || !matched_parent_mod)
+                    && !self.is_associated_item()
+                    && (!(self.is_module() || self.def_kind == "enum") || !matched_parent_mod)
                 {
                     self.record_ident(&name.ident);
                 }
@@ -7129,13 +7954,14 @@ impl<'a> RustRenameVisitor<'a> {
                 let alias = Self::clean_ident(&rename.rename);
                 if orig != "self"
                     && !self.is_field()
-                    && !self.is_method()
-                    && (!self.is_module() || !matched_parent_mod)
+                    && !self.is_associated_item()
+                    && (!(self.is_module() || self.def_kind == "enum") || !matched_parent_mod)
                 {
                     self.record_ident(&rename.ident);
                 }
-                if alias == self.old_name && orig != self.old_name {
-                    self.bind_local(&rename.rename);
+                if !self.scope_starts.is_empty() && alias == self.old_name && orig != self.old_name
+                {
+                    self.bind_local(&rename.rename, None);
                 }
             }
         }
@@ -7150,9 +7976,12 @@ impl<'a> RustRenameVisitor<'a> {
                 }
                 syn::FnArg::Typed(pat_type) => {
                     self.visit_type(&pat_type.ty);
+                    let ty = self.classify_type(&pat_type.ty);
+                    let prev_ty = std::mem::replace(&mut self.pending_pat_type, ty);
                     let prev_match = std::mem::replace(&mut self.in_match_pat, false);
                     self.visit_pat(&pat_type.pat);
                     self.in_match_pat = prev_match;
+                    self.pending_pat_type = prev_ty;
                 }
             }
         }
@@ -7161,6 +7990,18 @@ impl<'a> RustRenameVisitor<'a> {
 }
 
 impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
+    fn visit_file(&mut self, node: &'ast syn::File) {
+        if let Some(owner) = self.owner_name {
+            collect_trait_impl_types(&node.items, owner, &mut self.trait_impl_types);
+        }
+        let alias_shadow = items_have_alias_shadow(&node.items, self.old_name);
+        self.item_shadows.push((alias_shadow, false));
+        for item in &node.items {
+            self.visit_item(item);
+        }
+        self.item_shadows.pop();
+    }
+
     fn visit_attribute(&mut self, _node: &'ast syn::Attribute) {}
 
     fn visit_lifetime(&mut self, _node: &'ast syn::Lifetime) {}
@@ -7178,14 +8019,25 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         self.visit_visibility(&node.vis);
-        if self.def_kind == "function" {
+        let shadows_old = (self.in_block || !self.scope_starts.is_empty())
+            && Self::clean_ident(&node.sig.ident) == self.old_name;
+        if shadows_old {
+            self.bind_local(&node.sig.ident, None);
+        } else if self.def_kind == "function" {
             self.record_ident(&node.sig.ident);
         }
         let prev_floor = std::mem::replace(&mut self.locals_floor, self.locals.len());
+        let prev_owner = std::mem::replace(&mut self.in_matching_owner, false);
+        self.push_type_params(&node.sig.generics);
         self.push_scope();
+        if shadows_old {
+            self.bind_local(&node.sig.ident, None);
+        }
         self.visit_fn_signature(&node.sig);
         self.visit_block(&node.block);
         self.pop_scope();
+        self.pop_type_params();
+        self.in_matching_owner = prev_owner;
         self.locals_floor = prev_floor;
     }
 
@@ -7195,13 +8047,18 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
             self.record_ident(&node.ident);
         }
         if let Some((_, items)) = &node.content {
+            let alias_shadow = items_have_alias_shadow(items, self.old_name);
+            self.item_shadows.push((alias_shadow, false));
+            let prev_in_block = std::mem::replace(&mut self.in_block, false);
+            let prev_owner = std::mem::replace(&mut self.in_matching_owner, false);
             let prev_floor = std::mem::replace(&mut self.locals_floor, self.locals.len());
-            self.push_scope();
             for item in items {
                 self.visit_item(item);
             }
-            self.pop_scope();
             self.locals_floor = prev_floor;
+            self.in_matching_owner = prev_owner;
+            self.in_block = prev_in_block;
+            self.item_shadows.pop();
         }
     }
 
@@ -7245,7 +8102,12 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
         if self.def_kind == "trait" {
             self.record_ident(&node.ident);
         }
+        let matches_owner = self
+            .owner_name
+            .is_none_or(|owner| Self::clean_ident(&node.ident) == owner);
         let prev_floor = std::mem::replace(&mut self.locals_floor, self.locals.len());
+        let prev_owner = std::mem::replace(&mut self.in_matching_owner, matches_owner);
+        self.push_type_params(&node.generics);
         self.visit_generics(&node.generics);
         for bound in &node.supertraits {
             self.visit_type_param_bound(bound);
@@ -7253,6 +8115,8 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
         for item in &node.items {
             self.visit_trait_item(item);
         }
+        self.pop_type_params();
+        self.in_matching_owner = prev_owner;
         self.locals_floor = prev_floor;
     }
 
@@ -7282,7 +8146,11 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
 
     fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
         self.visit_visibility(&node.vis);
-        if self.def_kind == "constant" {
+        let shadows_old = (self.in_block || !self.scope_starts.is_empty())
+            && Self::clean_ident(&node.ident) == self.old_name;
+        if shadows_old {
+            self.bind_local(&node.ident, None);
+        } else if self.def_kind == "constant" {
             self.record_ident(&node.ident);
         }
         let prev_floor = std::mem::replace(&mut self.locals_floor, self.locals.len());
@@ -7294,7 +8162,11 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
 
     fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
         self.visit_visibility(&node.vis);
-        if self.def_kind == "static" {
+        let shadows_old = (self.in_block || !self.scope_starts.is_empty())
+            && Self::clean_ident(&node.ident) == self.old_name;
+        if shadows_old {
+            self.bind_local(&node.ident, None);
+        } else if self.def_kind == "static" {
             self.record_ident(&node.ident);
         }
         let prev_floor = std::mem::replace(&mut self.locals_floor, self.locals.len());
@@ -7315,7 +8187,17 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        let matches_owner = self.owner_name.is_none_or(|owner| {
+            rust_type_tail_ident(&node.self_ty).as_deref() == Some(owner)
+                || node
+                    .trait_
+                    .as_ref()
+                    .and_then(|(_, path, _)| path.segments.last())
+                    .is_some_and(|seg| Self::clean_ident(&seg.ident) == owner)
+        });
         let prev_floor = std::mem::replace(&mut self.locals_floor, self.locals.len());
+        let prev_owner = std::mem::replace(&mut self.in_matching_owner, matches_owner);
+        self.push_type_params(&node.generics);
         self.visit_generics(&node.generics);
         if let Some((_, trait_path, _)) = &node.trait_ {
             self.visit_rust_path(None, trait_path, RustPathRole::Trait);
@@ -7324,25 +8206,29 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
         for item in &node.items {
             self.visit_impl_item(item);
         }
+        self.pop_type_params();
+        self.in_matching_owner = prev_owner;
         self.locals_floor = prev_floor;
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         self.visit_visibility(&node.vis);
-        if self.is_method() {
+        if self.is_method() && self.in_matching_owner {
             self.record_ident(&node.sig.ident);
         }
         let prev_floor = std::mem::replace(&mut self.locals_floor, self.locals.len());
+        self.push_type_params(&node.sig.generics);
         self.push_scope();
         self.visit_fn_signature(&node.sig);
         self.visit_block(&node.block);
         self.pop_scope();
+        self.pop_type_params();
         self.locals_floor = prev_floor;
     }
 
     fn visit_impl_item_type(&mut self, node: &'ast syn::ImplItemType) {
         self.visit_visibility(&node.vis);
-        if self.def_kind == "associated type" {
+        if self.def_kind == "associated type" && self.in_matching_owner {
             self.record_ident(&node.ident);
         }
         self.visit_generics(&node.generics);
@@ -7351,7 +8237,7 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
 
     fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
         self.visit_visibility(&node.vis);
-        if self.def_kind == "associated constant" {
+        if self.def_kind == "associated constant" && self.in_matching_owner {
             self.record_ident(&node.ident);
         }
         self.visit_generics(&node.generics);
@@ -7360,21 +8246,23 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
-        if self.is_method() {
+        if self.is_method() && self.in_matching_owner {
             self.record_ident(&node.sig.ident);
         }
         let prev_floor = std::mem::replace(&mut self.locals_floor, self.locals.len());
+        self.push_type_params(&node.sig.generics);
         self.push_scope();
         self.visit_fn_signature(&node.sig);
         if let Some(block) = &node.default {
             self.visit_block(block);
         }
         self.pop_scope();
+        self.pop_type_params();
         self.locals_floor = prev_floor;
     }
 
     fn visit_trait_item_type(&mut self, node: &'ast syn::TraitItemType) {
-        if self.def_kind == "associated type" {
+        if self.def_kind == "associated type" && self.in_matching_owner {
             self.record_ident(&node.ident);
         }
         self.visit_generics(&node.generics);
@@ -7387,7 +8275,7 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
     }
 
     fn visit_trait_item_const(&mut self, node: &'ast syn::TraitItemConst) {
-        if self.def_kind == "associated constant" {
+        if self.def_kind == "associated constant" && self.in_matching_owner {
             self.record_ident(&node.ident);
         }
         self.visit_generics(&node.generics);
@@ -7425,10 +8313,16 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
                 self.record_ident(ident);
             }
             self.visit_expr(&node.expr);
-        } else if self.is_field()
-            && let syn::Member::Named(ident) = &node.member
-        {
-            self.record_ident(ident);
+        } else if let syn::Member::Named(ident) = &node.member {
+            if self.is_field() {
+                self.record_ident(ident);
+            } else if matches!(
+                self.def_kind,
+                "constant" | "static" | "function" | "struct" | "type" | "variant"
+            ) && !self.is_value_shadowed()
+            {
+                self.record_shorthand_field_value(ident);
+            }
         }
     }
 
@@ -7463,8 +8357,31 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
 
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         self.visit_expr(&node.receiver);
-        if self.is_method() {
-            self.record_ident(&node.method);
+        if self.is_method() && Self::clean_ident(&node.method) == self.old_name {
+            match self.classify_receiver(&node.receiver) {
+                ReceiverMatch::ConfirmedMatch => self.record_ident(&node.method),
+                ReceiverMatch::ConfirmedOther => {}
+                ReceiverMatch::Unknown => {
+                    if self.has_competing_method {
+                        if self.error.is_none() {
+                            let raw = node.method.span().byte_range();
+                            let line =
+                                syntax_check::line_column(self.text, raw.start + self.offset).0;
+                            let owner = self.owner_name.unwrap_or("Type");
+                            self.error = Some(anyhow::anyhow!(
+                                "ambiguous method call `.{}()` in {}:{line}: multiple types define `{}` and receiver type cannot be statically confirmed; annotate the receiver type or use UFCS `{}::{}(...)` before renaming",
+                                self.old_name,
+                                self.file,
+                                self.old_name,
+                                owner,
+                                self.old_name,
+                            ));
+                        }
+                    } else {
+                        self.record_ident(&node.method);
+                    }
+                }
+            }
         }
         if let Some(turbo) = &node.turbofish {
             self.visit_angle_bracketed_generic_arguments(turbo);
@@ -7479,12 +8396,7 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
     }
 
     fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
-        let role = if self.def_kind == "variant" {
-            RustPathRole::Value
-        } else {
-            RustPathRole::Type
-        };
-        self.visit_rust_path(node.qself.as_ref(), &node.path, role);
+        self.visit_rust_path(node.qself.as_ref(), &node.path, RustPathRole::Struct);
         for field in &node.fields {
             self.visit_field_value(field);
         }
@@ -7502,7 +8414,7 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
     }
 
     fn visit_assoc_type(&mut self, node: &'ast syn::AssocType) {
-        if self.def_kind == "associated type" {
+        if self.def_kind == "associated type" && self.assoc_owner_matches {
             self.record_ident(&node.ident);
         }
         if let Some(generics) = &node.generics {
@@ -7512,7 +8424,7 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
     }
 
     fn visit_assoc_const(&mut self, node: &'ast syn::AssocConst) {
-        if self.def_kind == "associated constant" {
+        if self.def_kind == "associated constant" && self.assoc_owner_matches {
             self.record_ident(&node.ident);
         }
         if let Some(generics) = &node.generics {
@@ -7522,27 +8434,37 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
     }
 
     fn visit_pat_struct(&mut self, node: &'ast syn::PatStruct) {
-        let role = if self.def_kind == "variant" {
-            RustPathRole::Value
-        } else {
-            RustPathRole::Type
-        };
-        self.visit_rust_path(node.qself.as_ref(), &node.path, role);
+        self.visit_rust_path(node.qself.as_ref(), &node.path, RustPathRole::Struct);
+        let prev_ty = self.pending_pat_type.take();
         for field in &node.fields {
             self.visit_field_pat(field);
         }
+        self.pending_pat_type = prev_ty;
     }
 
     fn visit_pat_tuple_struct(&mut self, node: &'ast syn::PatTupleStruct) {
-        let role = if self.def_kind == "variant" {
-            RustPathRole::Value
-        } else {
-            RustPathRole::Type
-        };
-        self.visit_rust_path(node.qself.as_ref(), &node.path, role);
+        self.visit_rust_path(node.qself.as_ref(), &node.path, RustPathRole::Struct);
+        let prev_ty = self.pending_pat_type.take();
         for elem in &node.elems {
             self.visit_pat(elem);
         }
+        self.pending_pat_type = prev_ty;
+    }
+
+    fn visit_pat_tuple(&mut self, node: &'ast syn::PatTuple) {
+        let prev_ty = self.pending_pat_type.take();
+        for elem in &node.elems {
+            self.visit_pat(elem);
+        }
+        self.pending_pat_type = prev_ty;
+    }
+
+    fn visit_pat_slice(&mut self, node: &'ast syn::PatSlice) {
+        let prev_ty = self.pending_pat_type.take();
+        for elem in &node.elems {
+            self.visit_pat(elem);
+        }
+        self.pending_pat_type = prev_ty;
     }
 
     fn visit_pat_ident(&mut self, node: &'ast syn::PatIdent) {
@@ -7551,6 +8473,7 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
             && node.mutability.is_none()
             && node.subpat.is_none();
         if bare_match_pat
+            && !self.is_value_shadowed()
             && (self.def_kind == "constant"
                 || (self.def_kind == "struct" && self.old_name.starts_with(char::is_uppercase)))
             && Self::clean_ident(&node.ident) == self.old_name
@@ -7558,30 +8481,53 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
             self.record_ident(&node.ident);
             return;
         }
-        self.bind_local(&node.ident);
+        let ty = self.pending_pat_type.clone();
+        self.bind_local(&node.ident, ty);
         if let Some((_, subpat)) = &node.subpat {
             self.visit_pat(subpat);
         }
     }
 
     fn visit_local(&mut self, node: &'ast syn::Local) {
+        let mut inferred = None;
         if let Some(init) = &node.init {
             self.visit_expr(&init.expr);
+            inferred = self.classify_expr(&init.expr);
             if let Some((_, diverge)) = &init.diverge {
                 self.visit_expr(diverge);
             }
         }
         let prev_match = std::mem::replace(&mut self.in_match_pat, false);
-        self.visit_pat(&node.pat);
+        match &node.pat {
+            syn::Pat::Type(pt) => {
+                self.visit_type(&pt.ty);
+                let ty = self.classify_type(&pt.ty).or(inferred);
+                let prev_ty = std::mem::replace(&mut self.pending_pat_type, ty);
+                self.visit_pat(&pt.pat);
+                self.pending_pat_type = prev_ty;
+            }
+            _ => {
+                let prev_ty = std::mem::replace(&mut self.pending_pat_type, inferred);
+                self.visit_pat(&node.pat);
+                self.pending_pat_type = prev_ty;
+            }
+        }
         self.in_match_pat = prev_match;
     }
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
+        let (block_alias, block_val_item) = stmts_have_item_shadow(&node.stmts, self.old_name);
+        let (prev_alias, prev_val) = self.item_shadows.last().copied().unwrap_or((false, false));
+        self.item_shadows
+            .push((prev_alias || block_alias, prev_val || block_val_item));
+        let prev_in_block = std::mem::replace(&mut self.in_block, true);
         self.push_scope();
         for stmt in &node.stmts {
             self.visit_stmt(stmt);
         }
         self.pop_scope();
+        self.in_block = prev_in_block;
+        self.item_shadows.pop();
     }
 
     fn visit_expr_let(&mut self, node: &'ast syn::ExprLet) {
@@ -7634,7 +8580,20 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
         self.push_scope();
         let prev_match = std::mem::replace(&mut self.in_match_pat, false);
         for input in &node.inputs {
-            self.visit_pat(input);
+            match input {
+                syn::Pat::Type(pt) => {
+                    self.visit_type(&pt.ty);
+                    let ty = self.classify_type(&pt.ty);
+                    let prev_ty = std::mem::replace(&mut self.pending_pat_type, ty);
+                    self.visit_pat(&pt.pat);
+                    self.pending_pat_type = prev_ty;
+                }
+                _ => {
+                    let prev_ty = self.pending_pat_type.take();
+                    self.visit_pat(input);
+                    self.pending_pat_type = prev_ty;
+                }
+            }
         }
         self.in_match_pat = prev_match;
         self.visit_return_type(&node.output);
@@ -7650,6 +8609,41 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
             .last()
             .map(|seg| Self::clean_ident(&seg.ident))
             .unwrap_or_default();
+        if mac_name == "matches" {
+            if let Ok((expr, pat, guard)) = mac.parse_body_with(
+                |input: syn::parse::ParseStream<'_>| -> syn::Result<(
+                    syn::Expr,
+                    syn::Pat,
+                    Option<syn::Expr>,
+                )> {
+                    let expr: syn::Expr = input.parse()?;
+                    let _: syn::Token![,] = input.parse()?;
+                    let pat = syn::Pat::parse_multi_with_leading_vert(input)?;
+                    let guard = if input.peek(syn::Token![if]) {
+                        let _: syn::Token![if] = input.parse()?;
+                        Some(input.parse::<syn::Expr>()?)
+                    } else {
+                        None
+                    };
+                    let _ = input.parse::<Option<syn::Token![,]>>();
+                    if !input.is_empty() {
+                        return Err(input.error("unexpected trailing tokens in matches!"));
+                    }
+                    Ok((expr, pat, guard))
+                },
+            ) {
+                self.visit_expr(&expr);
+                self.push_scope();
+                let prev_match = std::mem::replace(&mut self.in_match_pat, true);
+                self.visit_pat(&pat);
+                self.in_match_pat = prev_match;
+                if let Some(guard) = &guard {
+                    self.visit_expr(guard);
+                }
+                self.pop_scope();
+            }
+            return;
+        }
         let standard = matches!(
             mac_name.as_str(),
             "assert"
@@ -7676,19 +8670,34 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
                 | "bail"
                 | "anyhow"
         );
-        if standard
-            && let Ok(expressions) = mac.parse_body_with(
+        if standard {
+            if let Ok(expressions) = mac.parse_body_with(
                 syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated,
-            )
-        {
-            for expr in &expressions {
-                match expr {
-                    syn::Expr::Assign(assign) if matches!(assign.left.as_ref(), syn::Expr::Path(p) if p.path.segments.len() == 1) =>
-                    {
-                        self.visit_expr(&assign.right);
+            ) {
+                for expr in &expressions {
+                    match expr {
+                        syn::Expr::Assign(assign) if matches!(assign.left.as_ref(), syn::Expr::Path(p) if p.path.segments.len() == 1) =>
+                        {
+                            self.visit_expr(&assign.right);
+                        }
+                        _ => self.visit_expr(expr),
                     }
-                    _ => self.visit_expr(expr),
                 }
+            } else if mac_name == "vec"
+                && let Ok((elem, count)) = mac.parse_body_with(
+                    |input: syn::parse::ParseStream<'_>| -> syn::Result<(syn::Expr, syn::Expr)> {
+                        let elem: syn::Expr = input.parse()?;
+                        let _: syn::Token![;] = input.parse()?;
+                        let count: syn::Expr = input.parse()?;
+                        if !input.is_empty() {
+                            return Err(input.error("unexpected trailing tokens in vec!"));
+                        }
+                        Ok((elem, count))
+                    },
+                )
+            {
+                self.visit_expr(&elem);
+                self.visit_expr(&count);
             }
         }
     }
@@ -7696,32 +8705,55 @@ impl<'ast> Visit<'ast> for RustRenameVisitor<'_> {
 
 /// Locates every AST-role-verified Rust identifier occurrence of `old_name`
 /// using `syn::visit::Visit`, skipping attributes, comments, strings,
-/// lifetimes, labels, unrelated fields/methods, non-module path prefixes,
-/// bare keywords when renaming raw identifiers, and shadowed locals.
+/// lifetimes, labels, unrelated fields/methods/owners, non-module path
+/// prefixes, bare keywords when renaming raw identifiers, and shadowed
+/// locals or module-level `use ... as` aliases.
 fn find_rust_identifier_spans(
+    file_path: &str,
     text: &str,
     old_name: &str,
+    new_name: &str,
     def_kind: &str,
-) -> Result<Vec<Range<usize>>> {
+    owner_name: Option<&str>,
+    has_competing_method: bool,
+) -> Result<Vec<(Range<usize>, Option<String>)>> {
     let file = crate::rust_syntax::parse_file(text)
-        .map_err(|err| anyhow::anyhow!("Rust parse error: {err}"))?;
+        .map_err(|err| anyhow::anyhow!("failed to parse Rust AST in {file_path}: {err}"))?;
     let offset = usize::from(text.starts_with('\u{feff}')) * '\u{feff}'.len_utf8()
         + file.shebang.as_ref().map_or(0, String::len);
     let mut visitor = RustRenameVisitor {
+        file: file_path,
         text,
         offset,
         old_name,
+        new_name,
         def_kind,
+        owner_name,
+        has_competing_method,
         require_raw: is_language_keyword(old_name, true, None),
         locals: Vec::with_capacity(32),
         scope_starts: Vec::with_capacity(16),
         locals_floor: 0,
+        pending_pat_type: None,
+        type_params: Vec::with_capacity(8),
+        type_param_starts: Vec::with_capacity(8),
+        trait_impl_types: BTreeSet::new(),
+        item_shadows: Vec::with_capacity(8),
+        in_block: false,
+        in_matching_owner: false,
+        assoc_owner_matches: false,
         in_match_pat: false,
         spans: Vec::new(),
+        error: None,
     };
     visitor.visit_file(&file);
-    visitor.spans.sort_by_key(|range| (range.start, range.end));
-    visitor.spans.dedup();
+    if let Some(err) = visitor.error {
+        return Err(err);
+    }
+    visitor
+        .spans
+        .sort_by_key(|(range, _)| (range.start, range.end));
+    visitor.spans.dedup_by(|a, b| a.0 == b.0);
     Ok(visitor.spans)
 }
 
@@ -7751,12 +8783,16 @@ fn component_template_mentions_ident(raw: &str, masked: &str, ident: &str) -> bo
     if raw.len() != masked.len() || ident.is_empty() {
         return false;
     }
+    let raw_bytes = raw.as_bytes();
+    let masked_bytes = masked.as_bytes();
+    let mut scan = 0;
+    let mut in_comment = false;
     let mut from = 0;
     while let Some(off) = raw[from..].find(ident) {
         let start = from + off;
         let end = start + ident.len();
         from = end;
-        if !masked.as_bytes()[start..end].iter().all(|&b| b == b' ') {
+        if !masked_bytes[start..end].iter().all(|&b| b == b' ') {
             continue;
         }
         let before_ok = raw[..start]
@@ -7770,10 +8806,28 @@ fn component_template_mentions_ident(raw: &str, masked: &str, ident: &str) -> bo
         if !before_ok || !after_ok {
             continue;
         }
-        let prefix = &raw[..start];
-        if let Some(open) = prefix.rfind("<!--")
-            && prefix[open + 4..].rfind("-->").is_none()
-        {
+        // Track HTML comments ONLY outside `<script>` regions (where `masked`
+        // holds blanked spaces) so `const marker = "<!--"` inside `<script>`
+        // never suppresses template checks.
+        while scan < start {
+            if !in_comment {
+                if raw_bytes[scan..].starts_with(b"<!--")
+                    && masked_bytes.get(scan..scan + 4) == Some(b"    ")
+                {
+                    in_comment = true;
+                    scan += 4;
+                    continue;
+                }
+            } else if raw_bytes[scan..].starts_with(b"-->")
+                && masked_bytes.get(scan..scan + 3) == Some(b"   ")
+            {
+                in_comment = false;
+                scan += 3;
+                continue;
+            }
+            scan += 1;
+        }
+        if in_comment {
             continue;
         }
         return true;
@@ -7944,6 +8998,30 @@ fn collect_treesitter_namespace_imports(
     namespaces
 }
 
+fn js_pattern_binds_name(node: tree_sitter::Node<'_>, text: &str, old_name: &str) -> bool {
+    match node.kind() {
+        "identifier" => node_text(node, text) == old_name,
+        "required_parameter" | "optional_parameter" => node
+            .child_by_field_name("pattern")
+            .or_else(|| node.child_by_field_name("name"))
+            .is_some_and(|p| js_pattern_binds_name(p, text, old_name)),
+        "assignment_pattern" | "object_assignment_pattern" => node
+            .child_by_field_name("left")
+            .is_some_and(|p| js_pattern_binds_name(p, text, old_name)),
+        "rest_pattern" => node
+            .named_child(0)
+            .is_some_and(|p| js_pattern_binds_name(p, text, old_name)),
+        "pair_pattern" => node
+            .child_by_field_name("value")
+            .is_some_and(|p| js_pattern_binds_name(p, text, old_name)),
+        "object_pattern" | "array_pattern" => (0..node.named_child_count()).any(|i| {
+            node.named_child(i as u32)
+                .is_some_and(|c| js_pattern_binds_name(c, text, old_name))
+        }),
+        _ => false,
+    }
+}
+
 fn fn_params_bind_name(
     fn_node: tree_sitter::Node<'_>,
     text: &str,
@@ -7984,41 +9062,271 @@ fn fn_params_bind_name(
                 }
                 _ => {}
             },
-            Grammar::JavaScript => match pkind {
-                "identifier" if node_text(param, text) == old_name => return true,
-                "required_parameter" | "optional_parameter"
-                    if param.child_by_field_name("pattern").is_some_and(|p| {
-                        p.kind() == "identifier" && node_text(p, text) == old_name
-                    }) =>
-                {
-                    return true;
-                }
-                "assignment_pattern"
-                    if param.child_by_field_name("left").is_some_and(|p| {
-                        p.kind() == "identifier" && node_text(p, text) == old_name
-                    }) =>
-                {
-                    return true;
-                }
-                "rest_pattern"
-                    if param.named_child(0).is_some_and(|p| {
-                        p.kind() == "identifier" && node_text(p, text) == old_name
-                    }) =>
-                {
-                    return true;
-                }
-                _ => {}
-            },
+            Grammar::JavaScript if js_pattern_binds_name(param, text, old_name) => return true,
             _ => {}
         }
     }
     false
 }
 
+fn js_enclosing_scope_range(
+    node: tree_sitter::Node<'_>,
+    is_var: bool,
+    total_len: usize,
+) -> Range<usize> {
+    let mut cur = node.parent();
+    while let Some(anc) = cur {
+        let kind = anc.kind();
+        if is_var {
+            if matches!(
+                kind,
+                "function_declaration"
+                    | "function_expression"
+                    | "arrow_function"
+                    | "method_definition"
+                    | "generator_function_declaration"
+                    | "generator_function"
+            ) {
+                return anc
+                    .child_by_field_name("body")
+                    .map_or_else(|| anc.byte_range(), |b| b.byte_range());
+            }
+            if kind == "program" {
+                return 0..total_len;
+            }
+        } else if matches!(
+            kind,
+            "statement_block"
+                | "switch_body"
+                | "switch_case"
+                | "switch_default"
+                | "for_statement"
+                | "for_in_statement"
+        ) {
+            return anc.byte_range();
+        } else if kind == "program" {
+            return 0..total_len;
+        }
+        cur = anc.parent();
+    }
+    0..total_len
+}
+
+fn py_enclosing_scope_range(node: tree_sitter::Node<'_>, total_len: usize) -> Range<usize> {
+    let mut cur = node.parent();
+    while let Some(anc) = cur {
+        if matches!(anc.kind(), "function_definition" | "class_definition") {
+            return anc
+                .child_by_field_name("body")
+                .map_or_else(|| anc.byte_range(), |b| b.byte_range());
+        }
+        cur = anc.parent();
+    }
+    0..total_len
+}
+
+fn collect_treesitter_shadow_ranges(
+    tree: &tree_sitter::Tree,
+    text: &str,
+    family: Grammar,
+    file: &str,
+    def_file: &str,
+    def_kind: &str,
+    old_name: &str,
+) -> Vec<Range<usize>> {
+    let mut shadow_ranges = Vec::new();
+    let is_local_def = def_kind == "local";
+    let mut cursor = tree.walk();
+    'walk: loop {
+        let node = cursor.node();
+        let kind = node.kind();
+        let skip_subtree = kind.contains("comment");
+
+        if !skip_subtree && !is_local_def {
+            match family {
+                Grammar::JavaScript => match kind {
+                    "function_declaration"
+                    | "function_expression"
+                    | "arrow_function"
+                    | "method_definition"
+                    | "generator_function_declaration"
+                    | "generator_function" => {
+                        if fn_params_bind_name(node, text, family, old_name)
+                            && let Some(body) = node.child_by_field_name("body")
+                        {
+                            shadow_ranges.push(body.byte_range());
+                        }
+                        if kind == "function_declaration"
+                            && node
+                                .child_by_field_name("name")
+                                .is_some_and(|n| node_text(n, text) == old_name)
+                        {
+                            let is_top_level = node.parent().is_some_and(|p| {
+                                p.kind() == "program"
+                                    || (p.kind() == "export_statement"
+                                        && p.parent().is_some_and(|gp| gp.kind() == "program"))
+                            });
+                            if !(is_top_level && file == def_file) {
+                                shadow_ranges.push(js_enclosing_scope_range(
+                                    node,
+                                    false,
+                                    text.len(),
+                                ));
+                            }
+                        }
+                    }
+                    "import_specifier" => {
+                        if node
+                            .child_by_field_name("alias")
+                            .is_some_and(|a| node_text(a, text) == old_name)
+                            && node
+                                .child_by_field_name("name")
+                                .is_none_or(|n| node_text(n, text) != old_name)
+                        {
+                            shadow_ranges.push(0..text.len());
+                        }
+                    }
+                    "variable_declarator" => {
+                        if let Some(lhs) = node.child_by_field_name("name")
+                            && js_pattern_binds_name(lhs, text, old_name)
+                        {
+                            let decl = node.parent();
+                            let is_var = decl.is_some_and(|d| d.kind() == "variable_declaration");
+                            let is_top_level_def = file == def_file
+                                && lhs.kind() == "identifier"
+                                && decl.and_then(|d| d.parent()).is_some_and(|p| {
+                                    p.kind() == "program"
+                                        || (p.kind() == "export_statement"
+                                            && p.parent().is_some_and(|gp| gp.kind() == "program"))
+                                })
+                                && matches!(def_kind, "variable" | "constant" | "function");
+                            if !is_top_level_def {
+                                shadow_ranges.push(js_enclosing_scope_range(
+                                    node,
+                                    is_var,
+                                    text.len(),
+                                ));
+                            }
+                        }
+                    }
+                    "for_in_statement" => {
+                        if node
+                            .child_by_field_name("left")
+                            .is_some_and(|l| js_pattern_binds_name(l, text, old_name))
+                        {
+                            shadow_ranges.push(node.byte_range());
+                        }
+                    }
+                    "catch_clause"
+                        if node
+                            .child_by_field_name("parameter")
+                            .is_some_and(|p| js_pattern_binds_name(p, text, old_name)) =>
+                    {
+                        shadow_ranges.push(node.byte_range());
+                    }
+                    _ => {}
+                },
+                Grammar::Python => match kind {
+                    "function_definition" | "lambda" => {
+                        if fn_params_bind_name(node, text, family, old_name)
+                            && let Some(body) = node.child_by_field_name("body")
+                        {
+                            shadow_ranges.push(body.byte_range());
+                        }
+                    }
+                    "aliased_import"
+                        if node
+                            .child_by_field_name("alias")
+                            .is_some_and(|a| node_text(a, text) == old_name)
+                            && node
+                                .child_by_field_name("name")
+                                .is_none_or(|n| node_text(n, text) != old_name) =>
+                    {
+                        shadow_ranges.push(py_enclosing_scope_range(node, text.len()));
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+
+        if !skip_subtree && cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+        }
+    }
+    shadow_ranges
+}
+
+fn go_composite_type_is_non_struct(ty: tree_sitter::Node<'_>) -> bool {
+    matches!(
+        ty.kind(),
+        "map_type" | "slice_type" | "array_type" | "implicit_length_array_type"
+    )
+}
+
+fn is_go_struct_literal_field_key(node: tree_sitter::Node<'_>) -> bool {
+    if node.kind() != "identifier" {
+        return false;
+    }
+    let Some(lit_elem) = node.parent().filter(|p| p.kind() == "literal_element") else {
+        return false;
+    };
+    let Some(keyed) = lit_elem.parent().filter(|p| p.kind() == "keyed_element") else {
+        return false;
+    };
+    let is_key = keyed
+        .child_by_field_name("key")
+        .or_else(|| keyed.named_child(0))
+        == Some(lit_elem);
+    if !is_key {
+        return false;
+    }
+    let Some(lit_val) = keyed.parent().filter(|p| p.kind() == "literal_value") else {
+        return false;
+    };
+    let Some(parent) = lit_val.parent() else {
+        return false;
+    };
+    if parent.kind() == "composite_literal" {
+        return parent
+            .child_by_field_name("type")
+            .is_some_and(|ty| !go_composite_type_is_non_struct(ty));
+    }
+    // Elided struct literal inside a slice/array/map literal, e.g. `[]Box{{Calc: Calc(1)}}`.
+    if parent.kind() == "literal_element" {
+        let mut cur = parent.parent();
+        while let Some(anc) = cur {
+            if anc.kind() == "composite_literal" {
+                if let Some(ty) = anc.child_by_field_name("type") {
+                    let inner = match ty.kind() {
+                        "slice_type" | "array_type" | "implicit_length_array_type" => {
+                            ty.child_by_field_name("element")
+                        }
+                        "map_type" => ty.child_by_field_name("value"),
+                        _ => None,
+                    };
+                    if let Some(elem_ty) = inner {
+                        return !go_composite_type_is_non_struct(elem_ty);
+                    }
+                }
+                return true;
+            }
+            cur = anc.parent();
+        }
+    }
+    false
+}
+
 /// Locates every AST-role-verified Tree-sitter identifier leaf equal to
-/// `old_name`, preserving comments, string literals, object keys, Python
-/// kwargs/parameters, PHP `$vars`, and failing closed on unsafe JS/TS
-/// destructuring patterns or Vue/Svelte/Astro template references.
+/// `old_name`, preserving comments, string literals, object keys, Go struct
+/// literal keys, Python kwargs/parameters/lambdas, PHP `$vars`, and failing
+/// closed on unsafe JS/TS shorthand destructuring or Vue/Svelte/Astro template
+/// references.
 #[allow(clippy::too_many_arguments)]
 fn find_treesitter_identifier_spans(
     parser_slot: &mut Option<tree_sitter::Parser>,
@@ -8067,31 +9375,22 @@ fn find_treesitter_identifier_spans(
     let is_module_def = matches!(def_kind, "module" | "mod");
     let namespaces =
         collect_treesitter_namespace_imports(&tree, parse_input, parse_grammar, file, def_file);
+    let shadow_ranges = collect_treesitter_shadow_ranges(
+        &tree,
+        parse_input,
+        family,
+        file,
+        def_file,
+        def_kind,
+        old_name,
+    );
 
     let mut spans: Vec<(Range<usize>, Option<String>)> = Vec::new();
-    let mut shadow_ranges: Vec<Range<usize>> = Vec::new();
     let mut cursor = tree.walk();
     'walk: loop {
         let node = cursor.node();
         let kind = node.kind();
         let skip_subtree = kind.contains("comment");
-
-        // Track function bodies where a parameter shadows `old_name`.
-        if !skip_subtree
-            && !is_var_def
-            && matches!(
-                kind,
-                "function_definition"
-                    | "function_declaration"
-                    | "function_expression"
-                    | "arrow_function"
-                    | "method_definition"
-            )
-            && fn_params_bind_name(node, parse_input, family, old_name)
-            && let Some(body) = node.child_by_field_name("body")
-        {
-            shadow_ranges.push(body.byte_range());
-        }
 
         if !skip_subtree && is_treesitter_identifier(parse_grammar, node) {
             let range = node.byte_range();
@@ -8144,6 +9443,15 @@ fn find_treesitter_identifier_spans(
                         };
                     }
 
+                    // 2b. Go struct literal field keys (`Box{Calc: Calc(1)}`).
+                    if include
+                        && family == Grammar::Go
+                        && !is_member_def
+                        && is_go_struct_literal_field_key(node)
+                    {
+                        include = false;
+                    }
+
                     // 3. JS/TS AST-role filtering.
                     if include && family == Grammar::JavaScript {
                         let is_import_or_export_alias =
@@ -8151,18 +9459,21 @@ fn find_treesitter_identifier_spans(
                                 && parent.and_then(|p| p.child_by_field_name("alias"))
                                     == Some(node);
                         let is_ns_alias = pkind == "namespace_import" && !is_module_def;
-                        let is_param_binding = !is_var_def
+                        let is_param_binding = def_kind != "local"
                             && ((matches!(pkind, "required_parameter" | "optional_parameter")
                                 && parent.and_then(|p| p.child_by_field_name("pattern"))
                                     == Some(node))
-                                || (pkind == "assignment_pattern"
-                                    && parent.and_then(|p| p.child_by_field_name("left"))
-                                        == Some(node)
-                                    && parent
-                                        .and_then(|p| p.parent())
-                                        .is_some_and(|gp| gp.kind() == "formal_parameters"))
+                                || (matches!(
+                                    pkind,
+                                    "assignment_pattern" | "object_assignment_pattern"
+                                ) && parent.and_then(|p| p.child_by_field_name("left"))
+                                    == Some(node))
                                 || pkind == "formal_parameters"
+                                || pkind == "array_pattern"
                                 || (pkind == "arrow_function"
+                                    && parent.and_then(|p| p.child_by_field_name("parameter"))
+                                        == Some(node))
+                                || (pkind == "catch_clause"
                                     && parent.and_then(|p| p.child_by_field_name("parameter"))
                                         == Some(node))
                                 || (pkind == "rest_pattern"
@@ -8183,7 +9494,7 @@ fn find_treesitter_identifier_spans(
                     if include && family == Grammar::Python {
                         let is_kwarg_name = pkind == "keyword_argument"
                             && parent.and_then(|p| p.child_by_field_name("name")) == Some(node);
-                        let is_param_name = !is_var_def
+                        let is_param_name = def_kind != "local"
                             && ((matches!(pkind, "default_parameter" | "typed_default_parameter")
                                 && parent.and_then(|p| p.child_by_field_name("name"))
                                     == Some(node))
@@ -8204,9 +9515,10 @@ fn find_treesitter_identifier_spans(
                                 gp.kind() == "import_from_statement"
                                     && gp.child_by_field_name("module_name") == parent
                             });
-                        let is_unrelated_attr = pkind == "attribute"
+                        let is_attr_access = pkind == "attribute"
                             && parent.and_then(|p| p.child_by_field_name("attribute"))
-                                == Some(node)
+                                == Some(node);
+                        let is_unrelated_attr = is_attr_access
                             && !is_member_def
                             && !parent
                                 .and_then(|p| p.child_by_field_name("object"))
@@ -8218,7 +9530,7 @@ fn find_treesitter_identifier_spans(
                             || is_import_alias
                             || is_import_module_seg
                             || is_unrelated_attr
-                            || is_shadowed
+                            || (is_shadowed && !is_attr_access)
                         {
                             include = false;
                         }
@@ -10810,6 +12122,727 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("unrelated.py")).unwrap(),
             py_orig
+        );
+    }
+
+    #[test]
+    fn rename_rust_owner_enum_alias_shadow_macros_shorthand_and_lowercase_type() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            concat!(
+                "pub mod owner;\n",
+                "pub mod status;\n",
+                "pub mod status_user;\n",
+                "pub mod free_go;\n",
+                "pub mod other;\n",
+                "pub mod target;\n",
+                "pub mod alias_mod;\n",
+                "pub mod api;\n",
+                "pub mod facade;\n",
+                "pub mod unrelated_facade;\n",
+                "pub mod lower_and_shorthand;\n",
+            ),
+        )
+        .unwrap();
+
+        // P0-1: Method & UFCS owner check (`Foo::new` vs `Vec::new` / `String::new` / `Bar::new`,
+        //       `Foo::ping` vs `Bar::ping` on typed receivers + fail-closed on untyped receiver).
+        fs::write(
+            dir.path().join("src/owner.rs"),
+            concat!(
+                "pub struct Foo;\n",
+                "impl Foo {\n",
+                "    pub fn new() -> Self { Foo }\n",
+                "    pub fn make() -> Self { Self::new() }\n",
+                "    pub fn ping(&self) -> i32 { 1 }\n",
+                "    pub fn self_ping(&self) -> i32 { self.ping() }\n",
+                "}\n",
+                "pub struct Bar;\n",
+                "impl Bar {\n",
+                "    pub fn new() -> Self { Bar }\n",
+                "    pub fn make() -> Self { Self::new() }\n",
+                "    pub fn ping(&self) -> i32 { 2 }\n",
+                "    pub fn self_ping(&self) -> i32 { self.ping() }\n",
+                "}\n",
+                "pub fn use_both(f: Foo, b: Bar) -> i32 {\n",
+                "    let _v: Vec<i32> = Vec::new();\n",
+                "    let _s = String::new();\n",
+                "    let _f2 = Foo::new();\n",
+                "    let _b2 = Bar::new();\n",
+                "    let _f3 = <Foo>::new();\n",
+                "    let _v2 = <Vec<i32>>::new();\n",
+                "    f.ping() + b.ping()\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+
+        // P0-1: Free fn `go` must NEVER touch `<A as Runner>::go()`.
+        fs::write(
+            dir.path().join("src/free_go.rs"),
+            concat!(
+                "pub trait Runner { fn go(); }\n",
+                "pub struct A;\n",
+                "impl Runner for A { fn go() {} }\n",
+                "pub fn go() -> i32 { 1 }\n",
+                "pub fn run() -> i32 {\n",
+                "    <A as Runner>::go();\n",
+                "    go()\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+
+        // P0-2: Enum rename vs same-named variant & `use Enum::{...}` / `*` / `Ok` / `Status`.
+        fs::write(
+            dir.path().join("src/status.rs"),
+            concat!(
+                "pub enum Status {\n",
+                "    Status(i32),\n",
+                "    Ok,\n",
+                "    Err,\n",
+                "}\n",
+                "pub enum Outer {\n",
+                "    Status(Status),\n",
+                "}\n",
+                "pub fn wrap(v: i32) -> Outer {\n",
+                "    let o = Outer::Status(Status::Status(v));\n",
+                "    match o {\n",
+                "        Outer::Status(Status::Status(n)) => Outer::Status(Status::Status(n + 1)),\n",
+                "        _ => Outer::Status(Status::Ok),\n",
+                "    }\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/status_user.rs"),
+            concat!(
+                "use crate::status::Status::{Ok, Err};\n",
+                "pub mod glob_use {\n",
+                "    use crate::status::Status::*;\n",
+                "    pub fn mk() { let _ = Ok; }\n",
+                "}\n",
+                "pub mod single_use {\n",
+                "    use crate::status::Status::Ok as Good;\n",
+                "    use crate::status::Status::Status;\n",
+                "    pub fn mk() { let _ = (Good, Status(1)); }\n",
+                "}\n",
+                "pub fn pair() { let _ = (Ok, Err); }\n",
+            ),
+        )
+        .unwrap();
+
+        // P0-3, P1-3, P1-4: Module-level `use ... as old_fn` (order-independent!),
+        // nested block-local `fn old_fn()`, `vec![old_fn(); 3]`, `matches!`, `ensure!`.
+        fs::write(
+            dir.path().join("src/other.rs"),
+            "pub fn helper(x: i32) -> i32 { x * 10 }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/target.rs"),
+            concat!(
+                "pub fn old_fn(x: i32) -> i32 { x + 1 }\n",
+                "pub fn nested_and_macros(v: Option<i32>) -> Vec<i32> {\n",
+                "    let outer = old_fn(1);\n",
+                "    let inner = {\n",
+                "        let pre = old_fn(2);\n",
+                "        fn old_fn(n: i32) -> i32 {\n",
+                "            if n > 0 { old_fn(n - 1) } else { 0 }\n",
+                "        }\n",
+                "        pre + old_fn(3)\n",
+                "    };\n",
+                "    let _m1 = matches!(old_fn(outer), 1..=10 if old_fn(inner) > 0);\n",
+                "    let _m2 = matches!(v, Some(old_fn) if old_fn > 0);\n",
+                "    let _ = ensure_or_log(old_fn(4));\n",
+                "    vec![old_fn(5); 3]\n",
+                "}\n",
+                "fn ensure_or_log(n: i32) -> Result<(), String> {\n",
+                "    macro_rules! ensure { ($c:expr, $m:expr) => { if !$c { return Err($m.into()); } }; }\n",
+                "    ensure!(old_fn(n) > 0, \"bad\");\n",
+                "    Ok(())\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/alias_mod.rs"),
+            concat!(
+                "pub fn before_use() -> i32 {\n",
+                "    old_fn(1) + crate::target::old_fn(2)\n",
+                "}\n",
+                "use crate::other::helper as old_fn;\n",
+                "pub fn after_use() -> i32 {\n",
+                "    old_fn(3) + crate::target::old_fn(4)\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+
+        // P1-2: `pub use api::old_fn as my_alias` updates `facade.rs` without propagating `old_fn`.
+        fs::write(
+            dir.path().join("src/api.rs"),
+            "pub use crate::target::old_fn;\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/facade.rs"),
+            "pub use crate::api::old_fn as my_alias;\n",
+        )
+        .unwrap();
+        let unrelated_facade_orig = "pub fn unrelated() -> i32 { let old_fn = 7; old_fn }\n// mentions crate::facade::old_fn\n";
+        fs::write(
+            dir.path().join("src/unrelated_facade.rs"),
+            unrelated_facade_orig,
+        )
+        .unwrap();
+
+        // P1-5: lowercase struct `my_ctx::new()` & Rust `const limit` struct-init shorthand `Cfg { limit }`.
+        fs::write(
+            dir.path().join("src/lower_and_shorthand.rs"),
+            concat!(
+                "#[allow(non_camel_case_types)]\n",
+                "pub struct my_ctx;\n",
+                "impl my_ctx {\n",
+                "    pub fn new() -> Self { my_ctx }\n",
+                "}\n",
+                "pub fn build_ctx() -> my_ctx { my_ctx::new() }\n",
+                "#[allow(non_upper_case_globals)]\n",
+                "pub const limit: usize = 64;\n",
+                "pub struct Cfg { pub limit: usize }\n",
+                "pub fn default_cfg() -> Cfg { Cfg { limit } }\n",
+                "pub fn custom_cfg(limit: usize) -> Cfg { Cfg { limit } }\n",
+            ),
+        )
+        .unwrap();
+
+        let ws = test_workspace(dir.path());
+        let index = Index::open(&ws).unwrap();
+
+        // 1. P0-1a: `Foo::new` -> `create` leaves `Vec::new`, `String::new`, `Bar::new`, `Self::new` in `impl Bar` untouched.
+        let p_new =
+            plan_symbol_rename(&ws, &index, "demo::owner::Foo::new", "create", None, true).unwrap();
+        apply_symbol_rename(&ws, &p_new).unwrap();
+        let owner_src = fs::read_to_string(dir.path().join("src/owner.rs")).unwrap();
+        assert!(
+            owner_src.contains("pub fn create() -> Self { Foo }"),
+            "{owner_src}"
+        );
+        assert!(
+            owner_src.contains("pub fn make() -> Self { Self::create() }"),
+            "{owner_src}"
+        );
+        assert!(
+            owner_src.contains("let _f2 = Foo::create();"),
+            "{owner_src}"
+        );
+        assert!(
+            owner_src.contains("let _f3 = <Foo>::create();"),
+            "{owner_src}"
+        );
+        assert!(
+            owner_src.contains("pub fn new() -> Self { Bar }"),
+            "{owner_src}"
+        );
+        assert!(
+            owner_src.contains("pub fn make() -> Self { Self::new() }"),
+            "{owner_src}"
+        );
+        assert!(
+            owner_src.contains("let _v: Vec<i32> = Vec::new();"),
+            "{owner_src}"
+        );
+        assert!(owner_src.contains("let _s = String::new();"), "{owner_src}");
+        assert!(owner_src.contains("let _b2 = Bar::new();"), "{owner_src}");
+        assert!(
+            owner_src.contains("let _v2 = <Vec<i32>>::new();"),
+            "{owner_src}"
+        );
+
+        // 2. P0-1b: `Foo::ping` -> `poke` renames `f.ping()` & `self.ping()` in `impl Foo`, leaves `b.ping()` & `impl Bar` untouched.
+        let index = Index::open(&ws).unwrap();
+        let p_ping =
+            plan_symbol_rename(&ws, &index, "demo::owner::Foo::ping", "poke", None, true).unwrap();
+        apply_symbol_rename(&ws, &p_ping).unwrap();
+        let owner_src = fs::read_to_string(dir.path().join("src/owner.rs")).unwrap();
+        assert!(
+            owner_src.contains("pub fn poke(&self) -> i32 { 1 }"),
+            "{owner_src}"
+        );
+        assert!(
+            owner_src.contains("pub fn self_ping(&self) -> i32 { self.poke() }"),
+            "{owner_src}"
+        );
+        assert!(
+            owner_src.contains("pub fn ping(&self) -> i32 { 2 }"),
+            "{owner_src}"
+        );
+        assert!(
+            owner_src.contains("pub fn self_ping(&self) -> i32 { self.ping() }"),
+            "{owner_src}"
+        );
+        assert!(owner_src.contains("f.poke() + b.ping()"), "{owner_src}");
+
+        // 3. P0-1c: Untyped receiver `.poke()` when competing `Bar::poke` exists fails closed.
+        fs::write(
+            dir.path().join("src/owner.rs"),
+            format!(
+                "{owner_src}\nimpl Bar {{ pub fn poke(&self) -> i32 {{ 3 }} }}\nfn mystery() -> Foo {{ Foo }}\npub fn ambig() -> i32 {{ mystery().poke() }}\n"
+            ),
+        )
+        .unwrap();
+        let index = Index::open(&ws).unwrap();
+        let ambig_err =
+            plan_symbol_rename(&ws, &index, "demo::owner::Foo::poke", "beep", None, true)
+                .unwrap_err()
+                .to_string();
+        assert!(ambig_err.contains("ambiguous method call"), "{ambig_err}");
+
+        // 4. P0-1d: Free fn `go` -> `launch` leaves `<A as Runner>::go()` untouched.
+        let p_go =
+            plan_symbol_rename(&ws, &index, "demo::free_go::go", "launch", None, true).unwrap();
+        apply_symbol_rename(&ws, &p_go).unwrap();
+        let go_src = fs::read_to_string(dir.path().join("src/free_go.rs")).unwrap();
+        assert!(go_src.contains("pub trait Runner { fn go(); }"), "{go_src}");
+        assert!(
+            go_src.contains("impl Runner for A { fn go() {} }"),
+            "{go_src}"
+        );
+        assert!(go_src.contains("<A as Runner>::go();"), "{go_src}");
+        assert!(go_src.contains("pub fn launch() -> i32 { 1 }"), "{go_src}");
+        assert!(go_src.contains("    launch()\n"), "{go_src}");
+
+        // 5. P0-2: Enum `Status` -> `State` preserves `Outer::Status` & variant `::Status`, updates all `use Status::...` forms.
+        let index = Index::open(&ws).unwrap();
+        let p_status =
+            plan_symbol_rename(&ws, &index, "demo::status::Status", "State", None, true).unwrap();
+        apply_symbol_rename(&ws, &p_status).unwrap();
+        let status_src = fs::read_to_string(dir.path().join("src/status.rs")).unwrap();
+        assert!(status_src.contains("pub enum State {"), "{status_src}");
+        assert!(status_src.contains("Status(i32),"), "{status_src}");
+        assert!(status_src.contains("Status(State),"), "{status_src}");
+        assert!(
+            status_src.contains("let o = Outer::Status(State::Status(v));"),
+            "{status_src}"
+        );
+        assert!(
+            status_src.contains(
+                "Outer::Status(State::Status(n)) => Outer::Status(State::Status(n + 1)),"
+            ),
+            "{status_src}"
+        );
+        assert!(
+            status_src.contains("_ => Outer::Status(State::Ok),"),
+            "{status_src}"
+        );
+        let status_user = fs::read_to_string(dir.path().join("src/status_user.rs")).unwrap();
+        assert!(
+            status_user.contains("use crate::status::State::{Ok, Err};"),
+            "{status_user}"
+        );
+        assert!(
+            status_user.contains("use crate::status::State::*;"),
+            "{status_user}"
+        );
+        assert!(
+            status_user.contains("use crate::status::State::Ok as Good;"),
+            "{status_user}"
+        );
+        assert!(
+            status_user.contains("use crate::status::State::Status;"),
+            "{status_user}"
+        );
+
+        // 6. P0-3, P1-2, P1-3, P1-4: Rename `demo::target::old_fn` -> `new_fn`.
+        let index = Index::open(&ws).unwrap();
+        let p_fn =
+            plan_symbol_rename(&ws, &index, "demo::target::old_fn", "new_fn", None, true).unwrap();
+        assert!(
+            !p_fn
+                .files
+                .iter()
+                .any(|f| f.path == "src/unrelated_facade.rs"),
+            "renamed pub use alias must not propagate old_name to unrelated files: {:?}",
+            p_fn.files
+        );
+        apply_symbol_rename(&ws, &p_fn).unwrap();
+        let alias_src = fs::read_to_string(dir.path().join("src/alias_mod.rs")).unwrap();
+        assert!(
+            alias_src.contains("old_fn(1) + crate::target::new_fn(2)"),
+            "{alias_src}"
+        );
+        assert!(
+            alias_src.contains("use crate::other::helper as old_fn;"),
+            "{alias_src}"
+        );
+        assert!(
+            alias_src.contains("old_fn(3) + crate::target::new_fn(4)"),
+            "{alias_src}"
+        );
+        let target_src = fs::read_to_string(dir.path().join("src/target.rs")).unwrap();
+        assert!(
+            target_src.contains("pub fn new_fn(x: i32) -> i32"),
+            "{target_src}"
+        );
+        assert!(
+            target_src.contains("let outer = new_fn(1);"),
+            "{target_src}"
+        );
+        assert!(target_src.contains("let pre = old_fn(2);"), "{target_src}");
+        assert!(
+            target_src.contains("fn old_fn(n: i32) -> i32"),
+            "{target_src}"
+        );
+        assert!(
+            target_src.contains("if n > 0 { old_fn(n - 1) }"),
+            "{target_src}"
+        );
+        assert!(target_src.contains("pre + old_fn(3)"), "{target_src}");
+        assert!(
+            target_src.contains("matches!(new_fn(outer), 1..=10 if new_fn(inner) > 0)"),
+            "{target_src}"
+        );
+        assert!(
+            target_src.contains("matches!(v, Some(old_fn) if old_fn > 0)"),
+            "{target_src}"
+        );
+        assert!(target_src.contains("vec![new_fn(5); 3]"), "{target_src}");
+        assert!(
+            target_src.contains("ensure!(new_fn(n) > 0, \"bad\");"),
+            "{target_src}"
+        );
+        let facade_src = fs::read_to_string(dir.path().join("src/facade.rs")).unwrap();
+        assert!(
+            facade_src.contains("pub use crate::api::new_fn as my_alias;"),
+            "{facade_src}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/unrelated_facade.rs")).unwrap(),
+            unrelated_facade_orig
+        );
+
+        // 7. P1-5: lowercase `my_ctx::new()` & Rust `const limit` shorthand `Cfg { limit }`.
+        let index = Index::open(&ws).unwrap();
+        let p_ctx = plan_symbol_rename(
+            &ws,
+            &index,
+            "demo::lower_and_shorthand::my_ctx",
+            "new_ctx",
+            None,
+            true,
+        )
+        .unwrap();
+        apply_symbol_rename(&ws, &p_ctx).unwrap();
+        let index = Index::open(&ws).unwrap();
+        let p_lim = plan_symbol_rename(
+            &ws,
+            &index,
+            "demo::lower_and_shorthand::limit",
+            "cap",
+            None,
+            true,
+        )
+        .unwrap();
+        apply_symbol_rename(&ws, &p_lim).unwrap();
+        let ls_src = fs::read_to_string(dir.path().join("src/lower_and_shorthand.rs")).unwrap();
+        assert!(ls_src.contains("pub struct new_ctx;"), "{ls_src}");
+        assert!(
+            ls_src.contains("pub fn build_ctx() -> new_ctx { new_ctx::new() }"),
+            "{ls_src}"
+        );
+        assert!(ls_src.contains("pub const cap: usize = 64;"), "{ls_src}");
+        assert!(
+            ls_src.contains("pub struct Cfg { pub limit: usize }"),
+            "{ls_src}"
+        );
+        assert!(
+            ls_src.contains("pub fn default_cfg() -> Cfg { Cfg { limit: cap } }"),
+            "{ls_src}"
+        );
+        assert!(
+            ls_src.contains("pub fn custom_cfg(limit: usize) -> Cfg { Cfg { limit } }"),
+            "{ls_src}"
+        );
+    }
+
+    #[test]
+    fn rename_go_struct_key_ts_alias_destructuring_python_lambda_and_vue_script_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("go")).unwrap();
+        fs::create_dir_all(dir.path().join("web")).unwrap();
+        fs::create_dir_all(dir.path().join("py")).unwrap();
+
+        // P0-4: Go struct composite literal field key (`Box{Calc: Calc(1)}`) vs map key (`map[int]int{LIMIT: LIMIT}`).
+        fs::write(
+            dir.path().join("go/main.go"),
+            concat!(
+                "package main\n\n",
+                "type Box struct { Calc int }\n",
+                "const LIMIT = 7\n",
+                "func Calc(x int) int { return x + 1 }\n",
+                "func run() (Box, []Box, map[int]int) {\n",
+                "    b := Box{Calc: Calc(1)}\n",
+                "    bs := []Box{{Calc: Calc(2)}}\n",
+                "    m := map[int]int{LIMIT: LIMIT}\n",
+                "    return b, bs, m\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+
+        // P0-5: TS aliased imports/re-exports, pair_pattern/rest_pattern/local const shadows.
+        fs::write(
+            dir.path().join("web/math.ts"),
+            "export function calcTotal(a: number): number { return a + 1; }\nexport function other(): number { return 0; }\n",
+        )
+        .unwrap();
+        let aliased_only_orig = concat!(
+            "import { other as calcTotal } from \"./math\";\n",
+            "export function run(): number { return calcTotal(); }\n",
+        );
+        fs::write(dir.path().join("web/aliased.ts"), aliased_only_orig).unwrap();
+        let barrel_alias_orig = "export { other as calcTotal } from \"./math\";\n";
+        fs::write(dir.path().join("web/barrel.ts"), barrel_alias_orig).unwrap();
+        let barrel_consumer_orig = concat!(
+            "import { calcTotal } from \"./barrel\";\n",
+            "export function viaBarrel(): number { return calcTotal(); }\n",
+        );
+        fs::write(dir.path().join("web/barrel_user.ts"), barrel_consumer_orig).unwrap();
+        fs::write(
+            dir.path().join("web/shadows.ts"),
+            concat!(
+                "import { calcTotal } from \"./math\";\n",
+                "export function paramAlias({ x: calcTotal }: { x: number }): number {\n",
+                "  return calcTotal + 1;\n",
+                "}\n",
+                "export function restLocal(arr: number[]): number {\n",
+                "  const [...calcTotal] = arr;\n",
+                "  return calcTotal.length;\n",
+                "}\n",
+                "export function objLocal(obj: { x: number }): number {\n",
+                "  const { x: calcTotal } = obj;\n",
+                "  return calcTotal;\n",
+                "}\n",
+                "export function realCall(n: number): number {\n",
+                "  return calcTotal(n);\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("web/alias_and_ns.ts"),
+            concat!(
+                "import { other as calcTotal } from \"./math\";\n",
+                "import * as mathNs from \"./math\";\n",
+                "export function mixed(): number {\n",
+                "  return calcTotal() + mathNs.calcTotal(1);\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+
+        // P0-5: Python lambda parameter shadow + aliased import shadow.
+        fs::write(
+            dir.path().join("py/util.py"),
+            "def fetch_user(uid: int) -> int:\n    return uid + 1\ndef other_py(uid: int) -> int:\n    return uid * 2\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("py/lambdas.py"),
+            concat!(
+                "from py.util import fetch_user\n",
+                "fn = lambda fetch_user: fetch_user + 1\n",
+                "def call_real(uid: int) -> int:\n",
+                "    return fetch_user(uid)\n",
+            ),
+        )
+        .unwrap();
+        let py_aliased_only_orig = concat!(
+            "from py.util import other_py as fetch_user\n",
+            "def keep(uid: int) -> int:\n",
+            "    return fetch_user(uid)\n",
+        );
+        fs::write(dir.path().join("py/aliased_only.py"), py_aliased_only_orig).unwrap();
+        fs::write(
+            dir.path().join("py/aliased_py.py"),
+            concat!(
+                "from py.util import other_py as fetch_user\n",
+                "import py.util as u\n",
+                "def run(uid: int) -> int:\n",
+                "    return fetch_user(uid) + u.fetch_user(uid)\n",
+            ),
+        )
+        .unwrap();
+
+        let ws = test_workspace(dir.path());
+        let index = Index::open(&ws).unwrap();
+
+        // 1. Go `Calc` -> `Compute` preserves struct field key `Calc:` and renames value `Calc(1)` / `Calc(2)`.
+        let go_plan = plan_symbol_rename(&ws, &index, "Calc", "Compute", None, true).unwrap();
+        apply_symbol_rename(&ws, &go_plan).unwrap();
+        let go_after = fs::read_to_string(dir.path().join("go/main.go")).unwrap();
+        assert!(
+            go_after.contains("type Box struct { Calc int }"),
+            "{go_after}"
+        );
+        assert!(go_after.contains("func Compute(x int) int"), "{go_after}");
+        assert!(
+            go_after.contains("b := Box{Calc: Compute(1)}"),
+            "{go_after}"
+        );
+        assert!(
+            go_after.contains("bs := []Box{{Calc: Compute(2)}}"),
+            "{go_after}"
+        );
+        // Non-struct composite literal (`map[int]int{LIMIT: LIMIT}`) keeps BOTH key and value renamable.
+        let mut go_parser = None;
+        let mut go_lang = None;
+        let map_spans = find_treesitter_identifier_spans(
+            &mut go_parser,
+            &mut go_lang,
+            Grammar::Go,
+            "go/main.go",
+            "go/main.go",
+            "constant",
+            &go_after,
+            "LIMIT",
+            "CAP",
+        )
+        .unwrap();
+        assert_eq!(
+            map_spans.len(),
+            3,
+            "const LIMIT + map key + map value: {map_spans:?}"
+        );
+
+        // 2. TS `calcTotal` -> `sumValues` ignores `other as calcTotal` files and preserves destructuring/rest shadows.
+        let index = Index::open(&ws).unwrap();
+        let ts_plan =
+            plan_symbol_rename(&ws, &index, "calcTotal", "sumValues", None, true).unwrap();
+        assert!(
+            !ts_plan.files.iter().any(|f| f.path == "web/aliased.ts"),
+            "{:?}",
+            ts_plan.files
+        );
+        assert!(
+            !ts_plan.files.iter().any(|f| f.path == "web/barrel.ts"),
+            "{:?}",
+            ts_plan.files
+        );
+        assert!(
+            !ts_plan.files.iter().any(|f| f.path == "web/barrel_user.ts"),
+            "{:?}",
+            ts_plan.files
+        );
+        apply_symbol_rename(&ws, &ts_plan).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("web/aliased.ts")).unwrap(),
+            aliased_only_orig
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("web/barrel.ts")).unwrap(),
+            barrel_alias_orig
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("web/barrel_user.ts")).unwrap(),
+            barrel_consumer_orig
+        );
+        let shadows_after = fs::read_to_string(dir.path().join("web/shadows.ts")).unwrap();
+        assert!(
+            shadows_after.contains("import { sumValues } from \"./math\";"),
+            "{shadows_after}"
+        );
+        assert!(
+            shadows_after.contains(
+                "paramAlias({ x: calcTotal }: { x: number }): number {\n  return calcTotal + 1;"
+            ),
+            "{shadows_after}"
+        );
+        assert!(
+            shadows_after.contains("const [...calcTotal] = arr;\n  return calcTotal.length;"),
+            "{shadows_after}"
+        );
+        assert!(
+            shadows_after.contains("const { x: calcTotal } = obj;\n  return calcTotal;"),
+            "{shadows_after}"
+        );
+        assert!(
+            shadows_after.contains("return sumValues(n);"),
+            "{shadows_after}"
+        );
+        let alias_ns_after = fs::read_to_string(dir.path().join("web/alias_and_ns.ts")).unwrap();
+        assert!(
+            alias_ns_after.contains("return calcTotal() + mathNs.sumValues(1);"),
+            "{alias_ns_after}"
+        );
+
+        // 3. P1-1: Vue `<script>` containing `const marker = "<!--"` MUST NOT bypass template guard.
+        fs::write(
+            dir.path().join("web/Trick.vue"),
+            "<script setup lang=\"ts\">\nconst marker = \"<!--\";\nimport { sumValues } from \"./math\";\nconst n = sumValues(1);\n</script>\n<template><div>{{ sumValues(2) }}</div></template>\n",
+        )
+        .unwrap();
+        let index = Index::open(&ws).unwrap();
+        let vue_err = plan_symbol_rename(&ws, &index, "sumValues", "totalValue", None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            vue_err.contains("template in web/Trick.vue references 'sumValues' outside <script>"),
+            "{vue_err}"
+        );
+        // Real HTML comment outside `<script>` still does not falsely fail.
+        fs::write(
+            dir.path().join("web/Trick.vue"),
+            "<script setup lang=\"ts\">\nimport { sumValues } from \"./math\";\nconst n = sumValues(1);\n</script>\n<template><!-- sumValues(2) --><div>ok</div></template>\n",
+        )
+        .unwrap();
+        let index = Index::open(&ws).unwrap();
+        let vue_ok =
+            plan_symbol_rename(&ws, &index, "sumValues", "totalValue", None, true).unwrap();
+        assert!(vue_ok.files.iter().any(|f| f.path == "web/Trick.vue"));
+
+        // 4. Python `fetch_user` -> `load_account` preserves `lambda fetch_user: fetch_user + 1` and `other_py as fetch_user`.
+        let py_plan =
+            plan_symbol_rename(&ws, &index, "fetch_user", "load_account", None, true).unwrap();
+        assert!(
+            !py_plan.files.iter().any(|f| f.path == "py/aliased_only.py"),
+            "{:?}",
+            py_plan.files
+        );
+        apply_symbol_rename(&ws, &py_plan).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("py/aliased_only.py")).unwrap(),
+            py_aliased_only_orig
+        );
+        let py_lambda = fs::read_to_string(dir.path().join("py/lambdas.py")).unwrap();
+        assert!(
+            py_lambda.contains("from py.util import load_account"),
+            "{py_lambda}"
+        );
+        assert!(
+            py_lambda.contains("fn = lambda fetch_user: fetch_user + 1"),
+            "{py_lambda}"
+        );
+        assert!(
+            py_lambda.contains("return load_account(uid)"),
+            "{py_lambda}"
+        );
+        let py_aliased = fs::read_to_string(dir.path().join("py/aliased_py.py")).unwrap();
+        assert!(
+            py_aliased.contains("from py.util import other_py as fetch_user"),
+            "{py_aliased}"
+        );
+        assert!(
+            py_aliased.contains("return fetch_user(uid) + u.load_account(uid)"),
+            "{py_aliased}"
         );
     }
 }

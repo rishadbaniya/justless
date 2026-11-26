@@ -794,19 +794,68 @@ impl<'ast> Visit<'ast> for Extractor {
                 | "dbg"
                 | "vec"
                 | "matches"
+                | "ensure"
+                | "bail"
+                | "anyhow"
         );
         // `stringify!` turns its tokens into text, and a `macro_rules!` body is patterns.
         let other = self.every_macro && !matches!(name, "stringify" | "macro_rules");
-        if (standard || other)
-            && let Ok(expressions) =
-                mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
-        {
-            for expression in &expressions {
-                match expression {
-                    // A field such as `info!(value = 3)` names no item.
-                    Expr::Assign(field) if !standard => self.visit_expr(&field.right),
-                    _ => self.visit_expr(expression),
+        if name == "matches" {
+            if let Ok((expr, pat, guard)) = mac.parse_body_with(
+                |input: syn::parse::ParseStream<'_>| -> syn::Result<(Expr, Pat, Option<Expr>)> {
+                    let expr: Expr = input.parse()?;
+                    let _: Token![,] = input.parse()?;
+                    let pat = Pat::parse_multi_with_leading_vert(input)?;
+                    let guard = if input.peek(Token![if]) {
+                        let _: Token![if] = input.parse()?;
+                        Some(input.parse::<Expr>()?)
+                    } else {
+                        None
+                    };
+                    let _ = input.parse::<Option<Token![,]>>();
+                    if !input.is_empty() {
+                        return Err(input.error("unexpected trailing tokens in matches!"));
+                    }
+                    Ok((expr, pat, guard))
+                },
+            ) {
+                self.visit_expr(&expr);
+                self.push_scope();
+                self.visit_pat(&pat);
+                self.bind(&pat, None);
+                if let Some(guard) = &guard {
+                    self.visit_expr(guard);
                 }
+                self.pop_scope();
+            }
+            return;
+        }
+        if standard || other {
+            if let Ok(expressions) =
+                mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+            {
+                for expression in &expressions {
+                    match expression {
+                        // A field such as `info!(value = 3)` names no item.
+                        Expr::Assign(field) if !standard => self.visit_expr(&field.right),
+                        _ => self.visit_expr(expression),
+                    }
+                }
+            } else if name == "vec"
+                && let Ok((elem, count)) = mac.parse_body_with(
+                    |input: syn::parse::ParseStream<'_>| -> syn::Result<(Expr, Expr)> {
+                        let elem: Expr = input.parse()?;
+                        let _: Token![;] = input.parse()?;
+                        let count: Expr = input.parse()?;
+                        if !input.is_empty() {
+                            return Err(input.error("unexpected trailing tokens in vec!"));
+                        }
+                        Ok((elem, count))
+                    },
+                )
+            {
+                self.visit_expr(&elem);
+                self.visit_expr(&count);
             }
         }
     }
@@ -1039,5 +1088,59 @@ mod tests {
             .map(|r| (r.from, r.kind))
             .collect();
         assert_eq!(calls, [(Some(inner_idx), Kind::Call)]);
+    }
+
+    #[test]
+    fn extracts_references_inside_ensure_bail_anyhow_vec_repeat_and_matches() {
+        let src = concat!(
+            "fn helper() -> i32 { 1 }\n",
+            "fn guard_fn() -> bool { true }\n",
+            "const COUNT: usize = 3;\n",
+            "enum Status { Ok, Err }\n",
+            "fn check(s: Status) -> Result<(), String> {\n",
+            "    let _v = vec![helper(); COUNT];\n",
+            "    let _m = matches!(s, Status::Ok if guard_fn());\n",
+            "    let _shadowed = matches!(Some(1), Some(helper) if helper > 0);\n",
+            "    ensure!(helper() > 0, \"bad\");\n",
+            "    if false { bail!(\"{}\", helper()); }\n",
+            "    let _e = anyhow!(\"{}\", helper());\n",
+            "    Ok(())\n",
+            "}\n",
+        );
+        let syntax = parse(src).unwrap();
+        let helper_calls = syntax
+            .references
+            .iter()
+            .filter(|r| r.kind == Kind::Call && r.path == ["helper"])
+            .count();
+        assert_eq!(
+            helper_calls, 4,
+            "expected helper() in vec repeat, ensure!, bail!, anyhow!: {:?}",
+            syntax.references
+        );
+        assert!(
+            syntax
+                .references
+                .iter()
+                .any(|r| r.path == ["COUNT"] && r.kind == Kind::Reference),
+            "expected COUNT in vec repeat: {:?}",
+            syntax.references
+        );
+        assert!(
+            syntax
+                .references
+                .iter()
+                .any(|r| r.path == ["guard_fn"] && r.kind == Kind::Call),
+            "expected guard_fn() in matches! guard: {:?}",
+            syntax.references
+        );
+        assert!(
+            !syntax
+                .references
+                .iter()
+                .any(|r| r.path == ["helper"] && r.kind == Kind::Reference),
+            "pattern-bound `helper` in matches! guard must stay shadowed: {:?}",
+            syntax.references
+        );
     }
 }

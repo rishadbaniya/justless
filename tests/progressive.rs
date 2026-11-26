@@ -1989,3 +1989,110 @@ fn rename_cli_hardened_ast_roles_reexports_vue_and_file_scoping() {
     contains(&a_after, "r + foo + b.foo");
     assert_eq!(read(root, "unrelated.py"), py_orig);
 }
+
+#[test]
+fn rename_cli_q9_owner_enum_shadow_go_ts_py_vue_regressions() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("go")).unwrap();
+    fs::create_dir_all(root.join("web")).unwrap();
+    fs::create_dir_all(root.join("py")).unwrap();
+
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"q9\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        concat!(
+            "pub mod status;\n",
+            "pub struct Foo;\n",
+            "impl Foo { pub fn new() -> Self { Foo } }\n",
+            "pub fn make() -> (Foo, Vec<i32>, String) { (Foo::new(), Vec::new(), String::new()) }\n",
+            "pub trait Runner { fn go(); }\n",
+            "impl Runner for Foo { fn go() {} }\n",
+            "pub fn go() -> i32 { <Foo as Runner>::go(); 1 }\n",
+            "pub fn call_go() -> i32 { go() }\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/status.rs"),
+        concat!(
+            "pub enum Status { Status(i32), Ok }\n",
+            "pub enum Outer { Status(Status) }\n",
+            "pub fn mk() -> Outer {\n",
+            "    use self::Status::{Ok, Status as St};\n",
+            "    let _ = (Ok, St(1));\n",
+            "    Outer::Status(Status::Status(2))\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("go/main.go"),
+        "package main\ntype Box struct { Calc int }\nfunc Calc(x int) int { return x }\nfunc run() Box { return Box{Calc: Calc(1)} }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("web/math.ts"),
+        "export function calcTotal(a: number): number { return a + 1; }\nexport function other(): number { return 0; }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("web/Trick.vue"),
+        "<script setup lang=\"ts\">\nconst marker = \"<!--\";\nimport { calcTotal } from \"./math\";\nconst v = calcTotal(1);\n</script>\n<template><span>{{ calcTotal(2) }}</span></template>\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("py/util.py"),
+        "def fetch_user(uid: int) -> int:\n    return uid + 1\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("py/app.py"),
+        "from py.util import fetch_user\nfn = lambda fetch_user: fetch_user + 1\ndef run(u): return fetch_user(u)\n",
+    )
+    .unwrap();
+
+    // 1. Rust `Foo::new` -> `create` leaves `Vec::new()` and `String::new()` intact.
+    let out = json(root, &["rename", "q9::Foo::new", "create", "--json"]);
+    assert_eq!(out["dry_run"], false);
+    let lib_src = read(root, "src/lib.rs");
+    contains(&lib_src, "(Foo::create(), Vec::new(), String::new())");
+
+    // 2. Rust free fn `go` -> `launch` leaves `<Foo as Runner>::go()` intact.
+    let _ = json(root, &["rename", "q9::go", "launch", "--json"]);
+    let lib_src = read(root, "src/lib.rs");
+    contains(
+        &lib_src,
+        "pub fn launch() -> i32 { <Foo as Runner>::go(); 1 }",
+    );
+    contains(&lib_src, "pub fn call_go() -> i32 { launch() }");
+
+    // 3. Rust enum `Status` -> `State` preserves `Outer::Status` & `::Status`, renames `use self::Status::{...}`.
+    let _ = json(root, &["rename", "q9::status::Status", "State", "--json"]);
+    let status_src = read(root, "src/status.rs");
+    contains(&status_src, "use self::State::{Ok, Status as St};");
+    contains(&status_src, "Outer::Status(State::Status(2))");
+
+    // 4. Go `Calc` -> `Compute` keeps struct field key `Calc:`.
+    let _ = json(root, &["rename", "Calc", "Compute", "--json"]);
+    contains(&read(root, "go/main.go"), "return Box{Calc: Compute(1)}");
+
+    // 5. Vue `<script>` with `"<!--"` still fails closed on `<template>` reference.
+    let vue_fail = run(root, &["rename", "calcTotal", "sumValues"], b"");
+    assert!(!vue_fail.status.success());
+    contains(
+        &stderr(&vue_fail),
+        "template in web/Trick.vue references 'calcTotal' outside <script>",
+    );
+
+    // 6. Python `fetch_user` -> `load_account` preserves `lambda fetch_user: fetch_user + 1`.
+    let _ = json(root, &["rename", "fetch_user", "load_account", "--json"]);
+    let py_app = read(root, "py/app.py");
+    contains(&py_app, "fn = lambda fetch_user: fetch_user + 1");
+    contains(&py_app, "def run(u): return load_account(u)");
+}

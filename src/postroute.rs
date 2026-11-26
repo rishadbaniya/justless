@@ -1343,6 +1343,9 @@ fn plan(command: &str) -> Option<Plan> {
 /// as a script fed by a here-document, a loop, a list or a pipe. Its output gets
 /// the clipped preview of a run.
 fn unknown_plan(command: &str) -> Option<Plan> {
+    if command_disables_justless(command) {
+        return None;
+    }
     let (commands, alone) = runs(command)?;
     lone(command).or_else(|| loose(&commands, alone))
 }
@@ -1390,6 +1393,9 @@ fn lone(command: &str) -> Option<Plan> {
 fn loose(commands: &Commands, alone: bool) -> Option<Plan> {
     let mut first = None;
     for (words, piped) in commands {
+        if stage_disables_justless(words) {
+            return None;
+        }
         let words = strip(words).unwrap_or(words);
         let refs: Vec<&str> = words.iter().map(String::as_str).collect();
         // A command routed for its preview alone has no report that would hide
@@ -1441,15 +1447,19 @@ type Commands = Vec<(Vec<String>, bool)>;
 /// given its commands with `-c`, and `eval`, run text this cannot see, so such a
 /// line is `None`. `None` too when the line runs `justless` or nothing but notes
 /// such as `echo`.
-fn runs(command: &str) -> Option<(Commands, bool)> {
-    enum Piece {
-        Word(String),
-        Pipe,
-        /// Any other operator, or the start of a substitution: a command follows.
-        Break,
-        /// A redirection, whose next word is a file or descriptor.
-        Target,
-    }
+enum ShellPiece {
+    Word(String),
+    Pipe,
+    /// Any other operator, or the start of a substitution: a command follows.
+    Break,
+    /// A redirection, whose next word is a file or descriptor.
+    Target,
+}
+
+/// Tokenize a shell command line loosely, stripping here-document bodies,
+/// comments and single-quoted opaque literals so loops, subshells, `if`
+/// blocks and substitutions still yield their command words.
+fn shell_pieces(command: &str) -> Option<Vec<ShellPiece>> {
     if command.len() > 64 * 1024 {
         return None;
     }
@@ -1493,9 +1503,9 @@ fn runs(command: &str) -> Option<(Commands, bool)> {
     let mut word = String::new();
     let mut double = false;
     let mut chars = text.chars().peekable();
-    fn flush(pieces: &mut Vec<Piece>, word: &mut String) {
+    fn flush(pieces: &mut Vec<ShellPiece>, word: &mut String) {
         if !word.is_empty() {
-            pieces.push(Piece::Word(std::mem::take(word)));
+            pieces.push(ShellPiece::Word(std::mem::take(word)));
         }
     }
     while let Some(c) = chars.next() {
@@ -1518,15 +1528,15 @@ fn runs(command: &str) -> Option<(Commands, bool)> {
             '$' if chars.peek() == Some(&'(') => {
                 chars.next();
                 flush(&mut pieces, &mut word);
-                pieces.push(Piece::Break);
+                pieces.push(ShellPiece::Break);
             }
             '`' => {
                 flush(&mut pieces, &mut word);
-                pieces.push(Piece::Break);
+                pieces.push(ShellPiece::Break);
             }
             '\n' if !double => {
                 flush(&mut pieces, &mut word);
-                pieces.push(Piece::Break);
+                pieces.push(ShellPiece::Break);
             }
             c if c.is_whitespace() => flush(&mut pieces, &mut word),
             c if double => word.push(c),
@@ -1537,18 +1547,18 @@ fn runs(command: &str) -> Option<(Commands, bool)> {
             }
             ';' | '&' | '(' | ')' => {
                 flush(&mut pieces, &mut word);
-                pieces.push(Piece::Break);
+                pieces.push(ShellPiece::Break);
             }
             '|' => {
                 flush(&mut pieces, &mut word);
                 if chars.peek() == Some(&'|') {
                     chars.next();
-                    pieces.push(Piece::Break);
+                    pieces.push(ShellPiece::Break);
                 } else {
                     if chars.peek() == Some(&'&') {
                         chars.next();
                     }
-                    pieces.push(Piece::Pipe);
+                    pieces.push(ShellPiece::Pipe);
                 }
             }
             '<' | '>' => {
@@ -1563,12 +1573,60 @@ fn runs(command: &str) -> Option<(Commands, bool)> {
                 {
                     chars.next();
                 }
-                pieces.push(Piece::Target);
+                pieces.push(ShellPiece::Target);
             }
             c => word.push(c),
         }
     }
     flush(&mut pieces, &mut word);
+    Some(pieces)
+}
+
+/// Extract every command stage (including leading assignments and `export`)
+/// from a shell line that [`parse`] rejected (comments, subshells, `if`
+/// blocks, `$(...)`, here-documents).
+fn loose_stages(command: &str) -> Vec<Vec<String>> {
+    let Some(pieces) = shell_pieces(command) else {
+        return Vec::new();
+    };
+    let mut stages: Vec<Vec<String>> = Vec::new();
+    let (mut starts, mut target, mut collecting) = (true, false, false);
+    for piece in pieces {
+        let word = match piece {
+            ShellPiece::Word(word) => word,
+            ShellPiece::Target => {
+                target = true;
+                continue;
+            }
+            ShellPiece::Pipe | ShellPiece::Break => {
+                (starts, target, collecting) = (true, false, false);
+                continue;
+            }
+        };
+        if std::mem::take(&mut target) {
+            continue;
+        }
+        if !starts {
+            if collecting && let Some(words) = stages.last_mut() {
+                words.push(word);
+            }
+            continue;
+        }
+        let name = basename(&word);
+        if KEYWORDS.contains(&name) && name != "time" {
+            starts = BEFORE_A_COMMAND.contains(&name);
+            collecting = false;
+            continue;
+        }
+        starts = false;
+        stages.push(vec![word]);
+        collecting = true;
+    }
+    stages
+}
+
+fn runs(command: &str) -> Option<(Commands, bool)> {
+    let pieces = shell_pieces(command)?;
 
     let mut commands: Commands = Vec::new();
     let mut compound = false;
@@ -1579,13 +1637,13 @@ fn runs(command: &str) -> Option<(Commands, bool)> {
     let mut shell = String::new();
     for piece in pieces {
         let word = match piece {
-            Piece::Word(word) => word,
-            Piece::Target => {
+            ShellPiece::Word(word) => word,
+            ShellPiece::Target => {
                 target = true;
                 continue;
             }
-            Piece::Pipe | Piece::Break => {
-                piped = matches!(piece, Piece::Pipe);
+            ShellPiece::Pipe | ShellPiece::Break => {
+                piped = matches!(piece, ShellPiece::Pipe);
                 (starts, target, collecting, compound) = (true, false, false, true);
                 continue;
             }
@@ -2277,8 +2335,37 @@ fn stage_disables_justless(words: &[String]) -> bool {
                 }
                 rest.get(i..).unwrap_or(&[])
             }
-            "export" | "time" | "nohup" => &rest[1..],
-            "command" if rest.get(1).is_some_and(|w| !w.starts_with('-')) => &rest[1..],
+            "export" => {
+                let mut i = 1;
+                while let Some(arg) = rest.get(i) {
+                    if arg == "--" {
+                        i += 1;
+                        break;
+                    } else if arg.starts_with('-') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                return rest[i..]
+                    .iter()
+                    .any(|arg| disables_justless_assignment(arg));
+            }
+            "time" | "nohup" => &rest[1..],
+            "command" => {
+                let mut i = 1;
+                while let Some(arg) = rest.get(i) {
+                    if arg == "--" {
+                        i += 1;
+                        break;
+                    } else if arg.starts_with('-') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                rest.get(i..).unwrap_or(&[])
+            }
             "nice" => match rest.get(1).map(String::as_str) {
                 Some("-n") => rest.get(3..).unwrap_or(&[]),
                 Some(w) if w.starts_with('-') => rest.get(2..).unwrap_or(&[]),
@@ -2286,9 +2373,18 @@ fn stage_disables_justless(words: &[String]) -> bool {
             },
             "timeout" => {
                 let mut i = 1;
-                while rest.get(i).is_some_and(|w| w.starts_with('-')) {
-                    i += 1;
+                while let Some(option) = rest.get(i).filter(|w| w.starts_with('-')) {
+                    if option == "--" {
+                        i += 1;
+                        break;
+                    }
+                    i += if matches!(option.as_str(), "-s" | "--signal" | "-k" | "--kill-after") {
+                        2
+                    } else {
+                        1
+                    };
                 }
+                // Skip the duration argument.
                 rest.get(i + 1..).unwrap_or(&[])
             }
             _ => return false,
@@ -2297,12 +2393,20 @@ fn stage_disables_justless(words: &[String]) -> bool {
 }
 
 fn command_disables_justless(command: &str) -> bool {
-    parse(command).is_some_and(|segments| {
-        segments
+    if let Some(segments) = parse(command) {
+        return segments
             .iter()
             .flatten()
-            .any(|stage| stage_disables_justless(&stage.words))
-    })
+            .any(|stage| stage_disables_justless(&stage.words));
+    }
+    loose_stages(command)
+        .iter()
+        .any(|words| stage_disables_justless(words))
+        || runs(command).is_some_and(|(commands, _)| {
+            commands
+                .iter()
+                .any(|(words, _)| stage_disables_justless(words))
+        })
 }
 
 /// Skip leading assignments and wrappers that run the next word unchanged.
@@ -3963,5 +4067,79 @@ data:
             post_bash(&ws, "flutter pub deps | head -n 500", &pub_deps).is_none(),
             "lossless_only must skip floor::compact on strict pipes"
         );
+    }
+
+    #[test]
+    fn justless_disable_kill_switch_covers_timeout_multi_export_loose_and_compound_shells() {
+        let (_dir, ws) = test_workspace("");
+        let mut noisy = String::new();
+        for i in 1..=200 {
+            noisy.push_str(&format!(
+                "2026-01-15T10:00:{:02}Z INFO worker processed batch item={i:04} ok=true\n",
+                i % 60
+            ));
+        }
+        assert!(noisy.len() > 8_000);
+
+        // All 6 compound/wrapper JUSTLESS_DISABLE=1 forms MUST pass through untouched.
+        for disabled_cmd in [
+            "timeout -s TERM 10 env JUSTLESS_DISABLE=1 python3 report.py",
+            "timeout -k 5s --signal KILL 30 env JUSTLESS_DISABLE=1 python3 report.py",
+            "export FOO JUSTLESS_DISABLE=1 && python3 report.py",
+            "export FOO BAR=2 JUSTLESS_DISABLE=1; python3 report.py",
+            "# disable compaction for this run\nJUSTLESS_DISABLE=1 python3 report.py",
+            "(JUSTLESS_DISABLE=1 python3 report.py)",
+            "if true; then export FOO JUSTLESS_DISABLE=1; python3 report.py; fi",
+            "JUSTLESS_DISABLE=1 python3 - <<'EOF'\nprint('hi')\nEOF",
+            "out=$(JUSTLESS_DISABLE=1 python3 report.py); echo \"$out\"",
+        ] {
+            assert!(
+                command_disables_justless(disabled_cmd),
+                "command_disables_justless should be true for: {disabled_cmd}"
+            );
+            assert!(
+                post_bash(&ws, disabled_cmd, &noisy).is_none(),
+                "claude_bash should pass through untouched for: {disabled_cmd}"
+            );
+            assert!(
+                unknown_plan(disabled_cmd).is_none(),
+                "unknown_plan should return None for: {disabled_cmd}"
+            );
+        }
+
+        // `loose` itself returns `None` directly when a stage disables Justless.
+        let disabled_stage = vec![(
+            vec![
+                "timeout".to_owned(),
+                "-s".to_owned(),
+                "TERM".to_owned(),
+                "10".to_owned(),
+                "env".to_owned(),
+                "JUSTLESS_DISABLE=1".to_owned(),
+                "python3".to_owned(),
+                "report.py".to_owned(),
+            ],
+            false,
+        )];
+        assert!(loose(&disabled_stage, true).is_none());
+
+        // Non-kill-switch controls (comment text, heredoc body, single-quoted arg, `=0`)
+        // MUST NOT trigger false positives.
+        for enabled_cmd in [
+            "# JUSTLESS_DISABLE=1\npython3 report.py",
+            "python3 - <<'EOF'\nJUSTLESS_DISABLE=1\nEOF",
+            "echo 'JUSTLESS_DISABLE=1'; python3 report.py",
+            "JUSTLESS_DISABLE=0 python3 report.py",
+            "export FOO JUSTLESS_DISABLE=0 && python3 report.py",
+        ] {
+            assert!(
+                !command_disables_justless(enabled_cmd),
+                "false positive in command_disables_justless for: {enabled_cmd}"
+            );
+            assert!(
+                post_bash(&ws, enabled_cmd, &noisy).is_some(),
+                "claude_bash should still compact: {enabled_cmd}"
+            );
+        }
     }
 }
