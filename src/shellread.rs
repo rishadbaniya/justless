@@ -112,13 +112,15 @@ impl LineRange {
                 }
             } else if body.contains(',') {
                 Span::closed(body, ',')?
-            } else {
+            } else if spans.is_empty() && is_last {
                 let line = decimal(body)?;
                 Span {
                     first: line,
                     last: Some(line),
                     from_end: false,
                 }
+            } else {
+                return None;
             };
             spans.push(span);
         }
