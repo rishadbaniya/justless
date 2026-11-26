@@ -1400,10 +1400,10 @@ fn install_and_run_claude_and_agy_hooks() {
     let instructions = fs::read_to_string(root.join("CLAUDE.md")).unwrap();
     assert!(instructions.starts_with("# Team rules\n"));
     assert_eq!(instructions.matches("<!-- justless:begin -->").count(), 1);
-    // The block rides in every model request, so keep it within 400 bytes.
+    // The block rides in every model request, so keep it within 470 bytes.
     let block = &instructions[instructions.find("<!-- justless:begin -->").unwrap()
         ..instructions.find("<!-- justless:end -->").unwrap()];
-    assert!(block.len() <= 440, "{} bytes", block.len());
+    assert!(block.len() <= 470, "{} bytes", block.len());
     assert_all_in(
         block,
         &[

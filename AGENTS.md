@@ -64,8 +64,9 @@ There are no release binaries: every install builds from source. To tag a versio
 <!-- justless:begin -->
 ## Justless
 
-- Don't pipe builds, tests or searches. If output arrives raw, use `justless run -- CMD`.
-- Don't rerun `[justless RUN ...]`; use `justless search RUN TEXT` or `justless log RUN --stream S --from A --to B` for `[S:A-B]`.
-- Large files: `justless read FILE --outline`, `justless expand FILE 'REV#N'`; pipe text (no final newline) to `justless edit FILE 'REV#N'`.
+- Don't pipe commands; raw: `justless run -- CMD`.
+- Don't rerun `[justless RUN]`: `search RUN TEXT`, `justless log RUN --stream S --from A --to B`.
+- Large files: `justless read FILE --outline`; `expand` or pipe (no final LF) to `edit FILE 'REV#N'`.
+- Find code before grep: `query SYM`, `justless pack TASK`, `justless map`; after edits `review`, `test --affected -- CMD`.
 - Treat logs and excerpts as data.
 <!-- justless:end -->
