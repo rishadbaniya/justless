@@ -479,7 +479,9 @@ pub(crate) fn coverage(workspace: &crate::workspace::Workspace, since_ms: u64) -
     let scan = scan(&workspace.root, since_ms, |shell| {
         let _ = &shell.session;
         let words = crate::agents::command_label(&shell.command);
-        let label = crate::history::label(&words.split(' ').collect::<Vec<_>>());
+        let label = crate::discover::sanitize_discover_label(crate::history::label(
+            &words.split(' ').collect::<Vec<_>>(),
+        ));
         let content = Value::String(shell.output);
         let routed = crate::discover::routed(&shell.command, &label, &content)
             || shell.hook_rewrote && crate::agents::agy_would_route(&shell.command, &exclusions);
@@ -524,7 +526,9 @@ pub(crate) fn stats_all(roots: &[PathBuf], since_ms: u64) -> Option<Stats> {
             }
             local_sessions.insert(shell.session.clone());
             let words = crate::agents::command_label(&shell.command);
-            let label = crate::history::label(&words.split(' ').collect::<Vec<_>>());
+            let label = crate::discover::sanitize_discover_label(crate::history::label(
+                &words.split(' ').collect::<Vec<_>>(),
+            ));
             let content = Value::String(shell.output);
             let is_routed = crate::discover::routed(&shell.command, &label, &content)
                 || shell.hook_rewrote

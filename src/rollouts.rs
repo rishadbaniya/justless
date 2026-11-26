@@ -495,7 +495,9 @@ pub(crate) fn coverage(workspace: &crate::workspace::Workspace, since_ms: u64) -
     let exclusions = crate::rewrite::Exclusions::of(workspace).unwrap_or_default();
     let scan = scan(&workspace.root, since_ms, |shell| {
         let words = crate::agents::command_label(&shell.command);
-        let label = crate::history::label(&words.split(' ').collect::<Vec<_>>());
+        let label = crate::discover::sanitize_discover_label(crate::history::label(
+            &words.split(' ').collect::<Vec<_>>(),
+        ));
         let content = Value::String(shell.output);
         let route = if crate::discover::routed(&shell.command, &label, &content) {
             Route::ThroughJustless

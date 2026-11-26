@@ -825,7 +825,7 @@ pub(crate) fn routed(command: &str, label: &str, content: &Value) -> bool {
 /// Collapses any label that looks like a pasted token or oversized identifier
 /// to `"other"` so `discover` never emits secrets even when an agent invokes a
 /// malformed command starting with a credential token.
-fn sanitize_discover_label(label: String) -> String {
+pub(crate) fn sanitize_discover_label(label: String) -> String {
     const SECRET_PREFIXES: &[&str] = &[
         "ghp_",
         "gho_",
@@ -845,6 +845,15 @@ fn sanitize_discover_label(label: String) -> String {
         "glpat-",
         "npm_",
         "pypi-",
+        "whsec_",
+        "hf_",
+        "eyJ",
+        "rk_live_",
+        "rk_test_",
+        "dop_v1_",
+        "xoxa-",
+        "xoxe-",
+        "xoxs-",
     ];
     if label.is_empty()
         || label.len() > 48
@@ -4324,5 +4333,20 @@ mod tests {
                 "leaked `{forbidden}` in text:\n{text_out}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod label_secret_tests {
+    use super::sanitize_discover_label;
+
+    #[test]
+    fn token_shaped_labels_collapse_to_other() {
+        let webhook = ["whsec", "_1234567890abcdef1234567890abcdef"].concat();
+        let jwt = ["eyJ", "hbGciOiJIUzI1NiJ9"].concat();
+        for token in [webhook, jwt] {
+            assert_eq!(sanitize_discover_label(token), "other");
+        }
+        assert_eq!(sanitize_discover_label("cargo test".into()), "cargo test");
     }
 }

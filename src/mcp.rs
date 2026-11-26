@@ -1343,6 +1343,11 @@ fn normalize_relative(text: &str, allow_dot: bool) -> Option<String> {
             _ => return None,
         }
     }
+    // `.justless/` holds raw, unredacted run archives and internal state, which
+    // only `log`, `search` and the other history tools may show (redacted).
+    if parts.first().is_some_and(|first| *first == ".justless") {
+        return None;
+    }
     if parts.is_empty() {
         allow_dot.then(|| ".".to_owned())
     } else {
@@ -2444,5 +2449,21 @@ mod tests {
                 .expect("JSON-RPC error reply");
             assert_eq!(reply["error"]["code"], INVALID_PARAMS, "{req} -> {reply}");
         }
+    }
+}
+
+#[cfg(test)]
+mod justless_state_tests {
+    use super::normalize_relative;
+
+    #[test]
+    fn file_tools_cannot_reach_raw_run_archives() {
+        assert_eq!(normalize_relative(".justless/runs/r1/stdout", false), None);
+        assert_eq!(normalize_relative("./.justless/index.bin", false), None);
+        assert_eq!(normalize_relative(".justless", true), None);
+        assert_eq!(
+            normalize_relative("src/.justless-notes.md", false).as_deref(),
+            Some("src/.justless-notes.md")
+        );
     }
 }
