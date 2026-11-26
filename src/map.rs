@@ -4,9 +4,10 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::io::Write;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Arg, ArgMatches, Command};
 use serde_json::{Map, Value, json};
 
@@ -49,13 +50,65 @@ pub fn command() -> Command<'static> {
         .arg(
             Arg::new("json")
                 .long("json")
+                .conflicts_with("html")
                 .help("Print the selected items as JSON"),
+        )
+        .arg(
+            Arg::new("html")
+                .long("html")
+                .conflicts_with("json")
+                .help("Render a self-contained offline interactive HTML graph explorer"),
+        )
+        .arg(
+            Arg::new("out")
+                .long("out")
+                .takes_value(true)
+                .allow_invalid_utf8(true)
+                .value_name("PATH")
+                .requires("html")
+                .help("With --html, write the HTML explorer to PATH instead of stdout"),
         )
 }
 
 pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
     let budget = crate::context_budget(workspace, matches)?;
     let index = Index::open(workspace)?;
+    if matches.is_present("html") {
+        let focus = matches
+            .value_of("explain")
+            .map(|symbol| index.select(symbol))
+            .transpose()?;
+        let title = workspace
+            .root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("repository");
+        if let Some(out) = matches.value_of_os("out") {
+            let rendered = build_html(&index, title, &workspace.invocation().files, focus);
+            let path = Path::new(out);
+            std::fs::write(path, &rendered.html)
+                .with_context(|| format!("could not write {}", path.display()))?;
+            let comms = if rendered.communities == 1 {
+                "1 community".to_owned()
+            } else {
+                format!("{} communities", rendered.communities)
+            };
+            println!(
+                "Wrote {} · {} bytes · {} · {} · {comms}",
+                path.display(),
+                rendered.html.len(),
+                plural(rendered.nodes, "node"),
+                plural(rendered.edges, "edge"),
+            );
+        } else {
+            let html = render_html(&index, title, &workspace.invocation().files, focus);
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(html.as_bytes())?;
+            stdout.flush()?;
+        }
+        return Ok(());
+    }
     let json = matches.is_present("json");
     if let Some(symbol) = matches.value_of("explain") {
         return explain(workspace, &index, symbol, budget, json);
@@ -3556,6 +3609,1008 @@ fn explain(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Offline interactive HTML graph explorer (`justless map --html`)
+
+const HTML_MAX_NODES: usize = 250;
+const HTML_MAX_EDGES: usize = 1200;
+const HTML_MAX_BRIDGES: usize = 40;
+const HTML_MAX_COMMUNITIES: usize = 48;
+const HTML_FOCUS_NEIGHBORS: usize = 60;
+
+struct HtmlOutput {
+    html: String,
+    nodes: usize,
+    edges: usize,
+    communities: usize,
+}
+
+/// Escapes text for safe insertion into HTML element content (such as `<title>`).
+fn escape_html_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            '\u{2028}' => out.push_str("&#x2028;"),
+            '\u{2029}' => out.push_str("&#x2029;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Escapes serialized JSON for safe embedding inside a `<script>` element.
+/// Every `<`, `>`, `&`, U+2028, and U+2029 becomes a standard JSON `\uXXXX`
+/// escape so untrusted symbol or file names can never break out of `</script>`.
+fn escape_script_json(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Renders a self-contained, zero-CDN, XSS-safe interactive HTML graph explorer.
+pub(crate) fn render_html(
+    index: &Index,
+    title: &str,
+    invocation: &str,
+    focus: Option<usize>,
+) -> String {
+    build_html(index, title, invocation, focus).html
+}
+
+fn build_html(index: &Index, title: &str, invocation: &str, focus: Option<usize>) -> HtmlOutput {
+    let graph = Graph::new(index, MAX_RANKED * 40);
+    let all_bridges = find_bridges(&graph);
+    let def_count = index.definitions.len();
+
+    // Select up to HTML_MAX_NODES symbols: focused neighborhood (if `--explain`),
+    // top cross-community bridge endpoints, leaders from each community, and the
+    // highest-PageRank remaining hubs.
+    let mut selected_mask = vec![false; def_count];
+    let mut selected = Vec::<usize>::with_capacity(HTML_MAX_NODES.min(def_count));
+    fn try_add(
+        graph: &Graph<'_>,
+        selected_mask: &mut [bool],
+        selected: &mut Vec<usize>,
+        id: usize,
+        allow_file: bool,
+    ) -> bool {
+        if id >= selected_mask.len() || selected_mask[id] || selected.len() >= HTML_MAX_NODES {
+            return false;
+        }
+        if !allow_file && graph.definition(id).kind == "file" {
+            return false;
+        }
+        selected_mask[id] = true;
+        selected.push(id);
+        true
+    }
+
+    if let Some(fid) = focus
+        && fid < def_count
+    {
+        try_add(&graph, &mut selected_mask, &mut selected, fid, true);
+        let mut incoming: Vec<(bool, usize)> = index
+            .incoming(fid)
+            .filter_map(|e| e.from.filter(|&u| u != fid).map(|u| (e.inferred, u)))
+            .collect();
+        incoming.sort_by_key(|&(inf, id)| (inf, graph.rank(id)));
+        incoming.dedup_by_key(|item| item.1);
+        for (_, id) in incoming.into_iter().take(HTML_FOCUS_NEIGHBORS) {
+            try_add(&graph, &mut selected_mask, &mut selected, id, false);
+        }
+        let mut outgoing: Vec<(bool, usize)> = index
+            .outgoing(fid)
+            .filter(|e| e.to != fid)
+            .map(|e| (e.inferred, e.to))
+            .collect();
+        outgoing.sort_by_key(|&(inf, id)| (inf, graph.rank(id)));
+        outgoing.dedup_by_key(|item| item.1);
+        for (_, id) in outgoing.into_iter().take(HTML_FOCUS_NEIGHBORS) {
+            try_add(&graph, &mut selected_mask, &mut selected, id, false);
+        }
+    }
+
+    for bridge in all_bridges.iter().take(HTML_MAX_BRIDGES) {
+        let need =
+            usize::from(!selected_mask[bridge.from_id]) + usize::from(!selected_mask[bridge.to_id]);
+        if selected.len() + need <= HTML_MAX_NODES {
+            try_add(
+                &graph,
+                &mut selected_mask,
+                &mut selected,
+                bridge.from_id,
+                false,
+            );
+            try_add(
+                &graph,
+                &mut selected_mask,
+                &mut selected,
+                bridge.to_id,
+                false,
+            );
+        }
+    }
+
+    for community in graph.communities.groups.iter().take(HTML_MAX_COMMUNITIES) {
+        if selected.len() >= HTML_MAX_NODES {
+            break;
+        }
+        let mut best: [Option<usize>; 2] = [None, None];
+        for &id in &community.members {
+            let key = (!central(graph.definition(id)), graph.rank(id));
+            if best[0].is_none_or(|b| key < (!central(graph.definition(b)), graph.rank(b))) {
+                best[1] = best[0];
+                best[0] = Some(id);
+            } else if best[1].is_none_or(|b| key < (!central(graph.definition(b)), graph.rank(b))) {
+                best[1] = Some(id);
+            }
+        }
+        for id in best.into_iter().flatten() {
+            try_add(&graph, &mut selected_mask, &mut selected, id, false);
+        }
+    }
+
+    if selected.len() < HTML_MAX_NODES {
+        let remaining_slots = HTML_MAX_NODES - selected.len();
+        let mut rest: Vec<usize> = (0..def_count)
+            .filter(|&id| !selected_mask[id] && graph.definition(id).kind != "file")
+            .collect();
+        let rank_key = |id: usize| {
+            (
+                graph.def_meta(id).is_support,
+                !central(graph.definition(id)),
+                graph.rank(id),
+            )
+        };
+        if rest.len() > remaining_slots {
+            rest.select_nth_unstable_by_key(remaining_slots, |&id| rank_key(id));
+            rest.truncate(remaining_slots);
+        }
+        rest.sort_unstable_by_key(|&id| rank_key(id));
+        for id in rest {
+            try_add(&graph, &mut selected_mask, &mut selected, id, false);
+        }
+    }
+
+    selected.sort_unstable_by_key(|&id| {
+        (
+            focus != Some(id),
+            graph.def_meta(id).is_support,
+            !central(graph.definition(id)),
+            graph.rank(id),
+        )
+    });
+
+    let mut def_to_node = vec![usize::MAX; def_count];
+    for (idx, &def_id) in selected.iter().enumerate() {
+        def_to_node[def_id] = idx;
+    }
+    let focus_idx = focus
+        .filter(|&id| id < def_count && def_to_node[id] != usize::MAX)
+        .map(|id| def_to_node[id]);
+
+    // Areas summary (aligned with `area_section` ordering).
+    let num_areas = graph.area_map.names.len();
+    let mut area_files = vec![0usize; num_areas];
+    let mut area_symbols = vec![0usize; num_areas];
+    for (fid, meta) in graph.files.files.iter().enumerate() {
+        if meta.in_index_files {
+            area_files[graph.area_map.file_area[fid]] += 1;
+        }
+    }
+    for (id, def) in index.definitions.iter().enumerate() {
+        if def.kind != "file" {
+            area_symbols[graph.def_area_id(id)] += 1;
+        }
+    }
+    let mut ordered_areas: Vec<usize> = (0..num_areas).filter(|&a| area_files[a] > 0).collect();
+    ordered_areas.sort_by_key(|&a| {
+        let tier = if area_symbols[a] == 0 {
+            2u8
+        } else if graph.area_map.is_support[a] {
+            1u8
+        } else {
+            0u8
+        };
+        (
+            tier,
+            Reverse(area_symbols[a]),
+            Reverse(area_files[a]),
+            graph.area_map.names[a].as_str(),
+        )
+    });
+    let mut area_to_idx = vec![0usize; num_areas];
+    let mut areas_json = Vec::with_capacity(ordered_areas.len());
+    for (idx, &aid) in ordered_areas.iter().enumerate() {
+        area_to_idx[aid] = idx;
+        areas_json.push(json!({
+            "id": idx,
+            "name": graph.area_map.names[aid],
+            "files": area_files[aid],
+            "symbols": area_symbols[aid],
+            "support": graph.area_map.is_support[aid],
+        }));
+    }
+
+    // Communities represented in the graph.
+    let mut comm_shown = vec![0usize; graph.communities.groups.len()];
+    for &def_id in &selected {
+        if let Some(cid) = graph.communities.of[def_id] {
+            comm_shown[cid] += 1;
+        }
+    }
+    let mut comm_to_idx = vec![None::<usize>; graph.communities.groups.len()];
+    let mut communities_json = Vec::new();
+    for (cid, comm) in graph.communities.groups.iter().enumerate() {
+        if comm_shown[cid] == 0 {
+            continue;
+        }
+        let idx = communities_json.len();
+        comm_to_idx[cid] = Some(idx);
+        communities_json.push(json!({
+            "id": idx,
+            "name": comm.name,
+            "symbols": comm.members.len(),
+            "shown": comm_shown[cid],
+            "files": comm.files.len(),
+            "support": comm.support_only,
+        }));
+    }
+
+    // Top ranked architectural bridges whose endpoints are both in the canvas.
+    let mut top_bridge_pairs = HashMap::<(usize, usize), f64>::new();
+    let mut bridges_json = Vec::new();
+    for bridge in all_bridges.iter().take(HTML_MAX_BRIDGES) {
+        let from_n = def_to_node[bridge.from_id];
+        let to_n = def_to_node[bridge.to_id];
+        if from_n == usize::MAX || to_n == usize::MAX {
+            continue;
+        }
+        top_bridge_pairs.insert((bridge.from_id, bridge.to_id), bridge.score);
+        bridges_json.push(json!({
+            "from": from_n,
+            "to": to_n,
+            "from_comm": comm_to_idx[bridge.from_comm],
+            "to_comm": comm_to_idx[bridge.to_comm],
+            "from_lang": bridge.from_lang,
+            "to_lang": bridge.to_lang,
+            "kind": relationship(bridge.edge.kind),
+            "possible": bridge.edge.inferred,
+            "pair_links": bridge.pair_links,
+            "score": (bridge.score * 1000.0).round() / 1000.0,
+        }));
+    }
+
+    // Coalesce edges between included nodes.
+    struct EdgeAcc {
+        kind: Kind,
+        possible: bool,
+        bridge: bool,
+        top_bridge: bool,
+        count: usize,
+        priority: (bool, u8),
+    }
+    let mut edge_map = HashMap::<(usize, usize), EdgeAcc>::new();
+    for edge in &index.edges {
+        let Some(from_id) = edge.from else {
+            continue;
+        };
+        if from_id == edge.to {
+            continue;
+        }
+        let s = def_to_node[from_id];
+        let t = def_to_node[edge.to];
+        if s == usize::MAX || t == usize::MAX {
+            continue;
+        }
+        let cross_comm = matches!(
+            (graph.communities.of[from_id], graph.communities.of[edge.to]),
+            (Some(c1), Some(c2)) if c1 != c2
+        );
+        let top_bridge = top_bridge_pairs.contains_key(&(from_id, edge.to));
+        let prio = (edge.inferred, kind_rank(edge.kind));
+        edge_map
+            .entry((s, t))
+            .and_modify(|acc| {
+                acc.count += 1;
+                acc.bridge |= cross_comm;
+                acc.top_bridge |= top_bridge;
+                if prio < acc.priority {
+                    acc.kind = edge.kind;
+                    acc.possible = edge.inferred;
+                    acc.priority = prio;
+                }
+            })
+            .or_insert(EdgeAcc {
+                kind: edge.kind,
+                possible: edge.inferred,
+                bridge: cross_comm,
+                top_bridge,
+                count: 1,
+                priority: prio,
+            });
+    }
+
+    let mut edge_list: Vec<((usize, usize), EdgeAcc)> = edge_map.into_iter().collect();
+    if edge_list.len() > HTML_MAX_EDGES {
+        edge_list.sort_unstable_by_key(|&((s, t), ref acc)| {
+            let touches_focus = focus_idx.is_some_and(|f| f == s || f == t);
+            let combined_pr = graph.centrality.rank_key[selected[s]]
+                .saturating_add(graph.centrality.rank_key[selected[t]]);
+            (
+                !touches_focus,
+                !acc.top_bridge,
+                !acc.bridge,
+                acc.possible,
+                Reverse(acc.count),
+                Reverse(combined_pr),
+                s,
+                t,
+            )
+        });
+        edge_list.truncate(HTML_MAX_EDGES);
+    }
+    edge_list.sort_unstable_by_key(|&((s, t), _)| (s, t));
+
+    let edges_json: Vec<Value> = edge_list
+        .iter()
+        .map(|&((s, t), ref acc)| {
+            json!({
+                "from": s,
+                "to": t,
+                "kind": relationship(acc.kind),
+                "possible": acc.possible,
+                "bridge": acc.bridge,
+                "top_bridge": acc.top_bridge,
+                "count": acc.count,
+            })
+        })
+        .collect();
+
+    let nodes_json: Vec<Value> = selected
+        .iter()
+        .enumerate()
+        .map(|(idx, &def_id)| {
+            let def = graph.definition(def_id);
+            let meta = graph.def_meta(def_id);
+            let comm = graph.communities.of[def_id].and_then(|cid| comm_to_idx[cid]);
+            let pr = (graph.centrality.score[def_id] * 1000.0).round() / 1000.0;
+            json!({
+                "id": idx,
+                "name": name(def),
+                "qualified": def.qualified,
+                "kind": kind(def),
+                "file": def.location.file,
+                "start": def.location.start,
+                "end": def.location.end,
+                "lang": meta.indexed_lang.unwrap_or("text"),
+                "area": area_to_idx[graph.def_area_id(def_id)],
+                "comm": comm,
+                "pr": pr,
+                "in_deg": graph.degrees.dependents[def_id],
+                "out_deg": graph.degrees.dependencies[def_id],
+                "caller_files": graph.centrality.caller_files[def_id],
+                "caller_areas": graph.centrality.caller_areas[def_id],
+                "support": meta.is_support,
+            })
+        })
+        .collect();
+
+    // Repository summary metrics & language breakdown.
+    let total_symbols = index
+        .definitions
+        .iter()
+        .filter(|d| d.kind != "file")
+        .count();
+    let possible_links = index.edges.iter().filter(|e| e.inferred).count();
+    let mut lang_counts = BTreeMap::<&str, usize>::new();
+    for meta in &graph.files.files {
+        if meta.in_index_files
+            && let Some(lang) = meta.indexed_lang
+        {
+            *lang_counts.entry(lang).or_default() += 1;
+        }
+    }
+    let mut languages: Vec<(&str, usize)> = lang_counts.into_iter().collect();
+    languages.sort_by_key(|&(lang, count)| (Reverse(count), lang));
+
+    let focus_symbol = focus_idx.map(|idx| name(graph.definition(selected[idx])));
+    let payload = json!({
+        "summary": {
+            "title": title,
+            "files": index.files.len(),
+            "symbols": total_symbols,
+            "links": index.edges.len(),
+            "possible_links": possible_links,
+            "shown_nodes": nodes_json.len(),
+            "shown_edges": edges_json.len(),
+            "communities": graph.communities.groups.len(),
+            "isolated_symbols": graph.communities.isolated_symbols,
+            "bridges": all_bridges.len(),
+            "languages": languages,
+            "invocation": invocation,
+            "focus_symbol": focus_symbol,
+        },
+        "focus": focus_idx,
+        "areas": areas_json,
+        "communities": communities_json,
+        "bridges": bridges_json,
+        "nodes": nodes_json,
+        "edges": edges_json,
+    });
+
+    let raw_json = serde_json::to_string(&payload).expect("map HTML payload serializes");
+    let safe_json = escape_script_json(&raw_json);
+    let page_title = match focus_symbol {
+        Some(sym) => format!(
+            "Justless Map · {} · {}",
+            escape_html_text(sym),
+            escape_html_text(title)
+        ),
+        None => format!("Justless Map · {}", escape_html_text(title)),
+    };
+    let html = HTML_TEMPLATE
+        .replace("__JUSTLESS_TITLE__", &page_title)
+        .replace("__JUSTLESS_JSON__", &safe_json);
+
+    HtmlOutput {
+        html,
+        nodes: selected.len(),
+        edges: edge_list.len(),
+        communities: communities_json.len(),
+    }
+}
+
+const HTML_TEMPLATE: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+<title>__JUSTLESS_TITLE__</title>
+<style>
+:root{color-scheme:dark;--bg:#0b0f17;--panel:#111827;--panel2:#182133;--border:#243044;--text:#e5edf7;--muted:#8a99b2;--accent:#5b8def;--bridge:#f59e0b;--in:#2dd4bf;--out:#818cf8;--iso:#7b8798;--pill:#162033}
+:root[data-theme="light"]{color-scheme:light;--bg:#f6f8fb;--panel:#ffffff;--panel2:#eef2f7;--border:#d4dce8;--text:#0f172a;--muted:#526077;--accent:#2563eb;--bridge:#d97706;--in:#0d9488;--out:#4f46e5;--iso:#64748b;--pill:#edf2fa}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--text);font:13px/1.4 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.app{display:flex;flex-direction:column;height:100%}
+header{display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--panel);border-bottom:1px solid var(--border);flex-wrap:wrap}
+.brand{font-weight:700;letter-spacing:-.01em;white-space:nowrap}
+.stats{color:var(--muted);font-size:12px;white-space:nowrap}
+.spacer{flex:1}
+.search-wrap{display:flex;align-items:center;gap:6px;min-width:190px;max-width:320px;flex:1}
+input[type="search"]{width:100%;padding:5px 9px;border-radius:6px;border:1px solid var(--border);background:var(--panel2);color:var(--text);font:inherit;outline:none}
+input[type="search"]:focus{border-color:var(--accent)}
+.btn{padding:5px 9px;border-radius:6px;border:1px solid var(--border);background:var(--panel2);color:var(--text);font:12px/1.2 inherit;cursor:pointer;white-space:nowrap}
+.btn:hover{border-color:var(--accent)}
+.btn.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.bridge.active{background:var(--bridge);border-color:var(--bridge);color:#111}
+.bar{display:flex;align-items:center;gap:6px;padding:6px 12px;background:var(--panel);border-bottom:1px solid var(--border);overflow-x:auto;scrollbar-width:thin}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;border:1px solid var(--border);background:var(--pill);color:var(--text);font-size:12px;cursor:pointer;white-space:nowrap}
+.pill.active{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+.dot{width:8px;height:8px;border-radius:50%;flex:none}
+.main{display:flex;flex:1;min-height:0}
+.stage{position:relative;flex:1;min-width:0}
+canvas{display:block;width:100%;height:100%;cursor:grab}
+canvas.dragging{cursor:grabbing}
+canvas.hover{cursor:pointer}
+.tip{position:absolute;pointer-events:none;padding:4px 8px;border-radius:6px;background:var(--panel);border:1px solid var(--border);font-size:12px;box-shadow:0 6px 18px rgba(0,0,0,.28);display:none;max-width:320px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hint{position:absolute;left:10px;bottom:8px;font-size:11px;color:var(--muted);background:color-mix(in srgb,var(--panel) 84%,transparent);padding:3px 8px;border-radius:6px;border:1px solid var(--border);pointer-events:none}
+aside{width:330px;max-width:42vw;background:var(--panel);border-left:1px solid var(--border);overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:12px}
+.section-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 6px}
+.kv-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.card{padding:7px 9px;border-radius:7px;background:var(--panel2);border:1px solid var(--border)}
+.card .label{font-size:11px;color:var(--muted)}
+.card .val{font-size:14px;font-weight:600;margin-top:1px}
+.sym-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
+.sym-name{font-size:15px;font-weight:700;word-break:break-word}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;color:var(--muted);word-break:break-all}
+.badges{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
+.badge{padding:2px 7px;border-radius:999px;background:var(--panel2);border:1px solid var(--border);font-size:11px}
+.cmd-row{display:flex;align-items:center;gap:6px;padding:5px 7px;border-radius:6px;background:var(--panel2);border:1px solid var(--border);margin-bottom:5px}
+.cmd-row code{flex:1;font:11.5px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-x:auto;white-space:nowrap}
+.list{display:flex;flex-direction:column;gap:4px}
+.item{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;text-align:left;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--panel2);color:var(--text);font:inherit;cursor:pointer}
+.item:hover{border-color:var(--accent)}
+.item .sub{font-size:11px;color:var(--muted);white-space:nowrap}
+.item .title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.tag-b{color:var(--bridge);font-weight:600}
+@media(max-width:860px){.main{flex-direction:column}aside{width:100%;max-width:none;height:38vh;border-left:0;border-top:1px solid var(--border)}}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <span class="brand" id="brand"></span>
+    <span class="stats" id="stats"></span>
+    <span class="spacer"></span>
+    <div class="search-wrap">
+      <input id="search" type="search" placeholder="Search symbol, file, kind (/)..." aria-label="Search symbols">
+      <span class="stats" id="matchCount"></span>
+    </div>
+    <button class="btn bridge" id="bridgeBtn" type="button"></button>
+    <button class="btn" id="resetBtn" type="button">Reset</button>
+    <button class="btn" id="themeBtn" type="button"></button>
+  </header>
+  <div class="bar" id="commBar"></div>
+  <div class="main">
+    <div class="stage" id="stage">
+      <canvas id="cv"></canvas>
+      <div class="tip" id="tip"></div>
+      <div class="hint">Drag to pan · Scroll to zoom · Drag nodes · / Search · R Reset · Esc Clear</div>
+    </div>
+    <aside id="sidebar"></aside>
+  </div>
+</div>
+<script id="justless-graph" type="application/json">__JUSTLESS_JSON__</script>
+<script>
+(() => {
+  const DATA = JSON.parse(document.getElementById('justless-graph').textContent);
+  const PALETTE = ['#5b8def','#38bdf8','#34d399','#a78bfa','#f472b6','#fbbf24','#fb7185','#2dd4bf','#818cf8','#a3e635','#f97316','#e879f9'];
+  const nodes = DATA.nodes, edges = DATA.edges, comms = DATA.communities, bridges = DATA.bridges, sum = DATA.summary;
+  const outEdges = nodes.map(() => []), inEdges = nodes.map(() => []), nbrs = nodes.map(() => new Set());
+  const bridgeNodes = new Set();
+  let bridgeEdgeCount = 0;
+  for (const e of edges) {
+    outEdges[e.from].push(e); inEdges[e.to].push(e);
+    nbrs[e.from].add(e.to); nbrs[e.to].add(e.from);
+    if (e.bridge) { bridgeNodes.add(e.from); bridgeNodes.add(e.to); bridgeEdgeCount++; }
+  }
+  const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; };
+  const shQuote = s => /^[A-Za-z0-9_./:@+-]+$/.test(s) ? s : "'" + s.replace(/'/g, "'\\''") + "'";
+  const colorOf = c => c === null || c === undefined ? getCss('--iso') : PALETTE[c % PALETTE.length];
+  const getCss = k => getComputedStyle(document.documentElement).getPropertyValue(k).trim();
+
+  const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+  const stage = document.getElementById('stage'), tip = document.getElementById('tip');
+  const sidebar = document.getElementById('sidebar'), commBar = document.getElementById('commBar');
+  const searchEl = document.getElementById('search'), matchCount = document.getElementById('matchCount');
+  const bridgeBtn = document.getElementById('bridgeBtn'), resetBtn = document.getElementById('resetBtn'), themeBtn = document.getElementById('themeBtn');
+
+  document.getElementById('brand').textContent = 'Justless · ' + sum.title;
+  const capNote = sum.symbols > sum.shown_nodes ? ' (top ' + sum.shown_nodes + ' shown)' : '';
+  document.getElementById('stats').textContent = sum.files + ' files · ' + sum.symbols + ' symbols' + capNote + ' · ' + sum.links + ' links · ' + sum.communities + ' communities';
+  bridgeBtn.textContent = 'Bridges (' + bridgeEdgeCount + ')';
+
+  const state = { selected: DATA.focus, hovered: null, comm: null, bridgesOnly: false, query: '', matches: new Set(), theme: 'dark' };
+  const cam = { x: 0, y: 0, k: 1 };
+  let W = 800, H = 600, dpr = 1;
+
+  // Compute radii and community-clustered initial coordinates.
+  const commAnchors = [];
+  const C = comms.length, R = C <= 1 ? 0 : Math.max(185, Math.sqrt(Math.max(nodes.length, 1)) * 30);
+  for (let i = 0; i < C; i++) {
+    const a = (i / C) * Math.PI * 2 - Math.PI / 2;
+    commAnchors.push({ x: Math.cos(a) * R, y: Math.sin(a) * R });
+  }
+  const commIdxCount = comms.map(() => 0);
+  let isoIdx = 0;
+  for (const n of nodes) {
+    n.r = 5.5 + Math.min(15, Math.log1p(n.pr * 6 + (n.in_deg + n.out_deg) * 0.35) * 3.4);
+    n.vx = 0; n.vy = 0;
+    if (n.comm !== null && n.comm !== undefined && commAnchors[n.comm]) {
+      const k = commIdxCount[n.comm]++, a = k * 2.39996323, rad = k === 0 ? 0 : 22 + Math.sqrt(k) * 26;
+      n.ax = commAnchors[n.comm].x; n.ay = commAnchors[n.comm].y;
+      n.x = n.ax + Math.cos(a) * rad; n.y = n.ay + Math.sin(a) * rad;
+    } else {
+      const k = isoIdx++, a = k * 2.39996323, rad = R + 125 + (k % 3) * 28;
+      n.ax = Math.cos(a) * rad; n.ay = Math.sin(a) * rad;
+      n.x = n.ax; n.y = n.ay;
+    }
+  }
+
+  let alpha = 1, ticks = 0, raf = 0, pinned = null;
+  function simTick() {
+    const N = nodes.length;
+    if (N === 0) return false;
+    for (let i = 0; i < N; i++) {
+      const a = nodes[i];
+      for (let j = i + 1; j < N; j++) {
+        const b = nodes[j];
+        const dx = b.x - a.x, dy = b.y - a.y, d2 = dx * dx + dy * dy + 420;
+        const f = (1900 * alpha) / d2, d = Math.sqrt(d2);
+        const fx = (dx / d) * f, fy = (dy / d) * f;
+        a.vx -= fx; a.vy -= fy; b.vx += fx; b.vy += fy;
+      }
+    }
+    for (const e of edges) {
+      const a = nodes[e.from], b = nodes[e.to];
+      const dx = b.x - a.x, dy = b.y - a.y, d = Math.sqrt(dx * dx + dy * dy) || 1;
+      const target = e.bridge ? 205 : 72, str = (e.bridge ? 0.015 : 0.055) * alpha;
+      const f = (d - target) * str, fx = (dx / d) * f, fy = (dy / d) * f;
+      a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
+    }
+    for (const n of nodes) {
+      if (n.id === pinned) { n.vx = 0; n.vy = 0; continue; }
+      const g = (n.comm === null ? 0.016 : 0.048) * alpha;
+      n.vx = (n.vx + (n.ax - n.x) * g) * 0.78;
+      n.vy = (n.vy + (n.ay - n.y) * g) * 0.78;
+      n.x += Math.max(-24, Math.min(24, n.vx));
+      n.y += Math.max(-24, Math.min(24, n.vy));
+    }
+    alpha *= 0.965; ticks++;
+    return alpha >= 0.015 && ticks < 140;
+  }
+  for (let i = 0; i < 60 && simTick(); i++) {}
+
+  function resize() {
+    const r = stage.getBoundingClientRect();
+    W = Math.max(1, r.width); H = Math.max(1, r.height);
+    dpr = window.devicePixelRatio || 1;
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+    draw();
+  }
+  function fitView(subset) {
+    const list = subset && subset.length ? subset : nodes;
+    if (!list.length) { cam.x = W / 2; cam.y = H / 2; cam.k = 1; draw(); return; }
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const n of list) { x0 = Math.min(x0, n.x - n.r); y0 = Math.min(y0, n.y - n.r); x1 = Math.max(x1, n.x + n.r); y1 = Math.max(y1, n.y + n.r); }
+    const pad = 64, bw = Math.max(80, x1 - x0), bh = Math.max(80, y1 - y0);
+    cam.k = Math.max(0.2, Math.min(2.2, Math.min((W - pad * 2) / bw, (H - pad * 2) / bh)));
+    cam.x = W / 2 - ((x0 + x1) / 2) * cam.k;
+    cam.y = H / 2 - ((y0 + y1) / 2) * cam.k;
+    draw();
+  }
+  function centerOn(id) {
+    const n = nodes[id]; if (!n) return;
+    cam.k = Math.max(cam.k, 1.05);
+    cam.x = W / 2 - n.x * cam.k; cam.y = H / 2 - n.y * cam.k;
+    draw();
+  }
+  function nodeDimmed(n) {
+    if (state.comm !== null) {
+      const inComm = state.comm === -1 ? n.comm === null : n.comm === state.comm;
+      if (!inComm) return true;
+    }
+    if (state.bridgesOnly && !bridgeNodes.has(n.id)) return true;
+    if (state.query && !state.matches.has(n.id)) return true;
+    const focus = state.hovered !== null ? state.hovered : state.selected;
+    if (focus !== null && n.id !== focus && !nbrs[focus].has(n.id)) return true;
+    return false;
+  }
+
+  function draw() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = getCss('--bg');
+    ctx.fillRect(0, 0, W, H);
+    if (!nodes.length) {
+      ctx.fillStyle = getCss('--muted'); ctx.font = '14px system-ui,sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('No indexed symbols in this repository.', W / 2, H / 2);
+      return;
+    }
+    const textCol = getCss('--text'), mutedCol = getCss('--muted'), bgCol = getCss('--bg');
+    const bridgeCol = getCss('--bridge'), inCol = getCss('--in'), outCol = getCss('--out'), accCol = getCss('--accent');
+    const focus = state.hovered !== null ? state.hovered : state.selected;
+
+    ctx.save();
+    ctx.translate(cam.x, cam.y);
+    ctx.scale(cam.k, cam.k);
+
+    // Subtle community halos and cluster names.
+    for (let c = 0; c < comms.length; c++) {
+      if (state.comm !== null && state.comm !== c) continue;
+      let sx = 0, sy = 0, cnt = 0;
+      for (const n of nodes) if (n.comm === c) { sx += n.x; sy += n.y; cnt++; }
+      if (!cnt) continue;
+      const cx = sx / cnt, cy = sy / cnt;
+      let maxD = 36;
+      for (const n of nodes) if (n.comm === c) maxD = Math.max(maxD, Math.hypot(n.x - cx, n.y - cy) + n.r + 18);
+      ctx.beginPath(); ctx.arc(cx, cy, maxD, 0, Math.PI * 2);
+      ctx.fillStyle = colorOf(c) + '12'; ctx.fill();
+      ctx.strokeStyle = colorOf(c) + '30'; ctx.lineWidth = 1 / cam.k; ctx.stroke();
+      ctx.fillStyle = mutedCol; ctx.font = (11 / Math.sqrt(Math.max(0.5, cam.k))) + 'px system-ui,sans-serif';
+      ctx.textAlign = 'center'; ctx.fillText(comms[c].name, cx, cy - maxD - 6 / cam.k);
+    }
+
+    // Directed curved edges.
+    for (const e of edges) {
+      const a = nodes[e.from], b = nodes[e.to];
+      const touchesFocus = focus !== null && (e.from === focus || e.to === focus);
+      const dimmed = state.bridgesOnly ? !e.bridge : (nodeDimmed(a) && nodeDimmed(b) && !touchesFocus);
+      const isBridge = e.bridge;
+      ctx.save();
+      ctx.globalAlpha = touchesFocus ? 0.92 : dimmed ? 0.07 : isBridge ? (state.bridgesOnly ? 0.92 : 0.62) : 0.28;
+      ctx.strokeStyle = touchesFocus ? (e.to === focus ? inCol : outCol) : isBridge ? bridgeCol : mutedCol;
+      ctx.lineWidth = (touchesFocus ? 2 : isBridge && (state.bridgesOnly || e.top_bridge) ? 1.8 : 1.1) / Math.sqrt(Math.max(0.4, cam.k));
+      if (e.possible) ctx.setLineDash([4 / cam.k, 3 / cam.k]);
+      const dx = b.x - a.x, dy = b.y - a.y, dist = Math.hypot(dx, dy) || 1;
+      const bend = Math.min(24, dist * 0.12);
+      const mx = (a.x + b.x) / 2 - (dy / dist) * bend, my = (a.y + b.y) / 2 + (dx / dist) * bend;
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.quadraticCurveTo(mx, my, b.x, b.y); ctx.stroke();
+      if (touchesFocus || (isBridge && state.bridgesOnly) || cam.k > 0.9) {
+        const ang = Math.atan2(b.y - my, b.x - mx), tipX = b.x - Math.cos(ang) * (b.r + 3), tipY = b.y - Math.sin(ang) * (b.r + 3), sz = 5.5 / Math.sqrt(Math.max(0.5, cam.k));
+        ctx.setLineDash([]); ctx.fillStyle = ctx.strokeStyle; ctx.beginPath();
+        ctx.moveTo(tipX, tipY); ctx.lineTo(tipX - Math.cos(ang - 0.45) * sz, tipY - Math.sin(ang - 0.45) * sz);
+        ctx.lineTo(tipX - Math.cos(ang + 0.45) * sz, tipY - Math.sin(ang + 0.45) * sz); ctx.closePath(); ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    // Nodes.
+    for (const n of nodes) {
+      const dim = nodeDimmed(n), sel = n.id === state.selected, hov = n.id === state.hovered, matched = state.matches.has(n.id);
+      ctx.save();
+      ctx.globalAlpha = dim ? 0.16 : 1;
+      ctx.beginPath(); ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
+      ctx.fillStyle = colorOf(n.comm); ctx.fill();
+      ctx.lineWidth = (sel || hov || matched ? 2.4 : 1.1) / cam.k;
+      ctx.strokeStyle = sel || matched ? accCol : hov ? textCol : bgCol;
+      ctx.stroke();
+      if (sel) {
+        ctx.beginPath(); ctx.arc(n.x, n.y, n.r + 4.5 / cam.k, 0, Math.PI * 2);
+        ctx.strokeStyle = accCol; ctx.lineWidth = 1.6 / cam.k; ctx.stroke();
+      }
+      const showLabel = sel || hov || matched || (focus !== null && nbrs[focus].has(n.id)) || (!dim && (n.id < 16 || cam.k > 1.15));
+      if (showLabel) {
+        ctx.font = (sel || hov ? '600 ' : '') + (11.5 / Math.sqrt(Math.max(0.55, cam.k))) + 'px system-ui,sans-serif';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+        const label = n.name.length > 28 ? n.name.slice(0, 27) + '…' : n.name;
+        ctx.lineWidth = 3 / cam.k; ctx.strokeStyle = bgCol; ctx.strokeText(label, n.x, n.y + n.r + 3 / cam.k);
+        ctx.fillStyle = textCol; ctx.fillText(label, n.x, n.y + n.r + 3 / cam.k);
+      }
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  function renderCommBar() {
+    commBar.replaceChildren();
+    const mk = (label, color, val) => {
+      const b = el('button', 'pill' + (state.comm === val ? ' active' : '')); b.type = 'button';
+      if (color) { const d = el('span', 'dot'); d.style.background = color; b.appendChild(d); }
+      b.appendChild(document.createTextNode(label));
+      b.onclick = () => {
+        state.comm = state.comm === val ? null : val;
+        renderCommBar();
+        if (state.comm === null) fitView(nodes);
+        else fitView(nodes.filter(n => state.comm === -1 ? n.comm === null : n.comm === state.comm));
+      };
+      commBar.appendChild(b);
+    };
+    mk('All (' + nodes.length + ')', null, null);
+    for (const c of comms) mk(c.name + ' (' + c.shown + ')', PALETTE[c.id % PALETTE.length], c.id);
+    const isoCnt = nodes.filter(n => n.comm === null).length;
+    if (isoCnt) mk('Isolated (' + isoCnt + ')', getCss('--iso'), -1);
+  }
+
+  function copyText(text, btn) {
+    const done = () => { const prev = btn.textContent; btn.textContent = 'Copied'; setTimeout(() => { btn.textContent = prev; }, 1100); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+    } else fallbackCopy(text, done);
+  }
+  function fallbackCopy(text, done) {
+    const ta = document.createElement('textarea'); ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); } catch (_) {} document.body.removeChild(ta); done();
+  }
+
+  function renderSidebar() {
+    sidebar.replaceChildren();
+    if (state.selected !== null && nodes[state.selected]) {
+      const n = nodes[state.selected];
+      const back = el('button', 'btn', '← Overview'); back.type = 'button';
+      back.onclick = () => { state.selected = null; renderSidebar(); draw(); };
+      const head = el('div', 'sym-head');
+      head.append(el('div', 'sym-name', n.name), back);
+      sidebar.appendChild(head);
+      sidebar.appendChild(el('div', 'mono', n.qualified));
+      sidebar.appendChild(el('div', 'mono', n.file + ':' + n.start + (n.end > n.start ? '-' + n.end : '')));
+
+      const badges = el('div', 'badges');
+      badges.append(el('span', 'badge', n.kind), el('span', 'badge', n.lang));
+      if (n.comm !== null && comms[n.comm]) {
+        const cb = el('button', 'pill', ''); cb.type = 'button';
+        const d = el('span', 'dot'); d.style.background = PALETTE[n.comm % PALETTE.length];
+        cb.append(d, document.createTextNode(comms[n.comm].name));
+        cb.onclick = () => { state.comm = n.comm; renderCommBar(); fitView(nodes.filter(x => x.comm === n.comm)); };
+        badges.appendChild(cb);
+      }
+      sidebar.appendChild(badges);
+
+      const grid = el('div', 'kv-grid');
+      const card = (k, v) => { const c = el('div', 'card'); c.append(el('div', 'label', k), el('div', 'val', String(v))); return c; };
+      grid.append(card('PageRank', n.pr.toFixed(3)), card('Degree (in / out)', n.in_deg + ' / ' + n.out_deg), card('Caller files', n.caller_files), card('Caller areas', n.caller_areas));
+      sidebar.appendChild(grid);
+
+      const cmdSec = el('div');
+      cmdSec.appendChild(el('div', 'section-title', 'Justless commands'));
+      const inv = sum.invocation || 'justless';
+      for (const cmd of [
+        inv + ' query ' + shQuote(n.name),
+        inv + ' map --explain ' + shQuote(n.name),
+        inv + ' expand ' + shQuote(n.file) + ' L' + n.start + '-' + n.end,
+      ]) {
+        const row = el('div', 'cmd-row');
+        const code = el('code', '', cmd);
+        const btn = el('button', 'btn', 'Copy'); btn.type = 'button'; btn.onclick = () => copyText(cmd, btn);
+        row.append(code, btn); cmdSec.appendChild(row);
+      }
+      sidebar.appendChild(cmdSec);
+
+      const addRelList = (title, list, isIn, total) => {
+        const sec = el('div');
+        const extra = total > list.length ? ' (+' + (total - list.length) + ' outside view)' : '';
+        sec.appendChild(el('div', 'section-title', title + ' (' + list.length + ')' + extra));
+        if (!list.length) { sec.appendChild(el('div', 'stats', 'None in view')); }
+        else {
+          const box = el('div', 'list');
+          const sorted = [...list].sort((a, b) => (b.bridge - a.bridge) || (nodes[isIn ? b.from : b.to].pr - nodes[isIn ? a.from : a.to].pr));
+          for (const e of sorted) {
+            const other = nodes[isIn ? e.from : e.to];
+            const b = el('button', 'item'); b.type = 'button';
+            b.append(el('span', 'title', other.name), el('span', 'sub' + (e.bridge ? ' tag-b' : ''), e.kind + (e.bridge ? ' · bridge' : '')));
+            b.onclick = () => { state.selected = other.id; renderSidebar(); centerOn(other.id); };
+            box.appendChild(b);
+          }
+          sec.appendChild(box);
+        }
+        sidebar.appendChild(sec);
+      };
+      addRelList('Incoming callers', inEdges[n.id], true, n.in_deg);
+      addRelList('Outgoing callees', outEdges[n.id], false, n.out_deg);
+      return;
+    }
+
+    const grid = el('div', 'kv-grid');
+    const card = (k, v) => { const c = el('div', 'card'); c.append(el('div', 'label', k), el('div', 'val', String(v))); return c; };
+    grid.append(card('Files', sum.files), card('Symbols', sum.symbols), card('Links', sum.links), card('Bridges', sum.bridges));
+    sidebar.appendChild(grid);
+
+    if (sum.languages && sum.languages.length) {
+      const sec = el('div'); sec.appendChild(el('div', 'section-title', 'Languages'));
+      const row = el('div', 'badges');
+      for (const [lang, cnt] of sum.languages.slice(0, 10)) row.appendChild(el('span', 'badge', lang + ' · ' + cnt));
+      sec.appendChild(row); sidebar.appendChild(sec);
+    }
+
+    if (nodes.length) {
+      const sec = el('div'); sec.appendChild(el('div', 'section-title', 'Top Hubs'));
+      const box = el('div', 'list');
+      for (const n of nodes.slice(0, 12)) {
+        const b = el('button', 'item'); b.type = 'button';
+        b.append(el('span', 'title', n.name), el('span', 'sub', 'in ' + n.in_deg + ' · out ' + n.out_deg));
+        b.onclick = () => { state.selected = n.id; renderSidebar(); centerOn(n.id); };
+        box.appendChild(b);
+      }
+      sec.appendChild(box); sidebar.appendChild(sec);
+    }
+
+    if (bridges.length) {
+      const sec = el('div'); sec.appendChild(el('div', 'section-title', 'Cross-community Bridges'));
+      const box = el('div', 'list');
+      for (const br of bridges.slice(0, 12)) {
+        const a = nodes[br.from], bNode = nodes[br.to];
+        if (!a || !bNode) continue;
+        const btn = el('button', 'item'); btn.type = 'button';
+        btn.append(el('span', 'title', a.name + ' → ' + bNode.name), el('span', 'sub tag-b', br.kind));
+        btn.onclick = () => { state.selected = a.id; renderSidebar(); centerOn(a.id); };
+        box.appendChild(btn);
+      }
+      sec.appendChild(box); sidebar.appendChild(sec);
+    }
+  }
+
+  function screenToWorld(sx, sy) { return { x: (sx - cam.x) / cam.k, y: (sy - cam.y) / cam.k }; }
+  function hitTest(sx, sy) {
+    const p = screenToWorld(sx, sy);
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const n = nodes[i], hit = Math.max(n.r + 4, 10 / cam.k);
+      if (Math.hypot(n.x - p.x, n.y - p.y) <= hit) return n;
+    }
+    return null;
+  }
+
+  let dragMode = null, dragNode = null, dragStart = null, moved = false;
+  cv.addEventListener('pointerdown', e => {
+    const r = cv.getBoundingClientRect(), sx = e.clientX - r.left, sy = e.clientY - r.top;
+    const hit = hitTest(sx, sy);
+    dragStart = { x: e.clientX, y: e.clientY, cx: cam.x, cy: cam.y }; moved = false;
+    if (hit) { dragMode = 'node'; dragNode = hit; pinned = hit.id; }
+    else { dragMode = 'pan'; cv.classList.add('dragging'); }
+    cv.setPointerCapture(e.pointerId);
+  });
+  cv.addEventListener('pointermove', e => {
+    const r = cv.getBoundingClientRect(), sx = e.clientX - r.left, sy = e.clientY - r.top;
+    if (dragMode) {
+      if (Math.hypot(e.clientX - dragStart.x, e.clientY - dragStart.y) > 4) moved = true;
+      if (dragMode === 'pan') { cam.x = dragStart.cx + (e.clientX - dragStart.x); cam.y = dragStart.cy + (e.clientY - dragStart.y); draw(); }
+      else if (dragMode === 'node' && dragNode) { const p = screenToWorld(sx, sy); dragNode.x = p.x; dragNode.y = p.y; draw(); }
+      return;
+    }
+    const hit = hitTest(sx, sy);
+    const next = hit ? hit.id : null;
+    cv.classList.toggle('hover', !!hit);
+    if (hit) {
+      tip.style.display = 'block';
+      tip.style.left = Math.min(W - 220, sx + 14) + 'px';
+      tip.style.top = Math.max(8, sy - 28) + 'px';
+      tip.textContent = hit.name + ' [' + hit.kind + '] · ' + hit.file + ':' + hit.start;
+    } else tip.style.display = 'none';
+    if (next !== state.hovered) { state.hovered = next; draw(); }
+  });
+  cv.addEventListener('pointerup', e => {
+    if (dragMode && !moved) {
+      state.selected = dragMode === 'node' && dragNode ? dragNode.id : null;
+      renderSidebar(); draw();
+    }
+    dragMode = null; dragNode = null; pinned = null; cv.classList.remove('dragging');
+    try { cv.releasePointerCapture(e.pointerId); } catch (_) {}
+  });
+  cv.addEventListener('dblclick', e => {
+    const r = cv.getBoundingClientRect(), hit = hitTest(e.clientX - r.left, e.clientY - r.top);
+    if (hit) { state.selected = hit.id; renderSidebar(); centerOn(hit.id); }
+  });
+  cv.addEventListener('wheel', e => {
+    e.preventDefault();
+    const r = cv.getBoundingClientRect(), sx = e.clientX - r.left, sy = e.clientY - r.top;
+    const factor = e.deltaY < 0 ? 1.14 : 1 / 1.14;
+    const nk = Math.max(0.15, Math.min(6, cam.k * factor));
+    cam.x = sx - ((sx - cam.x) / cam.k) * nk;
+    cam.y = sy - ((sy - cam.y) / cam.k) * nk;
+    cam.k = nk; draw();
+  }, { passive: false });
+
+  searchEl.addEventListener('input', () => {
+    const q = searchEl.value.trim().toLowerCase();
+    state.query = q; state.matches.clear();
+    if (q) {
+      for (const n of nodes) {
+        if (n.name.toLowerCase().includes(q) || n.qualified.toLowerCase().includes(q) || n.file.toLowerCase().includes(q) || n.kind.toLowerCase().includes(q) || n.lang.toLowerCase().includes(q)) {
+          state.matches.add(n.id);
+        }
+      }
+      matchCount.textContent = state.matches.size + ' match' + (state.matches.size === 1 ? '' : 'es');
+    } else matchCount.textContent = '';
+    draw();
+  });
+  searchEl.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && state.matches.size) {
+      const first = [...state.matches][0];
+      state.selected = first; renderSidebar(); centerOn(first);
+    }
+  });
+  bridgeBtn.onclick = () => { state.bridgesOnly = !state.bridgesOnly; bridgeBtn.classList.toggle('active', state.bridgesOnly); draw(); };
+  resetBtn.onclick = () => { state.comm = null; state.bridgesOnly = false; state.query = ''; state.matches.clear(); searchEl.value = ''; matchCount.textContent = ''; bridgeBtn.classList.remove('active'); renderCommBar(); fitView(nodes); };
+  const setTheme = t => { state.theme = t; document.documentElement.dataset.theme = t; themeBtn.textContent = t === 'dark' ? 'Light' : 'Dark'; renderCommBar(); draw(); };
+  themeBtn.onclick = () => setTheme(state.theme === 'dark' ? 'light' : 'dark');
+
+  window.addEventListener('keydown', e => {
+    if (e.key === '/' && document.activeElement !== searchEl) { e.preventDefault(); searchEl.focus(); searchEl.select(); }
+    else if (e.key === 'Escape') {
+      if (searchEl.value) { searchEl.value = ''; searchEl.dispatchEvent(new Event('input')); }
+      else if (state.selected !== null) { state.selected = null; renderSidebar(); draw(); }
+      searchEl.blur();
+    } else if ((e.key === 'r' || e.key === 'R') && document.activeElement !== searchEl) resetBtn.click();
+  });
+  window.addEventListener('resize', resize);
+
+  const initTheme = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  setTheme(initTheme);
+  resize();
+  fitView(nodes);
+  renderSidebar();
+  if (state.selected !== null && nodes[state.selected]) centerOn(state.selected);
+  (function settle() { if (simTick()) { draw(); raf = requestAnimationFrame(settle); } else { draw(); cancelAnimationFrame(raf); } })();
+})();
+</script>
+</body>
+</html>
+"##;
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -4115,5 +5170,176 @@ mod tests {
         // Tight budget stays strictly within ceiling.
         let tight = render_explain(&index, "list_orders", 420);
         assert!(tight.len() <= 420, "{} bytes\n{tight}", tight.len());
+    }
+
+    fn extract_embedded_json(html: &str) -> Value {
+        let marker = r#"<script id="justless-graph" type="application/json">"#;
+        let start = html.find(marker).expect("graph script tag") + marker.len();
+        let end = html[start..].find("</script>").expect("closing script tag") + start;
+        serde_json::from_str(&html[start..end]).expect("valid embedded JSON")
+    }
+
+    #[test]
+    fn map_html_is_offline_self_contained_and_contains_nodes_communities_and_bridges() {
+        let (_dir, index) = write_repo(&[
+            (
+                "frontend/format.ts",
+                "export function formatOrder(v: string): string {\n  return v.trim();\n}\n",
+            ),
+            (
+                "frontend/orders.ts",
+                "import { formatOrder } from './format.js';\nexport async function fetchOrders() {\n  const r = await fetch('/api/orders');\n  return formatOrder(await r.text());\n}\n",
+            ),
+            (
+                "backend/orders.py",
+                "from fastapi import APIRouter\nfrom backend.repo import query_orders\nrouter = APIRouter()\n@router.get('/api/orders')\ndef list_orders():\n    return query_orders()\n",
+            ),
+            (
+                "backend/repo.py",
+                "from backend.helpers import normalize_rows\ndef query_orders():\n    return normalize_rows(database.execute('SELECT id FROM purchase_orders'))\n",
+            ),
+            (
+                "backend/helpers.py",
+                "def normalize_rows(rows):\n    return rows\n",
+            ),
+            (
+                "db/schema.sql",
+                "CREATE TABLE purchase_orders (id INTEGER PRIMARY KEY);\n",
+            ),
+        ]);
+
+        let html = render_html(&index, "mixed-demo", "justless", None);
+        assert!(html.starts_with("<!DOCTYPE html>"), "missing doctype");
+        assert!(html.contains("<canvas id=\"cv\"></canvas>"));
+        assert!(!html.contains("http://"), "must not contain http:// URLs");
+        assert!(!html.contains("https://"), "must not contain https:// URLs");
+        assert!(
+            !html.contains("<script src"),
+            "must not load external scripts"
+        );
+        assert!(
+            !html.contains("<link "),
+            "must not load external stylesheets"
+        );
+        assert!(!html.contains("innerHTML"), "must not use innerHTML");
+
+        let payload = extract_embedded_json(&html);
+        let node_names: Vec<&str> = payload["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["name"].as_str().unwrap())
+            .collect();
+        assert!(node_names.contains(&"fetchOrders"), "{node_names:?}");
+        assert!(node_names.contains(&"list_orders"), "{node_names:?}");
+        assert!(node_names.contains(&"query_orders"), "{node_names:?}");
+        assert!(
+            !payload["communities"].as_array().unwrap().is_empty(),
+            "expected communities: {payload}"
+        );
+        assert!(
+            !payload["bridges"].as_array().unwrap().is_empty(),
+            "expected cross-community bridges: {payload}"
+        );
+        assert!(
+            !payload["areas"].as_array().unwrap().is_empty(),
+            "expected areas: {payload}"
+        );
+        assert_eq!(payload["summary"]["title"], "mixed-demo");
+    }
+
+    #[test]
+    fn map_html_escapes_xss_payloads_in_symbol_and_file_names() {
+        let (_dir, mut index) = write_repo(&[(
+            "src/app.py",
+            "def safe_helper():\n    return 1\n\ndef entry():\n    return safe_helper()\n",
+        )]);
+        let xss = "</script><img src=x onerror=alert(1)>";
+        let weird = format!("{xss}<!-- & \u{2028}\u{2029} -->");
+        let old_file = index.definitions[0].location.file.clone();
+        if let Some(content) = index.files.remove(&old_file) {
+            index.files.insert(format!("evil/{xss}.py"), content);
+        }
+        for def in &mut index.definitions {
+            def.location.file = format!("evil/{xss}.py");
+            if def.kind != "file" {
+                def.qualified = format!("evil/{xss}.py::{weird}");
+            } else {
+                def.qualified = format!("evil/{xss}.py");
+            }
+        }
+        for edge in &mut index.edges {
+            edge.location.file = format!("evil/{xss}.py");
+        }
+
+        let html = render_html(&index, &weird, "justless", None);
+        assert!(
+            !html.contains(xss),
+            "unescaped XSS payload appeared in HTML"
+        );
+        assert!(
+            !html.contains("<img src=x"),
+            "unescaped <img> tag appeared in HTML"
+        );
+        assert!(
+            !html.contains('\u{2028}') && !html.contains('\u{2029}'),
+            "raw line/paragraph separators must be escaped"
+        );
+        assert_eq!(
+            html.matches("</script>").count(),
+            2,
+            "must have exactly 2 closing script tags (data + app)"
+        );
+
+        let payload = extract_embedded_json(&html);
+        assert_eq!(payload["summary"]["title"], weird);
+        assert!(
+            payload["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["name"].as_str().unwrap() == weird),
+            "escaped JSON must round-trip original symbol string losslessly"
+        );
+    }
+
+    #[test]
+    fn map_html_cli_supports_explain_and_out_and_rejects_json_conflict() {
+        // `--html` conflicts with `--json`.
+        let conflict = command().try_get_matches_from(["map", "--html", "--json"]);
+        assert!(conflict.is_err(), "--html and --json must conflict");
+
+        // `--out` requires `--html`.
+        let orphan_out = command().try_get_matches_from(["map", "--out", "graph.html"]);
+        assert!(orphan_out.is_err(), "--out without --html must fail");
+
+        // `--html --explain SYMBOL --out PATH` parses and executes end-to-end.
+        let (dir, _index) = write_repo(&[
+            ("src/core.py", "def compute_total(x):\n    return x + 1\n"),
+            (
+                "src/api.py",
+                "from src.core import compute_total\ndef handle_request():\n    return compute_total(41)\n",
+            ),
+        ]);
+        let out_path = dir.path().join("explorer.html");
+        let matches = command()
+            .try_get_matches_from([
+                "map",
+                "--html",
+                "--explain",
+                "compute_total",
+                "--out",
+                out_path.to_str().unwrap(),
+            ])
+            .expect("--html --explain --out must parse cleanly");
+        let ws = Workspace::discover(Some(dir.path())).unwrap();
+        run(&ws, &matches).expect("map --html --explain --out must succeed");
+
+        let written = fs::read_to_string(&out_path).expect("HTML file written");
+        assert!(written.starts_with("<!DOCTYPE html>"));
+        let payload = extract_embedded_json(&written);
+        let focus = payload["focus"].as_u64().expect("focus node index set") as usize;
+        assert_eq!(payload["nodes"][focus]["name"], "compute_total");
+        assert_eq!(payload["summary"]["focus_symbol"], "compute_total");
     }
 }
