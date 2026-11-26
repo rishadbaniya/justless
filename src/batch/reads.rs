@@ -1,6 +1,8 @@
 //! Reproduce the bytes downstream of line selections and column cuts while
 //! retaining the source line of each surviving row.
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Component, Path};
 
@@ -30,9 +32,9 @@ pub(super) struct SourceLines {
     outside: bool,
 }
 
-struct Row {
+struct Row<'a> {
     source_line: usize,
-    text: String,
+    text: Cow<'a, str>,
 }
 
 impl Files {
@@ -155,6 +157,39 @@ impl Files {
         filters: &[Filter],
     ) -> Option<(String, SourceLines)> {
         let snap = self.files.get(key)?;
+        // Fast path for unnumbered whole-file reads (`cat FILE`): skip building
+        // per-line Row vectors and return a single clone of the snapshot text.
+        if numbered == Numbers::None
+            && matches!(select, Filter::All)
+            && filters.iter().all(|f| matches!(f, Filter::All))
+        {
+            let lines = if snap.text.is_empty() {
+                0
+            } else {
+                snap.text.as_bytes().iter().filter(|&&b| b == b'\n').count()
+                    + usize::from(!snap.text.ends_with('\n'))
+            };
+            if lines > 100_000 {
+                return None;
+            }
+            let spans = if lines == 0 {
+                Vec::new()
+            } else {
+                vec![(1, lines)]
+            };
+            return Some((
+                snap.text.clone(),
+                SourceLines {
+                    key: key.to_owned(),
+                    name: name.to_owned(),
+                    path: path.to_owned(),
+                    spans,
+                    cut: false,
+                    object: false,
+                    outside: false,
+                },
+            ));
+        }
         let mut rows = Vec::new();
         for (i, line) in snap.text.split_inclusive('\n').enumerate() {
             if i >= 100_000 {
@@ -163,13 +198,13 @@ impl Files {
             let text = match numbered {
                 // `nl` treats these lines as section delimiters.
                 Numbers::Nl if line.starts_with("\\:") => return None,
-                Numbers::Nl => format!(
+                Numbers::Nl => Cow::Owned(format!(
                     "{:>6}\t{}\n",
                     i + 1,
                     line.strip_suffix('\n').unwrap_or(line)
-                ),
-                Numbers::Cat => format!("{:>6}\t{line}", i + 1),
-                Numbers::None => line.to_owned(),
+                )),
+                Numbers::Cat => Cow::Owned(format!("{:>6}\t{line}", i + 1)),
+                Numbers::None => Cow::Borrowed(line),
             };
             rows.push(Row {
                 source_line: i + 1,
@@ -181,7 +216,8 @@ impl Files {
             rows = apply(rows, filter)?;
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
-        let mut text = String::new();
+        let total_len: usize = rows.iter().map(|r| r.text.len()).sum();
+        let mut text = String::with_capacity(total_len);
         for row in rows {
             if let Some((_, end)) = spans.last_mut()
                 && row.source_line <= *end + 1
@@ -271,18 +307,20 @@ impl Files {
             if source.cut && !visible.contains(name.rsplit("::").next()?) {
                 continue;
             }
-            let row = format!("  L{a}-{b} {kind} {name}\n");
             count += 1;
-            if count == shown + 1 && out.len() + row.len() + 32 <= budget {
-                out.push_str(&row);
-                shown += 1;
+            if count == shown + 1 {
+                let row = format!("  L{a}-{b} {kind} {name}\n");
+                if out.len() + row.len() + 32 <= budget {
+                    out.push_str(&row);
+                    shown += 1;
+                }
             }
         }
         if shown < 2 {
             return None;
         }
         if count > shown {
-            out.push_str(&format!("  … {} more symbols\n", count - shown));
+            let _ = writeln!(out, "  … {} more symbols", count - shown);
         }
         Some(out)
     }
@@ -304,23 +342,28 @@ pub(super) fn outside(ws: &Workspace, path: &Path, named: &Path) -> Option<std::
 }
 
 pub(super) fn filter(text: String, filters: &[Filter]) -> Option<String> {
-    if filters.is_empty() {
+    if filters.iter().all(|f| matches!(f, Filter::All)) {
         return Some(text);
     }
     let mut rows = text
         .split_inclusive('\n')
         .map(|line| Row {
             source_line: 0,
-            text: line.to_owned(),
+            text: Cow::Borrowed(line),
         })
         .collect::<Vec<_>>();
     for filter in filters {
         rows = apply(rows, filter)?;
     }
-    Some(rows.into_iter().map(|r| r.text).collect())
+    let total_len: usize = rows.iter().map(|r| r.text.len()).sum();
+    let mut out = String::with_capacity(total_len);
+    for r in rows {
+        out.push_str(&r.text);
+    }
+    Some(out)
 }
 
-fn apply(mut rows: Vec<Row>, filter: &Filter) -> Option<Vec<Row>> {
+fn apply<'a>(mut rows: Vec<Row<'a>>, filter: &Filter) -> Option<Vec<Row<'a>>> {
     match filter {
         Filter::All => {}
         Filter::First(n) => rows.truncate(*n),
@@ -346,7 +389,7 @@ fn apply(mut rows: Vec<Row>, filter: &Filter) -> Option<Vec<Row>> {
                     target_os = "netbsd"
                 )) && !row.text.ends_with('\n')
                 {
-                    row.text.push('\n');
+                    row.text.to_mut().push('\n');
                 }
                 size += row.text.len() * copies;
                 if size > MAX_BYTES || selected.len() + copies > 100_000 {
@@ -364,7 +407,7 @@ fn apply(mut rows: Vec<Row>, filter: &Filter) -> Option<Vec<Row>> {
         }
         Filter::Columns(ranges) => {
             for row in &mut rows {
-                let mut line = String::new();
+                let mut line = String::with_capacity(row.text.len());
                 for (i, c) in row
                     .text
                     .strip_suffix('\n')
@@ -377,7 +420,7 @@ fn apply(mut rows: Vec<Row>, filter: &Filter) -> Option<Vec<Row>> {
                     }
                 }
                 line.push('\n');
-                row.text = line;
+                row.text = Cow::Owned(line);
             }
         }
     }

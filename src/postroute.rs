@@ -107,12 +107,13 @@ static ERROR_LINE: LazyLock<Regex> = LazyLock::new(|| {
     )
     .expect("error line pattern")
 });
-/// Lines of a failing test: a Rust panic and its assertion, a Go `--- FAIL:` and a
-/// pytest `FAILED` line. A test report that names no failing test, such as one
-/// whose `FAILED` line a `| tail` cut off, is followed by these instead.
+/// Lines of a failing test: a Rust panic and its assertion, a Go `--- FAIL:`, a
+/// pytest `FAILED` line, or a Dart/Flutter test failure. A test report that names
+/// no failing test, such as one whose `FAILED` line a `| tail` cut off, is
+/// followed by these instead.
 static FAILURE_LINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"^(?:thread '[^']*' (?:\(\d+\) )?panicked at |assertion|  left: | right: |--- FAIL: |FAILED |\s*(?:FAIL|TIMEOUT) \[|failures:\s*$)",
+        r"^(?:thread '[^']*' (?:\(\d+\) )?panicked at |assertion|  left: | right: |--- FAIL: |FAILED |\s*(?:FAIL|TIMEOUT) \[|failures:\s*$|\s*\d{2,}:\d{2}\s+\+\d+(?:\s+~\d+)?\s+-\d+:.*\[E\]|Some tests failed\.?$)",
     )
     .expect("test failure pattern")
 });
@@ -168,6 +169,82 @@ pub(crate) fn no_stderr(stderr: &str) -> bool {
             .is_some_and(|dir| !dir.is_empty() && !dir.contains('\n'))
 }
 
+/// Extract the command's exit status from a `tool_response` object. Preserves
+/// explicit non-zero exit codes (`exitCode`, `exit_code`, `returnCode`,
+/// `exitStatus`, integer `status`) and falls back to `returnCodeInterpretation`
+/// (parsing an explicit non-zero code when phrased like `Exit code N`, else 1).
+pub(crate) fn response_exit_status(response: &serde_json::Map<String, Value>) -> i32 {
+    for key in [
+        "exitCode",
+        "exit_code",
+        "returnCode",
+        "exitStatus",
+        "status",
+    ] {
+        if let Some(code) = response
+            .get(key)
+            .and_then(Value::as_i64)
+            .and_then(|n| i32::try_from(n).ok())
+        {
+            return code;
+        }
+    }
+    if let Some(text) = response
+        .get("returnCodeInterpretation")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return parse_interpretation_code(text).unwrap_or(1);
+    }
+    0
+}
+
+fn parse_interpretation_code(text: &str) -> Option<i32> {
+    let bytes = text.as_bytes();
+    for needle in [&b"exit code"[..], b"exit status", b"return code", b"status"] {
+        if let Some(pos) = find_ascii_icase(bytes, needle) {
+            let rest = text[pos + needle.len()..]
+                .trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ':' || c == '=');
+            let digits_end = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+            if digits_end > 0
+                && let Ok(code) = rest[..digits_end].parse::<i32>()
+                && code != 0
+            {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+#[inline]
+fn find_ascii_icase(hay: &[u8], needle_lower: &[u8]) -> Option<usize> {
+    let (&first, rest) = needle_lower.split_first()?;
+    if hay.len() < needle_lower.len() {
+        return None;
+    }
+    let first_upper = first.to_ascii_uppercase();
+    let last = hay.len() - needle_lower.len();
+    let mut i = 0;
+    while i <= last {
+        let off = hay[i..=last]
+            .iter()
+            .position(|&b| b == first || b == first_upper)?;
+        let pos = i + off;
+        if hay[pos + 1..pos + needle_lower.len()].eq_ignore_ascii_case(rest) {
+            return Some(pos);
+        }
+        i = pos + 1;
+    }
+    None
+}
+
+#[inline]
+fn has_run_marker(text: &str) -> bool {
+    text.contains("[justless run-") && RUN_MARKER.is_match(text)
+}
+
 /// Claude Code PostToolUse handler for the Bash tool. Returns `None` to leave the
 /// result unchanged: a command already routed through Justless, a background,
 /// interrupted or image result, output the run path would show verbatim, and any
@@ -203,7 +280,7 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     }
     // Output with a run marker was already routed, unless it is the text of a
     // `git show` blob, which the read below matches byte for byte.
-    let routed = RUN_MARKER.is_match(stdout);
+    let routed = has_run_marker(stdout);
     // The read parsers take the line with the plain variables it sets itself
     // filled in and its globs expanded, as the shell ran it. The reports below
     // read it as written.
@@ -302,17 +379,24 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     {
         return None;
     }
-    let shown_text = String::from_utf8_lossy(&output);
-    // A line `cut -c1-N` may have clipped reads as a search match still, since a
-    // match keeps its path and line number at the start, but not as a test, patch,
-    // lint or listing line.
-    if let Some(width) = plan.columns()
-        && plan.profile != Some(crate::filters::Profile::Search)
-        && shown_text.lines().any(|line| line.len() >= width)
-    {
-        return None;
-    }
-    let (start_cut, end_cut, ends_early) = plan.cut(shown_text.lines().count());
+    let column_width = plan.columns();
+    let has_filters = !plan.filters.is_empty() || !plan.later.is_empty();
+    let (clipped_columns, start_cut, end_cut, ends_early) =
+        if column_width.is_none() && !has_filters {
+            (false, false, false, false)
+        } else {
+            let shown_text = String::from_utf8_lossy(&output);
+            let clipped_columns = column_width
+                .is_some_and(|width| shown_text.lines().any(|line| line.len() >= width));
+            // A line `cut -c1-N` may have clipped reads as a search match still, since a
+            // match keeps its path and line number at the start, but not as a test, patch,
+            // lint or listing line.
+            if clipped_columns && plan.profile != Some(crate::filters::Profile::Search) {
+                return None;
+            }
+            let (start_cut, end_cut, ends_early) = plan.cut(shown_text.lines().count());
+            (clipped_columns, start_cut, end_cut, ends_early)
+        };
     // For a result Claude Code saved to a file, the agent would have seen the first
     // 2,000 characters. The report gets three quarters of that, so it fits with its
     // error lines and marker.
@@ -324,14 +408,9 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
             .sum::<usize>()
     });
     let budget = preview.map_or(run_budget, |preview| run_budget.min(preview * 3 / 4));
-    // Claude Code reports exit 1 as a valid result only with an interpretation,
-    // such as "No matches found".
-    let status = i32::from(
-        response
-            .get("returnCodeInterpretation")
-            .and_then(Value::as_str)
-            .is_some_and(|text| !text.is_empty()),
-    );
+    // Preserve explicit non-zero exit codes and `returnCodeInterpretation` so
+    // failing runs keep their exit status and failure signals through compaction.
+    let status = response_exit_status(response);
     let session = input["session_id"]
         .as_str()
         .filter(|id| !id.is_empty())
@@ -374,24 +453,32 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
         .iter()
         .map(|(_, bytes)| String::from_utf8_lossy(bytes))
         .collect();
-    // Redact the full output once up front so post-run formatters (DevOps
-    // inventories, logview, stacktrace collapsing, and unshown error scans)
-    // never leak secrets while keeping exact 1-based archive line numbers.
-    let redacted_bytes = redactor.map_or(Cow::Borrowed(output.as_slice()), |r| r.bytes(&output));
-    let redacted_text = String::from_utf8_lossy(&redacted_bytes);
     let archive_complete = shown.run.produced_bytes.is_empty();
     let is_json_view = text.starts_with("[JSON ");
     let was_clipped = text.contains("[output clipped. Full log retained.]");
     let cmd_refs: Vec<&str> = plan.source_words().iter().map(String::as_str).collect();
     let is_log_cmd = is_log_command(&cmd_refs);
-    let clipped_columns = plan
-        .columns()
-        .is_some_and(|width| shown_text.lines().any(|line| line.len() >= width));
     let mut replaced = false;
     let mut used_logview =
         is_log_cmd && shown.report && shown.run.summary.kind.is_empty() && !is_json_view;
-    if archive_complete && !shown.report && !is_json_view && !clipped_columns {
-        let mut replacement: Option<(String, bool)> = None;
+    let will_try_replace = archive_complete && !shown.report && !is_json_view && !clipped_columns;
+    let will_try_floor = plan.strict() && !shown.report;
+    let will_scan_errors =
+        !(shown.footer.is_empty() || shown.run.summary.kind == "lint" || used_logview);
+    // Redact the full output once lazily only when post-run formatters, floor
+    // compaction, or unshown error scans actually inspect it.
+    let redacted_bytes = if will_try_replace || will_try_floor || will_scan_errors {
+        redactor.map_or(Cow::Borrowed(output.as_slice()), |r| r.bytes(&output))
+    } else {
+        Cow::Borrowed(output.as_slice())
+    };
+    let redacted_text = if will_try_replace || will_try_floor {
+        String::from_utf8_lossy(&redacted_bytes)
+    } else {
+        Cow::Borrowed("")
+    };
+    if will_try_replace {
+        let mut replacement: Option<(String, bool, Option<crate::summary::Summary>)> = None;
         // 1. Extended DevOps inventories (`kubectl get events|svc|ing|pvc|cj`,
         //    `helm list|ls`, `docker|podman images`) when capture did not match
         //    them directly (e.g. flags before subcommands, aliases, or pipes).
@@ -401,7 +488,7 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
             && view.len() < output.len()
             && (was_clipped || view.len() + 64 < text.len())
         {
-            replacement = Some((view, false));
+            replacement = Some((view, false, None));
         }
         // 2. High-frequency CLI raw-dump compactors (`kubectl`/`oc describe`,
         //    `gh`/`glab` views, security audits, `outdated`/`pip list|freeze`,
@@ -412,7 +499,7 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
             && view.len() < output.len()
             && (was_clipped || view.len() + 64 < text.len())
         {
-            replacement = Some((view, false));
+            replacement = Some((view, false, None));
         }
         // 2a. Cloud & Kubernetes diff/manifest/listing compactors (`kubectl`/`oc diff`,
         //     `helm template`/`get manifest`, `aws s3 ls`, `gcloud`/`az`/`aws` display lists).
@@ -422,7 +509,7 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
             && view.len() < output.len()
             && (was_clipped || view.len() + 64 < text.len())
         {
-            replacement = Some((view, false));
+            replacement = Some((view, false, None));
         }
         // 2b. BuildKit / Docker / Compose / Podman build logs.
         if replacement.is_none()
@@ -438,22 +525,41 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
             && view.len() < output.len()
             && (was_clipped || view.len() + 64 < text.len())
         {
-            replacement = Some((view, false));
+            replacement = Some((view, false, None));
         }
         // 2c. Dependency trees and graphs (`cargo tree`, `npm ls`, `pnpm list`,
-        //     `yarn list`, `pipdeptree`, `go mod graph`, `mvn`, `gradle`).
+        //     `yarn list`, `pipdeptree`, `go mod graph`, `mvn`, `gradle`,
+        //     `dart pub deps`, `flutter pub deps`).
         if replacement.is_none()
             && let Some(view) = crate::deptree::format_words(&cmd_refs, &redacted_text, budget)
             && view.len() <= budget
             && view.len() < output.len()
             && (was_clipped || view.len() + 64 < text.len())
         {
-            replacement = Some((view, false));
+            replacement = Some((view, false, None));
+        }
+        // 2c2. Dart & Flutter analyzer grouped lint reports (handles leading
+        //      flags such as `flutter --no-color analyze` or `loose()` fallback).
+        if replacement.is_none()
+            && is_dart_analyze(&cmd_refs)
+            && let Some((view, summary)) = format_dart_analyze(
+                &run_ws.root,
+                &cmd_refs,
+                &redacted_text,
+                shown.run.status,
+                budget,
+            )
+            && view.len() <= budget
+            && view.len() < output.len()
+            && (was_clipped || view.len() + 64 < text.len())
+        {
+            replacement = Some((view, false, summary));
         }
         // 2d. Structured polyglot test runner reports (`pytest`, `unittest`,
-        //     `go test`, `dotnet`, `mvn`, `gradle`, `swift`, `ctest`, `mix`, `deno`).
+        //     `go test`, `dotnet`, `mvn`, `gradle`, `swift`, `ctest`, `mix`,
+        //     `deno`, `dart test`, `flutter test`).
         if replacement.is_none()
-            && let Some(runner) = crate::polyglot_tests::runner_for_words(&cmd_refs)
+            && let Some(runner) = polyglot_test_runner(&cmd_refs)
             && let Some(poly) = crate::polyglot_tests::format(
                 runner,
                 &redacted_text,
@@ -465,7 +571,14 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
             && poly.text.len() < output.len()
             && (was_clipped || poly.text.len() + 64 < text.len())
         {
-            replacement = Some((poly.text, false));
+            let mut summary = shown.run.summary.clone();
+            summary.kind = "tests".to_owned();
+            summary.items = poly
+                .items
+                .iter()
+                .map(crate::polyglot_tests::FailureItem::to_summary_item)
+                .collect();
+            replacement = Some((poly.text, false, Some(summary)));
         }
         // 2e. Universal lossless / bounded tables (`psql`, `mysql`, `duckdb`,
         //     `sqlite3`, `aws --output table`, Markdown tables).
@@ -477,7 +590,7 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
             && view.len() < output.len()
             && (was_clipped || view.len() + 64 < text.len())
         {
-            replacement = Some((view, false));
+            replacement = Some((view, false, None));
         }
         // 3. Structured or container/JSON/systemd log streams via `logview`.
         if replacement.is_none()
@@ -491,7 +604,7 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
             && (was_clipped || folded.len() + 64 < text.len())
             && (is_log_cmd || folded.len() * 4 <= output.len() * 3)
         {
-            replacement = Some((folded, true));
+            replacement = Some((folded, true, None));
         }
         // 3. Traceback-heavy outputs: collapse external runtime frames while
         //    keeping 100% of workspace frames & errors verbatim with `[stdout:A-B]`
@@ -510,10 +623,10 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
                 && candidate.len() < output.len()
                 && (was_clipped || candidate.len() < text.len())
             {
-                replacement = Some((candidate, false));
+                replacement = Some((candidate, false, None));
             }
         }
-        if let Some((mut body, logview)) = replacement {
+        if let Some((mut body, logview, new_summary)) = replacement {
             if !body.is_empty() && !body.ends_with('\n') {
                 body.push('\n');
             }
@@ -521,6 +634,9 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
                 && let Cow::Owned(redacted) = redactor.text(&body)
             {
                 body = redacted;
+            }
+            if let Some(summary) = new_summary {
+                shown.run.summary = summary;
             }
             text = body;
             shown.run.preview_bytes = text.len();
@@ -560,8 +676,9 @@ pub fn claude_bash(ws: &Workspace, input: &Value) -> Option<Value> {
     let errors = if shown.footer.is_empty() || summary.kind == "lint" || used_logview {
         String::new()
     } else {
-        let failures =
-            summary.kind.is_empty() || summary.kind == "tests" && summary.items.is_empty();
+        let failures = (status != 0 && summary.items.is_empty())
+            || summary.kind.is_empty()
+            || summary.kind == "tests" && summary.items.is_empty();
         // Past `max_run_bytes` the archive holds no lines, so `log` could not replay
         // an error line listed there by its number.
         let archived = shown.run.stream_bytes.first().map_or(usize::MAX, |&bytes| {
@@ -715,13 +832,17 @@ fn unshown_errors(
     for (index, line) in text.lines().enumerate().take(archived) {
         let trimmed = line.trim();
         if trimmed.is_empty()
-            || !(reports_error(line, program) || failures && FAILURE_LINE.is_match(line))
+            || !(reports_error(line, program) || failures && matches_failure_line(line))
             || shown.contains(trimmed)
         {
             continue;
         }
+        if listed >= ERROR_LINES {
+            more += 1;
+            continue;
+        }
         let entry = format!("stdout:{}: {}\n", index + 1, crate::search::clip(trimmed));
-        if listed < ERROR_LINES && lines.len() + entry.len() <= budget {
+        if lines.len() + entry.len() <= budget {
             lines.push_str(&entry);
             listed += 1;
         } else {
@@ -737,16 +858,36 @@ fn unshown_errors(
     format!("Error lines not shown above:\n{lines}")
 }
 
+#[inline]
+fn matches_failure_line(line: &str) -> bool {
+    let Some(&first) = line.as_bytes().first() else {
+        return false;
+    };
+    (first.is_ascii_whitespace()
+        || first.is_ascii_digit()
+        || matches!(first, b't' | b'a' | b'-' | b'F' | b'T' | b'f' | b'S'))
+        && FAILURE_LINE.is_match(line)
+}
+
 fn reports_error(line: &str, program: &str) -> bool {
-    if ERROR_LINE.is_match(line) {
+    if line
+        .as_bytes()
+        .first()
+        .is_some_and(|&b| matches!(b, b'e' | b'f' | b'F' | b'E' | b'p' | b'n' | b'T'))
+        && ERROR_LINE.is_match(line)
+    {
         return true;
     }
     let Some((tool, message)) = line.split_once(": ") else {
         return false;
     };
-    let message = message.to_ascii_lowercase();
-    (tool == program || TOOLS.contains(&tool))
-        && TOOL_ERRORS.iter().any(|needle| message.contains(needle))
+    if tool != program && !TOOLS.contains(&tool) {
+        return false;
+    }
+    let bytes = message.as_bytes();
+    TOOL_ERRORS
+        .iter()
+        .any(|needle| find_ascii_icase(bytes, needle.as_bytes()).is_some())
 }
 
 /// The directory a command's relative paths start from. Claude Code's main session
@@ -810,7 +951,7 @@ pub(crate) fn after_run(
     persisted: Option<u64>,
     (context_budget, outline_lines): (usize, u64),
 ) -> Option<AfterRun> {
-    if !cwd.starts_with(root) || excluded(exclusions, command) || RUN_MARKER.is_match(output) {
+    if !cwd.starts_with(root) || excluded(exclusions, command) || has_run_marker(output) {
         return None;
     }
     let size = persisted.unwrap_or(output.len() as u64);
@@ -1039,6 +1180,7 @@ fn plan(command: &str) -> Option<Plan> {
         Option<&'static str>,
         Option<&'static str>,
         Option<&'static str>,
+        Option<&'static str>,
         bool,
     );
     let mut found: Option<(Plan, KindKey)> = None;
@@ -1097,11 +1239,13 @@ fn plan(command: &str) -> Option<Plan> {
         let extra_inv = extra_inventory_kind(&refs).map(ExtraInventory::tag);
         let cli_view = crate::cli_views::kind_tag(&refs);
         let cloud_view = crate::cloud_views::kind_tag(&refs);
+        let dart_flutter = dart_flutter_kind(&refs);
         let log_cmd = is_log_command(&refs);
         if !crate::agents::supported_words(&refs)
             && extra_inv.is_none()
             && cli_view.is_none()
             && cloud_view.is_none()
+            && dart_flutter.is_none()
             && !log_cmd
         {
             return None;
@@ -1113,6 +1257,7 @@ fn plan(command: &str) -> Option<Plan> {
             extra_inv,
             cli_view,
             cloud_view,
+            dart_flutter,
             log_cmd,
         );
         // A search whose pattern matches every line, such as `grep -rn "" file`, is
@@ -1295,37 +1440,42 @@ fn runs(command: &str) -> Option<(Commands, bool)> {
     if command.len() > 64 * 1024 {
         return None;
     }
-    // Drop the body of each here-document.
-    let mut text = String::with_capacity(command.len());
-    let mut body: Option<(String, bool)> = None;
-    for line in command.split_inclusive('\n') {
-        if let Some((end, tabs)) = &body {
-            let mut last = line.trim_end_matches('\n');
-            if *tabs {
-                last = last.trim_start_matches('\t');
+    // Drop the body of each here-document (zero-alloc borrow when no `<<`).
+    let text: Cow<'_, str> = if command.contains("<<") {
+        let mut stripped = String::with_capacity(command.len());
+        let mut body: Option<(String, bool)> = None;
+        for line in command.split_inclusive('\n') {
+            if let Some((end, tabs)) = &body {
+                let mut last = line.trim_end_matches('\n');
+                if *tabs {
+                    last = last.trim_start_matches('\t');
+                }
+                if last == end {
+                    body = None;
+                }
+                continue;
             }
-            if last == end {
-                body = None;
+            stripped.push_str(line);
+            let marker = line.find("<<").filter(|&at| !line[at..].starts_with("<<<"));
+            if let Some(at) = marker {
+                let rest = &line[at + 2..];
+                let tabs = rest.starts_with('-');
+                let end: String = rest
+                    .trim_start_matches('-')
+                    .trim_start()
+                    .trim_start_matches(['\'', '"', '\\'])
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !end.is_empty() {
+                    body = Some((end, tabs));
+                }
             }
-            continue;
         }
-        text.push_str(line);
-        let marker = line.find("<<").filter(|&at| !line[at..].starts_with("<<<"));
-        if let Some(at) = marker {
-            let rest = &line[at + 2..];
-            let tabs = rest.starts_with('-');
-            let end: String = rest
-                .trim_start_matches('-')
-                .trim_start()
-                .trim_start_matches(['\'', '"', '\\'])
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            if !end.is_empty() {
-                body = Some((end, tabs));
-            }
-        }
-    }
+        Cow::Owned(stripped)
+    } else {
+        Cow::Borrowed(command)
+    };
     let mut pieces = Vec::new();
     let mut word = String::new();
     let mut double = false;
@@ -1659,6 +1809,160 @@ fn format_extra_inventory(
     }
 }
 
+/// Skip safe leading `dart` / `flutter` display flags before a subcommand.
+fn dart_flutter_subcommand<'a>(words: &'a [&'a str]) -> Option<(&'a str, &'a [&'a str])> {
+    let tool = crate::filters::unwrap_tool(words);
+    let (&program, mut args) = tool.split_first()?;
+    let base = basename(program);
+    if !matches!(base, "dart" | "flutter") {
+        return None;
+    }
+    while let Some((&arg, rest)) = args.split_first() {
+        if matches!(
+            arg,
+            "--no-color"
+                | "--color"
+                | "--suppress-analytics"
+                | "--disable-analytics"
+                | "--no-version-check"
+                | "-v"
+                | "--verbose"
+        ) || arg.starts_with("--directory=")
+        {
+            args = rest;
+        } else if matches!(arg, "-C" | "--directory")
+            && rest.first().is_some_and(|v| !v.starts_with('-'))
+        {
+            args = &rest[1..];
+        } else {
+            break;
+        }
+    }
+    Some((base, args))
+}
+
+/// Whether `words` runs display-oriented `dart analyze` or `flutter analyze`
+/// (matching `capture::known_lint_tool`, plus safe leading display flags).
+fn is_dart_analyze(words: &[&str]) -> bool {
+    let owned = crate::wrappers::effective(words);
+    let refs: Vec<&str> = match &owned {
+        Some(w) => w.iter().map(String::as_str).collect(),
+        None => words.to_vec(),
+    };
+    let Some((_, ["analyze", tail @ ..])) = dart_flutter_subcommand(&refs) else {
+        return false;
+    };
+    let mut iter = tail.iter().copied();
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            break;
+        }
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(f, v)| (f, Some(v)));
+        match flag {
+            "-h" | "--help" | "-V" | "--version" | "--json" | "--xml" | "--sarif"
+            | "--checkstyle" | "--watch" | "-w" | "--write" | "--machine" => return false,
+            "-f" | "--format" | "-format" | "--error-format" | "--formatter" | "--reporter"
+            | "--output-format" => {
+                let val = inline.or_else(|| iter.next()).unwrap_or("");
+                if matches!(
+                    val.to_ascii_lowercase().as_str(),
+                    "json"
+                        | "jsonl"
+                        | "ndjson"
+                        | "sarif"
+                        | "xml"
+                        | "checkstyle"
+                        | "junit"
+                        | "github"
+                        | "gitlab"
+                        | "rdjson"
+                        | "yaml"
+                        | "machine"
+                ) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Polyglot test runner recognition for `postroute`, also unwrapping safe
+/// leading `dart` / `flutter` display flags before `test`.
+fn polyglot_test_runner(words: &[&str]) -> Option<crate::polyglot_tests::Runner> {
+    if let Some(runner) = crate::polyglot_tests::runner_for_words(words) {
+        return Some(runner);
+    }
+    let owned = crate::wrappers::effective(words);
+    let refs: Vec<&str> = match &owned {
+        Some(w) => w.iter().map(String::as_str).collect(),
+        None => words.to_vec(),
+    };
+    let (base, args) = dart_flutter_subcommand(&refs)?;
+    if args.first() != Some(&"test") {
+        return None;
+    }
+    let mut normalized = Vec::with_capacity(args.len() + 1);
+    normalized.push(base);
+    normalized.extend_from_slice(args);
+    crate::polyglot_tests::runner_for_words(&normalized)
+}
+
+/// Recognize display-oriented `dart`/`flutter` `analyze`, `test`, and `pub deps`
+/// commands so `plan` routes them cleanly with full words, `cd`, and pipes.
+fn dart_flutter_kind(words: &[&str]) -> Option<&'static str> {
+    if is_dart_analyze(words) {
+        return Some("dart-analyze");
+    }
+    if polyglot_test_runner(words) == Some(crate::polyglot_tests::Runner::DartTest) {
+        return Some("dart-test");
+    }
+    let owned = crate::wrappers::effective(words);
+    let refs: Vec<&str> = match &owned {
+        Some(w) => w.iter().map(String::as_str).collect(),
+        None => words.to_vec(),
+    };
+    if dart_flutter_subcommand(&refs).is_some() && crate::deptree::is_supported(&refs) {
+        return Some("pub-deps");
+    }
+    None
+}
+
+fn format_dart_analyze(
+    root: &Path,
+    words: &[&str],
+    text: &str,
+    status: i32,
+    budget: usize,
+) -> Option<(String, Option<crate::summary::Summary>)> {
+    let owned = crate::wrappers::effective(words);
+    let refs: Vec<&str> = match &owned {
+        Some(w) => w.iter().map(String::as_str).collect(),
+        None => words.to_vec(),
+    };
+    let (base, _) = dart_flutter_subcommand(&refs)?;
+    let label = format!("{base} analyze");
+    let mut lint = crate::lint::Lint::for_tool(root, crate::lint::Tool::DartAnalyze);
+    for (index, raw) in text.lines().enumerate() {
+        let cleaned = if raw.contains('\x1b') {
+            crate::capture::ANSI.replace_all(raw, "")
+        } else {
+            Cow::Borrowed(raw)
+        };
+        lint.observe(&cleaned, index + 1, crate::capture::Stream::Stdout);
+    }
+    if status == 0
+        && let Some(clean) = lint.clean(&label)
+    {
+        return Some((clean, None));
+    }
+    lint.finish(&label, budget, None)
+        .map(|(report, summary)| (report, Some(summary)))
+}
+
 /// Whether `words` runs a container, Kubernetes, systemd or cloud log stream
 /// command eligible for `crate::logview::format` post-run compaction.
 fn is_log_command(words: &[&str]) -> bool {
@@ -1753,6 +2057,34 @@ fn is_log_command(words: &[&str]) -> bool {
     }
 }
 
+#[inline]
+fn is_structured_log_line(trimmed: &str) -> bool {
+    let Some(&first) = trimmed.as_bytes().first() else {
+        return false;
+    };
+    matches!(
+        first,
+        b'[' | b'0'
+            ..=b'9'
+                | b'A'
+                | b'C'
+                | b'D'
+                | b'E'
+                | b'F'
+                | b'I'
+                | b'J'
+                | b'M'
+                | b'N'
+                | b'O'
+                | b'S'
+                | b'T'
+                | b'W'
+                | b'l'
+                | b's'
+                | b't'
+    ) && STRUCTURED_LOG_LINE.is_match(trimmed)
+}
+
 /// Whether `text` is predominantly structured multi-line log output (timestamps,
 /// syslog/klog headers, container/compose prefixes, log-level prefixes, or
 /// structured JSON log records), suitable for `crate::logview::format`.
@@ -1789,17 +2121,18 @@ fn looks_like_structured_logs(text: &str) -> bool {
             return false;
         }
         non_empty += 1;
-        let matched = STRUCTURED_LOG_LINE.is_match(trimmed)
-            || is_json_log(trimmed)
-            || COMPOSE_LOG_LINE.captures(trimmed).is_some_and(|caps| {
-                let body = caps.get(1).map_or("", |m| m.as_str()).trim();
-                STRUCTURED_LOG_LINE.is_match(body)
-                    || is_json_log(body)
-                    || body.contains("HTTP/")
-                    || ["GET ", "POST ", "PUT ", "DELETE ", "PATCH "]
-                        .iter()
-                        .any(|m| body.contains(m))
-            });
+        let matched = is_json_log(trimmed)
+            || is_structured_log_line(trimmed)
+            || (trimmed.contains('|')
+                && COMPOSE_LOG_LINE.captures(trimmed).is_some_and(|caps| {
+                    let body = caps.get(1).map_or("", |m| m.as_str()).trim();
+                    is_json_log(body)
+                        || is_structured_log_line(body)
+                        || body.contains("HTTP/")
+                        || ["GET ", "POST ", "PUT ", "DELETE ", "PATCH "]
+                            .iter()
+                            .any(|m| body.contains(m))
+                }));
         if matched {
             structured += 1;
         }
@@ -2123,15 +2456,18 @@ fn line_filter(args: &[&str]) -> bool {
             positional += args.len();
             break;
         }
-        if let Some(long) = arg.strip_prefix("--") {
-            let name = format!("--{}", long.split('=').next().unwrap_or(long));
-            if REJECTED.contains(&name.as_str()) {
+        if arg.starts_with("--") {
+            let (name, has_eq) = match arg.split_once('=') {
+                Some((flag, _)) => (flag, true),
+                None => (*arg, false),
+            };
+            if REJECTED.contains(&name) {
                 return false;
             }
-            if VALUED.contains(&name.as_str()) && !long.contains('=') && args.next().is_none() {
+            if VALUED.contains(&name) && !has_eq && args.next().is_none() {
                 return false;
             }
-            patterns += usize::from(matches!(name.as_str(), "--regexp" | "--file"));
+            patterns += usize::from(matches!(name, "--regexp" | "--file"));
         } else if let Some(cluster) = arg.strip_prefix('-').filter(|c| !c.is_empty()) {
             for (i, flag) in cluster.char_indices() {
                 if "clLonbHqZzrRp".contains(flag) {
@@ -3364,5 +3700,130 @@ data:
         );
         assert!(shown.len() * 8 < gce.len(), "{shown}");
         assert_archive_exact_and_accounted(&ws, &shown, &gce);
+    }
+
+    #[test]
+    fn post_run_flutter_dart_and_nonzero_exit_compaction_preserve_signals() {
+        let (_dir, ws) = test_workspace("");
+        let post_bash_with_exit = |command: &str, stdout: &str, exit_code: i32| -> Option<Value> {
+            let input = json!({
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "session_id": "unit-flutter-exit",
+                "cwd": ws.root,
+                "tool_input": { "command": command },
+                "tool_response": {
+                    "stdout": stdout,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                    "exitCode": exit_code,
+                }
+            });
+            claude_bash(&ws, &input)
+        };
+
+        // 1. `flutter test` with non-zero exitCode: preserves failure detail,
+        //    exitCode in updatedToolOutput, `· exit 1` footer, and exact archive.
+        let mut flutter_test = String::new();
+        for i in 1..=140 {
+            flutter_test.push_str(&format!(
+                "00:{:02} +{i}: test/widgets/item_{i:03}_test.dart: widget_{i:03} renders cleanly\n",
+                i % 60
+            ));
+        }
+        flutter_test.push_str(
+            "\
+00:25 +140 -1: test/checkout_test.dart: rejects negative totals [E]
+  Expected: <42>
+    Actual: <-1>
+  test/checkout_test.dart 28:7  main.<fn>
+  package:flutter_test/src/widget_tester.dart 145:5  WidgetTester.pumpWidget
+00:26 +140 -1: Some tests failed.
+",
+        );
+        assert!(flutter_test.len() > 6_000);
+        let reply = post_bash_with_exit("flutter test", &flutter_test, 1)
+            .expect("failing flutter test compacted");
+        let updated = &reply["hookSpecificOutput"]["updatedToolOutput"];
+        assert_eq!(updated["exitCode"], 1);
+        let shown = updated["stdout"].as_str().unwrap();
+        assert!(shown.contains("rejects negative totals"), "{shown}");
+        assert!(shown.contains("Expected: <42>"), "{shown}");
+        assert!(shown.contains("· exit 1]"), "{shown}");
+        assert!(shown.len() * 3 < flutter_test.len(), "{shown}");
+        let id = run_id_from(shown);
+        let rec: Value = serde_json::from_slice(
+            &fs::read(ws.state.join("runs").join(&id).join("record.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rec["status"], 1);
+        assert_archive_exact_and_accounted(&ws, shown, &flutter_test);
+
+        // 2. `dart analyze` & `flutter --no-color analyze` with non-zero exit
+        //    and pipe: groups findings by rule and keeps `· exit 1`.
+        let mut analyze = String::from("Analyzing app...\n\n");
+        for i in 1..=90 {
+            analyze.push_str(&format!(
+                "   info • Prefer const with constant constructors • lib/ui/card_{i:02}.dart:{}:12 • prefer_const_constructors\n",
+                10 + i
+            ));
+        }
+        analyze.push_str(
+            "  error • The argument type 'String' can't be assigned to 'int' • lib/billing/total.dart:44:19 • argument_type_not_assignable\n\n91 issues found. (ran in 2.4s)\n",
+        );
+        assert!(analyze.len() > 6_000);
+        for cmd in ["dart analyze | head -n 500", "flutter --no-color analyze"] {
+            let reply = post_bash_with_exit(cmd, &analyze, 1)
+                .unwrap_or_else(|| panic!("{cmd} should compact"));
+            let updated = &reply["hookSpecificOutput"]["updatedToolOutput"];
+            assert_eq!(updated["exitCode"], 1, "{cmd}");
+            let shown = updated["stdout"].as_str().unwrap();
+            assert!(
+                shown.contains("argument_type_not_assignable"),
+                "{cmd}: {shown}"
+            );
+            assert!(
+                shown.contains("prefer_const_constructors"),
+                "{cmd}: {shown}"
+            );
+            assert!(
+                shown.contains("lib/billing/total.dart:44"),
+                "{cmd}: {shown}"
+            );
+            assert!(shown.contains("· exit 1]"), "{cmd}: {shown}");
+            assert!(shown.len() * 3 < analyze.len(), "{cmd}: {shown}");
+            assert_archive_exact_and_accounted(&ws, shown, &analyze);
+        }
+
+        // 3. `dart pub deps` & `flutter pub deps`: deduplicates repeated subtrees.
+        let mut pub_deps = String::from("Dart SDK 3.7.0\nFlutter SDK 3.29.0\nshop_app 1.0.0\n");
+        for i in 1..=35 {
+            pub_deps.push_str(&format!(
+                "|-- feature_{i:02} 1.0.0\n|   |-- shared_core 2.1.0\n|   |   |-- meta 1.16.0\n|   |   |-- collection 1.19.1\n|   |   '-- async 2.12.0\n|   '-- http 1.3.0\n"
+            ));
+        }
+        pub_deps.push_str("'-- logger 2.5.0\n");
+        assert!(pub_deps.len() > 4_096);
+        for cmd in ["dart pub deps", "flutter pub deps | head -n 500"] {
+            let shown =
+                post_bash(&ws, cmd, &pub_deps).unwrap_or_else(|| panic!("{cmd} should compact"));
+            assert!(shown.contains("shared_core 2.1.0"), "{cmd}: {shown}");
+            assert!(shown.contains("[stdout:"), "{cmd}: {shown}");
+            assert!(shown.len() * 2 < pub_deps.len(), "{cmd}: {shown}");
+            assert_archive_exact_and_accounted(&ws, &shown, &pub_deps);
+        }
+
+        // 4. Machine formats stay rejected from dart/flutter planning.
+        for rejected in [
+            &["dart", "analyze", "--format=machine"][..],
+            &["flutter", "analyze", "--write=out.txt"][..],
+            &["dart", "test", "--machine"][..],
+            &["flutter", "test", "--reporter=json"][..],
+            &["dart", "pub", "deps", "--json"][..],
+            &["flutter", "pub", "deps", "--json"][..],
+        ] {
+            assert_eq!(dart_flutter_kind(rejected), None, "{rejected:?}");
+        }
     }
 }

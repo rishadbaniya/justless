@@ -606,7 +606,11 @@ pub(super) fn expand(command: &str) -> Option<String> {
     for (stage, separator) in stages {
         let Some((name, value)) = assigned(stage.trim()) else {
             only_assignments = false;
-            out.push_str(&fill(stage, &values, &mut used));
+            if values.is_empty() || !stage.contains('$') {
+                out.push_str(stage);
+            } else {
+                out.push_str(&fill(stage, &values, &mut used));
+            }
             out.push_str(separator);
             before = separator;
             continue;
@@ -660,8 +664,11 @@ fn matches(word: &str, base: Option<&Path>) -> Option<Vec<String>> {
     let mut names = Vec::new();
     for entry in std::fs::read_dir(base.join(&folder)).ok()?.flatten() {
         let name = entry.file_name().into_string().ok()?;
+        if pattern.first() != Some(&'.') && name.starts_with('.') {
+            continue;
+        }
         let chars: Vec<char> = name.chars().collect();
-        if (pattern.first() == Some(&'.') || !name.starts_with('.')) && wildcard(&pattern, &chars) {
+        if wildcard(&pattern, &chars) {
             names.push(format!("{folder}{name}"));
         }
     }
@@ -736,15 +743,12 @@ pub(super) fn glob(command: &str, base: Option<&Path>) -> Option<String> {
         let bare = !word.contains(['\'', '"', '\\', '$', '`']);
         if bare && word.contains(['*', '?']) && !stage.is_empty() {
             let names = matches(word, folder.as_deref())?;
-            let quoted: Option<Vec<_>> = names
-                .iter()
-                .map(|name| {
-                    shlex::try_quote(name)
-                        .ok()
-                        .map(|quoted| quoted.into_owned())
-                })
-                .collect();
-            out.push_str(&quoted?.join(" "));
+            for (idx, name) in names.iter().enumerate() {
+                if idx > 0 {
+                    out.push(' ');
+                }
+                out.push_str(&shlex::try_quote(name).ok()?);
+            }
             found = true;
         } else {
             out.push_str(word);

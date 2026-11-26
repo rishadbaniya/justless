@@ -13,6 +13,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -91,7 +92,36 @@ impl FileView {
     }
 
     fn covers(&self, first: usize, last: usize) -> bool {
-        first > 0 && first <= last && (first..=last).all(|line| self.saw_line(line))
+        if first == 0 || first > last || self.seen_ranges.is_empty() {
+            return false;
+        }
+        if self
+            .seen_ranges
+            .iter()
+            .any(|&(from, to)| from <= first && last <= to)
+        {
+            return true;
+        }
+        if self.seen_ranges.len() == 1 {
+            return false;
+        }
+        // Fallback for unmerged adjacent/overlapping ranges (e.g. loaded from disk).
+        let mut cursor = first;
+        loop {
+            let mut extended = false;
+            for &(from, to) in &self.seen_ranges {
+                if from <= cursor && to >= cursor {
+                    if to >= last {
+                        return true;
+                    }
+                    cursor = to + 1;
+                    extended = true;
+                }
+            }
+            if !extended {
+                return false;
+            }
+        }
     }
 }
 
@@ -279,7 +309,7 @@ impl Memory {
             rows.extend((wa..=wb).map(Row::Line));
             rows
         };
-        let width = number(wb).to_string().len();
+        let width = decimal_digits(number(wb));
         let modified = !window_removed.is_empty() || (wa..=wb).any(|i| status[i] == Line::Changed);
         let whole_view = full(
             since
@@ -293,7 +323,7 @@ impl Memory {
             .iter()
             .map(|row| match row {
                 Row::Text(_) => location.len() + 1,
-                Row::Line(i) => format!("  {} | {}\n", number(*i), shown(lines[*i])).len(),
+                Row::Line(i) => 2 + decimal_digits(number(*i)) + 3 + shown(lines[*i]).len() + 1,
                 Row::Removed(_) => 0,
             })
             .sum();
@@ -415,19 +445,25 @@ impl Memory {
             }
             return;
         }
-        let saw: BTreeSet<usize> = (0..lines.len()).filter(|&i| known(i)).collect();
-        if saw.is_empty() {
+        let seen_ranges = ranges_from_iter((0..lines.len()).filter(|&i| known(i)));
+        if seen_ranges.is_empty() {
             return;
         }
-        let text: String = lines.concat();
-        let view = (text.len() <= VIEW_BYTES).then(|| View {
-            file: symbol.file.to_owned(),
-            symbol: symbol.name.to_owned(),
-            start: symbol.start,
-            revision,
-            text,
-            seen: ranges(&saw),
-            ms: crate::history::now_ms(),
+        let text_len: usize = lines.iter().map(|line| line.len()).sum();
+        let view = (text_len <= VIEW_BYTES).then(|| {
+            let mut text = String::with_capacity(text_len);
+            for line in lines {
+                text.push_str(line);
+            }
+            View {
+                file: symbol.file.to_owned(),
+                symbol: symbol.name.to_owned(),
+                start: symbol.start,
+                revision,
+                text,
+                seen: seen_ranges,
+                ms: crate::history::now_ms(),
+            }
         });
         self.changes
             .push((symbol.file.to_owned(), symbol.name.to_owned(), view));
@@ -507,6 +543,38 @@ impl Memory {
         }
     }
 
+    fn set_file(&mut self, file: &str, view: FileView) {
+        if let Some((_, slot)) = self
+            .file_changes
+            .iter_mut()
+            .rev()
+            .find(|(other, _)| other == file)
+        {
+            *slot = Some(view);
+        } else {
+            self.file_changes.push((file.to_owned(), Some(view)));
+        }
+    }
+
+    fn touch_file(&mut self, file: &str, ms: u64) {
+        if let Some((_, slot)) = self
+            .file_changes
+            .iter_mut()
+            .rev()
+            .find(|(other, _)| other == file)
+        {
+            if let Some(view) = slot.as_mut() {
+                view.ms = ms;
+            }
+            return;
+        }
+        if let Some(view) = self.store.files.iter().find(|entry| entry.file == file) {
+            let mut touched = view.clone();
+            touched.ms = ms;
+            self.file_changes.push((file.to_owned(), Some(touched)));
+        }
+    }
+
     /// Records that this session was shown inclusive 1-based lines `first..=last`
     /// of `file` at `revision`.
     pub(crate) fn record_range(
@@ -520,18 +588,44 @@ impl Memory {
         if first == 0 || last < first {
             return;
         }
-        let stored_text = if text.len() <= FILE_TEXT_BYTES {
-            text.to_owned()
-        } else {
-            String::new()
-        };
         let ms = crate::history::now_ms();
-        let updated = match self.current_file(file).cloned() {
-            Some(mut view) if view.revision == revision => {
+        // Fast path: mutate an already-staged FileView in place without cloning `text`.
+        if let Some((_, Some(view))) = self
+            .file_changes
+            .iter_mut()
+            .rev()
+            .find(|(other, _)| other == file)
+        {
+            if view.revision == revision {
+                view.seen_ranges.push((first, last));
+                view.seen_ranges = merge_line_ranges(std::mem::take(&mut view.seen_ranges));
+                if view.text.is_empty() && text.len() <= FILE_TEXT_BYTES {
+                    view.text = text.to_owned();
+                }
+                view.ms = ms;
+                return;
+            }
+            let kept_outline = view.outlined_revision.take().filter(|rev| rev == revision);
+            view.revision.clear();
+            view.revision.push_str(revision);
+            view.text = if text.len() <= FILE_TEXT_BYTES {
+                text.to_owned()
+            } else {
+                String::new()
+            };
+            view.seen_ranges.clear();
+            view.seen_ranges.push((first, last));
+            view.outlined_revision = kept_outline;
+            view.ms = ms;
+            return;
+        }
+        let updated = match self.current_file(file) {
+            Some(view) if view.revision == revision => {
+                let mut view = view.clone();
                 view.seen_ranges.push((first, last));
                 view.seen_ranges = merge_line_ranges(view.seen_ranges);
-                if view.text.is_empty() && !stored_text.is_empty() {
-                    view.text = stored_text;
+                if view.text.is_empty() && text.len() <= FILE_TEXT_BYTES {
+                    view.text = text.to_owned();
                 }
                 view.ms = ms;
                 view
@@ -539,21 +633,33 @@ impl Memory {
             Some(view) => FileView {
                 file: file.to_owned(),
                 revision: revision.to_owned(),
-                text: stored_text,
+                text: if text.len() <= FILE_TEXT_BYTES {
+                    text.to_owned()
+                } else {
+                    String::new()
+                },
                 seen_ranges: vec![(first, last)],
-                outlined_revision: view.outlined_revision.filter(|rev| rev == revision),
+                outlined_revision: view
+                    .outlined_revision
+                    .as_deref()
+                    .filter(|&rev| rev == revision)
+                    .map(str::to_owned),
                 ms,
             },
             None => FileView {
                 file: file.to_owned(),
                 revision: revision.to_owned(),
-                text: stored_text,
+                text: if text.len() <= FILE_TEXT_BYTES {
+                    text.to_owned()
+                } else {
+                    String::new()
+                },
                 seen_ranges: vec![(first, last)],
                 outlined_revision: None,
                 ms,
             },
         };
-        self.file_changes.push((file.to_owned(), Some(updated)));
+        self.set_file(file, updated);
     }
 
     /// Compares inclusive 1-based lines `first..=last` of `file` (whose full
@@ -573,21 +679,25 @@ impl Memory {
         fresh: bool,
         full_hint: &str,
     ) -> Option<String> {
-        let new_lines: Vec<&str> = text.split_inclusive('\n').collect();
-        let last = last.min(new_lines.len());
+        let total_lines = line_count(text);
+        let last = last.min(total_lines);
         if first == 0 || first > last {
             return None;
         }
         let effective_fresh = self.fresh || fresh;
-        let old = self.current_file(file).cloned();
         let path = display_path(file);
         let location = format!("{path}:{first}-{last}");
 
-        // Fast path: unchanged file at the same revision.
-        if let Some(ref old_view) = old
-            && old_view.revision == revision
-        {
-            if old_view.covers(first, last) {
+        // Fast path: unchanged file at the same revision. Inspect by reference
+        // first so unchanged re-reads avoid cloning cached file text and line vecs.
+        let same_rev = self
+            .current_file(file)
+            .is_some_and(|view| view.revision == revision);
+        if same_rev {
+            let covers = self
+                .current_file(file)
+                .is_some_and(|view| view.covers(first, last));
+            if covers {
                 if !effective_fresh {
                     let rev_short = &revision[..revision.len().min(12)];
                     let notice = format!(
@@ -595,9 +705,7 @@ impl Memory {
                     );
                     if notice.len() < whole.len() {
                         self.count_saved(whole.len(), notice.len());
-                        let mut touched = old_view.clone();
-                        touched.ms = crate::history::now_ms();
-                        self.file_changes.push((file.to_owned(), Some(touched)));
+                        self.touch_file(file, crate::history::now_ms());
                         return Some(notice);
                     }
                 }
@@ -609,29 +717,37 @@ impl Memory {
             if !effective_fresh {
                 let wa = first - 1;
                 let wb = last - 1;
-                let status: Vec<Line> = (0..new_lines.len())
-                    .map(|i| {
-                        if old_view.saw_line(i + 1) {
-                            Line::Seen
-                        } else {
-                            Line::Unseen
-                        }
-                    })
-                    .collect();
-                let count = wb - wa + 1;
-                let seen = (wa..=wb).filter(|&i| status[i] == Line::Seen).count();
-                if seen > 0 {
-                    let rev_short = &revision[..revision.len().min(12)];
-                    let summary = format!(
-                        "{location} · {seen} of {count} lines unchanged since you read them at {rev_short} · {full_hint}"
-                    );
-                    let rows = hunks(summary, &status, &[], wa, wb);
-                    let rendered = render_range_rows(&rows, &status, &new_lines, &[], last);
-                    if rendered.len() < whole.len() {
-                        self.count_saved(whole.len(), rendered.len());
-                        self.record_range(file, revision, text, first, last);
-                        return Some(rendered);
+                let rendered = {
+                    let old_view = self.current_file(file)?;
+                    let status: Vec<Line> = (0..total_lines)
+                        .map(|i| {
+                            if old_view.saw_line(i + 1) {
+                                Line::Seen
+                            } else {
+                                Line::Unseen
+                            }
+                        })
+                        .collect();
+                    let count = wb - wa + 1;
+                    let seen = (wa..=wb).filter(|&i| status[i] == Line::Seen).count();
+                    if seen > 0 {
+                        let new_lines: Vec<&str> = text.split_inclusive('\n').collect();
+                        let rev_short = &revision[..revision.len().min(12)];
+                        let summary = format!(
+                            "{location} · {seen} of {count} lines unchanged since you read them at {rev_short} · {full_hint}"
+                        );
+                        let rows = hunks(summary, &status, &[], wa, wb);
+                        Some(render_range_rows(&rows, &status, &new_lines, &[], last))
+                    } else {
+                        None
                     }
+                };
+                if let Some(rendered) = rendered
+                    && rendered.len() < whole.len()
+                {
+                    self.count_saved(whole.len(), rendered.len());
+                    self.record_range(file, revision, text, first, last);
+                    return Some(rendered);
                 }
             }
             self.record_range(file, revision, text, first, last);
@@ -639,111 +755,124 @@ impl Memory {
         }
 
         // Different revision (or first read of this file).
-        let Some(old_view) =
-            old.filter(|view| !view.text.is_empty() && !view.seen_ranges.is_empty())
-        else {
+        let can_diff = self
+            .current_file(file)
+            .is_some_and(|view| !view.text.is_empty() && !view.seen_ranges.is_empty());
+        if !can_diff {
             self.record_range(file, revision, text, first, last);
             return None;
-        };
+        }
 
         let wa = first - 1;
         let wb = last - 1;
-        let old_lines: Vec<&str> = old_view.text.split_inclusive('\n').collect();
-        let alignment = align(&old_lines, &new_lines);
-        let status: Vec<Line> = alignment
-            .from
-            .iter()
-            .map(|from| match from {
-                Some(j) if old_view.saw_line(*j + 1) => Line::Seen,
-                None => Line::Changed,
-                Some(_) => Line::Unseen,
-            })
-            .collect();
-        let removed: Vec<(usize, usize)> = alignment
-            .removed
-            .iter()
-            .copied()
-            .filter(|&(j, _)| old_view.saw_line(j + 1))
-            .collect();
-        let window_removed: Vec<(usize, usize)> = removed
-            .iter()
-            .copied()
-            .filter(|&(_, anchor)| (wa..=wb + 1).contains(&anchor))
-            .collect();
-        let count = wb - wa + 1;
-        let seen = (wa..=wb).filter(|&i| status[i] == Line::Seen).count();
-        let changed = !window_removed.is_empty() || seen < count;
-        let rev_short = &old_view.revision[..old_view.revision.len().min(12)];
-
-        let candidate = if effective_fresh {
-            None
-        } else if !changed {
-            Some(format!(
-                "{location} · unchanged since you read it at {rev_short} · {full_hint}\n"
-            ))
-        } else if seen > 0 || !window_removed.is_empty() {
-            let summary = format!(
-                "{location} · {seen} of {count} lines unchanged since you read them at {rev_short} · {full_hint}"
-            );
-            let rows = hunks(summary, &status, &window_removed, wa, wb);
-            Some(render_range_rows(
-                &rows, &status, &new_lines, &old_lines, last,
-            ))
-        } else {
-            None
-        };
-
-        let delta = candidate.filter(|rendered| rendered.len() < whole.len());
-        let whole_file = wa == 0 && wb + 1 == new_lines.len();
-        let shown_removed: BTreeSet<usize> = if delta.is_some() {
-            window_removed.iter().map(|&(j, _)| j).collect()
-        } else {
-            BTreeSet::new()
-        };
-        let all_removed_covered = removed.iter().all(|&(j, anchor)| {
-            shown_removed.contains(&j)
-                || (delta.is_none() && (whole_file || (wa < anchor && anchor <= wb)))
-        });
-        let showed_anything_new =
-            !window_removed.is_empty() || (wa..=wb).any(|i| status[i] != Line::Seen);
-        let stored_text = if text.len() <= FILE_TEXT_BYTES {
-            text.to_owned()
-        } else {
-            String::new()
-        };
-        let ms = crate::history::now_ms();
-        let kept_outline = old_view
-            .outlined_revision
-            .clone()
-            .filter(|rev| rev == revision);
-
-        if all_removed_covered {
-            let known: BTreeSet<usize> = (0..new_lines.len())
-                .filter(|&i| status[i] == Line::Seen || (wa..=wb).contains(&i))
-                .map(|i| i + 1)
+        let new_lines: Vec<&str> = text.split_inclusive('\n').collect();
+        let (delta, all_removed_covered, showed_anything_new, new_seen_ranges, kept_outline) = {
+            let old_view = self.current_file(file)?;
+            let old_lines: Vec<&str> = old_view.text.split_inclusive('\n').collect();
+            let alignment = align(&old_lines, &new_lines);
+            let status: Vec<Line> = alignment
+                .from
+                .iter()
+                .map(|from| match from {
+                    Some(j) if old_view.saw_line(*j + 1) => Line::Seen,
+                    None => Line::Changed,
+                    Some(_) => Line::Unseen,
+                })
                 .collect();
+            let removed: Vec<(usize, usize)> = alignment
+                .removed
+                .iter()
+                .copied()
+                .filter(|&(j, _)| old_view.saw_line(j + 1))
+                .collect();
+            let window_removed: Vec<(usize, usize)> = removed
+                .iter()
+                .copied()
+                .filter(|&(_, anchor)| (wa..=wb + 1).contains(&anchor))
+                .collect();
+            let count = wb - wa + 1;
+            let seen = (wa..=wb).filter(|&i| status[i] == Line::Seen).count();
+            let changed = !window_removed.is_empty() || seen < count;
+            let rev_short = &old_view.revision[..old_view.revision.len().min(12)];
+
+            let candidate = if effective_fresh {
+                None
+            } else if !changed {
+                Some(format!(
+                    "{location} · unchanged since you read it at {rev_short} · {full_hint}\n"
+                ))
+            } else if seen > 0 || !window_removed.is_empty() {
+                let summary = format!(
+                    "{location} · {seen} of {count} lines unchanged since you read them at {rev_short} · {full_hint}"
+                );
+                let rows = hunks(summary, &status, &window_removed, wa, wb);
+                Some(render_range_rows(
+                    &rows, &status, &new_lines, &old_lines, last,
+                ))
+            } else {
+                None
+            };
+
+            let delta = candidate.filter(|rendered| rendered.len() < whole.len());
+            let whole_file = wa == 0 && wb + 1 == new_lines.len();
+            let shown_removed: BTreeSet<usize> = if delta.is_some() {
+                window_removed.iter().map(|&(j, _)| j).collect()
+            } else {
+                BTreeSet::new()
+            };
+            let all_removed_covered = removed.iter().all(|&(j, anchor)| {
+                shown_removed.contains(&j)
+                    || (delta.is_none() && (whole_file || (wa < anchor && anchor <= wb)))
+            });
+            let showed_anything_new =
+                !window_removed.is_empty() || (wa..=wb).any(|i| status[i] != Line::Seen);
+            let new_seen_ranges = if all_removed_covered {
+                ranges_from_iter(
+                    (0..new_lines.len())
+                        .filter(|&i| status[i] == Line::Seen || (wa..=wb).contains(&i))
+                        .map(|i| i + 1),
+                )
+            } else {
+                Vec::new()
+            };
+            let kept_outline = old_view
+                .outlined_revision
+                .as_deref()
+                .filter(|&rev| rev == revision)
+                .map(str::to_owned);
+            (
+                delta,
+                all_removed_covered,
+                showed_anything_new,
+                new_seen_ranges,
+                kept_outline,
+            )
+        };
+
+        if all_removed_covered || showed_anything_new {
+            let stored_text = if text.len() <= FILE_TEXT_BYTES {
+                text.to_owned()
+            } else {
+                String::new()
+            };
+            let ms = crate::history::now_ms();
+            let seen_ranges = if all_removed_covered {
+                new_seen_ranges
+            } else {
+                // Unshown removals exist outside this window, while this view
+                // revealed new lines at `revision`. Reset to only `first..=last`
+                // so a revert or a later read of the other lines is never hidden.
+                vec![(first, last)]
+            };
             let updated = FileView {
                 file: file.to_owned(),
                 revision: revision.to_owned(),
                 text: stored_text,
-                seen_ranges: ranges(&known),
+                seen_ranges,
                 outlined_revision: kept_outline,
                 ms,
             };
-            self.file_changes.push((file.to_owned(), Some(updated)));
-        } else if showed_anything_new {
-            // Unshown removals exist outside this window, while this view
-            // revealed new lines at `revision`. Reset to only `first..=last`
-            // so a revert or a later read of the other lines is never hidden.
-            let updated = FileView {
-                file: file.to_owned(),
-                revision: revision.to_owned(),
-                text: stored_text,
-                seen_ranges: vec![(first, last)],
-                outlined_revision: kept_outline,
-                ms,
-            };
-            self.file_changes.push((file.to_owned(), Some(updated)));
+            self.set_file(file, updated);
         }
         // Otherwise: unchanged notice with unshown edits outside this window —
         // keep `old_view` intact so those edits are still shown when read.
@@ -767,27 +896,36 @@ impl Memory {
         full_hint: &str,
     ) -> Option<String> {
         let effective_fresh = self.fresh || fresh;
-        let old = self.current_file(file).cloned();
         let ms = crate::history::now_ms();
-        if let Some(ref old_view) = old
-            && old_view.outlined_revision.as_deref() == Some(revision)
-        {
+        let already_outlined = self
+            .current_file(file)
+            .is_some_and(|view| view.outlined_revision.as_deref() == Some(revision));
+        if already_outlined {
             if !effective_fresh {
                 let path = display_path(file);
                 let rev_short = &revision[..revision.len().min(12)];
                 let notice = format!("{path} · outline unchanged at {rev_short} · {full_hint}\n");
                 if notice.len() < whole.len() {
                     self.count_saved(whole.len(), notice.len());
-                    let mut touched = old_view.clone();
-                    touched.ms = ms;
-                    self.file_changes.push((file.to_owned(), Some(touched)));
+                    self.touch_file(file, ms);
                     return Some(notice);
                 }
             }
             return None;
         }
-        let updated = match old {
-            Some(mut view) => {
+        if let Some((_, Some(view))) = self
+            .file_changes
+            .iter_mut()
+            .rev()
+            .find(|(other, _)| other == file)
+        {
+            view.outlined_revision = Some(revision.to_owned());
+            view.ms = ms;
+            return None;
+        }
+        let updated = match self.current_file(file) {
+            Some(view) => {
+                let mut view = view.clone();
                 view.outlined_revision = Some(revision.to_owned());
                 view.ms = ms;
                 view
@@ -801,7 +939,7 @@ impl Memory {
                 ms,
             },
         };
-        self.file_changes.push((file.to_owned(), Some(updated)));
+        self.set_file(file, updated);
         None
     }
 
@@ -958,12 +1096,34 @@ fn load(path: &std::path::Path) -> Store {
 }
 
 fn excerpt_key(file: &str, lines: &[String]) -> String {
-    let mut text = format!("{file}\0");
+    let capacity = file.len() + 1 + lines.iter().map(|line| line.len() + 1).sum::<usize>();
+    let mut text = String::with_capacity(capacity);
+    text.push_str(file);
+    text.push('\0');
     for line in lines {
         text.push_str(line);
         text.push('\n');
     }
     source_digest(text.as_bytes())[..24].to_owned()
+}
+
+#[inline]
+fn decimal_digits(mut n: usize) -> usize {
+    let mut digits = 1;
+    while n >= 10 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+/// Exact line count matching `text.split_inclusive('\n').count()` without allocating.
+#[inline]
+fn line_count(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    text.as_bytes().iter().filter(|&&b| b == b'\n').count() + usize::from(!text.ends_with('\n'))
 }
 
 /// A line as `str::lines` yields it, without its line ending.
@@ -974,9 +1134,9 @@ fn shown(line: &str) -> &str {
     }
 }
 
-fn ranges(lines: &BTreeSet<usize>) -> Vec<(usize, usize)> {
+fn ranges_from_iter(lines: impl IntoIterator<Item = usize>) -> Vec<(usize, usize)> {
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for &line in lines {
+    for line in lines {
         match ranges.last_mut() {
             Some((_, to)) if *to + 1 == line => *to = line,
             _ => ranges.push((line, line)),
@@ -988,7 +1148,7 @@ fn ranges(lines: &BTreeSet<usize>) -> Vec<(usize, usize)> {
 fn merge_line_ranges(mut input: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     input.retain(|&(from, to)| from > 0 && from <= to);
     input.sort_unstable();
-    let mut merged: Vec<(usize, usize)> = Vec::new();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(input.len());
     for (from, to) in input {
         match merged.last_mut() {
             Some((_, prev_to)) if from <= prev_to.saturating_add(1) => {
@@ -1007,8 +1167,16 @@ fn render_range_rows(
     old_lines: &[&str],
     last_line: usize,
 ) -> String {
-    let width = last_line.to_string().len();
-    let mut out = String::new();
+    let width = decimal_digits(last_line);
+    let capacity: usize = rows
+        .iter()
+        .map(|row| match row {
+            Row::Text(text) => text.len() + 1,
+            Row::Line(i) => width + 6 + new_lines[*i].len(),
+            Row::Removed(j) => width + 6 + old_lines[*j].len(),
+        })
+        .sum();
+    let mut out = String::with_capacity(capacity);
     for row in rows {
         match row {
             Row::Text(text) => {
@@ -1021,14 +1189,10 @@ fn render_range_rows(
                 } else {
                     ' '
                 };
-                out.push_str(&format!(
-                    "{mark} {:>width$} | {}\n",
-                    i + 1,
-                    shown(new_lines[*i])
-                ));
+                let _ = writeln!(out, "{mark} {:>width$} | {}", i + 1, shown(new_lines[*i]));
             }
             Row::Removed(j) => {
-                out.push_str(&format!("- {:width$} | {}\n", "", shown(old_lines[*j])));
+                let _ = writeln!(out, "- {:width$} | {}", "", shown(old_lines[*j]));
             }
         }
     }
@@ -1093,30 +1257,34 @@ struct Alignment {
     removed: Vec<(usize, usize)>,
 }
 
-fn align(old: &[&str], new: &[&str]) -> Alignment {
-    let mut ids = HashMap::new();
-    let mut id = |line: &str| {
-        let next = ids.len();
-        *ids.entry(line.to_owned()).or_insert(next)
-    };
-    let old: Vec<usize> = old.iter().map(|line| id(line)).collect();
-    let new: Vec<usize> = new.iter().map(|line| id(line)).collect();
-    let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+fn align<'a>(old: &[&'a str], new: &[&'a str]) -> Alignment {
+    let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
     let suffix = old[prefix..]
         .iter()
         .rev()
         .zip(new[prefix..].iter().rev())
         .take_while(|(a, b)| a == b)
         .count();
-    let mut pairs: Vec<(usize, usize)> = (0..prefix).map(|i| (i, i)).collect();
-    pairs.extend(
-        common(
-            &old[prefix..old.len() - suffix],
-            &new[prefix..new.len() - suffix],
-        )
-        .into_iter()
-        .map(|(a, b)| (a + prefix, b + prefix)),
-    );
+    let old_mid = &old[prefix..old.len() - suffix];
+    let new_mid = &new[prefix..new.len() - suffix];
+    let mut pairs: Vec<(usize, usize)> =
+        Vec::with_capacity(prefix + suffix + old_mid.len().min(new_mid.len()));
+    pairs.extend((0..prefix).map(|i| (i, i)));
+    if !old_mid.is_empty() && !new_mid.is_empty() {
+        let mut ids: HashMap<&'a str, usize> =
+            HashMap::with_capacity(old_mid.len().max(new_mid.len()));
+        let mut id = |line: &'a str| {
+            let next = ids.len();
+            *ids.entry(line).or_insert(next)
+        };
+        let old_ids: Vec<usize> = old_mid.iter().map(|&line| id(line)).collect();
+        let new_ids: Vec<usize> = new_mid.iter().map(|&line| id(line)).collect();
+        pairs.extend(
+            common(&old_ids, &new_ids)
+                .into_iter()
+                .map(|(a, b)| (a + prefix, b + prefix)),
+        );
+    }
     pairs.extend((0..suffix).map(|k| (old.len() - suffix + k, new.len() - suffix + k)));
     let mut from = vec![None; new.len()];
     for &(a, b) in &pairs {
@@ -1400,6 +1568,111 @@ mod tests {
             .expect("delta survives outline refresh");
         assert!(delta.contains("compute_value(120)"), "{delta}");
         assert!(delta.contains("29 of 30 lines unchanged"), "{delta}");
+        mem.save(&ws);
+    }
+
+    #[test]
+    fn dedup_fast_paths_handle_unmerged_ranges_partial_overlaps_and_large_files() {
+        // 1. `FileView::covers` handles single, unsorted adjacent, overlapping, and gapped ranges.
+        let view = FileView {
+            file: "a.rs".into(),
+            revision: "rev1".into(),
+            text: String::new(),
+            seen_ranges: vec![(11, 20), (1, 10), (25, 30)],
+            outlined_revision: None,
+            ms: 1,
+        };
+        assert!(view.covers(1, 20));
+        assert!(view.covers(5, 15));
+        assert!(!view.covers(1, 25));
+        assert!(!view.covers(0, 10));
+        assert!(!view.covers(15, 10));
+
+        // 2. `align` fast paths: identical, pure insertion, pure deletion, and no-trailing-newline.
+        let base = ["a\n", "b\n", "c\n"];
+        assert_eq!(apply(&base, &base), base);
+        let inserted = ["a\n", "x\n", "y\n", "b\n", "c\n"];
+        assert_eq!(apply(&base, &inserted), inserted);
+        let deleted = ["a\n", "c\n"];
+        assert_eq!(apply(&base, &deleted), deleted);
+        assert_eq!(line_count(""), 0);
+        assert_eq!(line_count("only"), 1);
+        assert_eq!(line_count("a\nb\n"), 2);
+        assert_eq!(line_count("a\nb"), 2);
+
+        // 3. Same-revision partial overlap emits delta for unseen lines only,
+        //    and coalesced in-memory `record_range` updates don't duplicate entries.
+        let dir = tempfile::tempdir().unwrap();
+        let text = make_lines(50);
+        let rev = crate::source::revision_for("src/big.rs", text.as_bytes());
+        let hint = "full: justless expand src/big.rs L1-50 --fresh";
+        let (ws, mut mem) = test_memory(&dir, "s-edge", false);
+        mem.record_range("src/big.rs", &rev, &text, 1, 35);
+        mem.record_range("src/big.rs", &rev, &text, 36, 40);
+        assert_eq!(mem.file_changes.len(), 1);
+        let partial = mem
+            .show_range("src/big.rs", &rev, &text, 1, 50, &text, false, hint)
+            .expect("partial same-rev delta");
+        assert!(partial.contains("40 of 50 lines unchanged"), "{partial}");
+        assert!(partial.contains("item_45"), "{partial}");
+        assert!(!partial.contains("item_05"), "{partial}");
+        // Now 1..=50 is fully covered; re-reading emits 1-line unchanged notice.
+        let unchanged = mem
+            .show_range("src/big.rs", &rev, &text, 1, 50, &text, false, hint)
+            .expect("now fully covered");
+        assert!(
+            unchanged.contains("unchanged since you read it"),
+            "{unchanged}"
+        );
+        mem.save(&ws);
+
+        // 4. Large file (> FILE_TEXT_BYTES): caches revision + ranges without text,
+        //    still emits unchanged notice on repeat read and prints whole after edit.
+        let large_text = make_lines(3500);
+        assert!(large_text.len() > FILE_TEXT_BYTES);
+        let large_rev = crate::source::revision_for("src/huge.rs", large_text.as_bytes());
+        let (ws, mut mem) = test_memory(&dir, "s-large", false);
+        assert!(
+            mem.show_range(
+                "src/huge.rs",
+                &large_rev,
+                &large_text,
+                1,
+                3500,
+                &large_text,
+                false,
+                hint,
+            )
+            .is_none()
+        );
+        let hit = mem
+            .show_range(
+                "src/huge.rs",
+                &large_rev,
+                &large_text,
+                1,
+                3500,
+                &large_text,
+                false,
+                hint,
+            )
+            .expect("large unchanged notice");
+        assert!(hit.contains("unchanged since you read it"), "{hit}");
+        let large_edited = large_text.replacen("compute_value(1)", "compute_value(999)", 1);
+        let large_rev2 = crate::source::revision_for("src/huge.rs", large_edited.as_bytes());
+        assert!(
+            mem.show_range(
+                "src/huge.rs",
+                &large_rev2,
+                &large_edited,
+                1,
+                3500,
+                &large_edited,
+                false,
+                hint,
+            )
+            .is_none()
+        );
         mem.save(&ws);
     }
 }

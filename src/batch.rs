@@ -283,8 +283,8 @@ impl<'a> Batch<'a> {
         let mut repo: Option<(PathBuf, git::Repository)> = None;
         let mut status = 0;
         let mut may_have_closed_pipe = false;
-        let mut output = String::new();
-        let mut verified = Vec::new();
+        let mut output = String::with_capacity(actual.len());
+        let mut verified = Vec::with_capacity(self.0.len());
         let mut line = 1;
         for (index, piece) in self.0.iter().enumerate() {
             if Instant::now() >= deadline {
@@ -423,11 +423,9 @@ impl<'a> Batch<'a> {
                 });
             }
         }
-        let expected_status = i32::from(
-            response["returnCodeInterpretation"]
-                .as_str()
-                .is_some_and(|s| !s.is_empty()),
-        );
+        let expected_status = response
+            .as_object()
+            .map_or(0, crate::postroute::response_exit_status);
         if status != expected_status {
             return None;
         }
@@ -529,7 +527,9 @@ impl<'a> Batch<'a> {
             (&origin, &ranges),
         )
         .ok()?;
-        let mut view = String::new();
+        let view_cap =
+            result.previews.iter().map(|(_, b)| b.len()).sum::<usize>() + result.footer.len();
+        let mut view = String::with_capacity(view_cap);
         for (_, bytes) in result.previews {
             view.push_str(std::str::from_utf8(&bytes).ok()?);
         }
@@ -583,12 +583,11 @@ fn render(
     let headers: Vec<_> = items
         .iter()
         .map(|item| {
-            let span = match (item.range.first_line, item.range.last_line) {
-                (Some(a), Some(b)) => format!(" [stdout:{a}-{b}]"),
-                _ => " [no output]".into(),
-            };
             let header = item.header.as_deref().unwrap_or(item.piece.header);
-            format!("$ {header}{span}\n")
+            match (item.range.first_line, item.range.last_line) {
+                (Some(a), Some(b)) => format!("$ {header} [stdout:{a}-{b}]\n"),
+                _ => format!("$ {header} [no output]\n"),
+            }
         })
         .collect();
     let mut remaining = budget.checked_sub(headers.iter().map(|s| s.len() + 1).sum())?;
@@ -646,7 +645,10 @@ fn render(
         verbatim[i] = text.len() <= limit;
         bodies[i] = body;
     }
-    let mut out = String::new();
+    let total_len: usize = headers.iter().map(String::len).sum::<usize>()
+        + bodies.iter().map(String::len).sum::<usize>()
+        + headers.len();
+    let mut out = String::with_capacity(total_len);
     for (header, body) in headers.iter().zip(bodies) {
         out.push_str(header);
         out.push_str(&body);

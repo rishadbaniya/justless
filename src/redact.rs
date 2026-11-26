@@ -32,7 +32,7 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 
 use anyhow::{Result, anyhow, ensure};
 use clap::Arg;
-use regex::bytes::{Regex, RegexSet};
+use regex::bytes::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -272,31 +272,221 @@ struct Rule {
     tail: [bool; 256],
 }
 
-struct Rules {
-    set: RegexSet,
-    list: Vec<Rule>,
-}
-
 fn compile(pattern: &str) -> Regex {
     Regex::new(pattern).unwrap_or_else(|error| panic!("built-in pattern {pattern}: {error}"))
 }
 
-/// Compiled on the first line the prefilter hits, so clean output never pays for it.
-static RULES: LazyLock<Rules> = LazyLock::new(|| Rules {
-    set: RegexSet::new(SPECS.iter().map(|spec| spec.pattern)).expect("rule set"),
-    list: SPECS
+/// Each rule compiles lazily only when its sound byte pre-filter matches, so
+/// clean output and non-matching trigger lines never compile unused regexes.
+static RULES: [OnceLock<Rule>; SPECS.len()] = [const { OnceLock::new() }; SPECS.len()];
+
+fn rule(index: usize) -> &'static Rule {
+    RULES[index].get_or_init(|| {
+        let spec = &SPECS[index];
+        let class = compile(&format!("(?-u)^{}$", spec.tail));
+        Rule {
+            kind: spec.kind,
+            re: compile(spec.pattern),
+            check: spec.check,
+            tail: std::array::from_fn(|byte| class.is_match(&[byte as u8])),
+        }
+    })
+}
+
+#[inline]
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    let (&first, rest) = needle.split_first()?;
+    if hay.len() < needle.len() {
+        return None;
+    }
+    let last = hay.len() - needle.len();
+    let mut i = 0;
+    while i <= last {
+        let off = hay[i..=last].iter().position(|&b| b == first)?;
+        let pos = i + off;
+        if hay[pos + 1..pos + needle.len()] == *rest {
+            return Some(pos);
+        }
+        i = pos + 1;
+    }
+    None
+}
+
+#[inline]
+fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
+    find_bytes(hay, needle).is_some()
+}
+
+#[inline]
+fn contains_any_bytes(hay: &[u8], needles: &[&[u8]]) -> bool {
+    needles.iter().any(|needle| contains_bytes(hay, needle))
+}
+
+#[inline]
+fn find_ascii_icase(hay: &[u8], needle_lower: &[u8]) -> Option<usize> {
+    let (&first, rest) = needle_lower.split_first()?;
+    if hay.len() < needle_lower.len() {
+        return None;
+    }
+    let first_upper = first.to_ascii_uppercase();
+    let last = hay.len() - needle_lower.len();
+    let mut i = 0;
+    while i <= last {
+        let off = hay[i..=last]
+            .iter()
+            .position(|&b| b == first || b == first_upper)?;
+        let pos = i + off;
+        if hay[pos + 1..pos + needle_lower.len()].eq_ignore_ascii_case(rest) {
+            return Some(pos);
+        }
+        i = pos + 1;
+    }
+    None
+}
+
+#[inline]
+fn contains_any_ascii_icase(hay: &[u8], needles_lower: &[&[u8]]) -> bool {
+    needles_lower
         .iter()
-        .map(|spec| {
-            let class = compile(&format!("(?-u)^{}$", spec.tail));
-            Rule {
-                kind: spec.kind,
-                re: compile(spec.pattern),
-                check: spec.check,
-                tail: std::array::from_fn(|byte| class.is_match(&[byte as u8])),
-            }
-        })
-        .collect(),
-});
+        .any(|needle| find_ascii_icase(hay, needle).is_some())
+}
+
+/// Bitmask of rules in [`SPECS`] that could possibly match `tail`. Every check
+/// is a mathematically sound necessary condition (strict superset) of its rule's
+/// regex, so a zero bit guarantees the regex cannot match anywhere in `tail`.
+fn candidate_rules(tail: &[u8]) -> u32 {
+    debug_assert!(SPECS.len() <= 32);
+    let len = tail.len();
+    if len < 11 {
+        return 0;
+    }
+    let mut mask = 0u32;
+
+    // 0, 1: Single-line PEM private keys (require `-----BEGIN` and `PRIVATE KEY`).
+    if len >= 27 && contains_bytes(tail, b"-----BEGIN") && contains_bytes(tail, b"PRIVATE KEY") {
+        mask |= 1 << 1;
+        if len >= 51 && contains_bytes(tail, b"-----END") {
+            mask |= 1 << 0;
+        }
+    }
+    // 2: Base64-encoded PEM private key (`LS0tLS1CRUdJTi` + >=40 base64 chars).
+    if len >= 54 && contains_bytes(tail, b"LS0tLS1CRUdJTi") {
+        mask |= 1 << 2;
+    }
+    // 3: AWS access key (`A3T.|AKIA|ASIA|ABIA|ACCA` + 16 chars).
+    if len >= 20 && contains_any_bytes(tail, &[b"AKIA", b"ASIA", b"ABIA", b"ACCA", b"A3T"]) {
+        mask |= 1 << 3;
+    }
+    // 4: GitHub token (`gh[pousr]_` + >=36 or `github_pat_` + >=82).
+    if len >= 40
+        && contains_any_bytes(
+            tail,
+            &[b"ghp_", b"gho_", b"ghu_", b"ghs_", b"ghr_", b"github_pat_"],
+        )
+    {
+        mask |= 1 << 4;
+    }
+    // 5: GitLab token (`gl(pat|dt|rt|ptt)-` + >=20).
+    if len >= 25 && contains_any_bytes(tail, &[b"glpat-", b"gldt-", b"glrt-", b"glptt-"]) {
+        mask |= 1 << 5;
+    }
+    // 6: Slack token (`xox[abposre]-` + >=10 or `xapp-N-` + >=10).
+    if len >= 15 && (contains_bytes(tail, b"xox") || contains_bytes(tail, b"xapp-")) {
+        mask |= 1 << 6;
+    }
+    // 7: Slack webhook (`hooks.slack.com/` + `services|workflows|triggers/` + >=20).
+    if len >= 45 && contains_bytes(tail, b"hooks.slack.com/") {
+        mask |= 1 << 7;
+    }
+    // 8: Stripe key (`[rs]k_live_` + >=20).
+    if len >= 28 && contains_bytes(tail, b"k_live_") {
+        mask |= 1 << 8;
+    }
+    // 9, 10: Anthropic and OpenAI keys (both require `sk-`).
+    if len >= 28 && contains_bytes(tail, b"sk-") {
+        if len >= 32 && contains_bytes(tail, b"sk-ant-") {
+            mask |= 1 << 9;
+        }
+        if contains_any_bytes(
+            tail,
+            &[b"sk-proj-", b"sk-svcacct-", b"sk-admin-", b"T3BlbkFJ"],
+        ) {
+            mask |= 1 << 10;
+        }
+    }
+    // 11: Google API key (`AIza` + 35 chars).
+    if len >= 39 && contains_bytes(tail, b"AIza") {
+        mask |= 1 << 11;
+    }
+    // 12: npm token (`npm_` + 36 chars).
+    if len >= 40 && contains_bytes(tail, b"npm_") {
+        mask |= 1 << 12;
+    }
+    // 13: PyPI token (`pypi-AgEIcHlwaS5vcmc` + >=50).
+    if len >= 70 && contains_bytes(tail, b"pypi-AgEIcHlwaS5vcmc") {
+        mask |= 1 << 13;
+    }
+    // 14: Hugging Face token (`hf_` + 34 letters).
+    if len >= 37 && contains_bytes(tail, b"hf_") {
+        mask |= 1 << 14;
+    }
+    // 15: JWT (`eyJ` + >=8 + `.eyJ` + >=8 + `.` + >=8 -> >=32 bytes).
+    if len >= 32
+        && let Some(p) = find_bytes(tail, b"eyJ")
+        && len - p >= 32
+        && contains_bytes(&tail[p + 11..], b".eyJ")
+    {
+        mask |= 1 << 15;
+    }
+    // 16: URL password (`scheme://user:pass@`: requires `://`, then `:`, >=4 bytes, `@`).
+    if let Some(p) = find_bytes(tail, b"://")
+        && let Some(at) = tail[p + 3..].iter().rposition(|&b| b == b'@')
+        && at >= 5
+        && tail[p + 3..p + 3 + at - 4].contains(&b':')
+    {
+        mask |= 1 << 16;
+    }
+    // 17: Authorization header (case-insensitive `authorization`, then `:`/`=`, scheme, >=8).
+    if len >= 28
+        && let Some(p) = find_ascii_icase(tail, b"authorization")
+        && len - p >= 28
+        && tail[p + 13..].iter().any(|&b| b == b':' || b == b'=')
+    {
+        mask |= 1 << 17;
+    }
+    // 18: Standalone Bearer token (`bearer` + whitespace + >=16 bytes).
+    if len >= 23
+        && let Some(p) = find_ascii_icase(tail, b"bearer")
+        && len - p >= 23
+    {
+        mask |= 1 << 18;
+    }
+    // 19: Generic secret assignment (`keyword` >=5 bytes, `=`/`:`, value >=12 bytes).
+    if len >= 18
+        && let Some(r) = tail[5..len - 12]
+            .iter()
+            .rposition(|&b| b == b'=' || b == b':')
+        && contains_any_ascii_icase(
+            &tail[..5 + r],
+            &[b"token", b"secret", b"pass", b"key", b"credential"],
+        )
+    {
+        mask |= 1 << 19;
+    }
+    // 20: CLI secret flag (`--...keyword... <12+ chars>`).
+    if len >= 20
+        && let Some(p) = find_bytes(tail, b"--")
+        && len - p >= 20
+        && contains_any_ascii_icase(
+            &tail[p + 2..len - 13],
+            &[b"token", b"secret", b"pass", b"api-key"],
+        )
+    {
+        mask |= 1 << 20;
+    }
+
+    mask
+}
 
 static PREFILTER: LazyLock<Regex> = LazyLock::new(|| {
     let literals: Vec<_> = TRIGGERS.iter().map(|t| regex::escape(t)).collect();
@@ -438,12 +628,44 @@ impl Redactor {
 
     /// Redacts a whole slice, borrowing it when nothing was found.
     pub fn bytes<'a>(&self, input: &'a [u8]) -> Cow<'a, [u8]> {
-        if !PREFILTER.is_match(input) {
+        let Some(mut hit) = PREFILTER.find(input) else {
             return Cow::Borrowed(input);
-        }
+        };
+        // Zero-allocation fast path: inspect only trigger-hitting lines in
+        // place. Allocate an output buffer and hand off to `Engine` only when a
+        // line actually redacts a secret, opens a PEM block, or exceeds WINDOW.
+        let mut pos = 0;
+        let handoff = loop {
+            let line_start = input[pos..hit.start()]
+                .iter()
+                .rposition(|&byte| byte == b'\n')
+                .map_or(pos, |index| pos + index + 1);
+            let end = line_start + line_end(&input[line_start..]);
+            if end - line_start >= WINDOW {
+                break Some(line_start);
+            }
+            let line = &input[line_start..end];
+            let body = &line[..content_len(line)];
+            let stripped = without_colors(body);
+            if has_accepted_hit(self, &stripped) || pem_opens_plain(&stripped).is_some() {
+                break Some(line_start);
+            }
+            pos = end;
+            if pos >= input.len() {
+                break None;
+            }
+            match PREFILTER.find_at(input, pos) {
+                Some(next) => hit = next,
+                None => break None,
+            }
+        };
+        let Some(start) = handoff else {
+            return Cow::Borrowed(input);
+        };
         let mut engine = Engine::new(self, WINDOW, HOLD);
         let mut output = Vec::with_capacity(input.len() + 64);
-        for chunk in input.chunks(READ_SIZE) {
+        output.extend_from_slice(&input[..start]);
+        for chunk in input[start..].chunks(READ_SIZE) {
             engine.feed(chunk, &mut output);
         }
         engine.finish(&mut output);
@@ -826,9 +1048,16 @@ fn content_len(line: &[u8]) -> usize {
 /// timestamped log do.
 fn pem_opens(text: &[u8]) -> Option<Prefix> {
     let text = without_colors(text);
-    let begin = PEM_BEGIN.find_iter(&text).last()?;
+    pem_opens_plain(&text)
+}
+
+fn pem_opens_plain(text: &[u8]) -> Option<Prefix> {
+    if !contains_bytes(text, b"PRIVATE KEY") || !contains_bytes(text, b"-----BEGIN") {
+        return None;
+    }
+    let begin = PEM_BEGIN.find_iter(text).last()?;
     let tail = &text[begin.end()..];
-    (!PEM_END.is_match(tail) && PEM_TAIL.is_match(tail))
+    (!(contains_bytes(tail, b"-----END") && PEM_END.is_match(tail)) && PEM_TAIL.is_match(tail))
         .then(|| Prefix::new(&text[..begin.start()]))
 }
 
@@ -1163,18 +1392,24 @@ impl<'r> Engine<'r> {
             // Colors can split a keyword from its value. Match without them, and keep
             // the original bytes unless something was redacted.
             stripped = ANSI.replace_all(body, &b""[..]);
-            let before = self.count;
-            let mut redacted = Vec::with_capacity(stripped.len());
-            self.redact(&stripped, 0, None, &mut redacted);
-            if self.count > before {
-                out.extend_from_slice(&redacted);
-                &stripped[..]
+            if has_accepted_hit(self.redactor, &stripped) {
+                let before = self.count;
+                let mut redacted = Vec::with_capacity(stripped.len());
+                self.redact_inner(&stripped, 0, None, true, &mut redacted);
+                if self.count > before {
+                    out.extend_from_slice(&redacted);
+                    &stripped[..]
+                } else {
+                    out.extend_from_slice(body);
+                    body
+                }
             } else {
+                self.spans.clear();
                 out.extend_from_slice(body);
                 body
             }
         } else {
-            self.redact(body, 0, None, out);
+            self.redact_inner(body, 0, None, true, out);
             body
         };
         if let Some(prefix) = pem_opens(&out[start..]) {
@@ -1186,7 +1421,7 @@ impl<'r> Engine<'r> {
             self.spans.iter().find_map(|(marker, rule, secret)| {
                 // Base64 of a whole key that `base64` or `openssl base64` wrapped: the
                 // next lines hold the rest of it.
-                (matches!(RULES.list[*rule].check, Check::PemBase64)
+                (matches!(SPECS[*rule].check, Check::PemBase64)
                     && secret.len() <= WRAP_WIDTH
                     && hay[secret.end..].iter().all(u8::is_ascii_whitespace))
                 .then(|| (marker.clone(), hay[secret.clone()].to_vec()))
@@ -1223,7 +1458,10 @@ impl<'r> Engine<'r> {
         if pem.encoded.is_some() {
             return self.encoded_line(line, &text, plain, out);
         }
-        if PEM_END.is_match(&text) {
+        if contains_bytes(&text, b"PRIVATE KEY")
+            && contains_bytes(&text, b"-----END")
+            && PEM_END.is_match(&text)
+        {
             let line = PemLine {
                 original: line.to_vec(),
                 plain: None,
@@ -1353,14 +1591,25 @@ impl<'r> Engine<'r> {
         hold: Option<usize>,
         out: &mut Vec<u8>,
     ) -> (usize, Option<Continuation>) {
+        self.redact_inner(hay, from, hold, false, out)
+    }
+
+    fn redact_inner(
+        &mut self,
+        hay: &[u8],
+        from: usize,
+        hold: Option<usize>,
+        prefiltered: bool,
+        out: &mut Vec<u8>,
+    ) -> (usize, Option<Continuation>) {
         let end = hay.len();
-        let hits = if from < end && PREFILTER.is_match_at(hay, from) {
+        let hits = if from < end && (prefiltered || PREFILTER.is_match_at(hay, from)) {
             hits(self.redactor, hay, from, hold.is_some())
         } else {
             Vec::new()
         };
         let mut emit = hold.map_or(end, |hold| end.saturating_sub(hold).max(from));
-        if hold.is_some() {
+        if hold.is_some() && !hits.is_empty() {
             // A match that straddles the cut moves it, so nothing is applied twice.
             while let Some(next) = hits
                 .iter()
@@ -1377,8 +1626,8 @@ impl<'r> Engine<'r> {
             // A value longer than the hold runs on into the next window.
             emit = end;
             spans = resolve(&hits, end);
-            if let Some((secret, rule)) = spans.iter().find(|(secret, _)| secret.end == end) {
-                let rule = &RULES.list[*rule];
+            if let Some((secret, rule_idx)) = spans.iter().find(|(secret, _)| secret.end == end) {
+                let rule = rule(*rule_idx);
                 continuation = Some(Continuation {
                     kind: rule.kind,
                     tail: &rule.tail,
@@ -1398,14 +1647,14 @@ impl<'r> Engine<'r> {
         let base = out.len();
         self.spans.clear();
         let mut at = from;
-        for (secret, rule) in spans {
+        for (secret, rule_idx) in spans {
             out.extend_from_slice(&hay[at..secret.start]);
             if secret.end != end || continuation.is_none() {
-                let kind = RULES.list[rule].kind;
+                let kind = SPECS[rule_idx].kind;
                 let start = out.len() - base;
                 out.extend_from_slice(&self.redactor.marker(kind, &hay[secret.clone()]));
                 self.spans
-                    .push((start..out.len() - base, rule, secret.clone()));
+                    .push((start..out.len() - base, rule_idx, secret.clone()));
             }
             self.count += 1;
             at = secret.end;
@@ -1451,14 +1700,26 @@ fn line_end(data: &[u8]) -> usize {
         .map_or(data.len(), |index| index + 1)
 }
 
-/// Every rule match from `from`, accepted or not, in rule order. With `open_end`, the
-/// line goes on past `hay`, so a value that reaches its end is kept whole.
-fn hits(redactor: &Redactor, hay: &[u8], from: usize, open_end: bool) -> Vec<Hit> {
-    let rules = &*RULES;
-    let mut hits = Vec::new();
+/// Visit every rule match from `from` in rule order, stopping early when `visit`
+/// returns `true`. Shared by [`hits`] and [`has_accepted_hit`] so fast-path
+/// screening and full redaction stay strictly identical.
+fn scan_hits(
+    redactor: &Redactor,
+    hay: &[u8],
+    from: usize,
+    open_end: bool,
+    mut visit: impl FnMut(Hit) -> bool,
+) {
+    let mut mask = candidate_rules(&hay[from..]);
+    if mask == 0 {
+        return;
+    }
     let mut rescan = 2 * (hay.len() - from) + 4096;
-    for index in rules.set.matches_at(hay, from).iter() {
-        let rule = &rules.list[index];
+    while mask != 0 {
+        let index = mask.trailing_zeros() as usize;
+        mask &= mask - 1;
+        let rule = rule(index);
+        let generic = matches!(rule.check, Check::Generic(_));
         let mut at = from;
         while at <= hay.len()
             && let Some(captures) = rule.re.captures_at(hay, at)
@@ -1466,7 +1727,6 @@ fn hits(redactor: &Redactor, hay: &[u8], from: usize, open_end: bool) -> Vec<Hit
             let whole = captures.get(0).expect("match");
             let found = captures.name("s").expect("secret group");
             let quoted = captures.name("q").is_some();
-            let generic = matches!(rule.check, Check::Generic(_));
             let name = captures.name("n").map_or(&b""[..], |name| name.as_bytes());
             let colon = captures
                 .name("sep")
@@ -1494,13 +1754,15 @@ fn hits(redactor: &Redactor, hay: &[u8], from: usize, open_end: bool) -> Vec<Hit
                 && !inside_marker(hay, whole.start())
                 // A checksum after a source file name such as `src/to_tokens.rs`.
                 && !(generic && hex_digest(value) && SOURCE_FILE.is_match(name));
-            hits.push(Hit {
+            if visit(Hit {
                 start: whole.start(),
                 end: whole.end(),
                 secret,
                 rule: index,
                 ok,
-            });
+            }) {
+                return;
+            }
             // A rejected value can hold another assignment, as in
             // `token_url=https://h/?token=…`, so look inside it, within a budget
             // that keeps a long run of keywords linear.
@@ -1513,14 +1775,46 @@ fn hits(redactor: &Redactor, hay: &[u8], from: usize, open_end: bool) -> Vec<Hit
             at = next.max(whole.start() + 1);
         }
     }
+}
+
+/// Whether `hay` holds at least one accepted secret match (zero `Vec` allocation).
+fn has_accepted_hit(redactor: &Redactor, hay: &[u8]) -> bool {
+    let mut found = false;
+    scan_hits(redactor, hay, 0, false, |hit| {
+        if hit.ok {
+            found = true;
+            true
+        } else {
+            false
+        }
+    });
+    found
+}
+
+/// Every rule match from `from`, accepted or not, in rule order. With `open_end`, the
+/// line goes on past `hay`, so a value that reaches its end is kept whole.
+fn hits(redactor: &Redactor, hay: &[u8], from: usize, open_end: bool) -> Vec<Hit> {
+    let mut hits = Vec::new();
+    scan_hits(redactor, hay, from, open_end, |hit| {
+        hits.push(hit);
+        false
+    });
     hits
 }
 
 /// Accepted secrets of matches that start before `limit`. On overlap the earlier
 /// rule wins.
 fn resolve(hits: &[Hit], limit: usize) -> Vec<(Range<usize>, usize)> {
+    let mut accepted = hits.iter().filter(|hit| hit.ok && hit.start < limit);
+    let Some(first) = accepted.next() else {
+        return Vec::new();
+    };
+    let Some(second) = accepted.next() else {
+        return vec![(first.secret.clone(), first.rule)];
+    };
     let mut taken: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
-    for hit in hits.iter().filter(|hit| hit.ok && hit.start < limit) {
+    taken.insert(first.secret.start, (first.secret.end, first.rule));
+    for hit in std::iter::once(second).chain(accepted) {
         let overlaps = taken
             .range(..hit.secret.end)
             .next_back()
@@ -2631,5 +2925,115 @@ mod tests {
         assert!(!ends_key(format!("{}done", base64(b"-----\n")).as_bytes()));
         assert_eq!(base64_bytes(br"ab\ncd\r=="), 6);
         assert!(entropy(b"aaaaaaaaaaaa") < 0.1);
+    }
+
+    #[test]
+    fn prefilter_fast_path_preserves_full_parity_and_zero_alloc_borrowing() {
+        let redactor = redactor();
+        // 1. Clean multi-KB text with abundant non-secret triggers (URLs, code
+        //    keywords, placeholders, PEM certificates) hits the zero-alloc
+        //    Cow::Borrowed fast path and triggers zero false-positive rules.
+        let mut clean = String::new();
+        for i in 0..200 {
+            clean.push_str(&format!(
+                "row {i:03}: see https://docs.example.com/api/v1/items/{i} and token count is {i}\n"
+            ));
+            clean.push_str(
+                "    let password = std::env::var(\"DB_PASSWORD\")?; // warning: unused token\n",
+            );
+        }
+        assert!(clean.len() > 24 * 1024);
+        assert!(
+            matches!(redactor.text(&clean), Cow::Borrowed(s) if std::ptr::eq(s, clean.as_str()))
+        );
+        assert_eq!(
+            candidate_rules(b"see https://docs.example.com/api/v1/items/42"),
+            0
+        );
+        assert_eq!(candidate_rules(b"warning: unused variable token"), 0);
+        assert_eq!(candidate_rules(b"-----BEGIN CERTIFICATE-----"), 0);
+
+        // 2. Every secret category (PEM multi-line/single-line/base64, JWT,
+        //    AWS AKIA/ASIA, GitHub ghp_/github_pat_, Anthropic, OpenAI, URL
+        //    creds, Authorization/Bearer, .env assignment, CLI flag) matches
+        //    streaming Engine output byte-for-byte and never leaks its secret.
+        let asia = format!("{}{}", "AS", "IA") + &upper("asia-parity", 16);
+        let pat = format!("{}{}", "github_", "pat_") + &base62("pat-parity", 82);
+        let legacy_oai = format!(
+            "{}{}{}{}",
+            "sk-",
+            base62("oai-a", 20),
+            "T3BlbkFJ",
+            base62("oai-b", 20)
+        );
+        let env_secret = base62("env-parity", 24);
+        let cli_secret = base62("cli-parity", 24);
+        let pem_multi = private_key_block("pem-parity", "RSA ", 4).join("\n");
+        let pem_single = format!(
+            "{}{}{}",
+            header("EC "),
+            pem_body("pem-single-parity", 2).join(""),
+            footer("EC ")
+        );
+        let pem_b64 = base64(pem_multi.as_bytes());
+
+        let mut corpus = Vec::new();
+        for (kind, secret, line) in samples() {
+            corpus.push((kind, secret, line));
+        }
+        corpus.push((
+            "aws-asia",
+            asia.clone(),
+            format!("AWS_ACCESS_KEY_ID={asia}"),
+        ));
+        corpus.push(("github-pat", pat.clone(), format!("export GH_TOKEN={pat}")));
+        corpus.push((
+            "openai-legacy",
+            legacy_oai.clone(),
+            format!("OPENAI_API_KEY={legacy_oai}"),
+        ));
+        corpus.push((
+            "env-assignment",
+            env_secret.clone(),
+            format!("DATABASE_PASSWORD=\"{env_secret}\""),
+        ));
+        corpus.push((
+            "cli-flag",
+            cli_secret.clone(),
+            format!("tool --api-key {cli_secret} --verbose"),
+        ));
+        corpus.push(("pem-multi", pem_body("pem-parity", 4)[1].clone(), pem_multi));
+        corpus.push((
+            "pem-single",
+            pem_body("pem-single-parity", 2)[0].clone(),
+            pem_single,
+        ));
+        corpus.push((
+            "pem-b64",
+            pem_b64[20..60].to_owned(),
+            format!("key: {pem_b64}"),
+        ));
+
+        for (label, secret, text) in corpus {
+            // Prepend clean filler lines so the fast path advances across clean
+            // lines before handing off to Engine on the secret line.
+            let payload = format!("clean https://example.com line\n{text}\ntrailing clean line\n");
+            let via_bytes = redactor.bytes(payload.as_bytes());
+            let (via_engine, count) = redact(&redactor, payload.as_bytes());
+            assert!(count >= 1, "{label}: expected redaction");
+            assert!(
+                matches!(via_bytes, Cow::Owned(_)),
+                "{label}: expected owned"
+            );
+            assert_eq!(via_bytes.as_ref(), via_engine.as_slice(), "{label}");
+            let rendered = String::from_utf8(via_engine).unwrap();
+            assert!(!rendered.contains(&secret), "{label}: secret leaked");
+            assert!(rendered.contains("[redacted:"), "{label}: missing marker");
+            // Idempotent zero-alloc borrow on already-redacted text.
+            assert!(
+                matches!(redactor.text(&rendered), Cow::Borrowed(_)),
+                "{label}"
+            );
+        }
     }
 }

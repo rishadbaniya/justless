@@ -108,8 +108,8 @@ pub(super) fn parse(original: &[String], words: Vec<String>) -> Option<Grep> {
         if let Some(long) = arg.strip_prefix("--") {
             let (key, inline) = long
                 .split_once('=')
-                .map_or((long, None), |(k, v)| (k, Some(v.to_owned())));
-            let mut value = || inline.clone().or_else(|| args.next().cloned());
+                .map_or((long, None), |(k, v)| (k, Some(v)));
+            let mut value = || inline.or_else(|| args.next().map(String::as_str));
             match key {
                 "line-number" | "ignore-case" | "word-regexp" | "line-regexp" | "invert-match"
                 | "fixed-strings" | "extended-regexp" | "basic-regexp" | "only-matching"
@@ -120,14 +120,14 @@ pub(super) fn parse(original: &[String], words: Vec<String>) -> Option<Grep> {
                 "recursive" if inline.is_none() => grep.recursive = true,
                 "files-with-matches" | "count" if inline.is_none() => grep.per_file = true,
                 "after-context" | "before-context" | "context" | "max-count" => {
-                    number(&value()?)?;
+                    number(value()?)?;
                 }
                 "regexp" => {
                     value()?;
                     explicit = true;
                 }
                 "file" => {
-                    grep.patterns.push(value()?);
+                    grep.patterns.push(value()?.to_owned());
                     explicit = true;
                 }
                 _ => return None,
@@ -148,18 +148,18 @@ pub(super) fn parse(original: &[String], words: Vec<String>) -> Option<Grep> {
                 'A' | 'B' | 'C' | 'm' | 'e' | 'f' => {
                     let rest = &cluster[i + 1..];
                     let value = if rest.is_empty() {
-                        args.next()?.clone()
+                        args.next()?.as_str()
                     } else {
-                        rest.to_owned()
+                        rest
                     };
                     match c {
                         'e' => explicit = true,
                         'f' => {
-                            grep.patterns.push(value);
+                            grep.patterns.push(value.to_owned());
                             explicit = true;
                         }
                         _ => {
-                            number(&value)?;
+                            number(value)?;
                         }
                     }
                     break;
@@ -361,7 +361,7 @@ pub(super) fn arrange(
     let (mut out, mut lines) = (String::new(), 0);
     while lines < limit && !left.is_empty() {
         let at = &rest[out.len().min(rest.len())..];
-        let (index, shown) = left
+        let (index, end) = left
             .iter()
             .enumerate()
             .map(|(i, block)| {
@@ -369,14 +369,14 @@ pub(super) fn arrange(
                     .match_indices('\n')
                     .nth(limit - lines - 1)
                     .map_or(block.len(), |(n, _)| n + 1);
-                (i, &block[..end])
+                (i, end)
             })
-            .filter(|(_, shown)| fits(shown, at, trimmed))
-            .max_by_key(|(_, shown)| shown.len())?;
-        let shown = shown.to_owned();
+            .filter(|&(i, end)| fits(&left[i][..end], at, trimmed))
+            .max_by_key(|&(_, end)| end)?;
+        let block = left.swap_remove(index);
+        let shown = &block[..end];
         lines += shown.bytes().filter(|&b| b == b'\n').count();
-        out.push_str(&shown);
-        left.swap_remove(index);
+        out.push_str(shown);
     }
     Some(out)
 }
