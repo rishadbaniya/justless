@@ -48,16 +48,18 @@ pub fn line(text: &str) -> Cow<'_, str> {
     let mut out = Cow::Borrowed(text);
     let body = text.strip_suffix('\r').unwrap_or(text);
     if body.contains('\r') {
-        let frames: Vec<&str> = body.split('\r').collect();
-        let last = frames
-            .iter()
-            .rposition(|frame| !frame.trim().is_empty())
-            .unwrap_or(frames.len() - 1);
-        let collapsed = format!(
-            "{} [{} earlier progress frame(s) cut]",
-            frames[last],
-            frames.len() - 1
-        );
+        let mut count = 0usize;
+        let mut last = "";
+        let mut last_non_empty = None;
+        for frame in body.split('\r') {
+            count += 1;
+            last = frame;
+            if !frame.trim().is_empty() {
+                last_non_empty = Some(frame);
+            }
+        }
+        let shown = last_non_empty.unwrap_or(last);
+        let collapsed = format!("{shown} [{} earlier progress frame(s) cut]", count - 1);
         if collapsed.len() < body.len() {
             out = Cow::Owned(collapsed);
         }
@@ -74,6 +76,9 @@ fn encoded(byte: u8) -> bool {
 
 /// The text with each long base64 or hex run cut to its ends and a length.
 fn elide(text: &str) -> Option<String> {
+    if text.len() < HEX_RUN {
+        return None;
+    }
     let bytes = text.as_bytes();
     let mut out = String::new();
     let (mut copied, mut at) = (0, 0);
@@ -85,6 +90,9 @@ fn elide(text: &str) -> Option<String> {
         let start = at;
         while at < bytes.len() && encoded(bytes[at]) {
             at += 1;
+        }
+        if at - start < HEX_RUN {
+            continue;
         }
         let run = &text[start..at];
         let Some(kind) = kind(run) else {
@@ -106,33 +114,45 @@ fn elide(text: &str) -> Option<String> {
 }
 
 fn kind(run: &str) -> Option<&'static str> {
-    let count = |test: fn(&u8) -> bool| run.bytes().filter(test).count();
     let length = run.len();
+    let mut seen = 0u128;
+    let mut all_hex = true;
+    let (mut upper, mut lower, mut digit, mut slash, mut dash_under) = (0usize, 0, 0, 0, 0);
+    for b in run.bytes() {
+        seen |= 1u128 << (b & 0x7f);
+        all_hex &= b.is_ascii_hexdigit();
+        upper += usize::from(b.is_ascii_uppercase());
+        lower += usize::from(b.is_ascii_lowercase());
+        digit += usize::from(b.is_ascii_digit());
+        slash += usize::from(b == b'/');
+        dash_under += usize::from(b == b'-' || b == b'_');
+    }
     // A hex dump uses most digits; a run of one padding character is no data.
-    let distinct = run
-        .bytes()
-        .fold(0u128, |seen, b| seen | (1 << (b & 0x7f)))
-        .count_ones();
-    if length >= HEX_RUN && distinct >= 10 && run.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if length >= HEX_RUN && seen.count_ones() >= 10 && all_hex {
         return Some("hex");
     }
     // Encoded data mixes cases and digits throughout; paths and identifiers do not.
     (length >= BASE64_RUN
-        && count(u8::is_ascii_uppercase) * 10 >= length
-        && count(u8::is_ascii_lowercase) * 10 >= length
-        && count(u8::is_ascii_digit) * 30 >= length
-        && count(|b| *b == b'/') * 16 <= length
-        && count(|b| *b == b'-' || *b == b'_') * 16 <= length)
+        && upper * 10 >= length
+        && lower * 10 >= length
+        && digit * 30 >= length
+        && slash * 16 <= length
+        && dash_under * 16 <= length)
         .then_some("base64")
 }
 
 /// Whether `words` print a file's content, as `git show REV:PATH` and `git cat-file`
 /// do. Such output shown whole stays byte for byte.
 pub fn prints_file(words: &[&str]) -> bool {
-    let owned = crate::wrappers::effective(words);
-    let words: Vec<&str> = match &owned {
-        Some(words) => words.iter().map(String::as_str).collect(),
-        None => words.to_vec(),
+    let effective = crate::wrappers::effective_words(words);
+    let owned_refs: Vec<&str>;
+    let words: &[&str] = match &effective {
+        Some(crate::wrappers::EffectiveWords::Borrowed(slice)) => slice,
+        Some(crate::wrappers::EffectiveWords::Owned(vec)) => {
+            owned_refs = vec.iter().map(String::as_str).collect();
+            &owned_refs
+        }
+        None => words,
     };
     let is_git = |program: &str| {
         std::path::Path::new(program)
@@ -140,7 +160,7 @@ pub fn prints_file(words: &[&str]) -> bool {
             .and_then(|name| name.to_str())
             == Some("git")
     };
-    match words.as_slice() {
+    match words {
         [git, "show", rest @ ..] if is_git(git) => {
             let mut iter = rest.iter().copied();
             while let Some(arg) = iter.next() {
@@ -234,7 +254,11 @@ impl Floor {
     pub fn push(&mut self, text: &str, marked: bool, out: &mut Vec<Shown>) {
         let line = text.strip_suffix('\n').unwrap_or(text);
         // Colours, as `git diff --color` prints them, do not hide a hunk.
-        let plain = crate::capture::ANSI.replace_all(line, "");
+        let plain = if line.contains('\x1b') {
+            crate::capture::ANSI.replace_all(line, "")
+        } else {
+            Cow::Borrowed(line)
+        };
         let plain = plain.trim_end_matches('\r');
         self.patch = in_hunk(self.patch, plain);
         let keep = marked || self.patch || kept(plain);
@@ -244,19 +268,19 @@ impl Floor {
             self::line(line)
         };
         let newline = if text.ends_with('\n') { "\n" } else { "" };
-        if !keep && self.ts_repeats == 0 && self.last.as_deref() == Some(&shown) {
+        if !keep && self.ts_repeats == 0 && self.last.as_deref() == Some(shown.as_ref()) {
             self.repeats += 1;
             return;
         }
         let ts_key = if !keep {
             let trimmed = plain.trim();
             let key = crate::filters::log_dedup_key(trimmed);
-            (key != trimmed && !key.is_empty()).then(|| key.to_owned())
+            (key != trimmed && !key.is_empty()).then_some(key)
         } else {
             None
         };
         if !keep
-            && let Some(key) = ts_key.as_deref()
+            && let Some(key) = ts_key
             && self.last_ts_key.as_deref() == Some(key)
         {
             if self.repeats > 0 {
@@ -274,14 +298,21 @@ impl Floor {
             self.ts_repeats += 1;
             self.ts_bytes += shown.len() + newline.len();
             if self.ts_bytes <= 96 {
-                self.ts_buffered.push(format!("{shown}{newline}"));
+                let mut entry = String::with_capacity(shown.len() + newline.len());
+                entry.push_str(&shown);
+                entry.push_str(newline);
+                self.ts_buffered.push(entry);
             } else {
                 self.ts_buffered.clear();
             }
             return;
         }
+        let ts_key = ts_key.map(str::to_owned);
         self.flush(out);
-        out.push((format!("{shown}{newline}"), false));
+        let mut entry = String::with_capacity(shown.len() + newline.len());
+        entry.push_str(&shown);
+        entry.push_str(newline);
+        out.push((entry, false));
         self.last = (!keep).then(|| shown.into_owned());
         self.last_ts_key = ts_key;
     }
@@ -349,8 +380,15 @@ fn compact_with(
         floor.push(line, marked, &mut lines);
     }
     floor.flush(&mut lines);
-    let out: String = lines.into_iter().map(|(line, _)| line).collect();
-    (out != text && out.len() < text.len()).then_some(out)
+    let total_len: usize = lines.iter().map(|(line, _)| line.len()).sum();
+    if total_len >= text.len() {
+        return None;
+    }
+    let mut out = String::with_capacity(total_len);
+    for (line, _) in lines {
+        out.push_str(&line);
+    }
+    (out != text).then_some(out)
 }
 
 #[cfg(test)]
@@ -530,6 +568,41 @@ mod tests {
         );
         assert!(
             out.contains("    at settle (/work/src/orders.ts:42:9)\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn floor_preserves_multibyte_utf8_across_progress_elision_and_ansi() {
+        let hex = "0123456789abcdef".repeat(12);
+        let frames: String = (0..=40)
+            .map(|i| format!("\r進捗🚀 {:>3}%", i * 2))
+            .collect();
+        let e = "\u{1b}";
+        let mut input = format!("開始{frames}\n日本語データ: {hex} 完了✨\n{e}[32m緑の行{e}[0m\n");
+        for s in 1..=8 {
+            input.push_str(&format!(
+                "2026-11-26T10:00:{s:02}.000Z INFO 同期完了✨ node=α\n"
+            ));
+        }
+        let out = compact(&input).expect("compacted");
+        assert!(
+            out.contains("進捗🚀  80% [41 earlier progress frame(s) cut]\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "日本語データ: {}[… 168 hex characters cut …]{} 完了✨\n",
+                &hex[..12],
+                &hex[180..]
+            )),
+            "{out}"
+        );
+        assert!(out.contains(&format!("{e}[32m緑の行{e}[0m\n")), "{out}");
+        assert!(
+            out.contains(
+                "2026-11-26T10:00:01.000Z INFO 同期完了✨ node=α\n[similar line repeated 7 more time(s) with different timestamps]\n"
+            ),
             "{out}"
         );
     }

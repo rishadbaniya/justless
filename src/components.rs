@@ -9,7 +9,6 @@ use std::ops::Range;
 /// Astro frontmatter) replaced by spaces, keeping line breaks, and whether any
 /// script is JSX or TSX.
 pub(crate) fn scripts(source: &str, frontmatter: bool) -> (String, bool) {
-    let lower = source.to_ascii_lowercase();
     let mut keep = Vec::<Range<usize>>::new();
     let mut jsx = false;
     let mut at = 0;
@@ -17,17 +16,22 @@ pub(crate) fn scripts(source: &str, frontmatter: bool) -> (String, bool) {
         at = fence.end;
         keep.push(fence);
     }
-    while let Some(offset) = lower[at..].find('<') {
+    let bytes = source.as_bytes();
+    while let Some(offset) = source[at..].find('<') {
         let start = at + offset;
-        let rest = &lower[start..];
+        let rest = &source[start..];
         if rest.starts_with("<!--") {
             at = rest.find("-->").map_or(source.len(), |end| start + end + 3);
             continue;
         }
-        let opens = rest.strip_prefix("<script").is_some_and(|after| {
-            after.is_empty()
-                || after.starts_with(|c: char| c.is_whitespace() || c == '>' || c == '/')
-        });
+        let opens = bytes[start..]
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"<script"))
+            && {
+                let after = &source[start + 7..];
+                after.is_empty()
+                    || after.starts_with(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            };
         if !opens {
             at = start + 1;
             continue;
@@ -40,9 +44,7 @@ pub(crate) fn scripts(source: &str, frontmatter: bool) -> (String, bool) {
             at = tag_end;
             continue;
         }
-        let close = lower[tag_end..]
-            .find("</script")
-            .map_or(source.len(), |offset| tag_end + offset);
+        let close = find_close_script(source, tag_end).unwrap_or(source.len());
         if let Some(dialect_jsx) = dialect(tag) {
             jsx |= dialect_jsx;
             keep.push(tag_end..close);
@@ -50,18 +52,43 @@ pub(crate) fn scripts(source: &str, frontmatter: bool) -> (String, bool) {
         at = close;
     }
     let mut masked = String::with_capacity(source.len());
-    let mut kept = keep.iter().peekable();
-    for (offset, character) in source.char_indices() {
-        while kept.next_if(|range| range.end <= offset).is_some() {}
-        if kept.peek().is_some_and(|range| range.contains(&offset))
-            || matches!(character, '\n' | '\r')
+    let mut pos = 0;
+    for range in keep {
+        push_blanked(&mut masked, &source[pos..range.start]);
+        masked.push_str(&source[range.start..range.end]);
+        pos = range.end;
+    }
+    push_blanked(&mut masked, &source[pos..]);
+    (masked, jsx)
+}
+
+/// Find the byte offset of the next ASCII-case-insensitive `</script` starting at `from`.
+fn find_close_script(source: &str, mut from: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    while let Some(offset) = source[from..].find('<') {
+        let at = from + offset;
+        if bytes[at..]
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"</script"))
         {
-            masked.push(character);
-        } else {
-            masked.extend(std::iter::repeat_n(' ', character.len_utf8()));
+            return Some(at);
+        }
+        from = at + 1;
+    }
+    None
+}
+
+/// Append `segment` with every non-newline byte replaced by an ASCII space.
+/// Multi-byte UTF-8 sequences only contain bytes >= 0x80 (never `\n` or `\r`),
+/// so replacing each non-`\n`/`\r` byte with `' '` preserves exact UTF-8 byte length.
+fn push_blanked(out: &mut String, segment: &str) {
+    for byte in segment.bytes() {
+        match byte {
+            b'\n' => out.push('\n'),
+            b'\r' => out.push('\r'),
+            _ => out.push(' '),
         }
     }
-    (masked, jsx)
 }
 
 /// The body of an Astro frontmatter fence: from the line after an opening
@@ -103,60 +130,61 @@ fn tag_end(source: &str, start: usize) -> Option<usize> {
 /// so whether it is JSX. JSON, templates and other languages are not.
 fn dialect(tag: &str) -> Option<bool> {
     let mut jsx = false;
-    for (name, value) in attributes(tag) {
-        let value = value.to_ascii_lowercase();
-        match name.as_str() {
-            "lang" => match value.as_str() {
-                "js" | "javascript" | "ts" | "typescript" => {}
-                "jsx" | "tsx" => jsx = true,
-                _ => return None,
-            },
-            "type" => match value.as_str() {
-                ""
-                | "module"
-                | "text/javascript"
-                | "application/javascript"
-                | "text/typescript"
-                | "application/typescript" => {}
-                _ => return None,
-            },
-            _ => {}
+    let mut rest = tag;
+    while let Some((name, value, next)) = next_attribute(rest) {
+        rest = next;
+        if name.eq_ignore_ascii_case("lang") {
+            if value.eq_ignore_ascii_case("js")
+                || value.eq_ignore_ascii_case("javascript")
+                || value.eq_ignore_ascii_case("ts")
+                || value.eq_ignore_ascii_case("typescript")
+            {
+            } else if value.eq_ignore_ascii_case("jsx") || value.eq_ignore_ascii_case("tsx") {
+                jsx = true;
+            } else {
+                return None;
+            }
+        } else if name.eq_ignore_ascii_case("type")
+            && !(value.is_empty()
+                || value.eq_ignore_ascii_case("module")
+                || value.eq_ignore_ascii_case("text/javascript")
+                || value.eq_ignore_ascii_case("application/javascript")
+                || value.eq_ignore_ascii_case("text/typescript")
+                || value.eq_ignore_ascii_case("application/typescript"))
+        {
+            return None;
         }
     }
     Some(jsx)
 }
 
-/// The attributes of a tag, without the tag name, as lowercase names and raw
-/// values. An attribute without a value has an empty one.
-fn attributes(tag: &str) -> Vec<(String, &str)> {
-    let mut found = Vec::new();
-    let mut rest = tag;
-    loop {
-        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '/');
-        if rest.is_empty() {
-            return found;
-        }
-        let name_end = rest
-            .find(|c: char| c.is_whitespace() || c == '=' || c == '/')
-            .unwrap_or(rest.len());
-        let name = rest[..name_end].to_ascii_lowercase();
-        rest = rest[name_end..].trim_start();
-        let mut value = "";
-        if let Some(after) = rest.strip_prefix('=') {
-            let after = after.trim_start();
-            if let Some(quote) = after.chars().next().filter(|c| matches!(c, '"' | '\'')) {
-                let body = &after[1..];
-                let end = body.find(quote).unwrap_or(body.len());
-                value = &body[..end];
-                rest = body.get(end + 1..).unwrap_or("");
-            } else {
-                let end = after.find(char::is_whitespace).unwrap_or(after.len());
-                value = &after[..end];
-                rest = &after[end..];
-            }
-        }
-        found.push((name, value));
+/// The next `(name, value, remainder)` attribute of a tag without allocations.
+/// An attribute without a value has an empty one.
+fn next_attribute(tag: &str) -> Option<(&str, &str, &str)> {
+    let rest = tag.trim_start_matches(|c: char| c.is_whitespace() || c == '/');
+    if rest.is_empty() {
+        return None;
     }
+    let name_end = rest
+        .find(|c: char| c.is_whitespace() || c == '=' || c == '/')
+        .unwrap_or(rest.len());
+    let name = &rest[..name_end];
+    let mut rest = rest[name_end..].trim_start();
+    let mut value = "";
+    if let Some(after) = rest.strip_prefix('=') {
+        let after = after.trim_start();
+        if let Some(quote) = after.chars().next().filter(|c| matches!(c, '"' | '\'')) {
+            let body = &after[1..];
+            let end = body.find(quote).unwrap_or(body.len());
+            value = &body[..end];
+            rest = body.get(end + 1..).unwrap_or("");
+        } else {
+            let end = after.find(char::is_whitespace).unwrap_or(after.len());
+            value = &after[..end];
+            rest = &after[end..];
+        }
+    }
+    Some((name, value, rest))
 }
 
 #[cfg(test)]
@@ -189,6 +217,12 @@ mod tests {
                 true,
                 vec!["import Card from './Card.astro'\n", "\nhello()\n"],
                 false,
+            ),
+            (
+                "<template><p>日本語🚀</p></template>\n<SCRIPT LANG=\"TSX\">const s = \"é\"</SCRIPT>\n",
+                false,
+                vec!["const s = \"é\""],
+                true,
             ),
         ] {
             let (masked, found_jsx) = scripts(source, frontmatter);

@@ -37,10 +37,12 @@ pub enum Class {
     WrongTestPath,
     EmptyTests,
     WrongPackageManager,
+    PrerequisiteStep,
+    ToolchainWrapper,
 }
 
 impl Class {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 12] = [
         Self::MissingProgram,
         Self::ZshGlob,
         Self::ZshEquals,
@@ -51,6 +53,8 @@ impl Class {
         Self::WrongTestPath,
         Self::EmptyTests,
         Self::WrongPackageManager,
+        Self::PrerequisiteStep,
+        Self::ToolchainWrapper,
     ];
 
     pub fn name(self) -> &'static str {
@@ -65,6 +69,8 @@ impl Class {
             Self::WrongTestPath => "wrong_test_path",
             Self::EmptyTests => "empty_tests",
             Self::WrongPackageManager => "wrong_package_manager",
+            Self::PrerequisiteStep => "prerequisite_step",
+            Self::ToolchainWrapper => "toolchain_wrapper",
         }
     }
 
@@ -80,6 +86,8 @@ impl Class {
             Self::WrongTestPath => "wrong test path",
             Self::EmptyTests => "empty test run",
             Self::WrongPackageManager => "wrong package manager",
+            Self::PrerequisiteStep => "prerequisite step",
+            Self::ToolchainWrapper => "toolchain wrapper",
         }
     }
 
@@ -243,9 +251,9 @@ fn self_evident(event: &Event) -> Vec<(SelfHit, u64)> {
         || text.contains("no such file or directory")
         || text.contains("No such file or directory")
         || text.contains("No module named");
-    let words: Vec<&str> = event.raw.split_whitespace().collect();
     let line = |found: regex::Match| found.as_str().len() as u64 + 1;
     if maybe_missing {
+        let words: Vec<&str> = event.raw.split_whitespace().collect();
         for (pattern, kind) in MISSING.iter() {
             for captures in pattern.captures_iter(text) {
                 let operand = captures[1].to_owned();
@@ -266,7 +274,10 @@ fn self_evident(event: &Event) -> Vec<(SelfHit, u64)> {
                         |(hit, _)| matches!(hit, SelfHit::Missing(k, o) if k == kind && *o == operand),
                     )
                 {
-                    hits.push((SelfHit::Missing(*kind, operand), line(captures.get(0).expect("match"))));
+                    hits.push((
+                        SelfHit::Missing(*kind, operand),
+                        line(captures.get(0).expect("match")),
+                    ));
                 }
             }
         }
@@ -280,12 +291,16 @@ fn self_evident(event: &Event) -> Vec<(SelfHit, u64)> {
         hits.push((SelfHit::Glob(captures[1].to_owned()), bytes));
     }
     if text.contains(" not found") {
-        let unquoted = unquoted_words(&event.raw);
-        if let Some(captures) = EQUALS
-            .captures_iter(text)
-            .find(|captures| unquoted.contains(&format!("={}", &captures[1])))
-        {
-            hits.push((SelfHit::Equals, line(captures.get(0).expect("match"))));
+        let mut eq = EQUALS.captures_iter(text).peekable();
+        if eq.peek().is_some() {
+            let unquoted = unquoted_words(&event.raw);
+            if let Some(captures) = eq.find(|captures| {
+                unquoted
+                    .iter()
+                    .any(|word| word.strip_prefix('=') == Some(&captures[1]))
+            }) {
+                hits.push((SelfHit::Equals, line(captures.get(0).expect("match"))));
+            }
         }
     }
     hits
@@ -334,6 +349,10 @@ enum Hit {
     NoPackageJson,
     NoPyproject,
     NoGoMod,
+    NoPubspecYaml,
+    NoTerraformConfig,
+    NoDockerfile,
+    NoChartYaml,
     CargoPackage(String),
     CargoTarget(&'static str, String),
     NoSuchCommand(String),
@@ -343,6 +362,25 @@ enum Hit {
     TestPath(String),
     WorkspaceProtocol,
     Corepack(String),
+    FlutterPubGet,
+    DartCodegen,
+    FlutterSdkMismatch,
+    TerraformUpgrade,
+    TerraformInit,
+    TerraformStateLock,
+    TerraformWorkspace(String),
+    TerraformWorkspaceError,
+    HelmDeps,
+    KubectlNotFound,
+    KubectlEmptyNamespace(String),
+    KubectlContext,
+    DockerDaemon,
+    DockerBuildx,
+    DockerBuildFailed,
+    UvSync,
+    ModuleNotFound,
+    UvPackage(String),
+    PnpmFilter,
 }
 
 impl Hit {
@@ -353,6 +391,10 @@ impl Hit {
             Self::NoPackageJson => Some("package.json"),
             Self::NoPyproject => Some("pyproject.toml"),
             Self::NoGoMod => Some("go.mod"),
+            Self::NoPubspecYaml => Some("pubspec.yaml"),
+            Self::NoTerraformConfig => Some(".tf"),
+            Self::NoDockerfile => Some("Dockerfile"),
+            Self::NoChartYaml => Some("Chart.yaml"),
             _ => None,
         }
     }
@@ -365,6 +407,10 @@ struct Signatures {
     npm_enoent: Regex,
     no_pyproject: Regex,
     no_go_mod: Regex,
+    no_pubspec_yaml: Regex,
+    no_terraform_config: Regex,
+    no_dockerfile: Regex,
+    no_chart_yaml: Regex,
     cargo_package: Regex,
     cargo_target: Regex,
     cargo_command: Regex,
@@ -378,6 +424,25 @@ struct Signatures {
     node_path: Regex,
     workspace: Regex,
     corepack: Regex,
+    flutter_pub_get: Regex,
+    dart_codegen: Regex,
+    flutter_sdk_mismatch: Regex,
+    terraform_upgrade: Regex,
+    terraform_init: Regex,
+    terraform_state_lock: Regex,
+    terraform_workspace: Regex,
+    terraform_workspace_error: Regex,
+    helm_deps: Regex,
+    kubectl_not_found: Regex,
+    kubectl_empty_ns: Regex,
+    kubectl_context: Regex,
+    docker_daemon: Regex,
+    docker_buildx: Regex,
+    docker_build_failed: Regex,
+    uv_sync: Regex,
+    module_not_found: Regex,
+    uv_package: Regex,
+    pnpm_filter: Regex,
 }
 
 static SIGNATURES: LazyLock<Signatures> = LazyLock::new(|| {
@@ -401,6 +466,20 @@ static SIGNATURES: LazyLock<Signatures> = LazyLock::new(|| {
         no_go_mod: re(
             r"(?m)(?:go\.mod file not found in current directory or any parent directory|directory prefix \. does not contain main module or its selected dependencies)",
         ),
+        // flutter/dart [source]
+        no_pubspec_yaml: re(
+            r#"(?m)(?:No pubspec\.yaml file found|Could not find a file named "pubspec\.yaml")"#,
+        ),
+        // terraform / opentofu [source]
+        no_terraform_config: re(
+            r"(?m)(?:Error: No configuration files|(?:contains|has) no (?:Terraform|OpenTofu) configuration files)",
+        ),
+        // docker / buildkit [source]
+        no_dockerfile: re(
+            r"(?m)(?:failed to read dockerfile|unable to evaluate symlinks in Dockerfile path|open Dockerfile: no such file or directory)",
+        ),
+        // helm [source]
+        no_chart_yaml: re(r"(?m)Chart\.yaml file is missing"),
         // cargo [here]
         cargo_package: re(r"(?m)package ID specification `([^`]+)` did not match any packages"),
         cargo_target: re(r"(?m)no (bin|test|example|bench) target named `([^`]+)`"),
@@ -446,6 +525,68 @@ static SIGNATURES: LazyLock<Signatures> = LazyLock::new(|| {
         workspace: re(r#"(?m)Unsupported URL Type "workspace:""#),
         // corepack [source: the message template in the local corepack install]
         corepack: re(r"(?m)This project is configured to use (npm|pnpm|yarn|bun) because"),
+        // flutter/dart pub get [source: dart pub & analyzer]
+        flutter_pub_get: re(
+            r#"(?m)(?:please run ["'](?:flutter|dart) pub get["']|pubspec\.yaml has been modified since the last 'pub get'|Target of URI doesn't exist: 'package:|Couldn't resolve the package '|package_config\.json|pub get has not been run)"#,
+        ),
+        // dart/flutter build_runner codegen [source: analyzer & CFE]
+        dart_codegen: re(
+            r"(?m)(?:Target of URI hasn't been generated:|Error when reading '[^']*\.(?:g|freezed|mocks|gr)\.dart')",
+        ),
+        // flutter/dart SDK version constraint mismatch [source: pub & analyzer]
+        flutter_sdk_mismatch: re(
+            r"(?m)(?:requires (?:Flutter |a higher minimum Dart |a Dart )?SDK version|The current (?:Dart|Flutter) SDK version is|language version override can't specify a version greater than)",
+        ),
+        // terraform/opentofu provider lock upgrade [source]
+        terraform_upgrade: re(
+            r"(?m)(?:Inconsistent dependency lock file|(?:terraform|tofu|terragrunt) init -upgrade|does not match configured version constraint)",
+        ),
+        // terraform/opentofu/terragrunt initialization required [source]
+        terraform_init: re(
+            r#"(?m)(?:Initialization required|Plugin reinitialization required|Module not installed|Backend initialization required|Backend configuration changed|Required plugins are not installed|run "(?:terraform|tofu|terragrunt) init")"#,
+        ),
+        // terraform/opentofu state lock [source]
+        terraform_state_lock: re(r"(?m)(?:Error acquiring the state lock|Error locking state:)"),
+        // terraform/opentofu unknown workspace [source]
+        terraform_workspace: re(r#"(?m)Workspace "([^"]+)" doesn't exist"#),
+        // terraform/opentofu wrong active workspace [source]
+        terraform_workspace_error: re(
+            r#"(?m)(?:currently selected workspace|not allowed in the "default" workspace|cannot be used with the "default" workspace)"#,
+        ),
+        // helm missing chart dependencies [source]
+        helm_deps: re(
+            r"(?m)(?:found in Chart\.yaml, but missing in charts/|helm dependency (?:update|build)|Chart\.lock is out of sync)",
+        ),
+        // kubectl NotFound [source]
+        kubectl_not_found: re(r"(?m)Error from server \(NotFound\):"),
+        // kubectl empty namespace (often exit 0) [source]
+        kubectl_empty_ns: re(r"(?m)No resources found in ([A-Za-z0-9._-]+) namespace\."),
+        // kubectl unreachable / unset context [source]
+        kubectl_context: re(
+            r#"(?m)(?:connection to the server localhost:8080 was refused|current-context is not set|context "[^"]+" does not exist|Unable to connect to the server:)"#,
+        ),
+        // docker daemon / context unreachable [source]
+        docker_daemon: re(
+            r"(?m)(?:Cannot connect to the Docker daemon|Is the docker daemon running\?|failed to connect to the docker (?:API|daemon))",
+        ),
+        // docker buildx required [source]
+        docker_buildx: re(
+            r"(?m)(?:Multi-platform build is not supported for the docker driver|Legacy builder is deprecated)",
+        ),
+        // docker BuildKit build failure [source]
+        docker_build_failed: re(
+            r"(?m)(?:ERROR: failed to solve:|ERROR: failed to build:|failed to compute cache key:|invalid reference format|missing build-arg|required build arg)",
+        ),
+        // uv lockfile / venv out of sync [source]
+        uv_sync: re(
+            r"(?m)(?:The lockfile at `uv\.lock` needs to be updated|No virtual environment found; run `uv venv`)",
+        ),
+        // python missing module (only pairs with `uv run` or `uv sync`) [here]
+        module_not_found: re(r"(?m)ModuleNotFoundError: No module named '[^']+'"),
+        // uv unknown workspace package [source]
+        uv_package: re(r"(?m)Package `([^`]+)` not found in workspace"),
+        // pnpm workspace filter mismatch [source]
+        pnpm_filter: re(r"(?m)No projects matched the filters"),
     }
 });
 
@@ -465,6 +606,13 @@ static SIGNALS: LazyLock<Regex> = LazyLock::new(|| {
         "pyproject.toml",
         "go.mod",
         "does not contain main module",
+        "pubspec.yaml",
+        "No configuration files",
+        "configuration files",
+        "failed to read dockerfile",
+        "Dockerfile path",
+        "Chart.yaml",
+        "Chart.lock",
         "did not match any packages",
         "target named",
         "no such command",
@@ -483,6 +631,54 @@ static SIGNALS: LazyLock<Regex> = LazyLock::new(|| {
         "Could not find",
         "Unsupported URL Type",
         "is configured to use",
+        "pub get",
+        "Target of URI doesn't exist",
+        "Couldn't resolve the package",
+        "package_config.json",
+        "hasn't been generated",
+        "Error when reading '",
+        "SDK version",
+        "language version override",
+        "Inconsistent dependency lock file",
+        "init -upgrade",
+        "configured version constraint",
+        "Initialization required",
+        "Plugin reinitialization required",
+        "Module not installed",
+        "Backend initialization required",
+        "Backend configuration changed",
+        "Required plugins are not installed",
+        "terraform init",
+        "tofu init",
+        "terragrunt init",
+        "state lock",
+        "Error locking state",
+        "doesn't exist",
+        "selected workspace",
+        "\"default\" workspace",
+        "helm dependency",
+        "Error from server (NotFound)",
+        "No resources found in ",
+        "localhost:8080 was refused",
+        "current-context is not set",
+        "does not exist",
+        "Unable to connect to the server",
+        "Cannot connect to the Docker daemon",
+        "docker daemon running",
+        "connect to the docker",
+        "not supported for the docker driver",
+        "Legacy builder is deprecated",
+        "failed to solve:",
+        "failed to build:",
+        "failed to compute cache key",
+        "invalid reference format",
+        "build-arg",
+        "required build arg",
+        "uv.lock",
+        "No virtual environment found",
+        "ModuleNotFoundError",
+        "not found in workspace",
+        "No projects matched the filters",
     ];
     let pattern = words.map(regex::escape).join("|");
     Regex::new(&pattern).expect("signal words")
@@ -493,6 +689,9 @@ pub fn may_signal(text: &str) -> bool {
 }
 
 fn hits(text: &str) -> Vec<Hit> {
+    if !may_signal(text) {
+        return Vec::new();
+    }
     let s = &*SIGNATURES;
     let mut hits = Vec::new();
     let mut add = |hit: Hit| {
@@ -517,6 +716,18 @@ fn hits(text: &str) -> Vec<Hit> {
     }
     if s.no_go_mod.is_match(text) {
         add(Hit::NoGoMod);
+    }
+    if s.no_pubspec_yaml.is_match(text) {
+        add(Hit::NoPubspecYaml);
+    }
+    if s.no_terraform_config.is_match(text) {
+        add(Hit::NoTerraformConfig);
+    }
+    if s.no_dockerfile.is_match(text) {
+        add(Hit::NoDockerfile);
+    }
+    if s.no_chart_yaml.is_match(text) {
+        add(Hit::NoChartYaml);
     }
     for captures in s.cargo_package.captures_iter(text) {
         add(Hit::CargoPackage(captures[1].to_owned()));
@@ -576,6 +787,63 @@ fn hits(text: &str) -> Vec<Hit> {
     }
     for captures in s.corepack.captures_iter(text) {
         add(Hit::Corepack(captures[1].to_owned()));
+    }
+    if s.dart_codegen.is_match(text) {
+        add(Hit::DartCodegen);
+    }
+    if s.flutter_pub_get.is_match(text) {
+        add(Hit::FlutterPubGet);
+    }
+    if s.flutter_sdk_mismatch.is_match(text) {
+        add(Hit::FlutterSdkMismatch);
+    }
+    if s.terraform_upgrade.is_match(text) {
+        add(Hit::TerraformUpgrade);
+    }
+    if s.terraform_init.is_match(text) {
+        add(Hit::TerraformInit);
+    }
+    if s.terraform_state_lock.is_match(text) {
+        add(Hit::TerraformStateLock);
+    }
+    for captures in s.terraform_workspace.captures_iter(text) {
+        add(Hit::TerraformWorkspace(captures[1].to_owned()));
+    }
+    if s.terraform_workspace_error.is_match(text) {
+        add(Hit::TerraformWorkspaceError);
+    }
+    if s.helm_deps.is_match(text) {
+        add(Hit::HelmDeps);
+    }
+    if s.kubectl_not_found.is_match(text) {
+        add(Hit::KubectlNotFound);
+    }
+    for captures in s.kubectl_empty_ns.captures_iter(text) {
+        add(Hit::KubectlEmptyNamespace(captures[1].to_owned()));
+    }
+    if s.kubectl_context.is_match(text) {
+        add(Hit::KubectlContext);
+    }
+    if s.docker_daemon.is_match(text) {
+        add(Hit::DockerDaemon);
+    }
+    if s.docker_buildx.is_match(text) {
+        add(Hit::DockerBuildx);
+    }
+    if s.docker_build_failed.is_match(text) {
+        add(Hit::DockerBuildFailed);
+    }
+    if s.uv_sync.is_match(text) {
+        add(Hit::UvSync);
+    }
+    if s.module_not_found.is_match(text) {
+        add(Hit::ModuleNotFound);
+    }
+    for captures in s.uv_package.captures_iter(text) {
+        add(Hit::UvPackage(captures[1].to_owned()));
+    }
+    if s.pnpm_filter.is_match(text) {
+        add(Hit::PnpmFilter);
     }
     hits
 }
@@ -747,7 +1015,7 @@ struct Outcome {
     class: Class,
     key: Vec<(&'static str, String)>,
     context: Vec<(&'static str, String)>,
-    wrong: Wrong,
+    wrong: Option<Wrong>,
     typo: bool,
     nested: bool,
 }
@@ -937,28 +1205,57 @@ impl Builder<'_> {
             }
             return;
         }
-        if code == 0 && !f.masked || query_exit(f, code) {
+        if code == 0 && !f.masked {
+            // `kubectl get` exits 0 when printing "No resources found in <ns> namespace.".
+            if basename(f.program()) == "kubectl" {
+                let hits = thread.hits(at);
+                if let Some((hit, pointer)) = hits
+                    .iter()
+                    .find(|(hit, _)| matches!(hit, Hit::KubectlEmptyNamespace(_)))
+                    .cloned()
+                    && let Some((g, outcome)) = find(thread, at, false, |g_event, g| {
+                        if thread_has(thread, g_event, &hit) {
+                            return None;
+                        }
+                        kubectl_option(&hit, f, g)
+                    })
+                {
+                    self.record(thread, at, g, outcome, pointer, Some(&hit));
+                }
+            }
+            return;
+        }
+        if query_exit(f, code) {
+            return;
+        }
+        if thread.hits(at).is_empty() {
+            if code != 0 && !test_run(f, event) {
+                // Any failure text that names the flag the correction adds. A failed test
+                // run is left out: cargo's `to rerun pass --lib` is not a missing option.
+                let found = find(thread, at, false, |_, g| missing_option(f, g, None, event));
+                if let Some((g, outcome)) = found {
+                    self.record(thread, at, g, outcome, event.pointer.clone(), None);
+                }
+            }
             return;
         }
         let hits = thread.hits(at).to_vec();
         for (hit, pointer) in &hits {
-            let found = find(thread, at, false, |g_event, g| {
+            let direct = find(thread, at, false, |g_event, g| {
                 if g.masked && thread_has(thread, g_event, hit) {
                     return None;
                 }
                 pair(hit, event, f, code, g)
             });
+            let prereq = find_prereq(thread, at, hit, f);
+            let found = match (direct, prereq) {
+                (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            };
             if let Some((g, outcome)) = found {
                 self.record(thread, at, g, outcome, pointer.clone(), Some(hit));
                 return;
-            }
-        }
-        if hits.is_empty() && code != 0 && !test_run(f, event) {
-            // Any failure text that names the flag the correction adds. A failed test
-            // run is left out: cargo's `to rerun pass --lib` is not a missing option.
-            let found = find(thread, at, false, |_, g| missing_option(f, g, None, event));
-            if let Some((g, outcome)) = found {
-                self.record(thread, at, g, outcome, event.pointer.clone(), None);
             }
         }
     }
@@ -994,7 +1291,9 @@ impl Builder<'_> {
         candidate.fail((thread.index, at), event, pointer, event.failure_bytes);
         candidate.correct((thread.index, g));
         candidate.context(event.time_ms, &outcome.context);
-        candidate.expect(outcome.wrong);
+        if let Some(wrong) = outcome.wrong {
+            candidate.expect(wrong);
+        }
         // Identical failures just before this one belong to the same episode.
         for before in (0..at).rev() {
             let earlier = thread.events[before];
@@ -1073,22 +1372,106 @@ fn find<'e>(
     None
 }
 
+/// The first later successful prerequisite command (standalone or inside a chain)
+/// in the same directory within the window, provided an immediate retry of `f` did
+/// not fail again with the same hit.
+fn find_prereq(thread: &Thread, at: usize, hit: &Hit, f: &Cmd) -> Option<(usize, Outcome)> {
+    if !matches!(
+        hit,
+        Hit::FlutterPubGet
+            | Hit::DartCodegen
+            | Hit::TerraformUpgrade
+            | Hit::TerraformInit
+            | Hit::TerraformWorkspace(_)
+            | Hit::TerraformWorkspaceError
+            | Hit::HelmDeps
+            | Hit::KubectlContext
+            | Hit::DockerDaemon
+            | Hit::UvSync
+            | Hit::ModuleNotFound
+    ) {
+        return None;
+    }
+    let start = thread.events[at].time_ms;
+    let mut seen = 0;
+    for later in at + 1..thread.events.len() {
+        let event = thread.events[later];
+        if event.time_ms.saturating_sub(start) > WINDOW_MS {
+            break;
+        }
+        if event.status == Status::Unknown {
+            continue;
+        }
+        seen += 1;
+        if seen > WINDOW_EVENTS {
+            break;
+        }
+        if event.status != Status::Code(0) {
+            continue;
+        }
+        for cmd in event.commands() {
+            let Some(outcome) = prerequisite_step(hit, f, cmd) else {
+                continue;
+            };
+            // Reject the prerequisite if `f` immediately fails again with the same hit.
+            let still_broken = thread.events[later + 1..]
+                .iter()
+                .enumerate()
+                .take(WINDOW_EVENTS)
+                .any(|(offset, retry)| {
+                    retry.time_ms.saturating_sub(event.time_ms) <= WINDOW_MS
+                        && retry.status != Status::Code(0)
+                        && retry.status != Status::Unknown
+                        && retry
+                            .simple()
+                            .is_some_and(|c| c.argv == f.argv && c.same_place(f))
+                        && thread.has(later + 1 + offset, hit)
+                });
+            if !still_broken {
+                return Some((later, outcome));
+            }
+        }
+    }
+    None
+}
+
 fn pair(hit: &Hit, event: &Event, f: &Cmd, code: i32, g: &Cmd) -> Option<Outcome> {
     match hit {
         Hit::NoMakefile
         | Hit::NoCargoToml
         | Hit::NoPackageJson
         | Hit::NoPyproject
-        | Hit::NoGoMod => wrong_directory(hit, f, g),
+        | Hit::NoGoMod
+        | Hit::NoPubspecYaml
+        | Hit::NoTerraformConfig
+        | Hit::NoChartYaml => wrong_directory(hit, f, g),
+        Hit::NoDockerfile => wrong_directory(hit, f, g).or_else(|| docker_option(hit, f, g)),
         Hit::NoRule(_) => wrong_directory(hit, f, g).or_else(|| unknown_target(hit, f, g)),
         Hit::CargoPackage(_)
         | Hit::CargoTarget(..)
         | Hit::NoSuchCommand(_)
-        | Hit::MissingScript(_) => unknown_target(hit, f, g),
+        | Hit::MissingScript(_)
+        | Hit::TerraformWorkspace(_)
+        | Hit::UvPackage(_)
+        | Hit::PnpmFilter => unknown_target(hit, f, g),
         Hit::UnknownOption(flag) => unknown_option(flag, f, g),
         Hit::RequiredOption(flag) => missing_option(f, g, Some(flag), event),
         Hit::TestPath(path) => wrong_test_path(path, f, code, g),
         Hit::WorkspaceProtocol | Hit::Corepack(_) => wrong_package_manager(hit, f, g),
+        Hit::FlutterSdkMismatch | Hit::ModuleNotFound | Hit::DockerBuildx => {
+            toolchain_wrapper(hit, f, g)
+        }
+        Hit::TerraformUpgrade | Hit::TerraformStateLock => terraform_option(hit, f, g),
+        Hit::KubectlNotFound | Hit::KubectlEmptyNamespace(_) | Hit::KubectlContext => {
+            kubectl_option(hit, f, g)
+        }
+        Hit::DockerDaemon | Hit::DockerBuildFailed => docker_option(hit, f, g),
+        Hit::FlutterPubGet
+        | Hit::DartCodegen
+        | Hit::TerraformInit
+        | Hit::TerraformWorkspaceError
+        | Hit::HelmDeps
+        | Hit::UvSync => None,
     }
 }
 
@@ -1111,10 +1494,10 @@ fn wrong_directory(hit: &Hit, f: &Cmd, g: &Cmd) -> Option<Outcome> {
             ("manifest", hit.manifest()?.to_owned()),
             ("command", stem(&f.argv)),
         ],
-        wrong: Wrong::Command {
+        wrong: Some(Wrong::Command {
             dir: f.dir.clone(),
             argv: f.argv.clone(),
-        },
+        }),
         typo: false,
         nested,
     })
@@ -1157,10 +1540,10 @@ fn missing_script(name: &str, f: &Cmd, g: &Cmd) -> Option<Outcome> {
             ("replacement", y.to_owned()),
         ],
         context: vec![("dir", g.dir.clone())],
-        wrong: Wrong::Command {
+        wrong: Some(Wrong::Command {
             dir: f.dir.clone(),
             argv: canonical(&f.argv),
-        },
+        }),
         nested: false,
     })
 }
@@ -1221,6 +1604,34 @@ fn unknown_target(hit: &Hit, f: &Cmd, g: &Cmd) -> Option<Outcome> {
                 vec![],
             )
         }
+        Hit::TerraformWorkspace(name)
+            if matches!(program, "terraform" | "tofu")
+                && before.get(1).map(String::as_str) == Some("workspace")
+                && before.get(2).map(String::as_str) == Some("select")
+                && index == 3
+                && wrong == *name =>
+        {
+            (
+                "workspace",
+                format!("{program} workspace select"),
+                wrong.clone(),
+                right.clone(),
+                vec![],
+            )
+        }
+        Hit::UvPackage(name) if program == "uv" => {
+            let (x, y, flag) = flag_of(&["-p", "--package"])?;
+            (x == *name).then_some(())?;
+            let uv_stem = match f.argv.get(1).map(String::as_str) {
+                Some(sub) if !sub.starts_with('-') => format!("uv {sub}"),
+                _ => "uv".to_owned(),
+            };
+            ("package", uv_stem, x, y, vec![("flag", flag)])
+        }
+        Hit::PnpmFilter if program == "pnpm" => {
+            let (x, y, flag) = flag_of(&["-F", "--filter"])?;
+            ("filter", "pnpm".to_owned(), x, y, vec![("flag", flag)])
+        }
         _ => return None,
     };
     if y.is_empty() || y.starts_with('-') {
@@ -1237,10 +1648,10 @@ fn unknown_target(hit: &Hit, f: &Cmd, g: &Cmd) -> Option<Outcome> {
             ("replacement", y),
         ],
         context,
-        wrong: Wrong::Command {
+        wrong: Some(Wrong::Command {
             dir: f.dir.clone(),
             argv: before,
-        },
+        }),
         nested: false,
     })
 }
@@ -1249,10 +1660,10 @@ fn unknown_option(flag: &str, f: &Cmd, g: &Cmd) -> Option<Outcome> {
     if !flag.starts_with('-') || !f.same_place(g) || stem(&f.argv) != stem(&g.argv) {
         return None;
     }
-    let index = f
-        .argv
-        .iter()
-        .position(|word| word == flag || word.starts_with(&format!("{flag}=")))?;
+    let index = f.argv.iter().position(|word| {
+        word.strip_prefix(flag)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
+    })?;
     let replacement = if f.argv.len() == g.argv.len() {
         let (at, _, right) = replaced(&f.argv, &g.argv)?;
         (at == index && right.starts_with('-')).then(|| option_name(&right))?
@@ -1279,10 +1690,10 @@ fn unknown_option(flag: &str, f: &Cmd, g: &Cmd) -> Option<Outcome> {
             ("replacement", replacement),
         ],
         context: vec![],
-        wrong: Wrong::Command {
+        wrong: Some(Wrong::Command {
             dir: f.dir.clone(),
             argv: f.argv.clone(),
-        },
+        }),
         nested: false,
     })
 }
@@ -1321,10 +1732,10 @@ fn missing_option(f: &Cmd, g: &Cmd, required: Option<&String>, event: &Event) ->
         typo: false,
         key: vec![("stem", stem(&f.argv)), ("flag", flag)],
         context: vec![],
-        wrong: Wrong::Command {
+        wrong: Some(Wrong::Command {
             dir: f.dir.clone(),
             argv: f.argv.clone(),
-        },
+        }),
         nested: false,
     })
 }
@@ -1342,7 +1753,11 @@ fn wrong_test_path(path: &str, f: &Cmd, code: i32, g: &Cmd) -> Option<Outcome> {
     let target = node_id(path);
     let index = f.argv.iter().position(|word| {
         let word = node_id(word);
-        path_like(word) && (word == target || target.ends_with(&format!("/{word}")))
+        path_like(word)
+            && (word == target
+                || target
+                    .strip_suffix(word)
+                    .is_some_and(|prefix| prefix.ends_with('/')))
     })?;
     let (at, wrong, right) = replaced(&f.argv, &g.argv)?;
     let (wrong, right) = (node_id(&wrong), node_id(&right));
@@ -1362,10 +1777,10 @@ fn wrong_test_path(path: &str, f: &Cmd, code: i32, g: &Cmd) -> Option<Outcome> {
             ("to", to.to_owned()),
         ],
         context: vec![("dir", f.dir.clone())],
-        wrong: Wrong::Command {
+        wrong: Some(Wrong::Command {
             dir: f.dir.clone(),
             argv: f.argv.clone(),
-        },
+        }),
         nested: false,
     })
 }
@@ -1390,10 +1805,562 @@ fn wrong_package_manager(hit: &Hit, f: &Cmd, g: &Cmd) -> Option<Outcome> {
         typo: false,
         key: vec![("from", from.to_owned()), ("to", to.to_owned())],
         context: vec![("dir", g.dir.clone())],
-        wrong: Wrong::Command {
+        wrong: Some(Wrong::Command {
             dir: f.dir.clone(),
             argv: f.argv.clone(),
+        }),
+        nested: false,
+    })
+}
+
+fn prerequisite_step(hit: &Hit, f: &Cmd, g: &Cmd) -> Option<Outcome> {
+    if !f.same_place(g) {
+        return None;
+    }
+    let f_words = events::unwrap(&f.argv);
+    let f_prog = basename(f_words.first()?);
+    let f_sub = f_words.get(1).map(String::as_str).unwrap_or("");
+    let g_words = events::unwrap(&g.argv);
+    let g_prog = basename(g_words.first()?);
+    let g_has_fvm = basename(g.program()) == "fvm";
+    let mut context = vec![("dir", g.dir.clone())];
+
+    let (kind, prereq, stem_text): (&'static str, String, String) = match hit {
+        Hit::FlutterPubGet
+            if matches!(f_prog, "flutter" | "dart")
+                && !f_sub.is_empty()
+                && f_sub != "pub"
+                && matches!(g_prog, "flutter" | "dart")
+                && g_words.get(1).map(String::as_str) == Some("pub")
+                && g_words.get(2).map(String::as_str) == Some("get") =>
+        {
+            let prefix = if g_has_fvm { "fvm " } else { "" };
+            (
+                "pub_get",
+                format!("{prefix}{g_prog} pub get"),
+                stem(&f.argv),
+            )
+        }
+        Hit::DartCodegen if matches!(f_prog, "flutter" | "dart") && !f_sub.is_empty() => {
+            let base = match g_words
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                ["dart", "run", "build_runner", "build", ..] => "dart run build_runner build",
+                ["flutter", "pub", "run", "build_runner", "build", ..] => {
+                    "flutter pub run build_runner build"
+                }
+                _ => return None,
+            };
+            let prefix = if g_has_fvm { "fvm " } else { "" };
+            let delete_flag = if g_words
+                .iter()
+                .any(|w| w == "--delete-conflicting-outputs" || w == "-d")
+            {
+                " --delete-conflicting-outputs"
+            } else {
+                ""
+            };
+            (
+                "build_runner",
+                format!("{prefix}{base}{delete_flag}"),
+                stem(&f.argv),
+            )
+        }
+        Hit::TerraformInit | Hit::TerraformUpgrade
+            if matches!(f_prog, "terraform" | "tofu" | "terragrunt")
+                && !f_sub.is_empty()
+                && f_sub != "init"
+                && g_prog == f_prog =>
+        {
+            let (is_init, run_all) = match (
+                g_words.get(1).map(String::as_str),
+                g_words.get(2).map(String::as_str),
+            ) {
+                (Some("init"), _) => (true, false),
+                (Some("run-all"), Some("init")) => (true, true),
+                _ => (false, false),
+            };
+            if !is_init {
+                return None;
+            }
+            let upgrade = g_words.iter().any(|w| w == "-upgrade");
+            let base = if run_all {
+                format!("{g_prog} run-all init")
+            } else {
+                format!("{g_prog} init")
+            };
+            let (kind, prereq) = if upgrade {
+                ("tf_upgrade", format!("{base} -upgrade"))
+            } else if matches!(hit, Hit::TerraformUpgrade) {
+                return None;
+            } else {
+                ("tf_init", base)
+            };
+            (kind, prereq, stem(&f.argv))
+        }
+        Hit::TerraformWorkspace(_) | Hit::TerraformWorkspaceError
+            if matches!(f_prog, "terraform" | "tofu" | "terragrunt")
+                && !f_sub.is_empty()
+                && f_sub != "workspace"
+                && g_prog == f_prog
+                && g_words.get(1).map(String::as_str) == Some("workspace")
+                && matches!(g_words.get(2).map(String::as_str), Some("select" | "new")) =>
+        {
+            let action = g_words[2].as_str();
+            let ws = g_words.get(3)?.as_str();
+            if ws.is_empty() || ws.starts_with('-') {
+                return None;
+            }
+            (
+                "tf_workspace",
+                format!("{g_prog} workspace {action} {ws}"),
+                stem(&f.argv),
+            )
+        }
+        Hit::HelmDeps
+            if f_prog == "helm"
+                && !f_sub.is_empty()
+                && !matches!(f_sub, "dependency" | "dep")
+                && g_prog == "helm"
+                && matches!(
+                    g_words.get(1).map(String::as_str),
+                    Some("dependency" | "dep")
+                ) =>
+        {
+            let action = match g_words.get(2).map(String::as_str) {
+                Some("update" | "up") => "update",
+                Some("build") => "build",
+                _ => return None,
+            };
+            if let Some(chart_dir) = g_words
+                .iter()
+                .skip(3)
+                .find(|w| !w.starts_with('-') && !w.starts_with('/'))
+            {
+                context.push(("chart_dir", chart_dir.trim_start_matches("./").to_owned()));
+            }
+            (
+                "helm_deps",
+                format!("helm dependency {action}"),
+                stem(&f.argv),
+            )
+        }
+        Hit::KubectlContext
+            if f_prog == "kubectl"
+                && f_sub != "config"
+                && g_prog == "kubectl"
+                && g_words.get(1).map(String::as_str) == Some("config")
+                && g_words.get(2).map(String::as_str) == Some("use-context") =>
+        {
+            let ctx = g_words.get(3)?.as_str();
+            if ctx.is_empty() || ctx.starts_with('-') {
+                return None;
+            }
+            (
+                "kubectl_context",
+                format!("kubectl config use-context {ctx}"),
+                stem(&f.argv),
+            )
+        }
+        Hit::DockerDaemon if f_prog == "docker" && g_prog == "docker" => {
+            let prereq = match (
+                g_words.get(1).map(String::as_str),
+                g_words.get(2).map(String::as_str),
+                g_words.get(3).map(String::as_str),
+            ) {
+                (Some("context"), Some("use"), Some(ctx))
+                    if !ctx.is_empty() && !ctx.starts_with('-') =>
+                {
+                    format!("docker context use {ctx}")
+                }
+                (Some("buildx"), Some("use"), Some(builder))
+                    if !builder.is_empty() && !builder.starts_with('-') =>
+                {
+                    format!("docker buildx use {builder}")
+                }
+                _ => return None,
+            };
+            ("docker_context", prereq, docker_build_stem(&f.argv))
+        }
+        Hit::UvSync | Hit::ModuleNotFound
+            if g_prog == "uv"
+                && matches!(g_words.get(1).map(String::as_str), Some("sync" | "lock"))
+                && (basename(f.program()) == "uv"
+                    && !matches!(
+                        f.argv.get(1).map(String::as_str),
+                        Some("sync" | "lock" | "venv")
+                    )
+                    || matches!(f_prog, "python" | "python3" | "pytest" | "ruff" | "mypy")) =>
+        {
+            let action = g_words[1].as_str();
+            let target_stem = if basename(f.program()) == "uv" {
+                match f.argv.get(1).map(String::as_str) {
+                    Some(sub) if !sub.starts_with('-') => format!("uv {sub}"),
+                    _ => "uv".to_owned(),
+                }
+            } else {
+                stem(&f.argv)
+            };
+            ("uv_sync", format!("uv {action}"), target_stem)
+        }
+        _ => return None,
+    };
+
+    Some(Outcome {
+        class: Class::PrerequisiteStep,
+        typo: false,
+        key: vec![
+            ("kind", kind.to_owned()),
+            ("prereq", prereq),
+            ("stem", stem_text),
+        ],
+        context,
+        wrong: None,
+        nested: false,
+    })
+}
+
+fn toolchain_wrapper(hit: &Hit, f: &Cmd, g: &Cmd) -> Option<Outcome> {
+    if !f.same_place(g) {
+        return None;
+    }
+    let f_prog = basename(f.program());
+    let (kind, from, to): (&'static str, String, String) = match hit {
+        Hit::FlutterSdkMismatch if matches!(f_prog, "flutter" | "dart") => {
+            if basename(g.program()) != "fvm"
+                || g.argv.len() != f.argv.len() + 1
+                || g.argv.get(1).map(String::as_str) != Some(f_prog)
+                || g.argv[2..] != f.argv[1..]
+            {
+                return None;
+            }
+            ("fvm", f_prog.to_owned(), format!("fvm {f_prog}"))
+        }
+        Hit::ModuleNotFound
+            if matches!(f_prog, "python" | "python3" | "pytest" | "ruff" | "mypy") =>
+        {
+            if basename(g.program()) != "uv"
+                || g.argv.get(1).map(String::as_str) != Some("run")
+                || g.argv.len() != f.argv.len() + 2
+                || g.argv[3..] != f.argv[1..]
+            {
+                return None;
+            }
+            let inner = basename(&g.argv[2]);
+            let same_tool = inner == f_prog
+                || matches!(
+                    (f_prog, inner),
+                    ("python", "python3") | ("python3", "python")
+                );
+            if !same_tool {
+                return None;
+            }
+            ("uv", f_prog.to_owned(), format!("uv run {inner}"))
+        }
+        Hit::DockerBuildx
+            if f_prog == "docker" && f.argv.get(1).map(String::as_str) == Some("build") =>
+        {
+            if basename(g.program()) != "docker"
+                || g.argv.get(1).map(String::as_str) != Some("buildx")
+                || g.argv.get(2).map(String::as_str) != Some("build")
+                || g.argv[3..] != f.argv[2..]
+            {
+                return None;
+            }
+            (
+                "buildx",
+                "docker build".to_owned(),
+                "docker buildx build".to_owned(),
+            )
+        }
+        _ => return None,
+    };
+    Some(Outcome {
+        class: Class::ToolchainWrapper,
+        typo: false,
+        key: vec![("kind", kind.to_owned()), ("from", from), ("to", to)],
+        context: vec![("dir", g.dir.clone())],
+        wrong: Some(Wrong::Command {
+            dir: f.dir.clone(),
+            argv: f.argv.clone(),
+        }),
+        nested: false,
+    })
+}
+
+fn terraform_option(hit: &Hit, f: &Cmd, g: &Cmd) -> Option<Outcome> {
+    let prog = basename(f.program());
+    if !matches!(prog, "terraform" | "tofu" | "terragrunt")
+        || basename(g.program()) != prog
+        || !f.same_place(g)
+        || stem(&f.argv) != stem(&g.argv)
+    {
+        return None;
+    }
+    let added = added_words(&f.argv, &g.argv)?;
+    let [flag] = added.as_slice() else {
+        return None;
+    };
+    let valid = match hit {
+        Hit::TerraformUpgrade => {
+            matches!(f.argv.get(1).map(String::as_str), Some("init")) && flag == "-upgrade"
+        }
+        Hit::TerraformStateLock => flag == "-lock=false",
+        _ => false,
+    };
+    valid.then(|| Outcome {
+        class: Class::MissingOption,
+        typo: false,
+        key: vec![("stem", stem(&f.argv)), ("flag", flag.clone())],
+        context: vec![("dir", g.dir.clone())],
+        wrong: Some(Wrong::Command {
+            dir: f.dir.clone(),
+            argv: f.argv.clone(),
+        }),
+        nested: false,
+    })
+}
+
+/// Remove a single `flag value` or `flag=value` occurrence from `argv`.
+fn strip_opt<'a>(argv: &'a [String], flags: &[&str]) -> (Option<(&'a str, &'a str)>, Vec<&'a str>) {
+    let mut found = None;
+    let mut rest = Vec::with_capacity(argv.len());
+    let mut i = 0;
+    while i < argv.len() {
+        let word = argv[i].as_str();
+        if found.is_none() {
+            if let Some((flag, value)) = word.split_once('=')
+                && flags.contains(&flag)
+                && !value.is_empty()
+            {
+                found = Some((flag, value));
+                i += 1;
+                continue;
+            }
+            if flags.contains(&word)
+                && let Some(value) = argv.get(i + 1).map(String::as_str)
+                && !value.is_empty()
+                && !value.starts_with('-')
+            {
+                found = Some((word, value));
+                i += 2;
+                continue;
+            }
+        }
+        rest.push(word);
+        i += 1;
+    }
+    (found, rest)
+}
+
+fn kubectl_option(hit: &Hit, f: &Cmd, g: &Cmd) -> Option<Outcome> {
+    if basename(f.program()) != "kubectl" || basename(g.program()) != "kubectl" || !f.same_place(g)
+    {
+        return None;
+    }
+    let groups: &[&[&str]] = match hit {
+        Hit::KubectlNotFound | Hit::KubectlEmptyNamespace(_) => {
+            &[&["-n", "--namespace"], &["--context"], &["--kubeconfig"]]
+        }
+        Hit::KubectlContext => &[&["--context"], &["--kubeconfig"]],
+        _ => return None,
+    };
+    for &group in groups {
+        let (f_opt, f_rest) = strip_opt(&f.argv, group);
+        let (g_opt, g_rest) = strip_opt(&g.argv, group);
+        let Some((flag, value)) = g_opt else {
+            continue;
+        };
+        if f_rest != g_rest {
+            continue;
+        }
+        if flag == "--kubeconfig"
+            && (value.starts_with('/') || value.starts_with('~') || value.contains(".."))
+        {
+            continue;
+        }
+        let from_value = f_opt.map(|(_, v)| v).unwrap_or("");
+        if from_value == value {
+            continue;
+        }
+        let mut key = vec![
+            ("stem", "kubectl".to_owned()),
+            ("flag", flag.to_owned()),
+            ("value", value.to_owned()),
+        ];
+        if !from_value.is_empty() {
+            key.push(("from", from_value.to_owned()));
+        }
+        return Some(Outcome {
+            class: Class::MissingOption,
+            typo: !from_value.is_empty() && typo(from_value, value),
+            key,
+            context: vec![("dir", g.dir.clone())],
+            wrong: Some(Wrong::Command {
+                dir: f.dir.clone(),
+                argv: f.argv.clone(),
+            }),
+            nested: false,
+        });
+    }
+    // Also recognize adding `-A` / `--all-namespaces` on empty namespace output.
+    if matches!(hit, Hit::KubectlEmptyNamespace(_))
+        && let Some(added) = added_words(&f.argv, &g.argv)
+        && let [flag] = added.as_slice()
+        && matches!(flag.as_str(), "-A" | "--all-namespaces")
+    {
+        return Some(Outcome {
+            class: Class::MissingOption,
+            typo: false,
+            key: vec![("stem", "kubectl".to_owned()), ("flag", flag.clone())],
+            context: vec![("dir", g.dir.clone())],
+            wrong: Some(Wrong::Command {
+                dir: f.dir.clone(),
+                argv: f.argv.clone(),
+            }),
+            nested: false,
+        });
+    }
+    None
+}
+
+fn is_docker_build(argv: &[String]) -> bool {
+    let prog = argv.first().map(|s| basename(s)).unwrap_or("");
+    matches!(
+        (
+            prog,
+            argv.get(1).map(String::as_str),
+            argv.get(2).map(String::as_str)
+        ),
+        ("docker" | "podman", Some("build"), _)
+            | ("docker", Some("buildx"), Some("build"))
+            | ("docker" | "podman", Some("compose"), Some("build"))
+    )
+}
+
+fn docker_build_stem(argv: &[String]) -> String {
+    let prog = argv.first().map(|s| basename(s)).unwrap_or("");
+    match (
+        prog,
+        argv.get(1).map(String::as_str),
+        argv.get(2).map(String::as_str),
+    ) {
+        ("docker", Some("buildx"), Some("build")) => "docker buildx build".to_owned(),
+        ("docker" | "podman", Some("compose"), Some("build")) => format!("{prog} compose build"),
+        _ => stem(argv),
+    }
+}
+
+fn docker_option(hit: &Hit, f: &Cmd, g: &Cmd) -> Option<Outcome> {
+    let prog = basename(f.program());
+    if !matches!(prog, "docker" | "podman") || basename(g.program()) != prog || !f.same_place(g) {
+        return None;
+    }
+    let added = added_words(&f.argv, &g.argv)?;
+    let (stem_text, flag, value): (String, String, Option<String>) = match hit {
+        Hit::DockerBuildFailed if is_docker_build(&f.argv) => match added.as_slice() {
+            [flag] if matches!(flag.as_str(), "--no-cache" | "--pull") => {
+                (docker_build_stem(&f.argv), flag.clone(), None)
+            }
+            [flag, spec] if flag == "--build-arg" => {
+                let arg_name = spec.split_once('=').map_or(spec.as_str(), |(k, _)| k);
+                if arg_name.is_empty()
+                    || arg_name.starts_with('-')
+                    || privacy::is_secret_name(arg_name)
+                {
+                    return None;
+                }
+                (
+                    docker_build_stem(&f.argv),
+                    "--build-arg".to_owned(),
+                    Some(arg_name.to_owned()),
+                )
+            }
+            [word] if word.starts_with("--build-arg=") => {
+                let spec = &word["--build-arg=".len()..];
+                let arg_name = spec.split_once('=').map_or(spec, |(k, _)| k);
+                if arg_name.is_empty()
+                    || arg_name.starts_with('-')
+                    || privacy::is_secret_name(arg_name)
+                {
+                    return None;
+                }
+                (
+                    docker_build_stem(&f.argv),
+                    "--build-arg".to_owned(),
+                    Some(arg_name.to_owned()),
+                )
+            }
+            _ => return None,
         },
+        Hit::NoDockerfile if is_docker_build(&f.argv) => match added.as_slice() {
+            [flag, path] if matches!(flag.as_str(), "-f" | "--file") => {
+                if path.is_empty()
+                    || path.starts_with('-')
+                    || path.starts_with('/')
+                    || path.contains("..")
+                {
+                    return None;
+                }
+                (docker_build_stem(&f.argv), flag.clone(), Some(path.clone()))
+            }
+            [word] if word.starts_with("--file=") => {
+                let path = &word["--file=".len()..];
+                if path.is_empty() || path.starts_with('/') || path.contains("..") {
+                    return None;
+                }
+                (
+                    docker_build_stem(&f.argv),
+                    "--file".to_owned(),
+                    Some(path.to_owned()),
+                )
+            }
+            _ => return None,
+        },
+        Hit::DockerDaemon => match added.as_slice() {
+            [flag, val] if matches!(flag.as_str(), "--context" | "--builder") => {
+                if val.is_empty() || val.starts_with('-') {
+                    return None;
+                }
+                let st = if flag == "--context" {
+                    prog.to_owned()
+                } else {
+                    docker_build_stem(&f.argv)
+                };
+                (st, flag.clone(), Some(val.clone()))
+            }
+            [word] if word.starts_with("--context=") || word.starts_with("--builder=") => {
+                let (flag, val) = word.split_once('=')?;
+                if val.is_empty() || val.starts_with('-') {
+                    return None;
+                }
+                let st = if flag == "--context" {
+                    prog.to_owned()
+                } else {
+                    docker_build_stem(&f.argv)
+                };
+                (st, flag.to_owned(), Some(val.to_owned()))
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let mut key = vec![("stem", stem_text), ("flag", flag)];
+    if let Some(value) = value {
+        key.push(("value", value));
+    }
+    Some(Outcome {
+        class: Class::MissingOption,
+        typo: false,
+        key,
+        context: vec![("dir", g.dir.clone())],
+        wrong: Some(Wrong::Command {
+            dir: f.dir.clone(),
+            argv: f.argv.clone(),
+        }),
         nested: false,
     })
 }
@@ -1456,7 +2423,7 @@ fn empty_tests(runner: Runner, f: &Cmd, g_event: &Event, g: &Cmd) -> Option<Outc
             ("from", f.dir.clone()),
         ],
         context: vec![],
-        wrong,
+        wrong: Some(wrong),
         nested,
     })
 }
@@ -1553,6 +2520,14 @@ fn related(kind: Missing, operand: &str, failed: &Cmd, words: &[String]) -> bool
                     &["python3"],
                     &["uv", "run", "python"],
                     &["poetry", "run", "python"],
+                    &[".venv/bin/python"],
+                    &[".venv/bin/python3"],
+                ],
+                "python3" => &[
+                    &["uv", "run", "python3"],
+                    &["uv", "run", "python"],
+                    &[".venv/bin/python3"],
+                    &[".venv/bin/python"],
                 ],
                 "pip" => &[&["pip3"], &["python3", "-m", "pip"], &["uv", "pip"]],
                 "pytest" => &[
@@ -1560,6 +2535,12 @@ fn related(kind: Missing, operand: &str, failed: &Cmd, words: &[String]) -> bool
                     &["poetry", "run", "pytest"],
                     &[".venv/bin/pytest"],
                 ],
+                "ruff" => &[&["uv", "run", "ruff"], &[".venv/bin/ruff"]],
+                "mypy" => &[&["uv", "run", "mypy"], &[".venv/bin/mypy"]],
+                "flutter" => &[&["fvm", "flutter"]],
+                "dart" => &[&["fvm", "dart"]],
+                "terraform" => &[&["tofu"]],
+                "tofu" => &[&["terraform"]],
                 "node" => &[&["nodejs"]],
                 "fd" => &[&["fdfind"]],
                 "bat" => &[&["batcat"]],
@@ -1601,11 +2582,20 @@ fn contradicts(candidate: &Candidate, event: &Event) -> bool {
     if cmd.masked {
         return false;
     }
+    let same_argv = |a: &[String], b: &[String]| {
+        if a.first().map(String::as_str) == Some("npm")
+            || b.first().map(String::as_str) == Some("npm")
+        {
+            canonical(a) == canonical(b)
+        } else {
+            a == b
+        }
+    };
     candidate.wrong.iter().any(|wrong| match wrong {
         Wrong::Command { dir, argv } => {
             code == 0
                 && cmd.dir == *dir
-                && canonical(&cmd.argv) == canonical(argv)
+                && same_argv(&cmd.argv, argv)
                 && event_hits(event).is_empty()
         }
         Wrong::Program(lead) => {
@@ -1619,7 +2609,7 @@ fn contradicts(candidate: &Candidate, event: &Event) -> bool {
         }
         Wrong::Tests { dir, argv } => {
             cmd.dir == *dir
-                && canonical(&cmd.argv) == canonical(argv)
+                && same_argv(&cmd.argv, argv)
                 && events::runner(argv).is_some_and(|runner| ran_tests(runner, event))
         }
     })
@@ -1811,7 +2801,11 @@ fn contains_word(text: &str, word: &str) -> bool {
 
 /// A correction of one or two characters between names of at least four.
 fn typo(wrong: &str, right: &str) -> bool {
-    wrong != right && wrong.len() >= 4 && right.len() >= 4 && distance(wrong, right) <= 2
+    wrong != right
+        && wrong.len() >= 4
+        && right.len() >= 4
+        && wrong.chars().count().abs_diff(right.chars().count()) <= 2
+        && distance(wrong, right) <= 2
 }
 
 /// Damerau–Levenshtein distance (optimal string alignment).
@@ -1848,7 +2842,7 @@ pub fn scope(class: Class, slots: &BTreeMap<String, String>) -> Scope {
         Class::MissingProgram if get("kind") == "relative" => Scope::Project,
         Class::MissingProgram | Class::ZshGlob | Class::ZshEquals => Scope::Machine,
         Class::UnknownTarget if get("kind") == "subcommand" => Scope::Machine,
-        Class::UnknownOption | Class::MissingOption => {
+        Class::UnknownOption => {
             if get("stem")
                 .split(' ')
                 .next()
@@ -1859,8 +2853,78 @@ pub fn scope(class: Class, slots: &BTreeMap<String, String>) -> Scope {
                 Scope::Machine
             }
         }
+        Class::MissingOption => {
+            let head = get("stem").split(' ').next().unwrap_or("");
+            if head.contains('/')
+                || slots.contains_key("value")
+                || matches!(
+                    head,
+                    "terraform"
+                        | "tofu"
+                        | "terragrunt"
+                        | "kubectl"
+                        | "helm"
+                        | "docker"
+                        | "podman"
+                        | "flutter"
+                        | "dart"
+                        | "uv"
+                )
+            {
+                Scope::Project
+            } else {
+                Scope::Machine
+            }
+        }
         _ => Scope::Project,
     }
+}
+
+/// Find the first `.tf` file directly inside `dir`.
+fn find_tf_file(dir: &Path) -> Option<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".tf"))
+        .collect();
+    names.sort();
+    names.into_iter().next()
+}
+
+/// Walk from `start` up to the repository root looking for the first matching file.
+fn find_upward(root: &Path, start: &str, names: &[&str]) -> Option<String> {
+    let mut dir = start.to_owned();
+    loop {
+        let base = if dir.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(&dir)
+        };
+        if let Some(name) = names.iter().find(|name| base.join(name).is_file()) {
+            return Some(joined(&dir, name));
+        }
+        if dir.is_empty() {
+            return None;
+        }
+        dir = parent(&dir).to_owned();
+    }
+}
+
+/// Find a Terraform/OpenTofu/Terragrunt manifest in `dir`.
+fn find_tf_manifest(root: &Path, dir: &str) -> Option<String> {
+    let base = if dir.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(dir)
+    };
+    for name in ["terragrunt.hcl", ".terraform.lock.hcl"] {
+        if base.join(name).is_file() {
+            return Some(joined(dir, name));
+        }
+    }
+    find_tf_file(&base).map(|name| joined(dir, &name))
 }
 
 /// Confirm a rule against the current tree, `PATH` or `$SHELL`, without running anything.
@@ -1914,12 +2978,21 @@ pub fn check(root: &Path, env: &Env, class: Class, slots: &BTreeMap<String, Stri
         },
         Class::WrongDirectory => {
             let manifest = get("manifest");
+            if manifest == ".tf" {
+                if let Some(found) = find_tf_manifest(root, get("from")) {
+                    return Check::Stale(format!("{found} exists"));
+                } else if let Some(found) = find_tf_manifest(root, get("to")) {
+                    return Check::Verified(found);
+                } else {
+                    return Check::Stale(format!("{} has no .tf files", get("to")));
+                }
+            }
             let names: Vec<&str> = if manifest == "Makefile" {
                 MAKEFILES.to_vec()
             } else {
                 vec![manifest]
             };
-            let upward = manifest != "Makefile";
+            let upward = !matches!(manifest, "Makefile" | "Dockerfile" | "Chart.yaml");
             let find = |dir: &str| -> Option<String> {
                 let mut dir = dir.to_owned();
                 loop {
@@ -1982,7 +3055,7 @@ pub fn check(root: &Path, env: &Env, class: Class, slots: &BTreeMap<String, Stri
                         Check::Unverified
                     }
                 }
-                "package" => {
+                "package" if get("stem").starts_with("cargo") => {
                     let mut names = BTreeMap::new();
                     cargo_packages(root, root, 4, &mut names);
                     if let Some(path) = names.get(x) {
@@ -2000,10 +3073,50 @@ pub fn check(root: &Path, env: &Env, class: Class, slots: &BTreeMap<String, Stri
                         Some(false) => Check::Verified(format!("cargo-{x} not on PATH")),
                     }
                 }
+                "workspace" => match find_tf_manifest(root, dir) {
+                    Some(found) => Check::Verified(found),
+                    None => Check::Unverified,
+                },
+                "filter" => match find_upward(root, dir, &["pnpm-workspace.yaml"]) {
+                    Some(found) => Check::Verified(found),
+                    None => Check::Unverified,
+                },
                 _ => Check::Unverified,
             }
         }
-        Class::UnknownOption | Class::MissingOption => Check::Unverified,
+        Class::UnknownOption => Check::Unverified,
+        Class::MissingOption => {
+            let (stem_text, flag, value, dir) =
+                (get("stem"), get("flag"), get("value"), get("dir"));
+            if matches!(flag, "-f" | "--file" | "--kubeconfig") && !value.is_empty() {
+                if at(dir).join(value).is_file() {
+                    return Check::Verified(joined(dir, value));
+                }
+                return Check::Stale(format!("{} is missing", joined(dir, value)));
+            }
+            let head = stem_text.split(' ').next().unwrap_or("");
+            match head {
+                "terraform" | "tofu" | "terragrunt" => match find_tf_manifest(root, dir) {
+                    Some(found) => Check::Verified(found),
+                    None => Check::Unverified,
+                },
+                "docker" | "podman" => match find_upward(
+                    root,
+                    dir,
+                    &[
+                        "Dockerfile",
+                        "compose.yaml",
+                        "compose.yml",
+                        "docker-compose.yml",
+                        "docker-compose.yaml",
+                    ],
+                ) {
+                    Some(found) => Check::Verified(found),
+                    None => Check::Unverified,
+                },
+                _ => Check::Unverified,
+            }
+        }
         Class::WrongTestPath => {
             let base = at(get("dir"));
             if base.join(get("from")).exists() {
@@ -2065,6 +3178,56 @@ pub fn check(root: &Path, env: &Env, class: Class, slots: &BTreeMap<String, Stri
                 }
                 dir = parent(&dir).to_owned();
             }
+        }
+        Class::PrerequisiteStep => {
+            let dir = get("dir");
+            let found = match get("kind") {
+                "pub_get" | "build_runner" => find_upward(root, dir, &["pubspec.yaml"]),
+                "tf_init" | "tf_upgrade" | "tf_workspace" => find_tf_manifest(root, dir),
+                "helm_deps" => {
+                    let chart_dir = get("chart_dir");
+                    if !chart_dir.is_empty() && at(dir).join(chart_dir).join("Chart.yaml").is_file()
+                    {
+                        Some(joined(&joined(dir, chart_dir), "Chart.yaml"))
+                    } else if at(dir).join("Chart.yaml").is_file() {
+                        Some(joined(dir, "Chart.yaml"))
+                    } else {
+                        None
+                    }
+                }
+                "uv_sync" => find_upward(root, dir, &["uv.lock", "pyproject.toml"]),
+                "docker_context" => find_upward(
+                    root,
+                    dir,
+                    &[
+                        "Dockerfile",
+                        "compose.yaml",
+                        "compose.yml",
+                        "docker-compose.yml",
+                    ],
+                ),
+                _ => None,
+            };
+            found.map_or(Check::Unverified, Check::Verified)
+        }
+        Class::ToolchainWrapper => {
+            let dir = get("dir");
+            let found = match get("kind") {
+                "fvm" => find_upward(root, dir, &[".fvmrc", ".fvm/fvm_config.json"]),
+                "uv" => find_upward(root, dir, &["uv.lock", "pyproject.toml"]),
+                "buildx" => find_upward(
+                    root,
+                    dir,
+                    &[
+                        "Dockerfile",
+                        "compose.yaml",
+                        "compose.yml",
+                        "docker-compose.yml",
+                    ],
+                ),
+                _ => None,
+            };
+            found.map_or(Check::Unverified, Check::Verified)
         }
     }
 }
@@ -2188,15 +3351,20 @@ pub fn render(class: Class, slots: &BTreeMap<String, String>, check: &Check) -> 
             let (program, from, to, manifest) =
                 (get("program"), get("from"), get("to"), get("manifest"));
             safe(&[program, manifest]).then_some(())?;
+            let manifest_label = if manifest == ".tf" {
+                "Terraform files"
+            } else {
+                manifest
+            };
             if to.is_empty() {
                 safe(&[from]).then_some(())?;
                 format!("Run `{program}` from the repository root, not `{from}/`.")
             } else if from.is_empty() {
                 safe(&[to]).then_some(())?;
-                format!("Run `{program}` from `{to}/`; the repository root has no {manifest}.")
+                format!("Run `{program}` from `{to}/`; the repository root has no {manifest_label}.")
             } else {
                 safe(&[from, to]).then_some(())?;
-                format!("Run `{program}` from `{to}/`; `{from}/` has no {manifest}.")
+                format!("Run `{program}` from `{to}/`; `{from}/` has no {manifest_label}.")
             }
         }
         Class::UnknownTarget => {
@@ -2212,6 +3380,16 @@ pub fn render(class: Class, slots: &BTreeMap<String, String>, check: &Check) -> 
                     let (flag, kind) = (get("flag"), get("target_kind"));
                     safe(&[flag, kind]).then_some(())?;
                     format!("Use `{stem} {flag} {y}`; there is no {kind} target `{x}`.")
+                }
+                "workspace" => format!("Use `{stem} {y}`; there is no workspace `{x}`."),
+                "filter" => {
+                    let flag = if get("flag").is_empty() {
+                        "--filter"
+                    } else {
+                        get("flag")
+                    };
+                    safe(&[flag]).then_some(())?;
+                    format!("Use `{stem} {flag} {y}`; no workspace matched `{x}`.")
                 }
                 "script" => format!("Run `{stem} {y}`; there is no `{x}` script."),
                 "make" => format!("Run `make {y}`; there is no `{x}` target."),
@@ -2229,9 +3407,21 @@ pub fn render(class: Class, slots: &BTreeMap<String, String>, check: &Check) -> 
             }
         }
         Class::MissingOption => {
-            let (stem, flag) = (get("stem"), get("flag"));
+            let (stem, flag, value, from) =
+                (get("stem"), get("flag"), get("value"), get("from"));
             safe(&[stem, flag]).then_some(())?;
-            format!("Pass `{flag}` to `{stem}`.")
+            if flag == "--build-arg" && !value.is_empty() {
+                safe(&[value]).then_some(())?;
+                format!("Pass `--build-arg {value}=...` to `{stem}`.")
+            } else if !from.is_empty() && !value.is_empty() {
+                safe(&[from, value]).then_some(())?;
+                format!("Use `{flag} {value}`, not `{flag} {from}`, with `{stem}`.")
+            } else if !value.is_empty() {
+                safe(&[value]).then_some(())?;
+                format!("Pass `{flag} {value}` to `{stem}`.")
+            } else {
+                format!("Pass `{flag}` to `{stem}`.")
+            }
         }
         Class::WrongTestPath => {
             let (stem, from, to) = (get("stem"), get("from"), get("to"));
@@ -2265,6 +3455,41 @@ pub fn render(class: Class, slots: &BTreeMap<String, String>, check: &Check) -> 
                 Check::Verified(detail) => {
                     let lockfile = basename(detail);
                     format!("Use `{right}`, not `{wrong}`; this project has {lockfile}.")
+                }
+                _ => format!("Use `{right}`, not `{wrong}`, in this project."),
+            }
+        }
+        Class::PrerequisiteStep => {
+            let (kind, prereq, stem) = (get("kind"), get("prereq"), get("stem"));
+            safe(&[prereq, stem]).then_some(())?;
+            let reason = match kind {
+                "pub_get" => "when dependencies are out of date",
+                "build_runner" => "when generated files are missing",
+                "tf_init" => "when the working directory is not initialized",
+                "tf_upgrade" => "when provider locks are stale",
+                "tf_workspace" => "when the workspace is not selected",
+                "helm_deps" => "when chart dependencies are missing",
+                "kubectl_context" => "when the cluster context is unset",
+                "docker_context" => "when the daemon context is unset",
+                "uv_sync" => "when the environment or uv.lock is out of date",
+                _ => "before running it",
+            };
+            format!("Run `{prereq}` before `{stem}` {reason}.")
+        }
+        Class::ToolchainWrapper => {
+            let (kind, wrong, right) = (get("kind"), get("from"), get("to"));
+            safe(&[wrong, right]).then_some(())?;
+            match (kind, check) {
+                ("fvm", Check::Verified(detail)) => {
+                    let file = basename(detail);
+                    format!("Use `{right}`, not `{wrong}`; this project pins its SDK in {file}.")
+                }
+                ("uv", Check::Verified(detail)) => {
+                    let file = basename(detail);
+                    format!("Use `{right}`, not `{wrong}`; this project has {file}.")
+                }
+                ("buildx", _) => {
+                    format!("Use `{right}`, not `{wrong}`, for BuildKit features here.")
                 }
                 _ => format!("Use `{right}`, not `{wrong}`, in this project."),
             }
@@ -2311,6 +3536,10 @@ pub fn example(
                 "Cargo.toml" => "cargo: no Cargo.toml",
                 "package.json" => "npm: no package.json",
                 "go.mod" => "go: no go.mod",
+                "pubspec.yaml" => "flutter: no pubspec.yaml",
+                ".tf" => "terraform: no configuration files",
+                "Dockerfile" => "docker: no Dockerfile",
+                "Chart.yaml" => "helm: no Chart.yaml",
                 _ => "uv: no pyproject.toml",
             };
             (wrong, format!("{command}{}", within(get("to"))), signal)
@@ -2321,7 +3550,11 @@ pub fn example(
                 "package" | "target" => {
                     let flag = if flag.is_empty() { "-p" } else { flag };
                     let signal = if get("kind") == "package" {
-                        "cargo: unknown package"
+                        if stem.starts_with("uv") {
+                            "uv: unknown package"
+                        } else {
+                            "cargo: unknown package"
+                        }
                     } else {
                         "cargo: unknown target"
                     };
@@ -2329,6 +3562,19 @@ pub fn example(
                         format!("{stem} {flag} {x}"),
                         format!("{stem} {flag} {y}"),
                         signal,
+                    )
+                }
+                "workspace" => (
+                    format!("{stem} {x}"),
+                    format!("{stem} {y}"),
+                    "terraform: unknown workspace",
+                ),
+                "filter" => {
+                    let flag = if flag.is_empty() { "--filter" } else { flag };
+                    (
+                        format!("{stem} {flag} {x}"),
+                        format!("{stem} {flag} {y}"),
+                        "pnpm: unmatched filter",
                     )
                 }
                 "script" => {
@@ -2361,11 +3607,30 @@ pub fn example(
             };
             (format!("{stem} {flag}"), right, "unknown option")
         }
-        Class::MissingOption => (
-            get("stem").to_owned(),
-            format!("{} {}", get("stem"), get("flag")),
-            "missing option",
-        ),
+        Class::MissingOption => {
+            let (stem, flag, value, from) = (get("stem"), get("flag"), get("value"), get("from"));
+            if flag == "--build-arg" && !value.is_empty() {
+                (
+                    stem.to_owned(),
+                    format!("{stem} --build-arg {value}=..."),
+                    "docker: missing build-arg",
+                )
+            } else if !from.is_empty() && !value.is_empty() {
+                (
+                    format!("{stem} {flag} {from}"),
+                    format!("{stem} {flag} {value}"),
+                    "wrong option value",
+                )
+            } else if !value.is_empty() {
+                (
+                    stem.to_owned(),
+                    format!("{stem} {flag} {value}"),
+                    "missing option",
+                )
+            } else {
+                (stem.to_owned(), format!("{stem} {flag}"), "missing option")
+            }
+        }
         Class::WrongTestPath => (
             format!("{} {}/…", get("stem"), get("from")),
             format!("{} {}/…", get("stem"), get("to")),
@@ -2384,6 +3649,32 @@ pub fn example(
             get("to").to_owned(),
             "package manager",
         ),
+        Class::PrerequisiteStep => {
+            let (kind, prereq, stem) = (get("kind"), get("prereq"), get("stem"));
+            let signal = match kind {
+                "pub_get" => "flutter: pub get required",
+                "build_runner" => "dart: codegen required",
+                "tf_init" => "terraform: init required",
+                "tf_upgrade" => "terraform: init -upgrade required",
+                "tf_workspace" => "terraform: workspace required",
+                "helm_deps" => "helm: dependency update required",
+                "kubectl_context" => "kubectl: context required",
+                "docker_context" => "docker: daemon context required",
+                "uv_sync" => "uv: sync required",
+                _ => "prerequisite step required",
+            };
+            (stem.to_owned(), format!("{prereq} && {stem}"), signal)
+        }
+        Class::ToolchainWrapper => {
+            let (kind, wrong, right) = (get("kind"), get("from"), get("to"));
+            let signal = match kind {
+                "fvm" => "flutter: SDK version mismatch",
+                "uv" => "python: module missing outside uv",
+                "buildx" => "docker: buildx required",
+                _ => "toolchain wrapper",
+            };
+            (wrong.to_owned(), right.to_owned(), signal)
+        }
     })
 }
 
@@ -2411,7 +3702,10 @@ pub fn single_correction(candidate: &Candidate) -> bool {
                     .is_some_and(|kind| kind == "program")
                     && candidate.slots.contains_key("alternative")
             }
-            Class::WrongDirectory | Class::WrongPackageManager => true,
+            Class::WrongDirectory
+            | Class::WrongPackageManager
+            | Class::PrerequisiteStep
+            | Class::ToolchainWrapper => true,
             _ => false,
         }
 }
@@ -2585,6 +3879,83 @@ mod tests {
             (
                 "Usage Error: This project is configured to use bun because /x/package.json has a \"packageManager\" field",
                 Hit::Corepack("bun".into()),
+            ),
+            ("Error: No pubspec.yaml file found.", Hit::NoPubspecYaml),
+            ("Error: No configuration files", Hit::NoTerraformConfig),
+            (
+                "ERROR: failed to solve: failed to read dockerfile: open Dockerfile: no such file or directory",
+                Hit::NoDockerfile,
+            ),
+            ("Error: Chart.yaml file is missing", Hit::NoChartYaml),
+            (
+                "error - Target of URI doesn't exist: 'package:app/main.dart'.",
+                Hit::FlutterPubGet,
+            ),
+            (
+                "error - Target of URI hasn't been generated: 'package:app/user.g.dart'.",
+                Hit::DartCodegen,
+            ),
+            (
+                "Because app requires SDK version >=3.5.0 <4.0.0, version solving failed.",
+                Hit::FlutterSdkMismatch,
+            ),
+            (
+                "Error: Inconsistent dependency lock file",
+                Hit::TerraformUpgrade,
+            ),
+            ("Error: Initialization required.", Hit::TerraformInit),
+            (
+                "Error: Error acquiring the state lock",
+                Hit::TerraformStateLock,
+            ),
+            (
+                "Error: Workspace \"prd\" doesn't exist.",
+                Hit::TerraformWorkspace("prd".into()),
+            ),
+            (
+                "Error: Resource cannot be used with the \"default\" workspace",
+                Hit::TerraformWorkspaceError,
+            ),
+            (
+                "Error: found in Chart.yaml, but missing in charts/ directory: redis",
+                Hit::HelmDeps,
+            ),
+            (
+                "Error from server (NotFound): pods \"api-0\" not found",
+                Hit::KubectlNotFound,
+            ),
+            (
+                "No resources found in default namespace.",
+                Hit::KubectlEmptyNamespace("default".into()),
+            ),
+            ("error: current-context is not set", Hit::KubectlContext),
+            (
+                "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
+                Hit::DockerDaemon,
+            ),
+            (
+                "ERROR: Multi-platform build is not supported for the docker driver.",
+                Hit::DockerBuildx,
+            ),
+            (
+                "ERROR: failed to solve: failed to compute cache key: not found",
+                Hit::DockerBuildFailed,
+            ),
+            (
+                "error: The lockfile at `uv.lock` needs to be updated, but `--locked` was provided.",
+                Hit::UvSync,
+            ),
+            (
+                "ModuleNotFoundError: No module named 'fastapi'",
+                Hit::ModuleNotFound,
+            ),
+            (
+                "error: Package `api` not found in workspace",
+                Hit::UvPackage("api".into()),
+            ),
+            (
+                "ERR_PNPM_NO_MATCHING_WORKSPACE  No projects matched the filters in /repo",
+                Hit::PnpmFilter,
             ),
         ];
         for (line, expected) in cases {
@@ -2858,5 +4229,555 @@ mod tests {
             check(root, &env, go_candidate.class, &go_candidate.slots),
             Check::Stale("go.mod exists".into())
         );
+    }
+
+    #[test]
+    fn learns_modern_toolchain_recovery_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("pubspec.yaml"), "name: app\n").unwrap();
+        std::fs::write(root.join(".fvmrc"), "{\"flutter\":\"3.24.0\"}\n").unwrap();
+        std::fs::create_dir_all(root.join("infra")).unwrap();
+        std::fs::write(root.join("infra/main.tf"), "terraform {}\n").unwrap();
+        std::fs::create_dir_all(root.join("live")).unwrap();
+        std::fs::write(root.join("live/terragrunt.hcl"), "terraform {}\n").unwrap();
+        std::fs::create_dir_all(root.join("charts/app")).unwrap();
+        std::fs::write(root.join("charts/app/Chart.yaml"), "name: app\n").unwrap();
+        std::fs::create_dir_all(root.join("docker")).unwrap();
+        std::fs::write(root.join("docker/Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(root.join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(root.join("uv.lock"), "version = 1\n").unwrap();
+        std::fs::write(root.join("pnpm-workspace.yaml"), "packages:\n  - apps/*\n").unwrap();
+
+        let mk =
+            |thread: &str, time_ms: u64, dir_rel: &str, argv: &[&str], code: i32, body: &str| {
+                let cmd = Cmd {
+                    checkout: String::new(),
+                    dir: dir_rel.to_owned(),
+                    argv: argv.iter().map(|s| (*s).to_owned()).collect(),
+                    masked: false,
+                };
+                Event {
+                    thread: thread.to_owned(),
+                    session: thread.to_owned(),
+                    transcript: false,
+                    codex: false,
+                    time_ms,
+                    raw: argv.join(" "),
+                    env: Vec::new(),
+                    shape: events::Shape::Simple(cmd),
+                    status: Status::Code(code),
+                    texts: vec![events::Text {
+                        run: Some(format!("run-{time_ms}")),
+                        stream: "stderr",
+                        body: body.to_owned(),
+                    }],
+                    tests: events::Tests::default(),
+                    failure_bytes: body.len() as u64,
+                    pointer: Pointer::Run {
+                        id: format!("run-{time_ms}"),
+                        stream: "stderr",
+                    },
+                }
+            };
+
+        let events = vec![
+            // Flutter pub get prerequisite
+            mk(
+                "f1",
+                1_000,
+                "",
+                &["flutter", "analyze"],
+                1,
+                "error - Target of URI doesn't exist: 'package:flutter/material.dart'.\n",
+            ),
+            mk(
+                "f1",
+                2_000,
+                "",
+                &["flutter", "pub", "get"],
+                0,
+                "Got dependencies!\n",
+            ),
+            mk(
+                "f1",
+                3_000,
+                "",
+                &["flutter", "analyze"],
+                0,
+                "No issues found!\n",
+            ),
+            // Dart build_runner codegen prerequisite
+            mk(
+                "f2",
+                4_000,
+                "",
+                &["flutter", "test"],
+                1,
+                "error - Target of URI hasn't been generated: 'package:app/model.g.dart'.\n",
+            ),
+            mk(
+                "f2",
+                5_000,
+                "",
+                &[
+                    "dart",
+                    "run",
+                    "build_runner",
+                    "build",
+                    "--delete-conflicting-outputs",
+                ],
+                0,
+                "Succeeded\n",
+            ),
+            // Flutter FVM SDK mismatch wrapper
+            mk(
+                "f3",
+                6_000,
+                "",
+                &["flutter", "test"],
+                1,
+                "Because app requires SDK version >=3.5.0 <4.0.0, version solving failed.\n",
+            ),
+            mk(
+                "f3",
+                7_000,
+                "",
+                &["fvm", "flutter", "test"],
+                0,
+                "All tests passed!\n",
+            ),
+            // Terraform init before plan (follow-up plan success must NOT contradict!)
+            mk(
+                "t1",
+                10_000,
+                "infra",
+                &["terraform", "plan"],
+                1,
+                "Error: Initialization required. Please run \"terraform init\"\n",
+            ),
+            mk(
+                "t1",
+                11_000,
+                "infra",
+                &["terraform", "init"],
+                0,
+                "Terraform has been successfully initialized!\n",
+            ),
+            mk(
+                "t1",
+                12_000,
+                "infra",
+                &["terraform", "plan"],
+                0,
+                "No changes.\n",
+            ),
+            // OpenTofu init -upgrade
+            mk(
+                "t2",
+                13_000,
+                "infra",
+                &["tofu", "init"],
+                1,
+                "Error: Inconsistent dependency lock file\nRun tofu init -upgrade\n",
+            ),
+            mk(
+                "t2",
+                14_000,
+                "infra",
+                &["tofu", "init", "-upgrade"],
+                0,
+                "OpenTofu initialized!\n",
+            ),
+            // Terragrunt init before validate
+            mk(
+                "t3",
+                15_000,
+                "live",
+                &["terragrunt", "validate"],
+                1,
+                "Error: Module not installed\n",
+            ),
+            mk("t3", 16_000, "live", &["terragrunt", "init"], 0, "ok\n"),
+            // Terraform state lock -> -lock=false
+            mk(
+                "t4",
+                17_000,
+                "infra",
+                &["terraform", "plan"],
+                1,
+                "Error: Error acquiring the state lock\n",
+            ),
+            mk(
+                "t4",
+                18_000,
+                "infra",
+                &["terraform", "plan", "-lock=false"],
+                0,
+                "No changes.\n",
+            ),
+            // Terraform workspace mismatch (unknown workspace)
+            mk(
+                "t5",
+                19_000,
+                "infra",
+                &["terraform", "workspace", "select", "stage"],
+                1,
+                "Error: Workspace \"stage\" doesn't exist.\n",
+            ),
+            mk(
+                "t5",
+                20_000,
+                "infra",
+                &["terraform", "workspace", "select", "production"],
+                0,
+                "Switched to workspace \"production\".\n",
+            ),
+            // Helm dependency update
+            mk(
+                "k1",
+                21_000,
+                "",
+                &["helm", "template", "app", "charts/app"],
+                1,
+                "Error: found in Chart.yaml, but missing in charts/ directory: redis\n",
+            ),
+            mk(
+                "k1",
+                22_000,
+                "",
+                &["helm", "dependency", "update", "charts/app"],
+                0,
+                "Saving 1 charts\n",
+            ),
+            // kubectl exit-0 empty namespace + exit-1 NotFound -> -n staging (aggregated!)
+            mk(
+                "k2",
+                23_000,
+                "",
+                &["kubectl", "get", "pods"],
+                0,
+                "No resources found in default namespace.\n",
+            ),
+            mk(
+                "k2",
+                24_000,
+                "",
+                &["kubectl", "-n", "staging", "get", "pods"],
+                0,
+                "NAME   READY   STATUS\napi-0  1/1     Running\n",
+            ),
+            mk(
+                "k3",
+                25_000,
+                "",
+                &["kubectl", "describe", "pod", "api-0"],
+                1,
+                "Error from server (NotFound): pods \"api-0\" not found\n",
+            ),
+            mk(
+                "k3",
+                26_000,
+                "",
+                &["kubectl", "describe", "pod", "api-0", "-n", "staging"],
+                0,
+                "Name: api-0\n",
+            ),
+            // Privacy guard: kubectl secrets must be dropped as credentials!
+            mk(
+                "k4",
+                27_000,
+                "",
+                &["kubectl", "get", "secrets"],
+                0,
+                "No resources found in default namespace.\n",
+            ),
+            mk(
+                "k4",
+                28_000,
+                "",
+                &["kubectl", "-n", "prod", "get", "secrets"],
+                0,
+                "NAME TYPE\n",
+            ),
+            // Docker BuildKit: --build-arg (arg name only, never value!), --no-cache, buildx, -f
+            mk(
+                "d1",
+                30_000,
+                "",
+                &["docker", "build", "."],
+                1,
+                "ERROR: failed to solve: invalid reference format\n",
+            ),
+            mk(
+                "d1",
+                31_000,
+                "",
+                &["docker", "build", "--build-arg", "APP_ENV=staging", "."],
+                0,
+                "DONE\n",
+            ),
+            // Privacy guard: secret build-arg must be dropped!
+            mk(
+                "d2",
+                32_000,
+                "",
+                &["docker", "build", "."],
+                1,
+                "ERROR: failed to solve: missing build-arg\n",
+            ),
+            mk(
+                "d2",
+                33_000,
+                "",
+                &["docker", "build", "--build-arg=API_TOKEN=secret123", "."],
+                0,
+                "DONE\n",
+            ),
+            mk(
+                "d3",
+                34_000,
+                "",
+                &["docker", "build", "."],
+                1,
+                "ERROR: failed to solve: failed to compute cache key: not found\n",
+            ),
+            mk(
+                "d3",
+                35_000,
+                "",
+                &["docker", "build", "--no-cache", "."],
+                0,
+                "DONE\n",
+            ),
+            mk(
+                "d4",
+                36_000,
+                "",
+                &[
+                    "docker",
+                    "build",
+                    "--platform",
+                    "linux/amd64,linux/arm64",
+                    ".",
+                ],
+                1,
+                "ERROR: Multi-platform build is not supported for the docker driver.\n",
+            ),
+            mk(
+                "d4",
+                37_000,
+                "",
+                &[
+                    "docker",
+                    "buildx",
+                    "build",
+                    "--platform",
+                    "linux/amd64,linux/arm64",
+                    ".",
+                ],
+                0,
+                "DONE\n",
+            ),
+            mk(
+                "d5",
+                38_000,
+                "",
+                &["docker", "build", "."],
+                1,
+                "ERROR: failed to solve: failed to read dockerfile: open Dockerfile: no such file or directory\n",
+            ),
+            mk(
+                "d5",
+                39_000,
+                "",
+                &["docker", "build", "-f", "docker/Dockerfile", "."],
+                0,
+                "DONE\n",
+            ),
+            // uv workflow + pnpm monorepo filter
+            mk(
+                "u1",
+                40_000,
+                "",
+                &["pytest", "tests/"],
+                1,
+                "ModuleNotFoundError: No module named 'fastapi'\n",
+            ),
+            mk(
+                "u1",
+                41_000,
+                "",
+                &["uv", "run", "pytest", "tests/"],
+                0,
+                "1 passed\n",
+            ),
+            mk(
+                "u2",
+                42_000,
+                "",
+                &["uv", "run", "--locked", "pytest"],
+                1,
+                "error: The lockfile at `uv.lock` needs to be updated, but `--locked` was provided.\n",
+            ),
+            mk(
+                "u2",
+                43_000,
+                "",
+                &["uv", "sync"],
+                0,
+                "Resolved 5 packages\n",
+            ),
+            mk(
+                "u3",
+                44_000,
+                "",
+                &["pnpm", "--filter", "web", "build"],
+                1,
+                "ERR_PNPM_NO_MATCHING_WORKSPACE  No projects matched the filters\n",
+            ),
+            mk(
+                "u3",
+                45_000,
+                "",
+                &["pnpm", "--filter", "@app/web", "build"],
+                0,
+                "done\n",
+            ),
+        ];
+
+        let analysis = analyze(root, &events);
+        assert!(
+            analysis.credentials >= 1,
+            "expected credential drops for kubectl secrets / secret build-arg: {}",
+            analysis.credentials
+        );
+        let env = Env {
+            path: None,
+            shell: None,
+        };
+        let rendered: Vec<_> = analysis
+            .candidates
+            .iter()
+            .map(|c| {
+                assert!(!c.contradicted, "unexpected contradiction on {:?}", c.slots);
+                let chk = check(root, &env, c.class, &c.slots);
+                let text = render(c.class, &c.slots, &chk).expect("renderable");
+                (c.class, chk, text, c.sessions.len())
+            })
+            .collect();
+
+        for (expected_class, expected_text, expected_check) in [
+            (
+                Class::PrerequisiteStep,
+                "Run `flutter pub get` before `flutter analyze` when dependencies are out of date.",
+                Some(Check::Verified("pubspec.yaml".into())),
+            ),
+            (
+                Class::PrerequisiteStep,
+                "Run `dart run build_runner build --delete-conflicting-outputs` before `flutter test` when generated files are missing.",
+                Some(Check::Verified("pubspec.yaml".into())),
+            ),
+            (
+                Class::ToolchainWrapper,
+                "Use `fvm flutter`, not `flutter`; this project pins its SDK in .fvmrc.",
+                Some(Check::Verified(".fvmrc".into())),
+            ),
+            (
+                Class::PrerequisiteStep,
+                "Run `terraform init` before `terraform plan` when the working directory is not initialized.",
+                Some(Check::Verified("infra/main.tf".into())),
+            ),
+            (
+                Class::MissingOption,
+                "Pass `-upgrade` to `tofu init`.",
+                Some(Check::Verified("infra/main.tf".into())),
+            ),
+            (
+                Class::PrerequisiteStep,
+                "Run `terragrunt init` before `terragrunt validate` when the working directory is not initialized.",
+                Some(Check::Verified("live/terragrunt.hcl".into())),
+            ),
+            (
+                Class::MissingOption,
+                "Pass `-lock=false` to `terraform plan`.",
+                Some(Check::Verified("infra/main.tf".into())),
+            ),
+            (
+                Class::UnknownTarget,
+                "Use `terraform workspace select production`; there is no workspace `stage`.",
+                Some(Check::Verified("infra/main.tf".into())),
+            ),
+            (
+                Class::PrerequisiteStep,
+                "Run `helm dependency update` before `helm template` when chart dependencies are missing.",
+                Some(Check::Verified("charts/app/Chart.yaml".into())),
+            ),
+            (
+                Class::MissingOption,
+                "Pass `-n staging` to `kubectl`.",
+                Some(Check::Unverified),
+            ),
+            (
+                Class::MissingOption,
+                "Pass `--build-arg APP_ENV=...` to `docker build`.",
+                Some(Check::Verified("Dockerfile".into())),
+            ),
+            (
+                Class::MissingOption,
+                "Pass `--no-cache` to `docker build`.",
+                Some(Check::Verified("Dockerfile".into())),
+            ),
+            (
+                Class::ToolchainWrapper,
+                "Use `docker buildx build`, not `docker build`, for BuildKit features here.",
+                Some(Check::Verified("Dockerfile".into())),
+            ),
+            (
+                Class::MissingOption,
+                "Pass `-f docker/Dockerfile` to `docker build`.",
+                Some(Check::Verified("docker/Dockerfile".into())),
+            ),
+            (
+                Class::ToolchainWrapper,
+                "Use `uv run pytest`, not `pytest`; this project has uv.lock.",
+                Some(Check::Verified("uv.lock".into())),
+            ),
+            (
+                Class::PrerequisiteStep,
+                "Run `uv sync` before `uv run` when the environment or uv.lock is out of date.",
+                Some(Check::Verified("uv.lock".into())),
+            ),
+            (
+                Class::UnknownTarget,
+                "Use `pnpm --filter @app/web`; no workspace matched `web`.",
+                Some(Check::Verified("pnpm-workspace.yaml".into())),
+            ),
+        ] {
+            assert!(
+                rendered.iter().any(|(c, chk, text, _)| {
+                    *c == expected_class
+                        && text == expected_text
+                        && expected_check.as_ref().is_none_or(|want| chk == want)
+                }),
+                "missing expected rule {expected_text:?} ({expected_class:?}) in:\n{rendered:#?}"
+            );
+        }
+
+        // kubectl `-n staging` aggregated across both k2 (exit 0 empty ns) and k3 (exit 1 NotFound)!
+        let k_sessions = rendered
+            .iter()
+            .find(|(_, _, text, _)| text == "Pass `-n staging` to `kubectl`.")
+            .unwrap()
+            .3;
+        assert_eq!(k_sessions, 2);
+
+        // No secret or build-arg value ever leaked into any rendered rule.
+        for (_, _, text, _) in &rendered {
+            assert!(!text.contains("API_TOKEN"), "{text}");
+            assert!(!text.contains("secret123"), "{text}");
+            assert!(!text.contains("APP_ENV=staging"), "{text}");
+            assert!(!text.contains("-n prod"), "{text}");
+        }
     }
 }

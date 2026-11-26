@@ -116,10 +116,14 @@ pub struct Tests {
 
 impl Tests {
     fn observe(&mut self, line: &str) {
-        if let Some(captures) = RUNNING.captures(line) {
-            self.reports += 1;
-            self.ran |= captures[1].parse::<u64>().is_ok_and(|n| n > 0);
-        } else if let Some(captures) = FILTERED.captures(line) {
+        if line.starts_with("running ") {
+            if let Some(captures) = RUNNING.captures(line) {
+                self.reports += 1;
+                self.ran |= captures[1].parse::<u64>().is_ok_and(|n| n > 0);
+            }
+        } else if line.starts_with("test result: ")
+            && let Some(captures) = FILTERED.captures(line)
+        {
             self.filtered |= captures[1].parse::<u64>().is_ok_and(|n| n > 0);
         }
     }
@@ -264,18 +268,27 @@ pub fn transcripts(
             continue;
         };
         let mut pending: HashMap<String, Pending> = HashMap::new();
-        for (index, line) in BufReader::new(handle).lines().enumerate() {
-            let Ok(line) = line else {
+        let mut reader = BufReader::new(handle);
+        let mut line = String::new();
+        let mut line_no = 0usize;
+        loop {
+            line.clear();
+            let Ok(read) = reader.read_line(&mut line) else {
                 break;
             };
+            if read == 0 {
+                break;
+            }
+            line_no += 1;
+            let trimmed = line.trim_end_matches(['\n', '\r']);
             // Parse only a line that can start a shell call or finish a pending one;
             // other tools' calls and results are most of a transcript.
-            let starts = line.contains("\"tool_use\"") && line.contains("\"Bash\"");
-            let finishes = !pending.is_empty() && line.contains("\"tool_result\"");
-            if line.starts_with(BLOB) || !starts && !finishes {
+            let starts = trimmed.contains("\"tool_use\"") && trimmed.contains("\"Bash\"");
+            let finishes = !pending.is_empty() && trimmed.contains("\"tool_result\"");
+            if trimmed.starts_with(BLOB) || !starts && !finishes {
                 continue;
             }
-            let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            let Ok(entry) = serde_json::from_str::<Value>(trimmed) else {
                 continue;
             };
             let Some(parts) = entry["message"]["content"].as_array() else {
@@ -289,7 +302,11 @@ pub fn transcripts(
                     ) else {
                         continue;
                     };
-                    if time_ms < since_ms || cwd != root && !cwd.starts_with(&format!("{root}/")) {
+                    if time_ms < since_ms
+                        || cwd
+                            .strip_prefix(root.as_str())
+                            .is_none_or(|rest| !rest.is_empty() && !rest.starts_with('/'))
+                    {
                         continue;
                     }
                     let session = session_key(entry["sessionId"].as_str().unwrap_or_default());
@@ -334,7 +351,7 @@ pub fn transcripts(
                             part,
                             call,
                             &thread,
-                            index + 1,
+                            line_no,
                             stats,
                             &mut result.linked,
                         );
@@ -524,22 +541,24 @@ fn event(
     let body = bounded(content);
     let mut texts = Vec::new();
     let mut tests = None;
-    for captures in LINK.captures_iter(&body) {
-        let id = captures[1].to_owned();
-        linked.insert(id.clone());
-        let Ok((directory, _)) = crate::capture::load(workspace, &id) else {
-            continue;
-        };
-        for stream in ["stderr", "stdout"] {
-            if let Some(text) = read_bounded(&directory.join(stream)) {
-                texts.push(Text {
-                    run: Some(id.clone()),
-                    stream,
-                    body: text,
-                });
+    if body.contains("[justless run-") {
+        for captures in LINK.captures_iter(&body) {
+            let id = captures[1].to_owned();
+            linked.insert(id.clone());
+            let Ok((directory, _)) = crate::capture::load(workspace, &id) else {
+                continue;
+            };
+            for stream in ["stderr", "stdout"] {
+                if let Some(text) = read_bounded(&directory.join(stream)) {
+                    texts.push(Text {
+                        run: Some(id.clone()),
+                        stream,
+                        body: text,
+                    });
+                }
             }
+            tests.get_or_insert_with(|| count_tests(&directory.join("stdout")));
         }
-        tests.get_or_insert_with(|| count_tests(&directory.join("stdout")));
     }
     let tests = tests.unwrap_or_else(|| Tests::of(&body));
     texts.push(Text {
@@ -635,13 +654,16 @@ pub fn runs(
             continue;
         }
         let (shape, env) = normalizer.argv(&run.cwd, &run.argv);
-        let runner = match &shape {
-            Shape::Simple(cmd) => runner(&cmd.argv).is_some(),
-            _ => false,
+        let (runner, kubectl) = match &shape {
+            Shape::Simple(cmd) => (
+                runner(&cmd.argv).is_some(),
+                basename(cmd.program()) == "kubectl",
+            ),
+            _ => (false, false),
         };
         let directory = workspace.state.join("runs").join(&run.id);
         let mut texts = Vec::new();
-        if run.status != 0 || runner {
+        if run.status != 0 || runner || kubectl {
             for stream in ["stderr", "stdout"] {
                 if let Some(text) = read_bounded(&directory.join(stream)) {
                     texts.push(Text {
@@ -750,7 +772,11 @@ fn content_text(content: &Value) -> String {
 
 /// The first 16 KiB and the last 4 KiB, without terminal escapes.
 fn bounded(text: &str) -> String {
-    let text = ANSI.replace_all(text, "");
+    let text = if text.contains('\x1b') {
+        ANSI.replace_all(text, "")
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    };
     if text.len() <= HEAD + TAIL {
         return text.into_owned();
     }
@@ -762,17 +788,22 @@ fn bounded(text: &str) -> String {
 fn read_bounded(path: &Path) -> Option<String> {
     let mut file = File::open(path).ok()?;
     let length = file.metadata().ok()?.len();
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(length.min((HEAD + TAIL + 1) as u64) as usize);
     (&mut file).take(HEAD as u64).read_to_end(&mut bytes).ok()?;
     if length > (HEAD + TAIL) as u64 {
         file.seek(SeekFrom::Start(length - TAIL as u64)).ok()?;
         bytes.push(b'\n');
     }
     file.read_to_end(&mut bytes).ok()?;
-    Some(
-        ANSI.replace_all(&String::from_utf8_lossy(&bytes), "")
-            .into_owned(),
-    )
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+    };
+    Some(if text.contains('\x1b') {
+        ANSI.replace_all(&text, "").into_owned()
+    } else {
+        text
+    })
 }
 
 fn count_tests(path: &Path) -> Tests {
@@ -780,12 +811,23 @@ fn count_tests(path: &Path) -> Tests {
     let Ok(file) = File::open(path) else {
         return tests;
     };
-    for line in BufReader::new(file.take(TEST_SCAN)).split(b'\n') {
-        let Ok(line) = line else {
+    let mut reader = BufReader::new(file.take(TEST_SCAN));
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let Ok(read) = reader.read_until(b'\n', &mut buf) else {
             break;
         };
-        let text = String::from_utf8_lossy(&line);
-        tests.observe(ANSI.replace_all(text.trim_end(), "").as_ref());
+        if read == 0 {
+            break;
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let trimmed = text.trim_end();
+        if trimmed.contains('\x1b') {
+            tests.observe(ANSI.replace_all(trimmed, "").as_ref());
+        } else {
+            tests.observe(trimmed);
+        }
     }
     tests
 }
@@ -822,7 +864,12 @@ pub fn parse_timestamp(text: &str) -> Option<u64> {
     {
         return None;
     }
-    let millis: i64 = format!("{fraction:0<3}").get(..3)?.parse().ok()?;
+    let mut millis = 0i64;
+    let mut scale = 100i64;
+    for &digit in fraction.as_bytes().iter().take(3) {
+        millis += i64::from(digit - b'0') * scale;
+        scale /= 10;
+    }
     let days = days_from_civil(year, month, day);
     let total = days * 86_400_000 + ((hour * 60 + minute) * 60 + second) * 1000 + millis;
     u64::try_from(total).ok()
@@ -898,6 +945,9 @@ impl<'a> Normalizer<'a> {
     /// Split a root-relative directory into the nested checkout that holds it and the
     /// directory within that checkout, so `server/` means the same in a worktree.
     pub fn rebase(&mut self, dir: &str) -> (String, String) {
+        if dir.is_empty() {
+            return (String::new(), String::new());
+        }
         let parts: Vec<&str> = dir.split('/').filter(|part| !part.is_empty()).collect();
         let mut split = 0;
         if parts.len() >= 3 && parts[0] == ".claude" && parts[1] == "worktrees" {
@@ -1079,36 +1129,37 @@ impl<'a> Normalizer<'a> {
 
     /// Move a tool's directory flag into the directory, as in `make -C server test`.
     fn fold(&self, dir: &mut String, argv: &mut Vec<String>) -> Option<()> {
-        let program = argv[0].clone();
-        let flags: &[&str] = match program.as_str() {
-            "make" | "gmake" => &["-C", "--directory"],
-            "git" | "go" => &["-C"],
-            "pnpm" => &["-C", "--dir"],
-            "npm" => &["--prefix"],
-            "yarn" => &["--cwd"],
-            "cargo" => &["--manifest-path"],
-            "just" => &["--working-directory"],
+        let is_cargo = argv[0] == "cargo";
+        let (flags, leading): (&[&str], bool) = match argv[0].as_str() {
+            "make" | "gmake" => (&["-C", "--directory"], false),
+            "git" | "go" => (&["-C"], true),
+            "pnpm" => (&["-C", "--dir"], false),
+            "npm" => (&["--prefix"], false),
+            "yarn" | "bun" => (&["--cwd"], true),
+            "cargo" => (&["--manifest-path"], false),
+            "just" => (&["--working-directory"], false),
+            "terraform" | "tofu" => (&["-chdir"], true),
+            "terragrunt" => (&["--working-dir", "--terragrunt-working-dir"], false),
+            "uv" => (&["--directory", "--project"], true),
             _ => return Some(()),
         };
-        // Git and Go take -C only before the subcommand; `git commit -C` names a commit.
-        let leading = matches!(program.as_str(), "git" | "go" | "yarn");
         let mut index = 1;
         while index < argv.len() {
-            let word = argv[index].clone();
+            let word = argv[index].as_str();
             if word == "--" || leading && !word.starts_with('-') {
                 break;
             }
             let (value, width) = match word.split_once('=') {
-                Some((flag, value)) if flag.starts_with("--") && flags.contains(&flag) => {
+                Some((flag, value)) if flag.starts_with('-') && flags.contains(&flag) => {
                     (value.to_owned(), 1)
                 }
-                _ if flags.contains(&word.as_str()) => (argv.get(index + 1)?.clone(), 2),
+                _ if flags.contains(&word) => (argv.get(index + 1)?.clone(), 2),
                 _ => {
                     index += 1;
                     continue;
                 }
             };
-            let target = if program == "cargo" {
+            let target = if is_cargo {
                 let path = Path::new(&value);
                 if path.file_name().is_none_or(|name| name != "Cargo.toml") {
                     index += width;
@@ -1201,30 +1252,26 @@ fn lex(text: &str) -> Option<Vec<Token>> {
     {
         return None;
     }
-    let chars: Vec<char> = text.chars().collect();
+    let mut chars = text.chars().peekable();
     let mut tokens = Vec::new();
     let mut word = String::new();
     let mut redirect = false;
     let mut quote = None;
-    let mut index = 0;
     let flush = |word: &mut String, redirect: &mut bool, tokens: &mut Vec<Token>| {
         if !word.is_empty() {
             tokens.push(Token::Word(std::mem::take(word), *redirect));
         }
         *redirect = false;
     };
-    while index < chars.len() {
-        let c = chars[index];
-        let next = chars.get(index + 1).copied();
+    while let Some(c) = chars.next() {
+        let next = chars.peek().copied();
         if let Some(active) = quote {
             word.push(c);
             if c == active {
                 quote = None;
             } else if active == '"' && c == '\\' {
-                word.push(next?);
-                index += 1;
+                word.push(chars.next()?);
             }
-            index += 1;
             continue;
         }
         match c {
@@ -1234,19 +1281,18 @@ fn lex(text: &str) -> Option<Vec<Token>> {
             }
             '\\' => {
                 word.push(c);
-                word.push(next?);
-                index += 1;
+                word.push(chars.next()?);
             }
             c if c.is_whitespace() => flush(&mut word, &mut redirect, &mut tokens),
             '&' if next == Some('&') => {
                 flush(&mut word, &mut redirect, &mut tokens);
                 tokens.push(Token::Op("&&"));
-                index += 1;
+                chars.next();
             }
             '|' if next == Some('|') => {
                 flush(&mut word, &mut redirect, &mut tokens);
                 tokens.push(Token::Op("||"));
-                index += 1;
+                chars.next();
             }
             '|' | ';' => {
                 if matches!(next, Some('&' | ';')) {
@@ -1266,7 +1312,6 @@ fn lex(text: &str) -> Option<Vec<Token>> {
             '&' | '*' | '?' | '[' | ']' | '{' | '}' | '~' | '!' | '#' | '(' | ')' => return None,
             _ => word.push(c),
         }
-        index += 1;
     }
     if quote.is_some() {
         return None;

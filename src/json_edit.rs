@@ -5,6 +5,7 @@
 //! the byte span of each member and element instead, and deletes a selected child
 //! together with the comma and blank space that separate it from a neighbor.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
@@ -23,12 +24,13 @@ pub enum Step {
 /// root. A path inside another deleted path is ignored.
 pub fn delete(text: &str, paths: &[Vec<Step>]) -> Result<String> {
     let root = parse(text)?;
-    let mut targets: BTreeMap<usize, (&Node, BTreeSet<usize>)> = BTreeMap::new();
+    let mut targets: BTreeMap<usize, (&Node<'_>, BTreeSet<usize>)> = BTreeMap::new();
     for path in paths {
         let (last, parents) = path.split_last().context("cannot delete the root")?;
         let mut node = &root;
         for step in parents {
-            node = node.children()?[child(node, step)?].1;
+            let index = child(node, step)?;
+            node = node.child_node(index)?;
         }
         let index = child(node, last)?;
         targets
@@ -39,27 +41,27 @@ pub fn delete(text: &str, paths: &[Vec<Step>]) -> Result<String> {
     }
     let mut ranges = Vec::new();
     for (node, deleted) in targets.values() {
-        let spans: Vec<Range<usize>> = node.children()?.into_iter().map(|(s, _)| s).collect();
-        if deleted.len() == spans.len() {
+        let count = node.child_count()?;
+        if deleted.len() == count {
             ranges.push(node.span.start + 1..node.span.end - 1);
             continue;
         }
         // A run of deleted children takes the separator before the next kept child,
         // or, at the end, the separator after the last kept one.
         let mut at = 0;
-        while at < spans.len() {
+        while at < count {
             if !deleted.contains(&at) {
                 at += 1;
                 continue;
             }
             let first = at;
-            while at < spans.len() && deleted.contains(&at) {
+            while at < count && deleted.contains(&at) {
                 at += 1;
             }
-            ranges.push(if at < spans.len() {
-                spans[first].start..spans[at].start
+            ranges.push(if at < count {
+                node.child_span(first).start..node.child_span(at).start
             } else {
-                spans[first - 1].end..spans[at - 1].end
+                node.child_span(first - 1).end..node.child_span(at - 1).end
             });
         }
     }
@@ -80,11 +82,11 @@ pub fn delete(text: &str, paths: &[Vec<Step>]) -> Result<String> {
 
 /// Apply the same deletions to a parsed value, for checking the edited text.
 pub fn delete_value(value: &mut Value, paths: &[Vec<Step>]) {
-    let mut paths = paths.to_vec();
+    let mut paths: Vec<&[Step]> = paths.iter().map(Vec::as_slice).collect();
     // Later elements first, so earlier indices stay valid.
-    paths.sort();
+    paths.sort_unstable();
     paths.dedup();
-    for path in paths.iter().rev() {
+    for path in paths.into_iter().rev() {
         let Some((last, parents)) = path.split_last() else {
             continue;
         };
@@ -108,47 +110,63 @@ pub fn delete_value(value: &mut Value, paths: &[Vec<Step>]) {
 }
 
 #[derive(Debug)]
-struct Node {
+struct Node<'a> {
     span: Range<usize>,
-    kind: Kind,
+    kind: Kind<'a>,
 }
 
 #[derive(Debug)]
-enum Kind {
+enum Kind<'a> {
     /// Members with the byte offset where each key starts.
-    Object(Vec<(String, usize, Node)>),
-    Array(Vec<Node>),
+    Object(Vec<(Cow<'a, str>, usize, Node<'a>)>),
+    Array(Vec<Node<'a>>),
     Scalar,
 }
 
-impl Node {
-    /// Each child's deletable span, from its key or first byte to its last byte.
-    fn children(&self) -> Result<Vec<(Range<usize>, &Node)>> {
-        Ok(match &self.kind {
-            Kind::Object(members) => members
-                .iter()
-                .map(|(_, start, value)| (*start..value.span.end, value))
-                .collect(),
-            Kind::Array(items) => items.iter().map(|item| (item.span.clone(), item)).collect(),
+impl<'a> Node<'a> {
+    fn child_count(&self) -> Result<usize> {
+        match &self.kind {
+            Kind::Object(members) => Ok(members.len()),
+            Kind::Array(items) => Ok(items.len()),
             Kind::Scalar => bail!("JSON path continues past a scalar"),
-        })
+        }
+    }
+
+    fn child_node(&self, index: usize) -> Result<&Node<'a>> {
+        match &self.kind {
+            Kind::Object(members) => Ok(&members[index].2),
+            Kind::Array(items) => Ok(&items[index]),
+            Kind::Scalar => bail!("JSON path continues past a scalar"),
+        }
+    }
+
+    /// One child's deletable span, from its key or first byte to its last byte.
+    fn child_span(&self, index: usize) -> Range<usize> {
+        match &self.kind {
+            Kind::Object(members) => {
+                let (_, start, value) = &members[index];
+                *start..value.span.end
+            }
+            Kind::Array(items) => items[index].span.clone(),
+            Kind::Scalar => unreachable!("scalar has no children"),
+        }
     }
 }
 
 /// The index of a child. A repeated key resolves to its last occurrence, the one
 /// `serde_json` keeps.
-fn child(node: &Node, step: &Step) -> Result<usize> {
+fn child(node: &Node<'_>, step: &Step) -> Result<usize> {
     match (&node.kind, step) {
         (Kind::Object(members), Step::Key(key)) => members
             .iter()
-            .rposition(|(name, _, _)| name == key)
+            .rposition(|(name, _, _)| name.as_ref() == key.as_str())
             .with_context(|| format!("no JSON member {key}")),
         (Kind::Array(items), Step::Index(index)) if *index < items.len() => Ok(*index),
         _ => bail!("JSON path does not match the document"),
     }
 }
 
-fn parse(text: &str) -> Result<Node> {
+fn parse(text: &str) -> Result<Node<'_>> {
     let mut parser = Parser { text, at: 0 };
     parser.blank();
     let root = parser.value()?;
@@ -162,7 +180,7 @@ struct Parser<'a> {
     at: usize,
 }
 
-impl Parser<'_> {
+impl<'a> Parser<'a> {
     fn peek(&self) -> Option<u8> {
         self.text.as_bytes().get(self.at).copied()
     }
@@ -184,7 +202,7 @@ impl Parser<'_> {
         Ok(())
     }
 
-    fn value(&mut self) -> Result<Node> {
+    fn value(&mut self) -> Result<Node<'a>> {
         let start = self.at;
         let kind = match self.peek() {
             Some(b'{') => {
@@ -197,8 +215,14 @@ impl Parser<'_> {
                     loop {
                         self.blank();
                         let key_start = self.at;
-                        let key = self.string()?;
-                        let key: String = serde_json::from_str(&self.text[key])?;
+                        let key_span = self.string()?;
+                        let raw_key = &self.text[key_span];
+                        let inner = &raw_key[1..raw_key.len() - 1];
+                        let key: Cow<'a, str> = if !inner.bytes().any(|b| b == b'\\' || b < 0x20) {
+                            Cow::Borrowed(inner)
+                        } else {
+                            Cow::Owned(serde_json::from_str::<String>(raw_key)?)
+                        };
                         self.blank();
                         self.expect(b':')?;
                         self.blank();
@@ -262,7 +286,13 @@ impl Parser<'_> {
         self.expect(b'"')?;
         loop {
             match self.peek() {
-                Some(b'\\') => self.at += 2,
+                Some(b'\\') => {
+                    self.at += 1;
+                    let Some(escaped) = self.text[self.at..].chars().next() else {
+                        bail!("unterminated JSON string");
+                    };
+                    self.at += escaped.len_utf8();
+                }
                 Some(b'"') => {
                     self.at += 1;
                     return Ok(start..self.at);
@@ -343,5 +373,25 @@ mod tests {
         );
         assert!(delete(text, &[vec![key("missing")]]).is_err());
         assert!(delete(text, &[vec![]]).is_err());
+    }
+
+    #[test]
+    fn handles_multibyte_utf8_keys_escapes_and_malformed_backslashes() {
+        // Multi-byte UTF-8 keys (CJK, emoji, accented) and escaped unicode/quotes keep exact bytes.
+        let doc = "{\n  \"日本語\": \"値🚀\",\n  \"🚀key\": [\"α\", \"β\", \"γ\"],\n  \"esc\\\"\\u00fc\": true\n}\n";
+        check(
+            doc,
+            &[vec![key("🚀key"), Step::Index(1)]],
+            "{\n  \"日本語\": \"値🚀\",\n  \"🚀key\": [\"α\", \"γ\"],\n  \"esc\\\"\\u00fc\": true\n}\n",
+        );
+        check(
+            doc,
+            &[vec![key("日本語")], vec![key("esc\"ü")]],
+            "{\n  \"🚀key\": [\"α\", \"β\", \"γ\"]\n}\n",
+        );
+        // Backslash followed by multi-byte UTF-8 or EOF must never panic on char boundaries.
+        assert!(delete("{\"\\é\": 1}", &[vec![key("x")]]).is_err());
+        assert!(delete("{\"a\": \"\\", &[vec![key("a")]]).is_err());
+        assert!(delete("{\"a\": \"\\é\", \"b\": 2}", &[vec![key("b")]]).is_ok());
     }
 }

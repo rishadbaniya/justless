@@ -94,8 +94,6 @@ const NETWORK: &[&str] = &[
     "aws",
     "gcloud",
     "az",
-    "kubectl",
-    "helm",
     "doctl",
     "flyctl",
     "heroku",
@@ -124,12 +122,28 @@ pub fn carries_credential(raw: &str, env: &[String]) -> bool {
     screen(raw, env, None)
 }
 
+/// Whether an option or build-arg name looks like it carries a credential or secret.
+pub fn is_secret_name(name: &str) -> bool {
+    keyword(name)
+}
+
+fn contains_ascii_ignore_case(haystack: &str, needle: &[u8]) -> bool {
+    let bytes = haystack.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+    bytes
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 fn screen(raw: &str, env: &[String], root: Option<&Path>) -> bool {
     if TOKENS.is_match(raw) || raw.contains("://") || address(raw) {
         return true;
     }
-    let lower = raw.to_ascii_lowercase();
-    if lower.contains("authorization:") || lower.contains("bearer ") {
+    if contains_ascii_ignore_case(raw, b"authorization:")
+        || contains_ascii_ignore_case(raw, b"bearer ")
+    {
         return true;
     }
     let words =
@@ -155,10 +169,15 @@ fn screen(raw: &str, env: &[String], root: Option<&Path>) -> bool {
             if value.is_some_and(|value| !value.is_empty()) && keyword(name) {
                 return true;
             }
+            // Catch `--build-arg=API_TOKEN=val` or `--env=DB_PASSWORD=val`.
+            if value.is_some_and(secret_assignment) {
+                return true;
+            }
             if matches!(word.as_str(), "-H" | "--header")
                 && next.is_some_and(|value| {
-                    let value = value.to_ascii_lowercase();
-                    HEADERS.iter().any(|header| value.contains(header))
+                    HEADERS
+                        .iter()
+                        .any(|header| contains_ascii_ignore_case(value, header.as_bytes()))
                 })
             {
                 return true;
@@ -171,8 +190,10 @@ fn screen(raw: &str, env: &[String], root: Option<&Path>) -> bool {
             if let Some(root) = &root
                 && (part.starts_with('~')
                     || part.starts_with('/')
-                        && part != root
-                        && !part.starts_with(&format!("{root}/"))
+                        && part != root.as_ref()
+                        && part
+                            .strip_prefix(root.as_ref())
+                            .is_none_or(|rest| !rest.starts_with('/'))
                         && !part.starts_with("/dev/null"))
             {
                 return true;
@@ -202,8 +223,9 @@ pub fn safe_rule_text(text: &str) -> bool {
 }
 
 fn keyword(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    KEYWORDS.iter().any(|keyword| name.contains(keyword))
+    KEYWORDS
+        .iter()
+        .any(|keyword| contains_ascii_ignore_case(name, keyword.as_bytes()))
 }
 
 /// `NAME=value`, including dotted configuration keys such as git's `-c a.b=value`.
@@ -265,10 +287,31 @@ fn network(words: &[String]) -> bool {
             if NETWORK.contains(&name)
                 || matches!(
                     (name, next),
-                    ("docker", Some("login")) | ("gh", Some("auth")) | ("npm", Some("login"))
+                    ("docker", Some("login"))
+                        | ("gh", Some("auth"))
+                        | ("npm", Some("login"))
+                        | ("helm", Some("login" | "registry"))
+                        | ("terraform" | "tofu", Some("login"))
+                        | ("kubectl", Some("auth"))
                 )
             {
                 return true;
+            }
+            // Drop kubectl invocations that read, write or configure secrets/credentials.
+            if name == "kubectl" {
+                let mut look = index + 1;
+                while let Some(arg) = words.get(look) {
+                    if matches!(arg.as_str(), "&&" | "||" | ";" | "|") {
+                        break;
+                    }
+                    if arg.eq_ignore_ascii_case("secret")
+                        || arg.eq_ignore_ascii_case("secrets")
+                        || arg.eq_ignore_ascii_case("set-credentials")
+                    {
+                        return true;
+                    }
+                    look += 1;
+                }
             }
             start = false;
         }
@@ -306,6 +349,12 @@ mod tests {
             "sh -c 'true && API_TOKEN=x make'",
             "bash -c \"sh -c 'make --password hunter2'\"",
             "sh -c 'cat /home/someone/x'",
+            "kubectl get secrets -n prod",
+            "kubectl create secret generic app --from-literal=a=b",
+            "kubectl auth can-i get pods",
+            "helm registry login registry.example",
+            "terraform login",
+            "docker build --build-arg=API_TOKEN=hunter2 .",
         ] {
             assert!(unsafe_command(raw, &[], root), "{raw}");
         }
@@ -318,6 +367,9 @@ mod tests {
             "npm install left-pad@latest @types/node@next",
             "sh -c 'cd server && make test'",
             "git rev-parse 3f9a1c2e7b40d3c1a8e9f0b2c4d6e8f0a1b3c5d7",
+            "kubectl -n staging get pods",
+            "helm dependency update ./charts/app",
+            "docker build --build-arg APP_ENV=staging .",
         ] {
             assert!(!unsafe_command(raw, &[], root), "{raw}");
         }

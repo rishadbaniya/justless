@@ -283,7 +283,7 @@ fn imports(text: &str, name: &str) -> bool {
             fenced = !fenced;
             continue;
         }
-        if fenced {
+        if fenced || !line.contains('@') {
             continue;
         }
         // Drop backtick spans: each run of backticks opens or closes one.
@@ -681,7 +681,7 @@ pub fn plan(
         let oldest = state
             .removed
             .iter()
-            .min_by_key(|(id, removed)| (removed.at_ms, (*id).clone()))
+            .min_by_key(|(id, removed)| (removed.at_ms, id.as_str()))
             .map(|(id, _)| id.clone())
             .expect("a tombstone");
         state.removed.remove(&oldest);
