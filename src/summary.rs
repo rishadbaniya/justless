@@ -248,13 +248,25 @@ pub fn family(args: &[OsString]) -> String {
         }
         true
     };
-    let terraform_plan_display = || {
-        !tool.iter().skip(2).take_while(|&&a| a != "--").any(|&arg| {
-            matches!(
-                arg,
-                "-json" | "-h" | "-help" | "--help" | "-version" | "--version"
-            )
-        })
+    let terraform_plan_display = |skip: usize, stop_at_dashdash: bool| {
+        !tool
+            .iter()
+            .skip(skip)
+            .take_while(|&&a| !stop_at_dashdash || a != "--")
+            .any(|&arg| {
+                let flag = arg.split_once('=').map_or(arg, |(f, _)| f);
+                matches!(
+                    flag,
+                    "-json"
+                        | "--json"
+                        | "-h"
+                        | "-help"
+                        | "--help"
+                        | "-version"
+                        | "--version"
+                        | "show"
+                )
+            })
     };
     let pulumi_display = || {
         !tool.iter().skip(2).take_while(|&&a| a != "--").any(|&arg| {
@@ -301,7 +313,9 @@ pub fn family(args: &[OsString]) -> String {
         ["rspec", ..] if rspec_display() => "rspec",
         ["phpunit" | "paratest" | "pest", ..] if phpunit_display(1) => "phpunit",
         ["php", "artisan", "test", ..] if phpunit_display(3) => "phpunit",
-        ["terraform" | "tofu", "plan", ..] if terraform_plan_display() => "terraform plan",
+        ["terraform" | "tofu", "plan", ..] if terraform_plan_display(2, true) => "terraform plan",
+        ["terragrunt", "plan", ..] if terraform_plan_display(2, false) => "terraform plan",
+        ["terragrunt", "run-all", "plan"] if terraform_plan_display(3, false) => "terraform plan",
         ["pulumi", "preview", ..] if pulumi_display() => "pulumi preview",
         ["pulumi", "up", ..] if pulumi_dry_run() && pulumi_display() => "pulumi preview",
         [cmd @ ("cargo" | "git" | "go" | "npm" | "rg"), ..] => cmd,
@@ -5126,6 +5140,104 @@ Tests: 9, Assertions: 14, Failures: 1.
             "expected strong plan compaction: {} vs {}\n{rendered}",
             rendered.len(),
             raw.len()
+        );
+    }
+
+    #[test]
+    fn terragrunt_plan_and_run_all_plan_use_rich_terraform_plan_summary() {
+        let args = |line: &str| line.split(' ').map(OsString::from).collect::<Vec<_>>();
+        for routed in [
+            "terragrunt plan",
+            "terragrunt plan -out=tfplan",
+            "terragrunt run-all plan",
+            "terragrunt run-all plan --terragrunt-non-interactive",
+            "/usr/local/bin/terragrunt run-all plan --terragrunt-working-dir env/prod",
+        ] {
+            assert_eq!(family(&args(routed)), "terraform plan", "{routed}");
+        }
+        for skipped in [
+            "terragrunt plan -json",
+            "terragrunt plan --json",
+            "terragrunt run-all plan -json",
+            "terragrunt run-all plan --json",
+            "terragrunt run-all plan -- -json",
+            "terragrunt plan -h",
+            "terragrunt plan --help",
+            "terragrunt plan -version",
+            "terragrunt plan --version",
+            "terragrunt plan show",
+            "terragrunt run-all plan show",
+            "terragrunt show tfplan",
+            "terragrunt apply",
+            "terragrunt run-all apply",
+            "terragrunt destroy",
+        ] {
+            assert_eq!(family(&args(skipped)), "other", "{skipped}");
+        }
+
+        let fam = family(&args(
+            "terragrunt run-all plan --terragrunt-non-interactive",
+        ));
+        let mut raw = String::new();
+        for i in 0..24 {
+            raw.push_str(&format!(
+                "module.vpc.aws_subnet.private[{i}]: Refreshing state... [id=subnet-{i:04}]\n"
+            ));
+        }
+        raw.push_str(concat!(
+            "  # aws_instance.api must be replaced\n",
+            "-/+ resource \"aws_instance\" \"api\" {\n",
+            "      ~ ami           = \"ami-01\" -> \"ami-02\" # forces replacement\n",
+            "      ~ instance_type = \"t3.small\" -> \"t3.medium\"\n",
+            "    }\n\n",
+            "  # aws_s3_bucket.logs will be updated in-place\n",
+            "  ~ resource \"aws_s3_bucket\" \"logs\" {\n",
+            "      ~ tags = { \"Env\" = \"stage\" -> \"prod\" }\n",
+            "    }\n\n",
+            "Plan: 1 to add, 1 to change, 1 to destroy.\n",
+            "Changes to Outputs:\n",
+            "  ~ api_url = \"https://stage.example.com\" -> \"https://prod.example.com\"\n",
+            "Plan: 0 to add, 0 to change, 0 to destroy.\n",
+        ));
+        let stderr = concat!(
+            "╷\n",
+            "│ Warning: Deprecated attribute\n",
+            "│   on main.tf line 18, in resource \"aws_s3_bucket\" \"logs\":\n",
+            "╵\n",
+        );
+
+        let mut parser = Parser::new(&fam, None);
+        for (i, line) in raw.split_inclusive('\n').enumerate() {
+            parser.observe(line, i + 1);
+        }
+        for (i, line) in stderr.split_inclusive('\n').enumerate() {
+            parser.observe_stderr(line, i + 1);
+        }
+        let summary = parser.finish();
+        let rendered = summary.render(None, 0).unwrap();
+        assert!(
+            rendered.contains("Refreshed/read 24 resource(s) [stdout:1-24]\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("-/+ aws_instance.api must be replaced (replace: ami) [stdout:"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("~ aws_s3_bucket.logs will be updated in-place (tags) [stdout:"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Changes to Outputs:\n") && rendered.contains("api_url"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Warning: Deprecated attribute (on main.tf line 18"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Plan: 1 to add, 1 to change, 1 to destroy.\n"),
+            "{rendered}"
         );
     }
 

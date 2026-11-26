@@ -253,6 +253,11 @@ const ROUTED: &[(&[&str], &[&str])] = &[
     (&["tofu", "validate"], &[]),
     (&["tofu", "fmt"], &[]),
     (&["tofu", "init"], &[]),
+    (&["terragrunt", "plan"], &["-json", "--json"]),
+    (&["terragrunt", "run-all", "plan"], &["-json", "--json"]),
+    (&["terragrunt", "validate"], &["-json", "--json"]),
+    (&["terragrunt", "hclfmt"], &[]),
+    (&["terragrunt", "state", "list"], &[]),
     (&["pulumi", "preview"], &[]),
     (&["pulumi", "stack", "ls"], &[]),
     // Cloud display lists (read-only, non-secret, rejecting machine formats)
@@ -369,6 +374,14 @@ const PROGRESS: &[(&[&str], &str)] = &[
     ),
     (
         &["tofu", "plan"],
+        r": (Refreshing state\.\.\.|Reading\.\.\.|Still reading\.\.\.|Read complete after )",
+    ),
+    (
+        &["terragrunt", "plan"],
+        r": (Refreshing state\.\.\.|Reading\.\.\.|Still reading\.\.\.|Read complete after )",
+    ),
+    (
+        &["terragrunt", "run-all", "plan"],
         r": (Refreshing state\.\.\.|Reading\.\.\.|Still reading\.\.\.|Read complete after )",
     ),
     (
@@ -998,5 +1011,64 @@ mod tests {
         let omit = selection.omit.unwrap();
         assert!(omit.is_match("Looking in indexes: https://pypi.org/simple"));
         assert!(!omit.is_match("Collecting x"));
+    }
+
+    #[test]
+    fn terragrunt_routing_allows_safe_reads_and_rejects_mutating_or_secret_commands() {
+        for allowed in [
+            "terragrunt plan",
+            "terragrunt plan -out=tfplan",
+            "terragrunt run-all plan",
+            "terragrunt run-all plan --terragrunt-non-interactive",
+            "terragrunt validate",
+            "terragrunt hclfmt --terragrunt-check",
+            "terragrunt hclfmt",
+            "terragrunt state list",
+        ] {
+            let words: Vec<&str> = allowed.split(' ').collect();
+            assert!(routes(&words), "expected routed: {allowed}");
+            assert!(
+                crate::agents::supported_words(&words),
+                "expected supported: {allowed}"
+            );
+            assert!(!approvable(&words), "must never auto-approve: {allowed}");
+        }
+
+        for rejected in [
+            "terragrunt plan -json",
+            "terragrunt plan --json",
+            "terragrunt run-all plan -json",
+            "terragrunt run-all plan --json",
+            "terragrunt validate -json",
+            "terragrunt validate --json",
+            "terragrunt apply",
+            "terragrunt apply -auto-approve",
+            "terragrunt run-all apply",
+            "terragrunt destroy",
+            "terragrunt run-all destroy",
+            "terragrunt output",
+            "terragrunt run-all output",
+            "terragrunt state show aws_instance.web",
+            "terragrunt state pull",
+            "terragrunt state rm aws_instance.web",
+        ] {
+            let words: Vec<&str> = rejected.split(' ').collect();
+            assert!(!routes(&words), "must not route: {rejected}");
+            assert!(
+                !crate::agents::supported_words(&words),
+                "must stay as written: {rejected}"
+            );
+        }
+
+        for cmd in ["terragrunt plan", "terragrunt run-all plan"] {
+            assert!(
+                omitted(cmd, "aws_instance.web: Refreshing state... [id=i-0abc]"),
+                "{cmd}"
+            );
+            assert!(
+                !omitted(cmd, "Plan: 1 to add, 0 to change, 0 to destroy."),
+                "{cmd}"
+            );
+        }
     }
 }

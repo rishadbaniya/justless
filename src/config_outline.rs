@@ -1,6 +1,7 @@
 //! Structural outlines for config, DevOps, stylesheet, IDL, proxy, and markup files:
 //! TOML, YAML (including GitHub Actions workflows and OpenAPI/Swagger specs),
 //! JSON/JSONC (including OpenAPI/Swagger, root arrays, and large minified JSON),
+//! Terraform/OpenTofu/Terragrunt HCL (`*.tf`, `*.tofu`, `*.hcl`, `*.tfvars`),
 //! Nix (`*.nix`), Makefile/Justfile, Dockerfile/Containerfile,
 //! Nginx/Caddy/HAProxy configs, INI/Conf/EditorConfig/Properties,
 //! CSS/SCSS/Less, Proto/GraphQL/Prisma IDL schemas, and XML/HTML/MSBuild files.
@@ -83,6 +84,9 @@ pub fn sections(file: &str, text: &str, line_starts: &[usize]) -> Vec<Section> {
         Some("toml") => toml_sections(text, line_starts),
         Some("yaml" | "yml") => yaml_sections(file, text, line_starts),
         Some("json" | "jsonc") => json_sections(text, line_starts),
+        Some("tf" | "tofu" | "hcl" | "tfvars") => {
+            hcl_sections(text, line_starts, ext.as_deref() == Some("tfvars"))
+        }
         Some("nix") => nix_sections(text, line_starts),
         Some("conf") => {
             let ini = ini_sections(text, line_starts);
@@ -5113,6 +5117,780 @@ fn haproxy_sections(text: &str, line_starts: &[usize], explicit: bool) -> Vec<Se
     out
 }
 
+// ---------------------------------------------------------------------------
+// Terraform / OpenTofu / Terragrunt HCL (*.tf, *.tofu, *.hcl, *.tfvars)
+// ---------------------------------------------------------------------------
+
+enum HclFrame {
+    DoubleQuote(usize),
+    TemplateBrace,
+    Brace(usize),
+    Bracket(usize),
+    Paren(usize),
+}
+
+struct HclScan<'a> {
+    src: &'a str,
+    bytes: &'a [u8],
+    /// Maps `{`/`[`/`(` -> closing delimiter byte index, `"` -> exclusive end
+    /// after closing `"`, and `<<` -> exclusive end right after heredoc marker.
+    pair_end: BTreeMap<usize, usize>,
+    /// Maps comment start (`#`, `//`, `/*`) -> exclusive comment end.
+    trivia_end: BTreeMap<usize, usize>,
+}
+
+fn is_hcl_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+fn is_hcl_ident_cont(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')
+}
+
+/// Skip an HCL 2 heredoc (`<<MARKER` or `<<-MARKER`) starting at `start`.
+/// Returns the byte offset immediately after the closing marker (before `\r`/`\n`),
+/// or `None` if malformed or unterminated.
+fn skip_hcl_heredoc(src: &str, start: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    if !bytes.get(start..)?.starts_with(b"<<") {
+        return None;
+    }
+    let (indented, m_start) = if bytes.get(start + 2) == Some(&b'-') {
+        (true, start + 3)
+    } else {
+        (false, start + 2)
+    };
+    if m_start >= bytes.len() || !is_hcl_ident_start(bytes[m_start]) {
+        return None;
+    }
+    let mut m_end = m_start + 1;
+    while m_end < bytes.len() && is_hcl_ident_cont(bytes[m_end]) {
+        m_end += 1;
+    }
+    let marker = &src[m_start..m_end];
+    let mut after = m_end;
+    while after < bytes.len() && matches!(bytes[after], b' ' | b'\t') {
+        after += 1;
+    }
+    if bytes.get(after) == Some(&b'\r') {
+        after += 1;
+    }
+    if bytes.get(after) != Some(&b'\n') {
+        return None;
+    }
+
+    let mut pos = after + 1;
+    while pos < bytes.len() {
+        let line_end = src[pos..].find('\n').map_or(src.len(), |n| pos + n);
+        let raw_line = src[pos..line_end]
+            .strip_suffix('\r')
+            .unwrap_or(&src[pos..line_end]);
+        let candidate = if indented {
+            raw_line.trim_start_matches([' ', '\t'])
+        } else {
+            raw_line
+        };
+        if candidate == marker {
+            return Some(pos + raw_line.len());
+        }
+        pos = (line_end + 1).min(src.len());
+    }
+    None
+}
+
+impl<'a> HclScan<'a> {
+    fn parse(src: &'a str) -> Option<Self> {
+        let bytes = src.as_bytes();
+        let mut pair_end = BTreeMap::new();
+        let mut trivia_end = BTreeMap::new();
+        let mut stack: Vec<HclFrame> = Vec::new();
+        let mut i = if src.starts_with('\u{feff}') {
+            '\u{feff}'.len_utf8()
+        } else {
+            0
+        };
+
+        while i < bytes.len() {
+            if let Some(&HclFrame::DoubleQuote(str_start)) = stack.last() {
+                match bytes[i] {
+                    b'\\' => {
+                        i += 1;
+                        if i >= bytes.len() {
+                            return None;
+                        }
+                        i += src[i..].chars().next().map_or(1, char::len_utf8);
+                    }
+                    b'\n' => return None,
+                    b'$' if bytes[i..].starts_with(b"$$") => i += 2,
+                    b'%' if bytes[i..].starts_with(b"%%") => i += 2,
+                    b'$' | b'%' if bytes.get(i + 1) == Some(&b'{') => {
+                        stack.push(HclFrame::TemplateBrace);
+                        i += 2;
+                    }
+                    b'"' => {
+                        stack.pop();
+                        i += 1;
+                        pair_end.insert(str_start, i);
+                    }
+                    _ => i += 1,
+                }
+                continue;
+            }
+
+            let b = bytes[i];
+            if b == b'#' || bytes[i..].starts_with(b"//") {
+                let start = i;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                trivia_end.insert(start, i);
+                continue;
+            }
+            if bytes[i..].starts_with(b"/*") {
+                let start = i;
+                let end = src[i + 2..].find("*/")?;
+                i += 2 + end + 2;
+                trivia_end.insert(start, i);
+                continue;
+            }
+            if b == b'"' {
+                stack.push(HclFrame::DoubleQuote(i));
+                i += 1;
+                continue;
+            }
+            if bytes[i..].starts_with(b"<<") {
+                let end = skip_hcl_heredoc(src, i)?;
+                pair_end.insert(i, end);
+                i = end;
+                continue;
+            }
+            match b {
+                b'{' => {
+                    stack.push(HclFrame::Brace(i));
+                    i += 1;
+                }
+                b'}' => match stack.pop()? {
+                    HclFrame::Brace(open) => {
+                        pair_end.insert(open, i);
+                        i += 1;
+                    }
+                    HclFrame::TemplateBrace => i += 1,
+                    _ => return None,
+                },
+                b'[' => {
+                    stack.push(HclFrame::Bracket(i));
+                    i += 1;
+                }
+                b']' => match stack.pop()? {
+                    HclFrame::Bracket(open) => {
+                        pair_end.insert(open, i);
+                        i += 1;
+                    }
+                    _ => return None,
+                },
+                b'(' => {
+                    stack.push(HclFrame::Paren(i));
+                    i += 1;
+                }
+                b')' => match stack.pop()? {
+                    HclFrame::Paren(open) => {
+                        pair_end.insert(open, i);
+                        i += 1;
+                    }
+                    _ => return None,
+                },
+                _ => i += 1,
+            }
+        }
+
+        if !stack.is_empty() {
+            return None;
+        }
+        Some(Self {
+            src,
+            bytes,
+            pair_end,
+            trivia_end,
+        })
+    }
+
+    fn skip_trivia(&self, mut pos: usize, limit: usize) -> usize {
+        while pos < limit {
+            if self.bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            } else if let Some(&end) = self.trivia_end.get(&pos) {
+                pos = end.min(limit);
+            } else {
+                break;
+            }
+        }
+        pos
+    }
+
+    fn skip_inline_trivia(&self, mut pos: usize, limit: usize) -> usize {
+        while pos < limit {
+            if matches!(self.bytes[pos], b' ' | b'\t') {
+                pos += 1;
+            } else if self.bytes[pos..].starts_with(b"/*")
+                && let Some(&end) = self.trivia_end.get(&pos)
+                && !self.src[pos..end.min(limit)].contains('\n')
+            {
+                pos = end.min(limit);
+            } else {
+                break;
+            }
+        }
+        pos
+    }
+
+    fn read_ident(&self, pos: usize, limit: usize) -> Option<(&'a str, usize)> {
+        if pos >= limit || !is_hcl_ident_start(self.bytes[pos]) {
+            return None;
+        }
+        let mut end = pos + 1;
+        while end < limit && is_hcl_ident_cont(self.bytes[end]) {
+            end += 1;
+        }
+        Some((&self.src[pos..end], end))
+    }
+
+    fn step_balanced(&self, pos: usize, limit: usize) -> usize {
+        if pos >= limit {
+            return limit;
+        }
+        if let Some(&end) = self.trivia_end.get(&pos) {
+            return end.min(limit);
+        }
+        match self.bytes[pos] {
+            b'{' | b'[' | b'(' => {
+                if let Some(&close) = self.pair_end.get(&pos) {
+                    return (close + 1).min(limit);
+                }
+            }
+            b'"' => {
+                if let Some(&end) = self.pair_end.get(&pos) {
+                    return end.min(limit);
+                }
+            }
+            b'<' if self.bytes[pos..].starts_with(b"<<") => {
+                if let Some(&end) = self.pair_end.get(&pos) {
+                    return end.min(limit);
+                }
+            }
+            _ => {}
+        }
+        if is_hcl_ident_start(self.bytes[pos]) {
+            let mut end = pos + 1;
+            while end < limit && is_hcl_ident_cont(self.bytes[end]) {
+                end += 1;
+            }
+            return end;
+        }
+        pos + self.src[pos..limit]
+            .chars()
+            .next()
+            .map_or(1, char::len_utf8)
+    }
+}
+
+struct HclBlock<'a> {
+    kind: &'a str,
+    labels: Vec<&'a str>,
+    start: usize,
+    open_brace: usize,
+    end: usize,
+}
+
+struct HclAttr<'a> {
+    name: &'a str,
+    start: usize,
+    val_start: usize,
+    val_end: usize,
+    end: usize,
+}
+
+enum HclItem<'a> {
+    Block(HclBlock<'a>),
+    Attr(HclAttr<'a>),
+}
+
+fn parse_hcl_body<'a>(scan: &HclScan<'a>, start: usize, limit: usize) -> Option<Vec<HclItem<'a>>> {
+    let mut items = Vec::new();
+    let mut pos = scan.skip_trivia(start, limit);
+    while pos < limit {
+        let item_start = pos;
+        let (ident, after_ident) = scan.read_ident(pos, limit)?;
+        let next = scan.skip_inline_trivia(after_ident, limit);
+
+        if next < limit && scan.bytes[next] == b'=' && scan.bytes.get(next + 1) != Some(&b'=') {
+            let val_start = scan.skip_inline_trivia(next + 1, limit);
+            if val_start >= limit
+                || matches!(scan.bytes[val_start], b'\n' | b'\r' | b'#')
+                || scan.bytes[val_start..].starts_with(b"//")
+            {
+                return None;
+            }
+            let mut cur = val_start;
+            let mut last_expr = None;
+            let mut stmt_end = val_start;
+            while cur < limit {
+                let b = scan.bytes[cur];
+                if b == b'\n' {
+                    break;
+                }
+                if (b == b'#' || scan.bytes[cur..].starts_with(b"//"))
+                    && let Some(&t_end) = scan.trivia_end.get(&cur)
+                {
+                    cur = t_end.min(limit);
+                    stmt_end = cur;
+                    break;
+                }
+                if let Some(&t_end) = scan.trivia_end.get(&cur) {
+                    cur = t_end.min(limit);
+                    continue;
+                }
+                if b.is_ascii_whitespace() {
+                    cur += 1;
+                    continue;
+                }
+                let stepped = scan.step_balanced(cur, limit);
+                last_expr = Some(stepped);
+                stmt_end = stepped;
+                cur = stepped;
+            }
+            let val_end = last_expr?;
+            let end = item_start
+                + scan.src[item_start..stmt_end]
+                    .trim_end_matches([' ', '\t', '\r'])
+                    .len();
+            items.push(HclItem::Attr(HclAttr {
+                name: ident,
+                start: item_start,
+                val_start,
+                val_end,
+                end,
+            }));
+            pos = scan.skip_trivia(cur, limit);
+            continue;
+        }
+
+        let mut labels = Vec::new();
+        let mut cur = next;
+        while cur < limit {
+            let b = scan.bytes[cur];
+            if b == b'{' {
+                break;
+            }
+            if matches!(b, b'\n' | b'\r') {
+                return None;
+            }
+            if b == b'"' {
+                let str_end = *scan.pair_end.get(&cur)?;
+                if str_end > limit || str_end < cur + 2 {
+                    return None;
+                }
+                labels.push(&scan.src[cur + 1..str_end - 1]);
+                cur = scan.skip_inline_trivia(str_end, limit);
+            } else if let Some((label, after)) = scan.read_ident(cur, limit) {
+                labels.push(label);
+                cur = scan.skip_inline_trivia(after, limit);
+            } else {
+                return None;
+            }
+        }
+        if cur >= limit || scan.bytes[cur] != b'{' {
+            return None;
+        }
+        let close = *scan.pair_end.get(&cur)?;
+        if close >= limit {
+            return None;
+        }
+        items.push(HclItem::Block(HclBlock {
+            kind: ident,
+            labels,
+            start: item_start,
+            open_brace: cur,
+            end: close + 1,
+        }));
+        pos = scan.skip_trivia(close + 1, limit);
+    }
+    Some(items)
+}
+
+fn hcl_find_attr<'a>(items: &'a [HclItem<'a>], key: &str) -> Option<&'a HclAttr<'a>> {
+    items.iter().find_map(|item| match item {
+        HclItem::Attr(attr) if attr.name == key => Some(attr),
+        _ => None,
+    })
+}
+
+fn hcl_single_line_attr_sig(
+    text: &str,
+    attr: &HclAttr<'_>,
+    max_len: usize,
+    bounds: &Range<usize>,
+) -> Option<(usize, usize)> {
+    if attr.start >= bounds.start
+        && attr.val_end <= bounds.end
+        && attr.val_end > attr.start
+        && attr.val_end - attr.start <= max_len
+        && !text[attr.start..attr.val_end].contains('\n')
+    {
+        Some((attr.start, attr.val_end))
+    } else {
+        None
+    }
+}
+
+fn hcl_first_attr_sig(
+    text: &str,
+    items: &[HclItem<'_>],
+    keys: &[&str],
+    max_len: usize,
+    bounds: &Range<usize>,
+) -> Option<(usize, usize)> {
+    keys.iter()
+        .find_map(|k| hcl_find_attr(items, k))
+        .and_then(|a| hcl_single_line_attr_sig(text, a, max_len, bounds))
+}
+
+fn hcl_variable_sig(
+    text: &str,
+    items: &[HclItem<'_>],
+    bounds: &Range<usize>,
+) -> Option<(usize, usize)> {
+    for pair in items.windows(2) {
+        if let [HclItem::Attr(a), HclItem::Attr(b)] = pair
+            && matches!((a.name, b.name), ("type", "default") | ("default", "type"))
+            && hcl_single_line_attr_sig(text, a, 80, bounds).is_some()
+            && hcl_single_line_attr_sig(text, b, 80, bounds).is_some()
+            && b.val_end - a.start <= 100
+        {
+            let span = &text[a.start..b.val_end];
+            if !span.contains('#') && !span.contains("//") && !span.contains("/*") {
+                return Some((a.start, b.val_end));
+            }
+        }
+    }
+    hcl_first_attr_sig(text, items, &["type", "default", "description"], 90, bounds)
+}
+
+fn hcl_simple_quoted_value<'a>(text: &'a str, attr: &HclAttr<'_>) -> Option<&'a str> {
+    let raw = text[attr.val_start..attr.val_end].trim();
+    let inner = raw.strip_prefix('"')?.strip_suffix('"')?;
+    if !inner.is_empty()
+        && !inner.contains("${")
+        && !inner.contains('\n')
+        && !inner.chars().any(char::is_whitespace)
+    {
+        Some(inner)
+    } else {
+        None
+    }
+}
+
+fn hcl_single_line_value<'a>(text: &'a str, attr: &HclAttr<'_>) -> Option<&'a str> {
+    let raw = text[attr.val_start..attr.val_end].trim();
+    if !raw.is_empty() && !raw.contains('\n') {
+        Some(raw)
+    } else {
+        None
+    }
+}
+
+fn hcl_join_labels(prefix: &str, labels: &[&str]) -> String {
+    let mut out = String::from(prefix);
+    for label in labels {
+        if !label.is_empty() {
+            if !out.is_empty() {
+                out.push('.');
+            }
+            out.push_str(label);
+        }
+    }
+    if out.is_empty() {
+        "block".to_owned()
+    } else {
+        out
+    }
+}
+
+fn emit_hcl_attr(
+    text: &str,
+    line_starts: &[usize],
+    attr: &HclAttr<'_>,
+    name: String,
+    kind: &'static str,
+    out: &mut Vec<Section>,
+) {
+    let bytes = whole_line_or_exact(text, line_starts, attr.start, attr.end);
+    let (sig_start, header_end) = if attr.val_end > attr.val_start
+        && attr.val_end - attr.val_start <= 80
+        && !text[attr.val_start..attr.val_end].contains('\n')
+        && attr.val_start >= bytes.start
+        && attr.val_end <= bytes.end
+    {
+        (attr.val_start, attr.val_end)
+    } else {
+        (attr.start, attr.start)
+    };
+    out.push(Section {
+        name: clip_label(&name, 96),
+        kind,
+        bytes,
+        signature_start: sig_start,
+        header_end,
+    });
+}
+
+fn emit_hcl_block(
+    scan: &HclScan<'_>,
+    line_starts: &[usize],
+    block: &HclBlock<'_>,
+    out: &mut Vec<Section>,
+) {
+    let text = scan.src;
+    let bytes = whole_line_or_exact(text, line_starts, block.start, block.end);
+    let inner = parse_hcl_body(scan, block.open_brace + 1, block.end - 1).unwrap_or_default();
+
+    let (kind, name, sig): (&'static str, String, Option<(usize, usize)>) = match block.kind {
+        "resource" => {
+            let name = if block.labels.len() >= 2
+                && !block.labels[0].is_empty()
+                && !block.labels[1].is_empty()
+            {
+                format!("{}.{}", block.labels[0], block.labels[1])
+            } else {
+                hcl_join_labels("resource", &block.labels)
+            };
+            let sig = hcl_first_attr_sig(
+                text,
+                &inner,
+                &["for_each", "count", "depends_on"],
+                90,
+                &bytes,
+            );
+            ("resource", name, sig)
+        }
+        "data" => (
+            "data",
+            hcl_join_labels("data", &block.labels),
+            hcl_first_attr_sig(
+                text,
+                &inner,
+                &["for_each", "count", "depends_on"],
+                90,
+                &bytes,
+            ),
+        ),
+        "ephemeral" => (
+            "ephemeral",
+            hcl_join_labels("ephemeral", &block.labels),
+            hcl_first_attr_sig(
+                text,
+                &inner,
+                &["for_each", "count", "depends_on"],
+                90,
+                &bytes,
+            ),
+        ),
+        "module" => (
+            "module",
+            hcl_join_labels("module", &block.labels),
+            hcl_first_attr_sig(text, &inner, &["source", "for_each", "count"], 100, &bytes),
+        ),
+        "variable" => (
+            "variable",
+            hcl_join_labels("var", &block.labels),
+            hcl_variable_sig(text, &inner, &bytes),
+        ),
+        "output" => (
+            "output",
+            hcl_join_labels("output", &block.labels),
+            hcl_first_attr_sig(
+                text,
+                &inner,
+                &["value", "description", "sensitive"],
+                80,
+                &bytes,
+            ),
+        ),
+        "provider" => {
+            let alias_attr = hcl_find_attr(&inner, "alias");
+            let mut name = hcl_join_labels("provider", &block.labels);
+            if let Some(alias) = alias_attr.and_then(|a| hcl_simple_quoted_value(text, a)) {
+                name.push('.');
+                name.push_str(alias);
+            }
+            let sig = hcl_first_attr_sig(text, &inner, &["alias", "version", "region"], 90, &bytes);
+            ("provider", name, sig)
+        }
+        "terraform" => {
+            let sig =
+                hcl_first_attr_sig(text, &inner, &["source", "required_version"], 100, &bytes)
+                    .or_else(|| {
+                        inner.iter().find_map(|item| match item {
+                            HclItem::Block(b)
+                                if matches!(b.kind, "backend" | "cloud")
+                                    && b.start >= bytes.start
+                                    && b.open_brace <= bytes.end =>
+                            {
+                                let end = b.start
+                                    + text[b.start..b.open_brace]
+                                        .trim_end_matches([' ', '\t'])
+                                        .len();
+                                (end > b.start && !text[b.start..end].contains('\n'))
+                                    .then_some((b.start, end))
+                            }
+                            _ => None,
+                        })
+                    });
+            ("terraform", "terraform".to_owned(), sig)
+        }
+        "locals" => {
+            let attrs: Vec<&HclAttr<'_>> = inner
+                .iter()
+                .filter_map(|item| match item {
+                    HclItem::Attr(a) => Some(a),
+                    _ => None,
+                })
+                .collect();
+            let sig = if attrs.len() == 1 {
+                hcl_single_line_attr_sig(text, attrs[0], 90, &bytes)
+            } else {
+                None
+            };
+            let (sig_start, header_end) = sig.unwrap_or((block.start, block.start));
+            out.push(Section {
+                name: "locals".to_owned(),
+                kind: "locals",
+                bytes,
+                signature_start: sig_start,
+                header_end,
+            });
+            if attrs.len() >= 2 {
+                for attr in attrs.into_iter().take(256) {
+                    emit_hcl_attr(
+                        text,
+                        line_starts,
+                        attr,
+                        format!("local.{}", attr.name),
+                        "local",
+                        out,
+                    );
+                }
+            }
+            return;
+        }
+        "moved" => {
+            let from = hcl_find_attr(&inner, "from").and_then(|a| hcl_single_line_value(text, a));
+            let to = hcl_find_attr(&inner, "to").and_then(|a| hcl_single_line_value(text, a));
+            let name = match (from, to) {
+                (Some(f), Some(t)) => format!("{f} -> {t}"),
+                (None, Some(t)) => t.to_owned(),
+                (Some(f), None) => f.to_owned(),
+                (None, None) => "moved".to_owned(),
+            };
+            ("moved", name, None)
+        }
+        "import" => {
+            let name = hcl_find_attr(&inner, "to")
+                .and_then(|a| hcl_single_line_value(text, a))
+                .unwrap_or("import")
+                .to_owned();
+            let sig = hcl_first_attr_sig(text, &inner, &["id"], 90, &bytes);
+            ("import", name, sig)
+        }
+        "removed" => {
+            let name = hcl_find_attr(&inner, "from")
+                .and_then(|a| hcl_single_line_value(text, a))
+                .unwrap_or("removed")
+                .to_owned();
+            ("removed", name, None)
+        }
+        "check" => ("check", hcl_join_labels("check", &block.labels), None),
+        "include" => (
+            "include",
+            hcl_join_labels("include", &block.labels),
+            hcl_first_attr_sig(text, &inner, &["path"], 90, &bytes),
+        ),
+        "dependency" => (
+            "dependency",
+            hcl_join_labels("dependency", &block.labels),
+            hcl_first_attr_sig(text, &inner, &["config_path"], 90, &bytes),
+        ),
+        "dependencies" => (
+            "dependencies",
+            "dependencies".to_owned(),
+            hcl_first_attr_sig(text, &inner, &["paths"], 90, &bytes),
+        ),
+        "generate" => (
+            "generate",
+            hcl_join_labels("generate", &block.labels),
+            hcl_first_attr_sig(text, &inner, &["path"], 90, &bytes),
+        ),
+        "remote_state" => (
+            "remote_state",
+            "remote_state".to_owned(),
+            hcl_first_attr_sig(text, &inner, &["backend"], 90, &bytes),
+        ),
+        other => ("block", hcl_join_labels(other, &block.labels), None),
+    };
+
+    let (sig_start, header_end) = sig.unwrap_or((block.start, block.start));
+    out.push(Section {
+        name: clip_label(&name, 96),
+        kind,
+        bytes,
+        signature_start: sig_start,
+        header_end,
+    });
+}
+
+fn hcl_sections(text: &str, line_starts: &[usize], is_tfvars: bool) -> Vec<Section> {
+    if line_starts.len() < 2 {
+        return Vec::new();
+    }
+    let Some(scan) = HclScan::parse(text) else {
+        return Vec::new();
+    };
+    let start = if text.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    };
+    let Some(items) = parse_hcl_body(&scan, start, text.len()) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for item in &items {
+        match item {
+            HclItem::Block(block) => {
+                if is_tfvars {
+                    return Vec::new();
+                }
+                emit_hcl_block(&scan, line_starts, block, &mut out);
+            }
+            HclItem::Attr(attr) => {
+                let kind = if is_tfvars { "var" } else { "attr" };
+                emit_hcl_attr(
+                    text,
+                    line_starts,
+                    attr,
+                    attr.name.to_owned(),
+                    kind,
+                    &mut out,
+                );
+            }
+        }
+    }
+    if out.len() < 2 {
+        return Vec::new();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6342,5 +7120,355 @@ mod tests {
             "{h_page}"
         );
         assert!(h_page.contains("listen stats  bind *:8404\n"), "{h_page}");
+    }
+
+    #[test]
+    fn hcl_terraform_outlines_blocks_heredocs_interpolations_and_exact_spans() {
+        let tf = concat!(
+            "# Top comment with { unbalanced brace\n",
+            "// Line comment with \"unclosed quote\n",
+            "/* Block comment with /* fake <<EOF */\n",
+            "terraform {\n",
+            "  required_version = \">= 1.6.0\"\n",
+            "  backend \"s3\" {\n",
+            "    bucket = \"tf-state-prod\"\n",
+            "    key    = \"core/terraform.tfstate\"\n",
+            "  }\n",
+            "}\n\n",
+            "provider \"aws\" {\n",
+            "  region = var.region\n",
+            "}\n\n",
+            "provider \"aws\" {\n",
+            "  alias  = \"west\"\n",
+            "  region = \"us-west-2\"\n",
+            "}\n\n",
+            "variable \"region\" {\n",
+            "  type    = string\n",
+            "  default = \"us-east-1\"\n",
+            "}\n\n",
+            "locals {\n",
+            "  env         = \"prod\"\n",
+            "  bucket_name = \"${var.prefix}-${lookup(var.names, \"logs\", \"default\")}-$${escaped}\"\n",
+            "  policy_json = <<-EOF\n",
+            "    {\n",
+            "      \"Version\": \"2012-10-17\",\n",
+            "      \"Statement\": [{ \"Effect\": \"Allow\", \"Resource\": \"${var.arn}/*\" }]\n",
+            "    }\n",
+            "  EOF\n",
+            "}\n\n",
+            "data \"aws_iam_policy_document\" \"read\" {\n",
+            "  statement {\n",
+            "    actions   = [\"s3:GetObject\"]\n",
+            "    resources = [\"arn:aws:s3:::logs/*\"]\n",
+            "  }\n",
+            "}\n\n",
+            "module \"vpc\" {\n",
+            "  source  = \"terraform-aws-modules/vpc/aws\"\n",
+            "  version = \"5.13.0\"\n",
+            "  cidr    = \"10.0.0.0/16\"\n",
+            "  azs     = [\"us-east-1a\", \"us-east-1b\"]\n",
+            "}\n\n",
+            "resource \"aws_s3_bucket\" \"logs\" {\n",
+            "  for_each = toset(var.buckets)\n",
+            "  bucket   = \"${local.bucket_name}-${each.key}\"\n",
+            "  tags = {\n",
+            "    Env = local.env\n",
+            "  }\n",
+            "}\n\n",
+            "output \"bucket_arn\" {\n",
+            "  value = aws_s3_bucket.logs[\"main\"].arn\n",
+            "}\n\n",
+            "moved {\n",
+            "  from = aws_s3_bucket.old\n",
+            "  to   = aws_s3_bucket.logs\n",
+            "}\n\n",
+            "import {\n",
+            "  to = aws_s3_bucket.logs\n",
+            "  id = \"prod-logs-bucket\"\n",
+            "}\n\n",
+            "removed {\n",
+            "  from = aws_s3_bucket.legacy\n",
+            "  lifecycle {\n",
+            "    destroy = false\n",
+            "  }\n",
+            "}\n\n",
+            "check \"health\" {\n",
+            "  assert {\n",
+            "    condition     = var.region != \"\"\n",
+            "    error_message = \"region required\"\n",
+            "  }\n",
+            "}\n",
+        );
+
+        for file in ["infra/main.tf", "infra/main.tofu"] {
+            let found = sections(file, tf, &line_starts(tf));
+            assert_section_invariants(tf, &found);
+            let names: Vec<_> = found.iter().map(|s| (s.kind, s.name.as_str())).collect();
+            assert_eq!(
+                names,
+                [
+                    ("terraform", "terraform"),
+                    ("provider", "provider.aws"),
+                    ("provider", "provider.aws.west"),
+                    ("variable", "var.region"),
+                    ("locals", "locals"),
+                    ("local", "local.env"),
+                    ("local", "local.bucket_name"),
+                    ("local", "local.policy_json"),
+                    ("data", "data.aws_iam_policy_document.read"),
+                    ("module", "module.vpc"),
+                    ("resource", "aws_s3_bucket.logs"),
+                    ("output", "output.bucket_arn"),
+                    ("moved", "aws_s3_bucket.old -> aws_s3_bucket.logs"),
+                    ("import", "aws_s3_bucket.logs"),
+                    ("removed", "aws_s3_bucket.legacy"),
+                    ("check", "check.health"),
+                ],
+                "{file}"
+            );
+            assert_eq!(
+                &tf[found[9].bytes.clone()],
+                concat!(
+                    "module \"vpc\" {\n",
+                    "  source  = \"terraform-aws-modules/vpc/aws\"\n",
+                    "  version = \"5.13.0\"\n",
+                    "  cidr    = \"10.0.0.0/16\"\n",
+                    "  azs     = [\"us-east-1a\", \"us-east-1b\"]\n",
+                    "}\n",
+                )
+            );
+            assert!(tf[found[7].bytes.clone()].contains("\"Version\": \"2012-10-17\""));
+            assert!(tf[found[7].bytes.clone()].ends_with("  EOF\n"));
+            assert_eq!(
+                compact_ws(&tf[found[2].signature_start..found[2].header_end]),
+                "alias = \"west\""
+            );
+            assert_eq!(
+                compact_ws(&tf[found[3].signature_start..found[3].header_end]),
+                "type = string default = \"us-east-1\""
+            );
+            assert_eq!(
+                compact_ws(&tf[found[9].signature_start..found[9].header_end]),
+                "source = \"terraform-aws-modules/vpc/aws\""
+            );
+            assert_eq!(
+                compact_ws(&tf[found[10].signature_start..found[10].header_end]),
+                "for_each = toset(var.buckets)"
+            );
+        }
+
+        // Measure realistic byte reduction of HCL outlining vs raw `.tf` source.
+        let mut large_tf = String::new();
+        for i in 0..8 {
+            large_tf.push_str(&format!(
+                concat!(
+                    "resource \"aws_s3_bucket\" \"bucket_{i}\" {{\n",
+                    "  for_each = toset(var.envs)\n",
+                    "  bucket   = \"acme-logs-{i}-${{each.key}}\"\n",
+                    "  tags = {{\n",
+                    "    Service     = \"billing-{i}\"\n",
+                    "    Environment = each.key\n",
+                    "    ManagedBy   = \"terraform\"\n",
+                    "    CostCenter  = \"eng-platform-{i}\"\n",
+                    "  }}\n",
+                    "}}\n\n",
+                ),
+                i = i
+            ));
+        }
+        let large_lines = line_starts(&large_tf);
+        let large_found = sections("infra/storage.tf", &large_tf, &large_lines);
+        assert_section_invariants(&large_tf, &large_found);
+        assert_eq!(large_found.len(), 8);
+        let outline_bytes: usize = large_found
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| {
+                let first = line_of(&large_lines, s.bytes.start) + 1;
+                let last = line_of(&large_lines, s.bytes.end.saturating_sub(1)) + 1;
+                let sig = compact_ws(&large_tf[s.signature_start..s.header_end]);
+                format!(
+                    "#{} L{first}-{last} {} {}  {sig}\n",
+                    idx + 1,
+                    s.kind,
+                    s.name
+                )
+                .len()
+            })
+            .sum();
+        assert!(
+            outline_bytes * 2 < large_tf.len(),
+            "expected >50% HCL outline reduction: {outline_bytes} vs {}",
+            large_tf.len()
+        );
+
+        // `.terraform.lock.hcl` outlines its provider blocks cleanly.
+        let lock = concat!(
+            "provider \"registry.terraform.io/hashicorp/aws\" {\n",
+            "  version     = \"5.70.0\"\n",
+            "  constraints = \"~> 5.0\"\n",
+            "  hashes      = [\"h1:abc=\"]\n",
+            "}\n\n",
+            "provider \"registry.terraform.io/hashicorp/random\" {\n",
+            "  version = \"3.6.3\"\n",
+            "  hashes  = [\"h1:def=\"]\n",
+            "}\n",
+        );
+        let lock_found = sections(".terraform.lock.hcl", lock, &line_starts(lock));
+        assert_section_invariants(lock, &lock_found);
+        assert_eq!(
+            lock_found
+                .iter()
+                .map(|s| (s.kind, s.name.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("provider", "provider.registry.terraform.io/hashicorp/aws"),
+                (
+                    "provider",
+                    "provider.registry.terraform.io/hashicorp/random"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn hcl_terragrunt_tfvars_and_fail_closed_cases() {
+        let tg = concat!(
+            "include \"root\" {\n",
+            "  path = find_in_parent_folders()\n",
+            "}\n\n",
+            "terraform {\n",
+            "  source = \"git::https://example.com/modules.git//vpc?ref=v1.2.0\"\n",
+            "}\n\n",
+            "remote_state {\n",
+            "  backend = \"s3\"\n",
+            "  config = {\n",
+            "    bucket = \"org-tfstate\"\n",
+            "    region = \"us-east-1\"\n",
+            "  }\n",
+            "}\n\n",
+            "generate \"provider\" {\n",
+            "  path      = \"provider.tf\"\n",
+            "  if_exists = \"overwrite_terragrunt\"\n",
+            "  contents  = <<EOF\n",
+            "provider \"aws\" {\n",
+            "  region = \"us-east-1\"\n",
+            "}\n",
+            "EOF\n",
+            "}\n\n",
+            "dependency \"vpc\" {\n",
+            "  config_path = \"../vpc\"\n",
+            "}\n\n",
+            "inputs = {\n",
+            "  vpc_id = dependency.vpc.outputs.vpc_id\n",
+            "  env    = \"prod\"\n",
+            "}\n",
+        );
+        let tg_found = sections("envs/prod/app/terragrunt.hcl", tg, &line_starts(tg));
+        assert_section_invariants(tg, &tg_found);
+        assert_eq!(
+            tg_found
+                .iter()
+                .map(|s| (s.kind, s.name.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("include", "include.root"),
+                ("terraform", "terraform"),
+                ("remote_state", "remote_state"),
+                ("generate", "generate.provider"),
+                ("dependency", "dependency.vpc"),
+                ("attr", "inputs"),
+            ]
+        );
+        assert_eq!(
+            &tg[tg_found[5].bytes.clone()],
+            "inputs = {\n  vpc_id = dependency.vpc.outputs.vpc_id\n  env    = \"prod\"\n}\n"
+        );
+        assert_eq!(
+            compact_ws(&tg[tg_found[2].signature_start..tg_found[2].header_end]),
+            "backend = \"s3\""
+        );
+        assert_eq!(
+            compact_ws(&tg[tg_found[4].signature_start..tg_found[4].header_end]),
+            "config_path = \"../vpc\""
+        );
+
+        let tfvars = concat!(
+            "# Production variables\n",
+            "region      = \"us-east-1\"\n",
+            "multi_az    = true\n",
+            "subnet_ids  = [\n",
+            "  \"subnet-1\",\n",
+            "  \"subnet-2\",\n",
+            "]\n",
+            "tags = {\n",
+            "  Env  = \"prod\"\n",
+            "  Team = \"platform\"\n",
+            "}\n",
+            "user_data = <<EOF\n",
+            "#!/bin/bash\n",
+            "echo \"{not hcl}\"\n",
+            "EOF\n",
+        );
+        let var_found = sections("prod.auto.tfvars", tfvars, &line_starts(tfvars));
+        assert_section_invariants(tfvars, &var_found);
+        assert_eq!(
+            var_found
+                .iter()
+                .map(|s| (s.kind, s.name.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("var", "region"),
+                ("var", "multi_az"),
+                ("var", "subnet_ids"),
+                ("var", "tags"),
+                ("var", "user_data"),
+            ]
+        );
+        assert_eq!(
+            &tfvars[var_found[4].bytes.clone()],
+            "user_data = <<EOF\n#!/bin/bash\necho \"{not hcl}\"\nEOF\n"
+        );
+        // End-to-end Snapshot fallback: `.tfvars` has no Tree-sitter blocks, so
+        // `Snapshot::index` routes straight into `config_outline::hcl_sections`.
+        let mut var_snap =
+            crate::source::Snapshot::from_text("prod.auto.tfvars", tfvars.to_owned());
+        var_snap.index("prod.auto.tfvars").unwrap();
+        let var_page = var_snap.page("", None, 40, 4096).unwrap().display();
+        assert!(
+            var_page.contains("var region  \"us-east-1\"\n"),
+            "{var_page}"
+        );
+        assert!(var_page.contains("var user_data\n"), "{var_page}");
+
+        // Fail closed on unbalanced braces, unclosed strings/interpolations/heredocs/comments,
+        // or malformed syntax.
+        for (file, broken) in [
+            (
+                "main.tf",
+                "resource \"a\" \"b\" {\n  x = 1\nresource \"c\" \"d\" {}\n",
+            ),
+            ("main.tf", "resource \"a\" \"b\" {}\n}\n"),
+            (
+                "main.tf",
+                "variable \"a\" {\n  default = \"unclosed\n}\nvariable \"b\" {}\n",
+            ),
+            ("main.tf", "locals {\n  a = \"${var.x\"\n  b = 2\n}\n"),
+            (
+                "main.tf",
+                "locals {\n  a = <<EOF\n  never closed\n}\nvariable \"b\" {}\n",
+            ),
+            (
+                "main.tf",
+                "locals {\n  a = <<-EOF\n  never closed\n}\nvariable \"b\" {}\n",
+            ),
+            ("main.tf", "/* unclosed comment\nvariable \"a\" {}\n"),
+            ("prod.tfvars", "resource \"a\" \"b\" {}\na = 1\n"),
+        ] {
+            assert!(
+                sections(file, broken, &line_starts(broken)).is_empty(),
+                "expected fail-closed for {file}: {broken:?}"
+            );
+        }
     }
 }
