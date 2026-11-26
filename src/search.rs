@@ -16,8 +16,10 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
@@ -36,7 +38,7 @@ const MAX_LOC_STR_BYTES: usize = 72;
 const INLINE_KEY_BYTES: usize = 512;
 const INTRA_FOLD_MIN: usize = 3;
 const CROSS_DEDUP_MIN_FILES: usize = 3;
-const CROSS_DEDUP_MIN_LEN: usize = 20;
+const CROSS_DEDUP_MIN_LEN: usize = 10;
 const MAX_FILES: usize = 50_000;
 const MAX_CHECKS: usize = 200_000;
 /// Groups kept in a run record for rerun comparisons.
@@ -230,7 +232,10 @@ impl Parsed<'_> {
 /// Parse options against a spec, including short clusters such as `-rnI` and `-A3`.
 pub(crate) fn parse<'a>(args: &[&'a str], spec: &Spec) -> Option<Parsed<'a>> {
     let known = |name: &str, list: &'static str| list.split_whitespace().find(|f| *f == name);
-    let mut parsed = Parsed::default();
+    let mut parsed = Parsed {
+        seen: Vec::with_capacity(args.len()),
+        positional: Vec::with_capacity(args.len().min(4)),
+    };
     let mut args = args.iter().copied();
     while let Some(arg) = args.next() {
         if arg == "--" {
@@ -254,15 +259,18 @@ pub(crate) fn parse<'a>(args: &[&'a str], spec: &Spec) -> Option<Parsed<'a>> {
             }
         } else if arg.len() > 1 && arg.starts_with('-') {
             let body = &arg[1..];
+            let mut buf = [0u8; 5];
+            buf[0] = b'-';
             for (i, c) in body.char_indices() {
-                let flag = format!("-{c}");
-                if let Some(flag) = known(&flag, spec.valued) {
+                let n = c.encode_utf8(&mut buf[1..]).len();
+                let flag = std::str::from_utf8(&buf[..1 + n]).ok()?;
+                if let Some(flag) = known(flag, spec.valued) {
                     let rest = &body[i + c.len_utf8()..];
                     let value = if rest.is_empty() { args.next()? } else { rest };
                     parsed.seen.push((flag, Some(value)));
                     break;
                 }
-                parsed.seen.push((known(&flag, spec.flags)?, None));
+                parsed.seen.push((known(flag, spec.flags)?, None));
             }
         } else {
             parsed.positional.push(arg);
@@ -546,9 +554,178 @@ struct LineMode {
     only_matching: bool,
 }
 
+/// Strip ANSI CSI escape sequences (`\x1b\[[0-?]*[ -/]*[@-~]`) with a
+/// zero-allocation fast path when no ESC byte is present.
+fn strip_ansi_fast(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let Some(first_esc) = bytes.iter().position(|&b| b == 0x1b) else {
+        return Cow::Borrowed(text);
+    };
+    let mut out = String::new();
+    let mut copy_start = 0usize;
+    let mut i = first_esc;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'[') {
+            let mut j = i + 2;
+            while j < bytes.len() && (0x30..=0x3f).contains(&bytes[j]) {
+                j += 1;
+            }
+            while j < bytes.len() && (0x20..=0x2f).contains(&bytes[j]) {
+                j += 1;
+            }
+            if j < bytes.len() && (0x40..=0x7e).contains(&bytes[j]) {
+                if out.is_empty() {
+                    out.reserve(text.len());
+                }
+                out.push_str(&text[copy_start..i]);
+                i = j + 1;
+                copy_start = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if copy_start == 0 {
+        return Cow::Borrowed(text);
+    }
+    out.push_str(&text[copy_start..]);
+    Cow::Owned(out)
+}
+
+/// Collapse runs of unquoted ASCII horizontal whitespace (`' '` / `'\t'`) into a single
+/// space, keeping string literals verbatim and borrowing with zero allocation on the
+/// fast path when no tabs or consecutive spaces occur.
+fn normalize_ws(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let mut prev_space = false;
+    let mut needs_norm = false;
+    for &b in bytes {
+        if b == b'\t' || (b == b' ' && prev_space) {
+            needs_norm = true;
+            break;
+        }
+        prev_space = b == b' ';
+    }
+    if !needs_norm {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::new();
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut copy_start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == q {
+                quote = None;
+            }
+            i += 1;
+        } else if b == b' ' || b == b'\t' {
+            let ws_start = i;
+            while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                i += 1;
+            }
+            if i - ws_start > 1 || b == b'\t' {
+                if out.is_empty() {
+                    out.reserve(text.len());
+                }
+                out.push_str(&text[copy_start..ws_start]);
+                out.push(' ');
+                copy_start = i;
+            }
+        } else {
+            if b == b'"' || b == b'`' {
+                quote = Some(b);
+            } else if b == b'\'' {
+                let apostrophe =
+                    i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                let lifetime = i > 0
+                    && matches!(bytes[i - 1], b'<' | b'&')
+                    && bytes.get(i + 2) != Some(&b'\'');
+                if !apostrophe && !lifetime {
+                    quote = Some(b);
+                }
+            }
+            i += 1;
+        }
+    }
+    if copy_start == 0 {
+        return Cow::Borrowed(text);
+    }
+    out.push_str(&text[copy_start..]);
+    Cow::Owned(out)
+}
+
+/// Zero-allocation ASCII case-insensitive substring search (`needle_lower` must be
+/// ASCII-lowercased).
+fn find_ascii_ci(haystack: &str, needle_lower: &str) -> Option<usize> {
+    let n = needle_lower.as_bytes();
+    let h = haystack.as_bytes();
+    if n.is_empty() {
+        return Some(0);
+    }
+    if n.len() > h.len() {
+        return None;
+    }
+    let first = n[0];
+    let first_alt = if first.is_ascii_lowercase() {
+        first.to_ascii_uppercase()
+    } else {
+        first
+    };
+    let tail = &n[1..];
+    let limit = h.len() - n.len();
+    let mut i = 0;
+    while i <= limit {
+        let b = h[i];
+        if (b == first || b == first_alt)
+            && h[i + 1..i + n.len()]
+                .iter()
+                .zip(tail)
+                .all(|(hb, &nb)| hb.to_ascii_lowercase() == nb)
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+struct PatternSpec {
+    pattern: String,
+    fixed: bool,
+    ignore_case: bool,
+    smart_case: bool,
+    word: bool,
+}
+
+enum CompiledPattern {
+    Literal(String),
+    AsciiLiteralCi(String),
+    Regex(Regex),
+}
+
+impl CompiledPattern {
+    fn find(&self, haystack: &str) -> Option<(usize, usize)> {
+        match self {
+            Self::Literal(lit) => haystack.find(lit.as_str()).map(|s| (s, s + lit.len())),
+            Self::AsciiLiteralCi(lit) => {
+                find_ascii_ci(haystack, lit.as_str()).map(|s| (s, s + lit.len()))
+            }
+            Self::Regex(re) => re.find(haystack).map(|m| (m.start(), m.end())),
+        }
+    }
+}
+
 #[derive(Default)]
 struct PatternMatcher {
-    regexes: Vec<Regex>,
+    pending: Vec<PatternSpec>,
+    compiled: Vec<CompiledPattern>,
 }
 
 impl PatternMatcher {
@@ -583,39 +760,83 @@ impl PatternMatcher {
     }
 
     fn add(&mut self, pattern: &str, fixed: bool, ignore_case: bool, smart_case: bool, word: bool) {
-        if self.regexes.len() >= 16 {
+        if self.pending.len() + self.compiled.len() >= 16
+            || pattern.is_empty()
+            || pattern.len() > 2048
+        {
             return;
         }
-        if let Some(re) = compile_pattern(pattern, fixed, ignore_case, smart_case, word) {
-            self.regexes.push(re);
+        self.pending.push(PatternSpec {
+            pattern: pattern.to_owned(),
+            fixed,
+            ignore_case,
+            smart_case,
+            word,
+        });
+    }
+
+    fn ensure_compiled(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        for spec in self.pending.drain(..) {
+            if let Some(compiled) = compile_pattern(
+                &spec.pattern,
+                spec.fixed,
+                spec.ignore_case,
+                spec.smart_case,
+                spec.word,
+            ) {
+                self.compiled.push(compiled);
+            }
         }
     }
 
     /// The earliest match span `(start, end)` in `haystack`, optionally preferring
     /// a match at or after `from_byte`.
-    fn find(&self, haystack: &str, from_byte: Option<usize>) -> Option<(usize, usize)> {
-        if self.regexes.is_empty() {
+    fn find(&mut self, haystack: &str, from_byte: Option<usize>) -> Option<(usize, usize)> {
+        self.ensure_compiled();
+        if self.compiled.is_empty() {
             return None;
         }
         if let Some(at) = from_byte {
             let at = haystack.floor_char_boundary(at.min(haystack.len()));
             let after = self
-                .regexes
+                .compiled
                 .iter()
-                .filter_map(|re| {
-                    re.find(&haystack[at..])
-                        .map(|m| (at + m.start(), at + m.end()))
-                })
+                .filter_map(|pat| pat.find(&haystack[at..]).map(|(s, e)| (at + s, at + e)))
                 .min_by_key(|&(s, _)| s);
             if after.is_some() {
                 return after;
             }
         }
-        self.regexes
+        self.compiled
             .iter()
-            .filter_map(|re| re.find(haystack).map(|m| (m.start(), m.end())))
+            .filter_map(|pat| pat.find(haystack))
             .min_by_key(|&(s, _)| s)
     }
+}
+
+fn is_plain_literal(pattern: &str) -> bool {
+    !pattern.bytes().any(|b| {
+        matches!(
+            b,
+            b'\\'
+                | b'.'
+                | b'+'
+                | b'*'
+                | b'?'
+                | b'('
+                | b')'
+                | b'|'
+                | b'['
+                | b']'
+                | b'{'
+                | b'}'
+                | b'^'
+                | b'$'
+        )
+    })
 }
 
 fn compile_pattern(
@@ -624,11 +845,21 @@ fn compile_pattern(
     ignore_case: bool,
     smart_case: bool,
     word: bool,
-) -> Option<Regex> {
+) -> Option<CompiledPattern> {
     if pattern.is_empty() || pattern.len() > 2048 {
         return None;
     }
     let ci = ignore_case || (smart_case && !pattern.chars().any(char::is_uppercase));
+    if !word && (fixed || is_plain_literal(pattern)) {
+        if !ci {
+            return Some(CompiledPattern::Literal(pattern.to_owned()));
+        }
+        if pattern.is_ascii() {
+            return Some(CompiledPattern::AsciiLiteralCi(
+                pattern.to_ascii_lowercase(),
+            ));
+        }
+    }
     let build = |expr: &str| {
         RegexBuilder::new(expr)
             .case_insensitive(ci)
@@ -636,6 +867,7 @@ fn compile_pattern(
             .dfa_size_limit(64 * 1024)
             .build()
             .ok()
+            .map(CompiledPattern::Regex)
     };
     let wrap = |expr: String| {
         if word {
@@ -695,20 +927,55 @@ struct MatchSlot {
     raw_exact: Option<String>,
     raw_sha: Option<[u8; 32]>,
     count: usize,
-    /// Up to 2 exact original occurrences: `(seq, display_line, stdout_line, clipped)`.
-    samples: Vec<(usize, String, usize, bool)>,
-    /// File line locations for collapsed `L12,18,25: <body>` rendering (`count >= 3`).
-    locs: Vec<Loc>,
+    /// Up to 2 exact original occurrences stored inline: `(seq, display_line, stdout_line, clipped)`.
+    samples: [Option<(usize, String, usize, bool)>; 2],
+    samples_len: u8,
+    /// First file line location inline to avoid `Vec` allocation on single-hit / contiguous slots.
+    first_loc: Option<Loc>,
+    extra_locs: Vec<Loc>,
     last_line: Option<usize>,
     numbered: bool,
-    /// Trimmed (and windowed if long) body text used when `count >= INTRA_FOLD_MIN`.
-    folded_body: String,
+    /// Whether `raw_exact` was stored with a leading line-number prefix stripped.
+    prefix_stripped: bool,
+    /// Lazily populated windowed body for clipped (`> LINE_BYTES`) lines when folded.
+    folded_body: Option<String>,
+    first_col: Option<usize>,
     first_stdout: usize,
     first_seq: usize,
     clipped: bool,
 }
 
 impl MatchSlot {
+    fn first_sample(&self) -> Option<&(usize, String, usize, bool)> {
+        self.samples[0].as_ref()
+    }
+
+    fn samples(&self) -> impl Iterator<Item = &(usize, String, usize, bool)> {
+        self.samples[..usize::from(self.samples_len)]
+            .iter()
+            .flatten()
+    }
+
+    fn push_sample(&mut self, sample: (usize, String, usize, bool)) {
+        let idx = usize::from(self.samples_len);
+        if idx < self.samples.len() {
+            self.samples[idx] = Some(sample);
+            self.samples_len += 1;
+        }
+    }
+
+    fn clear_locs(&mut self) {
+        self.first_loc = None;
+        self.extra_locs.clear();
+    }
+
+    fn folded_body(&self) -> &str {
+        self.folded_body
+            .as_deref()
+            .or(self.raw_exact.as_deref())
+            .unwrap_or("")
+    }
+
     fn matches_raw(&self, hash: u64, raw: &str) -> bool {
         if self.hash != hash || self.raw_len != raw.len() {
             return false;
@@ -740,50 +1007,61 @@ impl MatchSlot {
             return;
         }
         self.last_line = Some(line);
+        let loc_count = usize::from(self.first_loc.is_some()) + self.extra_locs.len();
         if let Some(c) = col {
-            if self.locs.len() < MAX_FOLDED_RANGES {
-                self.locs.push(Loc::LineCol(line, c));
+            if loc_count < MAX_FOLDED_RANGES {
+                if self.first_loc.is_none() {
+                    self.first_loc = Some(Loc::LineCol(line, c));
+                } else {
+                    self.extra_locs.push(Loc::LineCol(line, c));
+                }
             }
             return;
         }
-        if let Some(Loc::Range(_, end)) = self.locs.last_mut()
+        if let Some(Loc::Range(_, end)) = self.extra_locs.last_mut().or(self.first_loc.as_mut())
             && *end + 1 == line
         {
             *end = line;
             return;
         }
-        if self.locs.len() < MAX_FOLDED_RANGES {
-            self.locs.push(Loc::Range(line, line));
+        if loc_count < MAX_FOLDED_RANGES {
+            if self.first_loc.is_none() {
+                self.first_loc = Some(Loc::Range(line, line));
+            } else {
+                self.extra_locs.push(Loc::Range(line, line));
+            }
         }
     }
 
-    fn format_folded(&self, pointers: bool) -> String {
-        let mut line = if self.numbered && !self.locs.is_empty() {
-            let locs = format_locs(&self.locs, self.count);
-            if self.folded_body.is_empty() {
-                format!("L{locs}:")
+    fn write_folded(&self, out: &mut String, pointers: bool) {
+        if self.numbered && self.first_loc.is_some() {
+            out.push('L');
+            write_locs(out, self.first_loc, &self.extra_locs, self.count);
+            let body = self.folded_body();
+            if body.is_empty() {
+                out.push(':');
             } else {
-                format!("L{locs}: {}", self.folded_body)
+                out.push_str(": ");
+                out.push_str(body);
             }
         } else {
-            // Unnumbered (or duplicate-line-number) fallback: keep exact original text.
-            let body = if self.numbered {
-                self.folded_body.as_str()
+            // Unnumbered (or duplicate-line-number) fallback: if a leading number was
+            // stripped tentatively and later rejected, keep the exact original text.
+            let body = if self.prefix_stripped {
+                self.first_sample()
+                    .map_or(self.folded_body(), |(_, s, _, _)| s.trim())
             } else {
-                self.samples
-                    .first()
-                    .map_or(self.folded_body.as_str(), |(_, s, _, _)| s.trim())
+                self.folded_body()
             };
             if body.is_empty() {
-                format!("×{}:", self.count)
+                let _ = write!(out, "×{}:", self.count);
             } else {
-                format!("×{}: {body}", self.count)
+                let _ = write!(out, "×{}: {body}", self.count);
             }
-        };
-        if pointers && self.clipped {
-            line.push_str(&format!(" [stdout:{}]", self.first_stdout));
         }
-        line
+        if pointers && self.clipped {
+            let _ = write!(out, " [stdout:{}]", self.first_stdout);
+        }
     }
 }
 
@@ -799,33 +1077,45 @@ fn sha256_bytes(text: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn format_locs(locs: &[Loc], total_count: usize) -> String {
-    let mut out = String::new();
+fn write_locs(out: &mut String, first_loc: Option<Loc>, extra_locs: &[Loc], total_count: usize) {
+    let start_len = out.len();
     let mut covered = 0usize;
-    for (i, loc) in locs.iter().enumerate() {
-        let (piece, span) = match *loc {
-            Loc::Range(a, b) if a == b => (format!("{a}"), 1),
-            Loc::Range(a, b) if b == a + 1 => (format!("{a},{b}"), 2),
-            Loc::Range(a, b) => (format!("{a}-{b}"), b - a + 1),
-            Loc::LineCol(l, c) => (format!("{l}:{c}"), 1),
-        };
-        if i >= 3 && out.len() + piece.len() + 1 > MAX_LOC_STR_BYTES {
-            break;
-        }
-        if !out.is_empty() {
+    for (i, &loc) in first_loc.iter().chain(extra_locs.iter()).enumerate() {
+        let before_len = out.len();
+        if i > 0 {
             out.push(',');
         }
-        out.push_str(&piece);
+        let span = match loc {
+            Loc::Range(a, b) if a == b => {
+                let _ = write!(out, "{a}");
+                1
+            }
+            Loc::Range(a, b) if b == a + 1 => {
+                let _ = write!(out, "{a},{b}");
+                2
+            }
+            Loc::Range(a, b) => {
+                let _ = write!(out, "{a}-{b}");
+                b - a + 1
+            }
+            Loc::LineCol(l, c) => {
+                let _ = write!(out, "{l}:{c}");
+                1
+            }
+        };
+        if i >= 3 && out.len() - start_len > MAX_LOC_STR_BYTES {
+            out.truncate(before_len);
+            break;
+        }
         covered += span;
     }
     if covered < total_count {
-        out.push_str(&format!(" (+{} more)", total_count - covered));
+        let _ = write!(out, " (+{} more)", total_count - covered);
     }
-    out
 }
 
 struct Group {
-    path: String,
+    path: Arc<str>,
     matches: usize,
     first: usize,
     last: usize,
@@ -846,66 +1136,101 @@ struct Group {
 }
 
 impl Group {
-    /// When every match in this file has the exact same trimmed body (captured in slot 0),
+    /// When every match in this file has the exact same normalized body (captured in slot 0),
     /// return that slot. Files with any other distinct match return `None`.
     fn single_body(&self) -> Option<&MatchSlot> {
         (self.slots.len() == 1 && self.slots[0].count == self.matches).then_some(&self.slots[0])
     }
 
-    /// Render up to `k` display lines for this file, returning the rendered lines
-    /// and the total number of matches those lines represent.
-    fn render_lines(&self, k: usize, pointers: bool) -> (Vec<String>, usize) {
-        if k == 0 {
-            return (Vec::new(), 0);
+    /// Write up to `k` indented display lines for this file directly into `out`,
+    /// returning the total number of matches those lines represent.
+    fn write_lines(&self, out: &mut String, k: usize, pointers: bool) -> usize {
+        if k == 0 || self.slots.is_empty() {
+            return 0;
         }
-        let mut items: Vec<(usize, usize, String)> = Vec::new();
-        for slot in &self.slots {
+        if let [slot] = self.slots.as_slice() {
             if slot.count >= INTRA_FOLD_MIN {
-                items.push((slot.first_seq, slot.count, slot.format_folded(pointers)));
+                out.push_str("  ");
+                slot.write_folded(out, pointers);
+                out.push('\n');
+                return slot.count;
+            }
+            let mut represented = 0usize;
+            for &(_, ref display, stdout_line, clipped) in slot.samples().take(k) {
+                out.push_str("  ");
+                out.push_str(display);
+                if pointers && clipped {
+                    let _ = write!(out, " [stdout:{stdout_line}]");
+                }
+                out.push('\n');
+                represented += 1;
+            }
+            return represented;
+        }
+        // `(seq, slot_idx, sample_idx)` where `sample_idx == u8::MAX` means folded slot.
+        let mut items: Vec<(usize, u8, u8)> = Vec::with_capacity(self.slots.len() * 2);
+        for (slot_idx, slot) in self.slots.iter().enumerate() {
+            if slot.count >= INTRA_FOLD_MIN {
+                items.push((slot.first_seq, slot_idx as u8, u8::MAX));
             } else {
-                for &(seq, ref display, stdout_line, clipped) in &slot.samples {
-                    let line = if pointers && clipped {
-                        format!("{display} [stdout:{stdout_line}]")
-                    } else {
-                        display.clone()
-                    };
-                    items.push((seq, 1, line));
+                for (sample_idx, &(seq, _, _, _)) in slot.samples().enumerate() {
+                    items.push((seq, slot_idx as u8, sample_idx as u8));
                 }
             }
         }
-        items.sort_by_key(|(seq, _, _)| *seq);
-        let mut out = Vec::with_capacity(k.min(items.len()));
+        items.sort_unstable_by_key(|&(seq, _, _)| seq);
         let mut represented = 0usize;
-        for (_, count, line) in items.into_iter().take(k) {
-            out.push(line);
-            represented += count;
+        for &(_, slot_idx, sample_idx) in items.iter().take(k) {
+            let slot = &self.slots[usize::from(slot_idx)];
+            out.push_str("  ");
+            if sample_idx == u8::MAX {
+                slot.write_folded(out, pointers);
+                represented += slot.count;
+            } else if let Some((_, display, stdout_line, clipped)) =
+                &slot.samples[usize::from(sample_idx)]
+            {
+                out.push_str(display);
+                if pointers && *clipped {
+                    let _ = write!(out, " [stdout:{stdout_line}]");
+                }
+                represented += 1;
+            }
+            out.push('\n');
         }
-        (out, represented)
+        represented
     }
 
-    /// Compact inline citation for a pure-boilerplate follower file.
-    fn follower_ref(&self, display_path: &str, pointers: bool) -> String {
-        let ptr = pointer(pointers, self);
+    /// Write a compact inline citation for a pure-boilerplate follower file into `out`.
+    fn write_follower_ref(&self, out: &mut String, hoist: &PrefixHoist, pointers: bool) {
+        hoist.write_display_path(out, &self.path);
         let Some(slot) = self.single_body() else {
-            return format!("{display_path} ×{}{ptr}", self.matches);
+            let _ = write!(out, " ×{}", self.matches);
+            write_pointer(out, pointers, self);
+            return;
         };
         if self.matches == 1 {
             if slot.numbered
-                && let Some(loc) = slot.locs.first()
+                && let Some(loc) = slot.first_loc
             {
-                return match *loc {
-                    Loc::Range(l, _) => format!("{display_path}:{l}{ptr}"),
-                    Loc::LineCol(l, c) => format!("{display_path}:{l}:{c}{ptr}"),
-                };
+                match loc {
+                    Loc::Range(l, _) => {
+                        let _ = write!(out, ":{l}");
+                    }
+                    Loc::LineCol(l, c) => {
+                        let _ = write!(out, ":{l}:{c}");
+                    }
+                }
             }
-            return format!("{display_path}{ptr}");
+            write_pointer(out, pointers, self);
+            return;
         }
-        if slot.numbered && !slot.locs.is_empty() {
-            let locs = format_locs(&slot.locs, slot.count);
-            format!("{display_path} ×{} L{locs}{ptr}", self.matches)
+        if slot.numbered && slot.first_loc.is_some() {
+            let _ = write!(out, " ×{} L", self.matches);
+            write_locs(out, slot.first_loc, &slot.extra_locs, slot.count);
         } else {
-            format!("{display_path} ×{}{ptr}", self.matches)
+            let _ = write!(out, " ×{}", self.matches);
         }
+        write_pointer(out, pointers, self);
     }
 }
 
@@ -947,9 +1272,10 @@ struct Blocks {
 /// Groups search output by file while the stream is scanned.
 pub struct Search {
     base: PathBuf,
+    probe: PathBuf,
     keep: Vec<String>,
     groups: Vec<Group>,
-    index: HashMap<String, usize>,
+    index: HashMap<Arc<str>, usize>,
     current: Option<usize>,
     pending: Vec<(usize, String)>,
     other: Option<(usize, String)>,
@@ -957,7 +1283,7 @@ pub struct Search {
     records: usize,
     matches: usize,
     context: usize,
-    exists: HashMap<String, bool>,
+    exists: HashMap<Arc<str>, bool>,
     checks: usize,
     overflow: bool,
     blocks: Option<Blocks>,
@@ -1032,6 +1358,7 @@ impl Search {
             });
         Self {
             base: base.to_path_buf(),
+            probe: PathBuf::with_capacity(base.as_os_str().len() + 64),
             keep: crate::listing::named_noise(words),
             groups: Vec::new(),
             index: HashMap::new(),
@@ -1055,7 +1382,8 @@ impl Search {
         if self.overflow {
             return;
         }
-        let line = text.trim_end_matches(['\n', '\r']);
+        let clean = strip_ansi_fast(text);
+        let line = clean.trim_end_matches(['\n', '\r']);
         if self.blocks.is_some() {
             self.block_line(line, n);
             return;
@@ -1079,7 +1407,7 @@ impl Search {
             return;
         }
         if let Some(c) = self.current
-            && let Some(rest) = line.strip_prefix(self.groups[c].path.as_str())
+            && let Some(rest) = line.strip_prefix(&*self.groups[c].path)
         {
             if let Some(text) = rest.strip_prefix(':') {
                 self.hit(c, text, n);
@@ -1104,12 +1432,16 @@ impl Search {
                 return;
             };
             // Lines printed just before a file's first match are its leading context.
-            let prefix = format!("{path}-");
-            for (m, pending) in std::mem::take(&mut self.pending) {
-                if pending.starts_with(&prefix) {
-                    self.context_line(c, m);
-                } else {
-                    self.unparsed_line(m, pending);
+            if !self.pending.is_empty() {
+                for (m, pending) in std::mem::take(&mut self.pending) {
+                    if pending
+                        .strip_prefix(path)
+                        .is_some_and(|rest| rest.starts_with('-'))
+                    {
+                        self.context_line(c, m);
+                    } else {
+                        self.unparsed_line(m, pending);
+                    }
                 }
             }
             self.hit(c, &line[end + 1..], n);
@@ -1129,9 +1461,14 @@ impl Search {
             self.overflow = true;
             return None;
         }
-        self.index.insert(path.to_owned(), self.groups.len());
+        let shared: Arc<str> = match self.exists.remove_entry(path) {
+            Some((key, _)) => key,
+            None => Arc::from(path),
+        };
+        let idx = self.groups.len();
+        self.index.insert(Arc::clone(&shared), idx);
         self.groups.push(Group {
-            path: path.to_owned(),
+            path: shared,
             matches: 0,
             first: n,
             last: n,
@@ -1142,7 +1479,7 @@ impl Search {
             blocks: Vec::new(),
             lead: None,
         });
-        Some(self.groups.len() - 1)
+        Some(idx)
     }
 
     fn hit(&mut self, c: usize, text: &str, n: usize) {
@@ -1168,21 +1505,23 @@ impl Search {
                 // identical lines such as `8080: foo` still fold together accurately.
                 for slot in &mut group.slots {
                     if slot.numbered
-                        && let Some((_, sample, _, _)) = slot.samples.first()
+                        && let Some((_, sample, _, _)) = slot.first_sample()
                     {
-                        let full = sample.trim().to_owned();
+                        let full = normalize_ws(sample.trim()).into_owned();
                         slot.hash = hash64(&full);
                         slot.raw_len = full.len();
                         if full.len() <= INLINE_KEY_BYTES {
-                            slot.raw_exact = Some(full.clone());
+                            slot.raw_exact = Some(full);
                             slot.raw_sha = None;
+                            slot.folded_body = None;
                         } else {
                             slot.raw_sha = Some(sha256_bytes(&full));
                             slot.raw_exact = None;
+                            slot.folded_body = Some(full);
                         }
-                        slot.folded_body = full;
                         slot.numbered = false;
-                        slot.locs.clear();
+                        slot.prefix_stripped = false;
+                        slot.clear_locs();
                     }
                 }
                 (None, None, "", text)
@@ -1195,12 +1534,13 @@ impl Search {
         let seq = group.next_seq;
         group.next_seq += 1;
 
-        let raw_trimmed = content.trim();
-        let hash = hash64(raw_trimmed);
+        let norm_key = normalize_ws(content.trim());
+        let key_str = norm_key.as_ref();
+        let hash = hash64(key_str);
         if let Some(slot) = group
             .slots
             .iter_mut()
-            .find(|slot| slot.matches_raw(hash, raw_trimmed))
+            .find(|slot| slot.matches_raw(hash, key_str))
         {
             slot.count += 1;
             if let Some(l) = line_no {
@@ -1208,33 +1548,42 @@ impl Search {
             } else {
                 slot.numbered = false;
             }
-            if slot.samples.len() < INTRA_FOLD_MIN - 1 {
-                let (display, clipped) = window_line(text, prefix_str, content, col, &self.matcher);
-                slot.samples.push((seq, display, n, clipped));
+            if usize::from(slot.samples_len) < INTRA_FOLD_MIN - 1 {
+                let (display, clipped) =
+                    window_line(text, prefix_str, content, col, &mut self.matcher);
+                slot.push_sample((seq, display, n, clipped));
+            }
+            if slot.clipped && slot.count == INTRA_FOLD_MIN && slot.folded_body.is_none() {
+                slot.folded_body = Some(window_snippet(
+                    key_str,
+                    slot.first_col.or(col),
+                    &mut self.matcher,
+                    WINDOW_SNIPPET_BYTES,
+                ));
             }
         } else if group.slots.len() < MAX_SLOTS {
-            let (display, clipped) = window_line(text, prefix_str, content, col, &self.matcher);
-            let folded_body = if clipped {
-                window_snippet(raw_trimmed, col, &self.matcher, WINDOW_SNIPPET_BYTES)
+            let (display, clipped) = window_line(text, prefix_str, content, col, &mut self.matcher);
+            let key_len = key_str.len();
+            let (raw_exact, raw_sha) = if key_len <= INLINE_KEY_BYTES {
+                (Some(norm_key.into_owned()), None)
             } else {
-                raw_trimmed.to_owned()
-            };
-            let (raw_exact, raw_sha) = if raw_trimmed.len() <= INLINE_KEY_BYTES {
-                (Some(raw_trimmed.to_owned()), None)
-            } else {
-                (None, Some(sha256_bytes(raw_trimmed)))
+                (None, Some(sha256_bytes(key_str)))
             };
             let mut slot = MatchSlot {
                 hash,
-                raw_len: raw_trimmed.len(),
+                raw_len: key_len,
                 raw_exact,
                 raw_sha,
                 count: 1,
-                samples: vec![(seq, display, n, clipped)],
-                locs: Vec::new(),
+                samples: [Some((seq, display, n, clipped)), None],
+                samples_len: 1,
+                first_loc: None,
+                extra_locs: Vec::new(),
                 last_line: None,
                 numbered: line_no.is_some(),
-                folded_body,
+                prefix_stripped: line_no.is_some(),
+                folded_body: None,
+                first_col: col,
                 first_stdout: n,
                 first_seq: seq,
                 clipped,
@@ -1305,8 +1654,11 @@ impl Search {
             return false;
         }
         self.checks += 1;
-        let found = self.base.join(candidate).is_file();
-        self.exists.insert(candidate.to_owned(), found);
+        self.probe.clear();
+        self.probe.push(&self.base);
+        self.probe.push(candidate);
+        let found = self.probe.is_file();
+        self.exists.insert(Arc::from(candidate), found);
         found
     }
 
@@ -1380,7 +1732,7 @@ impl Search {
         if let Some(open) = self.mode().open {
             let c = self.mode().list[open].group;
             let len = self.groups[c].path.len();
-            if line.starts_with(self.groups[c].path.as_str())
+            if line.starts_with(&*self.groups[c].path)
                 && let Some((matched, number, text)) = parts(line, len, numbered)
             {
                 // Without numbers, `settings-prod:3` or `settings-prod-3` after
@@ -1401,17 +1753,19 @@ impl Search {
             self.close_block();
         }
         if let Some(end) = self.path_end(line, ':', numbered) {
-            let path = line[..end].to_owned();
-            let Some(c) = self.group(&path, n) else {
+            let path = &line[..end];
+            let Some(c) = self.group(path, n) else {
                 return;
             };
             // Lines printed before a file's match are its leading context.
-            for (m, before) in std::mem::take(&mut self.mode().pending) {
-                match parts(&before, end, numbered).filter(|(matched, ..)| !matched) {
-                    Some((_, number, text)) if before.starts_with(&path) => {
-                        self.add_line(c, m, number, false, text)
+            if !self.mode().pending.is_empty() {
+                for (m, before) in std::mem::take(&mut self.mode().pending) {
+                    match parts(&before, end, numbered).filter(|(matched, ..)| !matched) {
+                        Some((_, number, text)) if before.starts_with(path) => {
+                            self.add_line(c, m, number, false, text)
+                        }
+                        _ => self.mode().failed = true,
                     }
-                    _ => self.mode().failed = true,
                 }
             }
             if let Some((_, number, text)) = parts(line, end, numbered) {
@@ -1447,13 +1801,13 @@ impl Search {
             self.mode().failed = true;
             return;
         };
-        let path = line[..end].to_owned();
-        let Some(c) = self.group(&path, *first) else {
+        let path = &line[..end];
+        let Some(c) = self.group(path, *first) else {
             return;
         };
         for (m, line) in &pending {
             match parts(line, end, numbered) {
-                Some((false, number, text)) if line.starts_with(&path) => {
+                Some((false, number, text)) if line.starts_with(path) => {
                     self.add_line(c, *m, number, false, text)
                 }
                 _ => self.mode().failed = true,
@@ -1505,7 +1859,7 @@ impl Search {
             if group.shown.len() < BLOCK_LINES {
                 let line = if matched && text.len() > LINE_BYTES {
                     let (_, col, prefix_str, content) = split_line_prefix(text, self.line_mode);
-                    window_line(text, prefix_str, content, col, &self.matcher).0
+                    window_line(text, prefix_str, content, col, &mut self.matcher).0
                 } else {
                     clip(text)
                 };
@@ -1555,13 +1909,10 @@ impl Search {
             plural(files, "file", "files")
         );
         if let Some(blocks) = &self.blocks {
-            header.push_str(&format!(
-                ", {}",
-                plural(blocks.list.len(), "block", "blocks")
-            ));
+            let _ = write!(header, ", {}", plural(blocks.list.len(), "block", "blocks"));
         }
         if self.context > 0 {
-            header.push_str(&format!(", {} context lines", self.context));
+            let _ = write!(header, ", {} context lines", self.context);
         }
         let summary = Summary {
             kind: "search".into(),
@@ -1578,20 +1929,8 @@ impl Search {
                 .collect(),
             ..Summary::default()
         };
-        let current = self.groups.iter().map(|g| (g.path.as_str(), g.matches));
+        let current = self.groups.iter().map(|g| (g.path.as_ref(), g.matches));
         let compared = compare(previous, "search", current, "no longer matched");
-        let other = self.other.as_ref().map_or_else(String::new, |(n, line)| {
-            format!(
-                "{} other line(s), first: {}{}\n",
-                self.unparsed,
-                clip(line),
-                if pointers {
-                    format!(" [stdout:{n}]")
-                } else {
-                    String::new()
-                }
-            )
-        });
         // Matches inside dependency and build directories collapse into one line each.
         let mut collapsed: Vec<(&str, usize, usize, usize, usize)> = Vec::new();
         order.retain(|g| {
@@ -1610,39 +1949,59 @@ impl Search {
             false
         });
         collapsed.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(b.0)));
-        let other: String = collapsed
-            .iter()
-            .map(|(prefix, files, matches, first, last)| {
-                format!(
-                    "{prefix}/ {} in {} collapsed{}\n",
-                    plural(*matches, "match", "matches"),
-                    plural(*files, "file", "files"),
-                    if pointers {
-                        format!(" [stdout:{first}-{last}]")
-                    } else {
-                        String::new()
-                    }
-                )
-            })
-            .chain(std::iter::once(other))
-            .collect();
+        let mut other = String::new();
+        for (prefix, files, matches, first, last) in &collapsed {
+            let _ = write!(
+                other,
+                "{prefix}/ {} in {} collapsed",
+                plural(*matches, "match", "matches"),
+                plural(*files, "file", "files"),
+            );
+            if pointers {
+                let _ = write!(other, " [stdout:{first}-{last}]");
+            }
+            other.push('\n');
+        }
+        if let Some((n, line)) = &self.other {
+            let _ = write!(
+                other,
+                "{} other line(s), first: {}",
+                self.unparsed,
+                clip(line)
+            );
+            if pointers {
+                let _ = write!(other, " [stdout:{n}]");
+            }
+            other.push('\n');
+        }
 
         let hoist = choose_prefix_hoist(&order, !collapsed.is_empty());
         let build_report = |hoist: &PrefixHoist| -> (String, (usize, usize)) {
-            let mut full_header = format!("{header}{}\n", hoist.header_suffix());
+            let mut full_header =
+                String::with_capacity(header.len() + compared.len() + hoist.header_extra_len() + 1);
+            full_header.push_str(&header);
+            hoist.write_header_suffix(&mut full_header);
+            full_header.push('\n');
             full_header.push_str(&compared);
             let room = budget.saturating_sub(full_header.len() + other.len() + 96);
-            if let Some(blocks) = &self.blocks {
-                let (body, tier) = block_body(&order, &blocks.list, room, pointers, hoist);
-                return (format!("{full_header}{body}{other}"), tier);
-            }
-            let (body, tier) = search_body(&order, room, pointers, hoist);
-            (format!("{full_header}{body}{other}"), tier)
+            let (body, tier) = if let Some(blocks) = &self.blocks {
+                block_body(&order, &blocks.list, room, pointers, hoist)
+            } else {
+                search_body(&order, room, pointers, hoist)
+            };
+            let mut report = String::with_capacity(full_header.len() + body.len() + other.len());
+            report.push_str(&full_header);
+            report.push_str(&body);
+            report.push_str(&other);
+            (report, tier)
         };
         let (report, hoist_tier) = build_report(&hoist);
-        // Only keep prefix hoisting when it achieves a richer detail tier within budget
-        // or is strictly smaller at the same detail tier.
-        if !matches!(hoist, PrefixHoist::None) {
+        // Full prefix hoisting that fits all files at a full-file detail tier is strictly
+        // smaller than plain rendering because `(order.len() - 1) * prefix.len() > 8`.
+        let guaranteed_smaller = matches!(hoist, PrefixHoist::Full(_))
+            && hoist_tier.0 > 0
+            && hoist_tier.1 == order.len();
+        if !matches!(hoist, PrefixHoist::None) && !guaranteed_smaller {
             let (plain, plain_tier) = build_report(&PrefixHoist::None);
             if plain_tier > hoist_tier || (plain_tier == hoist_tier && plain.len() <= report.len())
             {
@@ -1654,33 +2013,68 @@ impl Search {
 }
 
 /// Prefix hoisted into the search header when matching files share a deep directory.
-enum PrefixHoist {
+enum PrefixHoist<'a> {
     None,
     /// Every displayed file starts with `prefix` (ending with `/`). Header appends
     /// `, under {prefix}` and paths render relative to it.
-    Full(String),
+    Full(&'a str),
     /// A majority of displayed files share `prefix` (ending with `/`), while other
     /// files or collapsed trees sit outside it. Header appends ` (… = {prefix})`
     /// and matching paths render as `…/{rel}` so non-matching paths stay unambiguous.
-    Partial(String),
+    Partial(&'a str),
 }
 
-impl PrefixHoist {
-    fn header_suffix(&self) -> String {
+impl PrefixHoist<'_> {
+    fn header_extra_len(&self) -> usize {
         match self {
-            Self::None => String::new(),
-            Self::Full(prefix) => format!(", under {prefix}"),
-            Self::Partial(prefix) => format!(" (… = {prefix})"),
+            Self::None => 0,
+            Self::Full(prefix) => ", under ".len() + prefix.len(),
+            Self::Partial(prefix) => " (… = )".len() + prefix.len(),
         }
     }
 
-    fn display_path<'a>(&self, path: &'a str) -> Cow<'a, str> {
+    fn write_header_suffix(&self, out: &mut String) {
         match self {
-            Self::None => Cow::Borrowed(path),
-            Self::Full(prefix) => Cow::Borrowed(path.strip_prefix(prefix.as_str()).unwrap_or(path)),
-            Self::Partial(prefix) => match path.strip_prefix(prefix.as_str()) {
-                Some(rel) => Cow::Owned(format!("…/{rel}")),
-                None => Cow::Borrowed(path),
+            Self::None => {}
+            Self::Full(prefix) => {
+                out.push_str(", under ");
+                out.push_str(prefix);
+            }
+            Self::Partial(prefix) => {
+                out.push_str(" (… = ");
+                out.push_str(prefix);
+                out.push(')');
+            }
+        }
+    }
+
+    fn write_display_path(&self, out: &mut String, path: &str) {
+        match self {
+            Self::None => out.push_str(path),
+            Self::Full(prefix) => out.push_str(path.strip_prefix(prefix).unwrap_or(path)),
+            Self::Partial(prefix) => match path.strip_prefix(prefix) {
+                Some(rel) => {
+                    out.push_str("…/");
+                    out.push_str(rel);
+                }
+                None => out.push_str(path),
+            },
+        }
+    }
+
+    fn display_folder<'a>(&self, path: &'a str) -> Cow<'a, str> {
+        match self {
+            Self::None => Cow::Borrowed(path.rsplit_once('/').map_or(".", |(dir, _)| dir)),
+            Self::Full(prefix) => {
+                let rel = path.strip_prefix(prefix).unwrap_or(path);
+                Cow::Borrowed(rel.rsplit_once('/').map_or(".", |(dir, _)| dir))
+            }
+            Self::Partial(prefix) => match path.strip_prefix(prefix) {
+                Some(rel) => match rel.rsplit_once('/') {
+                    Some((dir, _)) => Cow::Owned(format!("…/{dir}")),
+                    None => Cow::Borrowed("…"),
+                },
+                None => Cow::Borrowed(path.rsplit_once('/').map_or(".", |(dir, _)| dir)),
             },
         }
     }
@@ -1693,15 +2087,15 @@ fn real_dir_depth(prefix: &str) -> usize {
         .count()
 }
 
-fn common_dir_prefix(paths: &[&str]) -> String {
+fn common_dir_prefix<'a>(mut paths: impl Iterator<Item = &'a str>) -> &'a str {
     fn dir_of(p: &str) -> &str {
         p.rfind('/').map_or("", |i| &p[..=i])
     }
-    let Some((first, rest)) = paths.split_first() else {
-        return String::new();
+    let Some(first) = paths.next() else {
+        return "";
     };
     let mut common = dir_of(first);
-    for path in rest {
+    for path in paths {
         let dir = dir_of(path);
         let shared = common
             .bytes()
@@ -1716,19 +2110,18 @@ fn common_dir_prefix(paths: &[&str]) -> String {
             break;
         }
     }
-    common.to_owned()
+    common
 }
 
-fn choose_prefix_hoist(order: &[&Group], has_collapsed: bool) -> PrefixHoist {
+fn choose_prefix_hoist<'a>(order: &[&'a Group], has_collapsed: bool) -> PrefixHoist<'a> {
     if order.len() < 2 {
         return PrefixHoist::None;
     }
     if !has_collapsed {
-        let paths: Vec<&str> = order.iter().map(|g| g.path.as_str()).collect();
-        let common = common_dir_prefix(&paths);
+        let common = common_dir_prefix(order.iter().map(|g| g.path.as_ref()));
         // Require at least 2 real directory components (ignoring leading `./`) so shallow
         // roots like `src/` or `./src/` stay inline, and verify net byte savings.
-        if real_dir_depth(&common) >= 2
+        if real_dir_depth(common) >= 2
             && common.len() >= 10
             && (order.len() - 1) * common.len() > ", under ".len()
         {
@@ -1738,18 +2131,25 @@ fn choose_prefix_hoist(order: &[&Group], has_collapsed: bool) -> PrefixHoist {
     if order.len() < 3 {
         return PrefixHoist::None;
     }
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut counts: HashMap<&'a str, usize> = HashMap::with_capacity(order.len());
     for group in order {
-        for (i, _) in group.path.match_indices('/') {
-            let prefix = &group.path[..=i];
-            if prefix.len() >= 12 && real_dir_depth(prefix) >= 2 {
-                *counts.entry(prefix).or_default() += 1;
+        let path = group.path.as_ref();
+        let mut depth = 0usize;
+        let mut seg_start = 0usize;
+        for (i, _) in path.match_indices('/') {
+            let seg = &path[seg_start..i];
+            if !seg.is_empty() && seg != "." {
+                depth += 1;
+            }
+            seg_start = i + 1;
+            if depth >= 2 && i + 1 >= 12 {
+                *counts.entry(&path[..=i]).or_default() += 1;
             }
         }
     }
     let marker_len = "…/".len();
     let header_fixed = " (… = )".len();
-    let mut best: Option<(&str, usize)> = None;
+    let mut best: Option<(&'a str, usize)> = None;
     for (prefix, count) in counts {
         if count < 3 || count * 2 < order.len() {
             continue;
@@ -1775,7 +2175,7 @@ fn choose_prefix_hoist(order: &[&Group], has_collapsed: bool) -> PrefixHoist {
         }
     }
     best.map_or(PrefixHoist::None, |(prefix, _)| {
-        PrefixHoist::Partial(prefix.to_owned())
+        PrefixHoist::Partial(prefix)
     })
 }
 
@@ -1788,25 +2188,30 @@ enum DisplayUnit {
 }
 
 impl DisplayUnit {
-    fn group_indices(&self) -> Vec<usize> {
+    fn push_group_indices(&self, out: &mut Vec<usize>) {
         match self {
-            Self::Single(i) => vec![*i],
-            Self::Boilerplate { leader, followers } => std::iter::once(*leader)
-                .chain(followers.iter().copied())
-                .collect(),
+            Self::Single(i) => out.push(*i),
+            Self::Boilerplate { leader, followers } => {
+                out.push(*leader);
+                out.extend_from_slice(followers);
+            }
         }
     }
 }
 
-fn build_display_units(order: &[&Group], pointers: bool, hoist: &PrefixHoist) -> Vec<DisplayUnit> {
-    // Group pure single-body files sharing the exact same trimmed line of sufficient length.
+fn build_display_units(
+    order: &[&Group],
+    pointers: bool,
+    hoist: &PrefixHoist<'_>,
+) -> Vec<DisplayUnit> {
+    // Group pure single-body files sharing the exact same normalized line of sufficient length.
     let mut buckets: Vec<Vec<usize>> = Vec::new();
     let mut by_hash: HashMap<(u64, usize), Vec<usize>> = HashMap::new();
     for (idx, group) in order.iter().enumerate() {
         let Some(slot) = group.single_body() else {
             continue;
         };
-        if slot.clipped || slot.folded_body.len() < CROSS_DEDUP_MIN_LEN {
+        if slot.clipped || slot.raw_len < CROSS_DEDUP_MIN_LEN {
             continue;
         }
         let bucket_list = by_hash.entry((slot.hash, slot.raw_len)).or_default();
@@ -1828,23 +2233,35 @@ fn build_display_units(order: &[&Group], pointers: bool, hoist: &PrefixHoist) ->
 
     let mut absorbed = vec![false; order.len()];
     let mut leader_followers: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut scratch = String::new();
     for indices in buckets {
         if indices.len() < CROSS_DEDUP_MIN_FILES {
             continue;
         }
         let leader = indices[0];
-        let followers = indices[1..].to_vec();
-        let plain_bytes: usize = indices
-            .iter()
-            .map(|&i| render_single(order[i], 1, pointers, hoist).len())
-            .sum();
-        let dedup_bytes =
-            render_boilerplate(order, leader, &followers, 1, None, pointers, hoist).len();
-        if dedup_bytes < plain_bytes {
-            for &f in &followers {
+        let followers = &indices[1..];
+        let mut plain_bytes = 0usize;
+        for &i in &indices {
+            scratch.clear();
+            write_single(&mut scratch, order[i], 1, pointers, hoist);
+            plain_bytes += scratch.len();
+        }
+        scratch.clear();
+        write_boilerplate(
+            &mut scratch,
+            order,
+            leader,
+            followers,
+            1,
+            None,
+            pointers,
+            hoist,
+        );
+        if scratch.len() < plain_bytes {
+            for &f in followers {
                 absorbed[f] = true;
             }
-            leader_followers.insert(leader, followers);
+            leader_followers.insert(leader, followers.to_vec());
         }
     }
 
@@ -1865,78 +2282,94 @@ fn build_display_units(order: &[&Group], pointers: bool, hoist: &PrefixHoist) ->
     units
 }
 
-fn render_single(g: &Group, k: usize, pointers: bool, hoist: &PrefixHoist) -> String {
-    let path = hoist.display_path(&g.path);
-    let mut text = format!("{path} ×{}{}\n", g.matches, pointer(pointers, g));
+fn write_single(out: &mut String, g: &Group, k: usize, pointers: bool, hoist: &PrefixHoist<'_>) {
+    hoist.write_display_path(out, &g.path);
+    let _ = write!(out, " ×{}", g.matches);
+    write_pointer(out, pointers, g);
+    out.push('\n');
     if k == 0 {
-        return text;
+        return;
     }
-    let (lines, represented) = g.render_lines(k, pointers);
-    for line in lines {
-        text.push_str(&format!("  {line}\n"));
-    }
+    let represented = g.write_lines(out, k, pointers);
     if g.matches > represented {
-        text.push_str(&format!("  +{} more in file\n", g.matches - represented));
+        let _ = writeln!(out, "  +{} more in file", g.matches - represented);
     }
-    text
 }
 
-fn render_boilerplate(
+#[allow(clippy::too_many_arguments)]
+fn write_boilerplate(
+    out: &mut String,
     order: &[&Group],
     leader: usize,
     followers: &[usize],
     k: usize,
     max_followers: Option<usize>,
     pointers: bool,
-    hoist: &PrefixHoist,
-) -> String {
-    let mut text = render_single(order[leader], k, pointers, hoist);
+    hoist: &PrefixHoist<'_>,
+) {
+    write_single(out, order[leader], k, pointers, hoist);
     if followers.is_empty() {
-        return text;
+        return;
     }
     let cap = max_followers
         .unwrap_or(followers.len())
         .min(followers.len());
-    let shown: Vec<String> = followers[..cap]
-        .iter()
-        .map(|&i| {
-            let g = order[i];
-            let display = hoist.display_path(&g.path);
-            g.follower_ref(&display, pointers)
-        })
-        .collect();
-    text.push_str(&format!(
-        "  same line in {}: {}",
+    let _ = write!(
+        out,
+        "  same line in {}: ",
         plural(followers.len(), "more file", "more files"),
-        shown.join(", ")
-    ));
+    );
+    for (pos, &i) in followers[..cap].iter().enumerate() {
+        if pos > 0 {
+            out.push_str(", ");
+        }
+        order[i].write_follower_ref(out, hoist, pointers);
+    }
     if cap < followers.len() {
-        let rest: Vec<&Group> = followers[cap..].iter().map(|&i| order[i]).collect();
-        let rest_matches: usize = rest.iter().map(|g| g.matches).sum();
-        text.push_str(&format!(
-            ", +{} ({}){}",
+        let rest = &followers[cap..];
+        let mut rest_matches = 0usize;
+        let mut min_first = usize::MAX;
+        let mut max_last = 0usize;
+        for &i in rest {
+            let g = order[i];
+            rest_matches += g.matches;
+            min_first = min_first.min(g.first);
+            max_last = max_last.max(g.last);
+        }
+        let _ = write!(
+            out,
+            ", +{} ({})",
             plural(rest.len(), "more file", "more files"),
             plural(rest_matches, "match", "matches"),
-            stdout_span(pointers, &rest),
-        ));
+        );
+        if pointers && min_first <= max_last {
+            write_stdout_range(out, min_first, max_last);
+        }
     }
-    text.push('\n');
-    text
+    out.push('\n');
 }
 
-fn render_unit(
+fn write_unit(
+    out: &mut String,
     order: &[&Group],
     unit: &DisplayUnit,
     k: usize,
     max_followers: Option<usize>,
     pointers: bool,
-    hoist: &PrefixHoist,
-) -> String {
+    hoist: &PrefixHoist<'_>,
+) {
     match unit {
-        DisplayUnit::Single(i) => render_single(order[*i], k, pointers, hoist),
-        DisplayUnit::Boilerplate { leader, followers } => {
-            render_boilerplate(order, *leader, followers, k, max_followers, pointers, hoist)
-        }
+        DisplayUnit::Single(i) => write_single(out, order[*i], k, pointers, hoist),
+        DisplayUnit::Boilerplate { leader, followers } => write_boilerplate(
+            out,
+            order,
+            *leader,
+            followers,
+            k,
+            max_followers,
+            pointers,
+            hoist,
+        ),
     }
 }
 
@@ -1944,13 +2377,14 @@ fn search_body(
     order: &[&Group],
     room: usize,
     pointers: bool,
-    hoist: &PrefixHoist,
+    hoist: &PrefixHoist<'_>,
 ) -> (String, (usize, usize)) {
     let units = build_display_units(order, pointers, hoist);
+    let mut body = String::with_capacity(room.min(4096));
     for k in [SHOWN, 5, 3, 2, 1] {
-        let mut body = String::new();
+        body.clear();
         for unit in &units {
-            body.push_str(&render_unit(order, unit, k, None, pointers, hoist));
+            write_unit(&mut body, order, unit, k, None, pointers, hoist);
             if body.len() > room {
                 break;
             }
@@ -1964,17 +2398,18 @@ fn search_body(
     // `room`, falling back from k=2 to k=1 when k=2 leaves too few files visible.
     let detail_budget = room * 2 / 3;
     let fill_detail = |k: usize, cap: usize| {
-        let mut body = String::new();
+        let mut out = String::with_capacity(detail_budget.min(4096));
         let mut listed = 0;
         for unit in &units {
-            let text = render_unit(order, unit, k, Some(cap), pointers, hoist);
-            if body.len() + text.len() > detail_budget {
+            let before = out.len();
+            write_unit(&mut out, order, unit, k, Some(cap), pointers, hoist);
+            if out.len() > detail_budget {
+                out.truncate(before);
                 break;
             }
-            body.push_str(&text);
             listed += 1;
         }
-        (body, listed)
+        (out, listed)
     };
     let (mut body, mut listed) = fill_detail(2, 8);
     if listed < 2 && units.len() >= 2 {
@@ -1992,11 +2427,11 @@ fn search_body(
             DisplayUnit::Boilerplate { followers, .. } => 1 + followers.len(),
         })
         .sum();
-    let remaining: Vec<&Group> = units[listed..]
-        .iter()
-        .flat_map(DisplayUnit::group_indices)
-        .map(|i| order[i])
-        .collect();
+    let mut remaining_idx = Vec::with_capacity(order.len().saturating_sub(listed_files));
+    for u in &units[listed..] {
+        u.push_group_indices(&mut remaining_idx);
+    }
+    let remaining: Vec<&Group> = remaining_idx.into_iter().map(|i| order[i]).collect();
     if remaining.is_empty() {
         return (body, (1, listed_files));
     }
@@ -2004,10 +2439,10 @@ fn search_body(
     // If every remaining file fits as a 1-line header (`path ×N [stdout:A-B]`), list
     // them all so no filenames are lost.
     let rem_room = room.saturating_sub(body.len());
-    let mut headers_only = String::new();
+    let mut headers_only = String::with_capacity(rem_room.min(2048));
     let mut all_fit = true;
     for group in &remaining {
-        headers_only.push_str(&render_single(group, 0, pointers, hoist));
+        write_single(&mut headers_only, group, 0, pointers, hoist);
         if headers_only.len() > rem_room {
             all_fit = false;
             break;
@@ -2023,19 +2458,29 @@ fn search_body(
     let fold_reserve = rem_room.min(220);
     let mut rem_listed = 0;
     for group in &remaining {
-        let line = render_single(group, 0, pointers, hoist);
-        if body.len() + line.len() + fold_reserve > room {
+        let before = body.len();
+        write_single(&mut body, group, 0, pointers, hoist);
+        if body.len() + fold_reserve > room {
+            body.truncate(before);
             break;
         }
-        body.push_str(&line);
         rem_listed += 1;
     }
     let tail = &remaining[rem_listed..];
     if !tail.is_empty() {
         let tag = stdout_span(pointers, tail);
-        body.push_str(&fold(tail, room.saturating_sub(body.len()), &tag, hoist));
+        let fold_room = room.saturating_sub(body.len());
+        write_fold(&mut body, tail, fold_room, &tag, hoist);
     }
     (body, (0, listed_files + rem_listed))
+}
+
+fn write_stdout_range(out: &mut String, a: usize, b: usize) {
+    if a == b {
+        let _ = write!(out, " [stdout:{a}]");
+    } else {
+        let _ = write!(out, " [stdout:{a}-{b}]");
+    }
 }
 
 fn stdout_span(pointers: bool, groups: &[&Group]) -> String {
@@ -2048,59 +2493,62 @@ fn stdout_span(pointers: bool, groups: &[&Group]) -> String {
     ) else {
         return String::new();
     };
-    if a == b {
-        format!(" [stdout:{a}]")
-    } else {
-        format!(" [stdout:{a}-{b}]")
-    }
+    let mut out = String::with_capacity(24);
+    write_stdout_range(&mut out, a, b);
+    out
 }
 
 /// The files that did not fit, summarized by directory, largest first, within
 /// `room` bytes for the directory names, ending with `tag`.
-fn fold(rest: &[&Group], room: usize, tag: &str, hoist: &PrefixHoist) -> String {
-    let mut folders: HashMap<String, (usize, usize)> = HashMap::new();
+fn write_fold(out: &mut String, rest: &[&Group], room: usize, tag: &str, hoist: &PrefixHoist<'_>) {
+    let mut folders: HashMap<Cow<'_, str>, (usize, usize)> =
+        HashMap::with_capacity(rest.len().min(32));
+    let mut total_matches = 0usize;
     for group in rest {
-        let shown = hoist.display_path(&group.path);
-        let folder = shown.rsplit_once('/').map_or(".", |(dir, _)| dir);
-        let entry = folders.entry(folder.to_owned()).or_default();
+        total_matches += group.matches;
+        let folder = hoist.display_folder(&group.path);
+        let entry = folders.entry(folder).or_default();
         entry.0 += 1;
         entry.1 += group.matches;
     }
     let mut folders: Vec<_> = folders.into_iter().collect();
     folders.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(a.0.cmp(&b.0)));
-    let matches: usize = rest.iter().map(|g| g.matches).sum();
     let head = format!(
         "+{} with {}",
         plural(rest.len(), "more file", "more files"),
-        plural(matches, "match", "matches"),
+        plural(total_matches, "match", "matches"),
     );
     // Reserve space for `head`, `" in "`, `", …"`, `tag` and `'\n'` so `fold` fits `room`.
     let fixed = head.len() + " in ".len() + ", …".len() + tag.len() + 1;
     let names_room = room.saturating_sub(fixed);
-    let mut names = String::new();
-    let mut named = 0;
+    let mut names = String::with_capacity(names_room.min(256));
+    let mut named = 0usize;
     for (folder, (files, matches)) in &folders {
-        let item = format!("{folder}/ {} ×{matches}", plural(*files, "file", "files"));
-        let sep = if names.is_empty() { 0 } else { 2 };
-        if names.len() + sep + item.len() > names_room {
-            break;
-        }
+        let before = names.len();
         if !names.is_empty() {
             names.push_str(", ");
         }
-        names.push_str(&item);
+        let _ = write!(
+            names,
+            "{folder}/ {} ×{matches}",
+            plural(*files, "file", "files")
+        );
+        if names.len() > names_room {
+            names.truncate(before);
+            break;
+        }
         named += 1;
     }
-    format!(
-        "{head}{}{}{}{tag}\n",
-        if named > 0 { " in " } else { "" },
-        names,
-        if named < folders.len() && named > 0 {
-            ", …"
-        } else {
-            ""
+    out.push_str(&head);
+    if named > 0 {
+        out.push_str(" in ");
+        out.push_str(&names);
+        if named < folders.len() {
+            out.push_str(", …");
         }
-    )
+    }
+    out.push_str(tag);
+    out.push('\n');
 }
 
 /// A block report: each file's match and block counts, its first block in full,
@@ -2111,73 +2559,102 @@ fn block_body(
     list: &[Block],
     room: usize,
     pointers: bool,
-    hoist: &PrefixHoist,
+    hoist: &PrefixHoist<'_>,
 ) -> (String, (usize, usize)) {
-    let tag = |a: usize, b: usize| match (pointers, a == b) {
-        (false, _) => String::new(),
-        (true, true) => format!(" [stdout:{a}]"),
-        (true, false) => format!(" [stdout:{a}-{b}]"),
+    let write_tag = |out: &mut String, a: usize, b: usize| {
+        if pointers {
+            write_stdout_range(out, a, b);
+        }
     };
-    let entry = |block: &Block| match (block.from, block.to) {
-        (Some(from), Some(to)) if from == to => format!("L{from}{}", tag(block.start, block.end)),
-        (Some(from), Some(to)) => format!("L{from}-{to}{}", tag(block.start, block.end)),
-        _ => tag(block.start, block.end).trim_start().to_owned(),
+    let write_entry = |out: &mut String, block: &Block| -> bool {
+        let before = out.len();
+        match (block.from, block.to) {
+            (Some(from), Some(to)) if from == to => {
+                let _ = write!(out, "L{from}");
+                write_tag(out, block.start, block.end);
+            }
+            (Some(from), Some(to)) => {
+                let _ = write!(out, "L{from}-{to}");
+                write_tag(out, block.start, block.end);
+            }
+            _ if pointers => {
+                if block.start == block.end {
+                    let _ = write!(out, "[stdout:{}]", block.start);
+                } else {
+                    let _ = write!(out, "[stdout:{}-{}]", block.start, block.end);
+                }
+            }
+            _ => {}
+        }
+        out.len() > before
     };
-    let render = |g: &Group, lines: usize, entries: usize| {
-        let path = hoist.display_path(&g.path);
-        let mut text = format!(
-            "{path} ×{} in {}{}\n",
+    let write_block_group = |out: &mut String, g: &Group, lines: usize, entries: usize| {
+        hoist.write_display_path(out, &g.path);
+        let _ = write!(
+            out,
+            " ×{} in {}",
             g.matches,
             plural(g.blocks.len(), "block", "blocks"),
-            pointer(pointers, g)
         );
+        write_pointer(out, pointers, g);
+        out.push('\n');
         // A cut block starts near its first match, and its range covers it whole.
         let Some(first) = g.blocks.first().filter(|_| lines > 0).map(|&b| &list[b]) else {
-            return text;
+            return;
         };
         let shown = lines.min(g.shown.len());
         let lead = g.lead.unwrap_or(0);
         let start = lead.saturating_sub(lines / 4).min(g.shown.len() - shown);
         for line in &g.shown[start..start + shown] {
-            text.push_str(&format!("  {line}\n"));
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
         }
         let size = first.end - first.start + 1;
         if size > shown {
-            let whole = entry(first);
-            text.push_str(&if whole.is_empty() {
-                format!("  +{}\n", plural(size - shown, "more line", "more lines"))
+            let marker = out.len();
+            out.push_str("  whole block ");
+            if !write_entry(out, first) {
+                out.truncate(marker);
+                let _ = writeln!(
+                    out,
+                    "  +{}",
+                    plural(size - shown, "more line", "more lines")
+                );
             } else {
-                format!("  whole block {whole}\n")
-            });
+                out.push('\n');
+            }
         }
         if let [_, rest @ ..] = g.blocks.as_slice()
             && let (Some(&a), Some(&b)) = (rest.first(), rest.last())
         {
-            text.push_str(&format!(
-                "  +{}{}",
-                plural(rest.len(), "more block", "more blocks"),
-                tag(list[a].start, list[b].end)
-            ));
-            let named: Vec<String> = rest
-                .iter()
-                .take(entries)
-                .map(|&i| entry(&list[i]))
-                .filter(|e| !e.is_empty())
-                .collect();
-            if !named.is_empty() {
-                text.push_str(&format!(": {}", named.join(", ")));
-                if named.len() < rest.len() {
-                    text.push_str(", …");
+            let _ = write!(
+                out,
+                "  +{}",
+                plural(rest.len(), "more block", "more blocks")
+            );
+            write_tag(out, list[a].start, list[b].end);
+            let mut named = 0usize;
+            for &i in rest.iter().take(entries) {
+                let sep_pos = out.len();
+                out.push_str(if named == 0 { ": " } else { ", " });
+                if write_entry(out, &list[i]) {
+                    named += 1;
+                } else {
+                    out.truncate(sep_pos);
                 }
             }
-            text.push('\n');
+            if named > 0 && named < rest.len() {
+                out.push_str(", …");
+            }
+            out.push('\n');
         }
-        text
     };
+    let mut body = String::with_capacity(room.min(4096));
     for (lines, entries) in [(BLOCK_LINES, 32), (12, 12), (6, 6), (3, 3), (1, 0)] {
-        let mut body = String::new();
+        body.clear();
         for group in order {
-            body.push_str(&render(group, lines, entries));
+            write_block_group(&mut body, group, lines, entries);
             if body.len() > room {
                 break;
             }
@@ -2187,14 +2664,16 @@ fn block_body(
         }
     }
     // Name files alone while they fit, then fold the rest by directory.
-    let mut body = String::new();
+    body.clear();
     let mut listed = 0;
+    let limit = room * 2 / 3;
     for group in order {
-        let text = render(group, 0, 0);
-        if body.len() + text.len() > room * 2 / 3 {
+        let before = body.len();
+        write_block_group(&mut body, group, 0, 0);
+        if body.len() > limit {
+            body.truncate(before);
             break;
         }
-        body.push_str(&text);
         listed += 1;
     }
     let rest = &order[listed..];
@@ -2202,14 +2681,35 @@ fn block_body(
         rest.iter().map(|g| g.first).min(),
         rest.iter().map(|g| g.last).max(),
     ) {
-        body.push_str(&fold(
-            rest,
-            room.saturating_sub(body.len()),
-            &tag(a, b),
-            hoist,
-        ));
+        let mut tag = String::with_capacity(24);
+        write_tag(&mut tag, a, b);
+        let fold_room = room.saturating_sub(body.len());
+        write_fold(&mut body, rest, fold_room, &tag, hoist);
     }
     (body, (0, listed))
+}
+
+/// Parse a positive base-10 integer prefix terminated by `:` (no leading zero),
+/// returning `(value, digit_count)` in a single byte pass.
+fn parse_pos_digits_colon(bytes: &[u8]) -> Option<(usize, usize)> {
+    let first = *bytes.first()?;
+    if !(b'1'..=b'9').contains(&first) {
+        return None;
+    }
+    let mut val = usize::from(first - b'0');
+    let mut i = 1usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_digit() {
+            val = val.checked_mul(10)?.checked_add(usize::from(b - b'0'))?;
+            i += 1;
+        } else if b == b':' {
+            return Some((val, i));
+        } else {
+            return None;
+        }
+    }
+    None
 }
 
 /// Parse an optional leading `line:` (or `line:col:` when `--column`/`--vimgrep` is
@@ -2219,40 +2719,20 @@ fn split_line_prefix(text: &str, mode: LineMode) -> (Option<usize>, Option<usize
         return (None, None, "", text);
     }
     let bytes = text.as_bytes();
-    if bytes
-        .first()
-        .is_none_or(|b| !b.is_ascii_digit() || *b == b'0')
-    {
-        return (None, None, "", text);
-    }
-    let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
-    if bytes.get(digits) != Some(&b':') {
-        return (None, None, "", text);
-    }
-    let Ok(line_no) = text[..digits].parse::<usize>() else {
+    let Some((line_no, digits)) = parse_pos_digits_colon(bytes) else {
         return (None, None, "", text);
     };
     let after_line = digits + 1;
-    if mode.has_col {
-        let rest = &text[after_line..];
-        let rbytes = rest.as_bytes();
-        if rbytes
-            .first()
-            .is_some_and(|b| b.is_ascii_digit() && *b != b'0')
-        {
-            let cdigits = rbytes.iter().take_while(|b| b.is_ascii_digit()).count();
-            if rbytes.get(cdigits) == Some(&b':')
-                && let Ok(col) = rest[..cdigits].parse::<usize>()
-            {
-                let after_col = after_line + cdigits + 1;
-                return (
-                    Some(line_no),
-                    Some(col),
-                    &text[..after_col],
-                    &text[after_col..],
-                );
-            }
-        }
+    if mode.has_col
+        && let Some((col, cdigits)) = parse_pos_digits_colon(&bytes[after_line..])
+    {
+        let after_col = after_line + cdigits + 1;
+        return (
+            Some(line_no),
+            Some(col),
+            &text[..after_col],
+            &text[after_col..],
+        );
     }
     (
         Some(line_no),
@@ -2270,20 +2750,23 @@ fn window_line(
     prefix: &str,
     content: &str,
     col: Option<usize>,
-    matcher: &PatternMatcher,
+    matcher: &mut PatternMatcher,
 ) -> (String, bool) {
     if raw.len() <= LINE_BYTES {
         return (raw.to_owned(), false);
     }
     let budget = WINDOW_SNIPPET_BYTES.min(LINE_BYTES.saturating_sub(prefix.len()).max(80));
     let snippet = window_snippet(content, col, matcher, budget);
-    (format!("{prefix}{snippet}"), true)
+    let mut out = String::with_capacity(prefix.len() + snippet.len());
+    out.push_str(prefix);
+    out.push_str(&snippet);
+    (out, true)
 }
 
 fn window_snippet(
     content: &str,
     col: Option<usize>,
-    matcher: &PatternMatcher,
+    matcher: &mut PatternMatcher,
     budget: usize,
 ) -> String {
     if content.len() <= budget {
@@ -2392,13 +2875,25 @@ fn skip_boilerplate(content: &str) -> usize {
 /// The line number at the start of `text` and the separator after it: `12:`
 /// before a match and `12-` before a context line.
 fn number(text: &str) -> Option<(usize, char)> {
-    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
-    let number = text[..digits].parse().ok()?;
-    let sep = text[digits..]
-        .chars()
-        .next()
-        .filter(|c| matches!(c, ':' | '-'))?;
-    Some((number, sep))
+    let bytes = text.as_bytes();
+    let first = *bytes.first()?;
+    if !first.is_ascii_digit() {
+        return None;
+    }
+    let mut val = usize::from(first - b'0');
+    let mut i = 1usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_digit() {
+            val = val.checked_mul(10)?.checked_add(usize::from(b - b'0'))?;
+            i += 1;
+        } else if matches!(b, b':' | b'-') {
+            return Some((val, b as char));
+        } else {
+            return None;
+        }
+    }
+    None
 }
 
 /// Whether a line whose file name ends at `len` is a match, its line number, and
@@ -2406,7 +2901,11 @@ fn number(text: &str) -> Option<(usize, char)> {
 /// lines carry no numbers.
 fn parts(line: &str, len: usize, numbered: bool) -> Option<(bool, Option<usize>, &str)> {
     let rest = line.get(len..)?;
-    let sep = rest.chars().next().filter(|c| matches!(c, ':' | '-'))?;
+    let sep = match *rest.as_bytes().first()? {
+        b':' => ':',
+        b'-' => '-',
+        _ => return None,
+    };
     if !numbered {
         return Some((sep == ':', None, rest));
     }
@@ -2429,11 +2928,9 @@ fn binary(line: &str) -> Option<&str> {
     Some(path.strip_prefix("grep: ").unwrap_or(path))
 }
 
-fn pointer(pointers: bool, group: &Group) -> String {
-    match (pointers, group.first == group.last) {
-        (false, _) => String::new(),
-        (true, true) => format!(" [stdout:{}]", group.first),
-        (true, false) => format!(" [stdout:{}-{}]", group.first, group.last),
+fn write_pointer(out: &mut String, pointers: bool, group: &Group) {
+    if pointers {
+        write_stdout_range(out, group.first, group.last);
     }
 }
 
@@ -3594,5 +4091,150 @@ mod tests {
             "{gg_report}"
         );
         assert_valid_stdout_pointers(&gg_report, gg_lines.len());
+    }
+
+    #[test]
+    fn ansi_fast_path_skips_alloc_and_colored_search_parses_identically() {
+        // Plain lines borrow with zero allocation (`Cow::Borrowed`).
+        let plain_line = "src/billing.rs:42:let total = compute_invoice(order);";
+        assert!(matches!(
+            super::strip_ansi_fast(plain_line),
+            std::borrow::Cow::Borrowed(s) if s == plain_line
+        ));
+        // Stray non-CSI ESC bytes also borrow without allocating.
+        let stray = "raw\x1btext";
+        assert!(matches!(
+            super::strip_ansi_fast(stray),
+            std::borrow::Cow::Borrowed(s) if s == stray
+        ));
+        // Colored `rg --color=always` lines strip cleanly and produce the exact same
+        // grouped output (including `--column` and `--heading -C1`) as plain input.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "").unwrap();
+        std::fs::write(dir.path().join("src/b.rs"), "").unwrap();
+
+        let plain_lines = vec![
+            "src/a.rs:10:5:let invoice = compute(1);".to_owned(),
+            "src/a.rs:20:5:let invoice = compute(2);".to_owned(),
+            "src/b.rs:7:9:return invoice;".to_owned(),
+        ];
+        let colored_lines = vec![
+            "\x1b[0m\x1b[35msrc/a.rs\x1b[0m:\x1b[0m\x1b[32m10\x1b[0m:5:let \x1b[0m\x1b[1m\x1b[31minvoice\x1b[0m = compute(1);".to_owned(),
+            "\x1b[0m\x1b[35msrc/a.rs\x1b[0m:\x1b[0m\x1b[32m20\x1b[0m:5:let \x1b[0m\x1b[1m\x1b[31minvoice\x1b[0m = compute(2);".to_owned(),
+            "\x1b[0m\x1b[35msrc/b.rs\x1b[0m:\x1b[0m\x1b[32m7\x1b[0m:9:return \x1b[0m\x1b[1m\x1b[31minvoice\x1b[0m;".to_owned(),
+        ];
+        let words = ["rg", "-n", "--column", "invoice", "src"];
+        let (plain_rep, _) = run_search(dir.path(), &words, "rg", &plain_lines, 4096, true);
+        let (color_rep, _) = run_search(dir.path(), &words, "rg", &colored_lines, 4096, true);
+        assert_eq!(color_rep, plain_rep);
+        assert_valid_stdout_pointers(&color_rep, colored_lines.len());
+
+        // Colored `rg -n -C1 --heading` also parses identically to uncolored input.
+        let h_words = ["rg", "-n", "-C1", "--heading", "invoice", "src"];
+        let h_plain = vec![
+            "src/a.rs".to_owned(),
+            "9-fn run() {".to_owned(),
+            "10:let invoice = compute(1);".to_owned(),
+            "".to_owned(),
+            "src/b.rs".to_owned(),
+            "7:return invoice;".to_owned(),
+        ];
+        let h_colored = vec![
+            "\x1b[35msrc/a.rs\x1b[0m".to_owned(),
+            "\x1b[32m9\x1b[0m-fn run() {".to_owned(),
+            "\x1b[32m10\x1b[0m:let \x1b[1;31minvoice\x1b[0m = compute(1);".to_owned(),
+            "".to_owned(),
+            "\x1b[35msrc/b.rs\x1b[0m".to_owned(),
+            "\x1b[32m7\x1b[0m:return \x1b[1;31minvoice\x1b[0m;".to_owned(),
+        ];
+        let (hp, _) = run_search(dir.path(), &h_words, "rg", &h_plain, 4096, true);
+        let (hc, _) = run_search(dir.path(), &h_words, "rg", &h_colored, 4096, true);
+        assert_eq!(hc, hp);
+        assert_valid_stdout_pointers(&hc, h_colored.len());
+    }
+
+    #[test]
+    fn whitespace_normalized_collapse_merges_aligned_boilerplate_without_merging_quoted_spaces() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        for f in [
+            "src/table.rs",
+            "src/strings.rs",
+            "src/u0.rs",
+            "src/u1.rs",
+            "src/u2.rs",
+            "src/u3.rs",
+        ] {
+            std::fs::write(dir.path().join(f), "").unwrap();
+        }
+
+        // 1. Intra-file aligned boilerplate with mixed tabs/spaces collapses cleanly
+        //    while keeping exact line numbers and distinct lines intact.
+        let aligned = vec![
+            "src/table.rs:4:    status:    OrderStatus::Pending,".to_owned(),
+            "src/table.rs:12:\tstatus:\t\tOrderStatus::Pending,".to_owned(),
+            "src/table.rs:27:  status:  OrderStatus::Pending,".to_owned(),
+            "src/table.rs:35:    status: OrderStatus::Pending,".to_owned(),
+            "src/table.rs:40:    status: OrderStatus::Committed,".to_owned(),
+        ];
+        let (report, _) = run_search(
+            dir.path(),
+            &["rg", "-n", "OrderStatus", "src"],
+            "rg",
+            &aligned,
+            4096,
+            true,
+        );
+        assert!(
+            report.contains("  L4,12,27,35: status: OrderStatus::Pending,\n")
+                && report.contains("  40:    status: OrderStatus::Committed,\n")
+                && !report.contains("more in file"),
+            "{report}"
+        );
+        assert_valid_stdout_pointers(&report, aligned.len());
+
+        // 2. Quoted whitespace differences (`"a  b"` vs `"a b"`) NEVER collapse together.
+        let quoted = vec![
+            "src/strings.rs:1:    assert_eq!(out, \"needle  spaced\");".to_owned(),
+            "src/strings.rs:2:    assert_eq!(out, \"needle  spaced\");".to_owned(),
+            "src/strings.rs:3:    assert_eq!(out, \"needle  spaced\");".to_owned(),
+            "src/strings.rs:4:    assert_eq!(out, \"needle spaced\");".to_owned(),
+        ];
+        let (q_report, _) = run_search(
+            dir.path(),
+            &["rg", "-n", "needle", "src"],
+            "rg",
+            &quoted,
+            4096,
+            true,
+        );
+        assert!(
+            q_report.contains("  L1-3: assert_eq!(out, \"needle  spaced\");\n")
+                && q_report.contains("  4:    assert_eq!(out, \"needle spaced\");\n"),
+            "{q_report}"
+        );
+
+        // 3. Multi-file identical boilerplate differing only in unquoted spacing (including
+        //    short `use crate::foo;` imports >= 10 B) collapses with exact line & stdout refs.
+        let multi = vec![
+            "src/u0.rs:1:use   crate::billing;".to_owned(),
+            "src/u1.rs:3:use crate::billing;".to_owned(),
+            "src/u2.rs:5:use\tcrate::billing;".to_owned(),
+            "src/u3.rs:8:use  crate::billing;".to_owned(),
+        ];
+        let (m_report, _) = run_search(
+            dir.path(),
+            &["rg", "-n", "billing", "src"],
+            "rg",
+            &multi,
+            4096,
+            true,
+        );
+        assert!(
+            m_report.contains("  same line in 3 more files: src/u1.rs:3 [stdout:2], src/u2.rs:5 [stdout:3], src/u3.rs:8 [stdout:4]\n"),
+            "{m_report}"
+        );
+        assert_valid_stdout_pointers(&m_report, multi.len());
     }
 }

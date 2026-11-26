@@ -3,10 +3,11 @@
 //! command for the next page, whose `--after` cursor names the search and the
 //! line the page stopped at.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read as _, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -280,10 +281,12 @@ fn short_hash(parts: &[&[u8]], bytes: usize) -> String {
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part);
     }
-    hasher.finalize()[..bytes]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(bytes * 2);
+    for &byte in &digest[..bytes] {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 impl Cursor {
@@ -813,6 +816,43 @@ pub fn run(workspace: &Workspace, matches: &ArgMatches, root_given: bool) -> Res
     Ok(())
 }
 
+/// Zero-allocation ASCII case-insensitive substring search (`needle_lower` must
+/// already have its ASCII letters lowercased). Matches `haystack.to_ascii_lowercase().find(needle_lower)`
+/// identically for all UTF-8 strings because ASCII bytes `0x00..=0x7f` never occur inside
+/// multi-byte UTF-8 sequences.
+fn find_ascii_ci(haystack: &str, needle_lower: &str) -> Option<usize> {
+    let n = needle_lower.as_bytes();
+    let h = haystack.as_bytes();
+    if n.is_empty() {
+        return Some(0);
+    }
+    if n.len() > h.len() {
+        return None;
+    }
+    let first = n[0];
+    let first_alt = if first.is_ascii_lowercase() {
+        first.to_ascii_uppercase()
+    } else {
+        first
+    };
+    let tail = &n[1..];
+    let limit = h.len() - n.len();
+    let mut i = 0;
+    while i <= limit {
+        let b = h[i];
+        if (b == first || b == first_alt)
+            && h[i + 1..i + n.len()]
+                .iter()
+                .zip(tail)
+                .all(|(hb, &nb)| hb.to_ascii_lowercase() == nb)
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Reads every candidate file in index order, counting all matches in scope
 /// and keeping up to `limit` after the cursor. One match per line.
 fn scan(
@@ -829,8 +869,9 @@ fn scan(
         total: 0,
         files: 0,
         before: 0,
-        page: Vec::new(),
+        page: Vec::with_capacity(limit.min(64)),
     };
+    let mut buf = String::new();
     for file in files {
         if !index
             .fingerprints
@@ -842,36 +883,81 @@ fn scan(
         let Ok(path) = workspace.source_path(file) else {
             continue;
         };
-        let Ok(text) = fs::read_to_string(path) else {
+        buf.clear();
+        let Ok(mut handle) = fs::File::open(path) else {
             continue;
         };
+        if handle.read_to_string(&mut buf).is_err() {
+            continue;
+        }
+        let text = buf.as_str();
+        let bytes = text.as_bytes();
+        let file_before = after.is_some_and(|(stop, _)| file.as_str() < stop);
+        let file_is_stop = after.is_some_and(|(stop, _)| file.as_str() == stop);
+        let stop_line = after.map_or(0, |(_, l)| l);
         let mut any = false;
-        for (offset, line) in text.lines().enumerate() {
-            let position = if insensitive {
-                line.to_ascii_lowercase().find(term)
+        let mut cursor = 0usize;
+        let mut line_no = 1usize;
+        let mut counted_to = 0usize;
+
+        while cursor < bytes.len() {
+            let rel = if insensitive {
+                find_ascii_ci(&text[cursor..], term)
             } else {
-                line.find(term)
+                text[cursor..].find(term)
             };
-            let Some(position) = position else {
+            let Some(rel) = rel else {
+                break;
+            };
+            let abs_pos = cursor + rel;
+            let line_start = bytes[cursor..abs_pos]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(cursor, |off| cursor + off + 1);
+            let (line_end, next_cursor) = match bytes[abs_pos..].iter().position(|&b| b == b'\n') {
+                Some(rel_nl) => {
+                    let nl = abs_pos + rel_nl;
+                    let end = if nl > line_start && bytes[nl - 1] == b'\r' {
+                        nl - 1
+                    } else {
+                        nl
+                    };
+                    (end, nl + 1)
+                }
+                None => (bytes.len(), bytes.len()),
+            };
+            // Match str::lines() semantics: `\r` immediately before `\n` is part of the
+            // line terminator, not line content.
+            if abs_pos + term.len() > line_end {
+                cursor = next_cursor;
                 continue;
-            };
+            }
             any = true;
             found.total += 1;
-            let number = offset + 1;
-            let seen = after.is_some_and(|(stop, stop_line)| {
-                file.as_str() < stop || (file.as_str() == stop && number <= stop_line)
-            });
-            if seen {
+            if file_before {
                 found.before += 1;
-            } else if found.page.len() < limit {
-                found.page.push(Hit::from_line(
-                    (*file).clone(),
-                    number,
-                    line,
-                    position,
-                    term.len(),
-                ));
+                cursor = next_cursor;
+                continue;
             }
+            if file_is_stop || found.page.len() < limit {
+                line_no += bytes[counted_to..line_start]
+                    .iter()
+                    .filter(|&&b| b == b'\n')
+                    .count();
+                counted_to = line_start;
+                if file_is_stop && line_no <= stop_line {
+                    found.before += 1;
+                } else if found.page.len() < limit {
+                    found.page.push(Hit::from_line(
+                        (*file).clone(),
+                        line_no,
+                        &text[line_start..line_end],
+                        abs_pos - line_start,
+                        term.len(),
+                    ));
+                }
+            }
+            cursor = next_cursor;
         }
         found.files += usize::from(any);
     }
@@ -1079,11 +1165,19 @@ struct FileGroup<'a> {
 
 struct CollapsedRow<'a> {
     lines: Vec<usize>,
-    snippet: &'a str,
+    key: Cow<'a, str>,
+    first_raw: &'a str,
+    raw_identical: bool,
+}
+
+enum BodyPrefix<'a> {
+    None,
+    Full(&'a str),
+    Partial(&'a str),
 }
 
 fn group_by_file(hits: &[Hit]) -> Vec<FileGroup<'_>> {
-    let mut groups = Vec::new();
+    let mut groups = Vec::with_capacity(hits.len().min(32));
     let mut start = 0;
     while start < hits.len() {
         let file = hits[start].file.as_str();
@@ -1107,15 +1201,15 @@ fn real_dir_depth(prefix: &str) -> usize {
         .count()
 }
 
-fn common_dir_prefix(paths: &[&str]) -> String {
+fn common_dir_prefix_iter<'a>(mut paths: impl Iterator<Item = &'a str>) -> &'a str {
     fn dir_of(path: &str) -> &str {
         path.rfind('/').map_or("", |i| &path[..=i])
     }
-    let Some((first, rest)) = paths.split_first() else {
-        return String::new();
+    let Some(first) = paths.next() else {
+        return "";
     };
     let mut common = dir_of(first);
-    for path in rest {
+    for path in paths {
         let dir = dir_of(path);
         let shared = common
             .bytes()
@@ -1130,10 +1224,15 @@ fn common_dir_prefix(paths: &[&str]) -> String {
             break;
         }
     }
-    common.to_owned()
+    common
 }
 
-fn hoistable_prefix(groups: &[FileGroup<'_>]) -> Option<String> {
+#[cfg(test)]
+fn common_dir_prefix(paths: &[&str]) -> String {
+    common_dir_prefix_iter(paths.iter().copied()).to_owned()
+}
+
+fn hoistable_prefix<'a>(groups: &[FileGroup<'a>]) -> Option<&'a str> {
     if groups.len() < 2 {
         return None;
     }
@@ -1143,53 +1242,230 @@ fn hoistable_prefix(groups: &[FileGroup<'_>]) -> Option<String> {
     {
         return None;
     }
-    let paths: Vec<&str> = groups.iter().map(|group| group.file).collect();
-    let common = common_dir_prefix(&paths);
-    if real_dir_depth(&common) < 2 {
+    let common = common_dir_prefix_iter(groups.iter().map(|group| group.file));
+    if real_dir_depth(common) < 2 {
         return None;
     }
     Some(common)
 }
 
+/// When full hoisting does not apply (for example because outlier files sit outside a
+/// deep monorepo subtree), find a 3+-segment directory prefix shared by at least 3 files
+/// whose `base: … = {prefix}` hoisting saves bytes cleanly.
+fn partial_hoistable_prefix<'a>(groups: &[FileGroup<'a>]) -> Option<&'a str> {
+    if groups.len() < 3 {
+        return None;
+    }
+    let mut counts: HashMap<&'a str, usize> = HashMap::with_capacity(groups.len());
+    for group in groups {
+        if display_path(group.file) != group.file {
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut seg_start = 0usize;
+        for (i, _) in group.file.match_indices('/') {
+            let seg = &group.file[seg_start..i];
+            if !seg.is_empty() && seg != "." {
+                depth += 1;
+            }
+            seg_start = i + 1;
+            if depth >= 3 && i + 1 >= 16 {
+                *counts.entry(&group.file[..=i]).or_default() += 1;
+            }
+        }
+    }
+    let marker_len = "…/".len();
+    let header_fixed = "base: … = \n".len();
+    let mut best: Option<(&'a str, usize)> = None;
+    for (prefix, count) in counts {
+        if count < 3 {
+            continue;
+        }
+        let gross = count.saturating_mul(prefix.len().saturating_sub(marker_len));
+        let cost = header_fixed + prefix.len();
+        let savings = gross.saturating_sub(cost);
+        if savings == 0 {
+            continue;
+        }
+        let replace = match best {
+            None => true,
+            Some((best_prefix, best_savings)) => {
+                savings > best_savings
+                    || (savings == best_savings && prefix.len() > best_prefix.len())
+                    || (savings == best_savings
+                        && prefix.len() == best_prefix.len()
+                        && prefix < best_prefix)
+            }
+        };
+        if replace {
+            best = Some((prefix, savings));
+        }
+    }
+    best.map(|(prefix, _)| prefix)
+}
+
+/// Collapse runs of unquoted ASCII horizontal whitespace (`' '` / `'\t'`) into a single
+/// space with a zero-allocation fast path when no tabs or consecutive spaces appear.
+fn normalize_ws(text: &str) -> Cow<'_, str> {
+    let bytes = text.as_bytes();
+    let mut prev_space = false;
+    let mut needs_norm = false;
+    for &b in bytes {
+        if b == b'\t' || (b == b' ' && prev_space) {
+            needs_norm = true;
+            break;
+        }
+        prev_space = b == b' ';
+    }
+    if !needs_norm {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::new();
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut copy_start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == q {
+                quote = None;
+            }
+            i += 1;
+        } else if b == b' ' || b == b'\t' {
+            let ws_start = i;
+            while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                i += 1;
+            }
+            if i - ws_start > 1 || b == b'\t' {
+                if out.is_empty() {
+                    out.reserve(text.len());
+                }
+                out.push_str(&text[copy_start..ws_start]);
+                out.push(' ');
+                copy_start = i;
+            }
+        } else {
+            if b == b'"' || b == b'`' {
+                quote = Some(b);
+            } else if b == b'\'' {
+                let apostrophe =
+                    i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                let lifetime = i > 0
+                    && matches!(bytes[i - 1], b'<' | b'&')
+                    && bytes.get(i + 2) != Some(&b'\'');
+                if !apostrophe && !lifetime {
+                    quote = Some(b);
+                }
+            }
+            i += 1;
+        }
+    }
+    if copy_start == 0 {
+        return Cow::Borrowed(text);
+    }
+    out.push_str(&text[copy_start..]);
+    Cow::Owned(out)
+}
+
 fn collapse_file_hits(hits: &[Hit]) -> Vec<CollapsedRow<'_>> {
-    let mut rows: Vec<CollapsedRow<'_>> = Vec::new();
-    let mut index_by_text: HashMap<&str, usize> = HashMap::new();
+    let mut rows: Vec<CollapsedRow<'_>> = Vec::with_capacity(hits.len());
+    if hits.len() <= 8 {
+        for hit in hits {
+            let raw = hit.text.as_str();
+            let key = normalize_ws(raw);
+            if let Some(row) = rows.iter_mut().find(|r| r.key.as_ref() == key.as_ref()) {
+                row.lines.push(hit.line);
+                if raw != row.first_raw {
+                    row.raw_identical = false;
+                }
+            } else {
+                rows.push(CollapsedRow {
+                    lines: vec![hit.line],
+                    key,
+                    first_raw: raw,
+                    raw_identical: true,
+                });
+            }
+        }
+        return rows;
+    }
+    let mut index_by_text: HashMap<Cow<'_, str>, usize> = HashMap::with_capacity(hits.len());
     for hit in hits {
-        let text = hit.text.as_str();
-        if let Some(&idx) = index_by_text.get(text) {
-            rows[idx].lines.push(hit.line);
+        let raw = hit.text.as_str();
+        let key = normalize_ws(raw);
+        if let Some(&idx) = index_by_text.get(key.as_ref()) {
+            let row = &mut rows[idx];
+            row.lines.push(hit.line);
+            if raw != row.first_raw {
+                row.raw_identical = false;
+            }
         } else {
             let idx = rows.len();
-            index_by_text.insert(text, idx);
+            index_by_text.insert(key.clone(), idx);
             rows.push(CollapsedRow {
                 lines: vec![hit.line],
-                snippet: text,
+                key,
+                first_raw: raw,
+                raw_identical: true,
             });
         }
     }
     rows
 }
 
-fn format_row(row: &CollapsedRow<'_>) -> String {
+fn write_row(out: &mut String, row: &CollapsedRow<'_>) {
     if row.lines.len() == 1 {
-        format!("{}: {}", row.lines[0], row.snippet)
-    } else {
-        let mut lines = String::new();
-        for (i, line) in row.lines.iter().enumerate() {
-            if i > 0 {
-                lines.push_str(", ");
-            }
-            let _ = write!(lines, "{line}");
-        }
-        format!("{lines} ({}×): {}", row.lines.len(), row.snippet)
+        let _ = write!(out, "{}: {}", row.lines[0], row.first_raw);
+        return;
     }
+    let mut first_piece = true;
+    let mut i = 0usize;
+    while i < row.lines.len() {
+        let start = row.lines[i];
+        let mut end = start;
+        let mut j = i + 1;
+        while j < row.lines.len() && row.lines[j] == end + 1 {
+            end = row.lines[j];
+            j += 1;
+        }
+        if !first_piece {
+            out.push_str(", ");
+        }
+        first_piece = false;
+        let run_len = j - i;
+        if run_len >= 3 {
+            let _ = write!(out, "{start}-{end}");
+        } else if run_len == 2 {
+            let _ = write!(out, "{start}, {end}");
+        } else {
+            let _ = write!(out, "{start}");
+        }
+        i = j;
+    }
+    let snippet = if row.raw_identical {
+        row.first_raw
+    } else {
+        row.key.as_ref()
+    };
+    let _ = write!(out, " ({}×): {snippet}", row.lines.len());
 }
 
 fn render_file_group(out: &mut String, rel_path: &str, group: &FileGroup<'_>) {
+    if let [hit] = group.hits {
+        let _ = writeln!(out, "{rel_path}:{}: {}", hit.line, hit.text);
+        return;
+    }
     let rows = collapse_file_hits(group.hits);
     if rows.len() == 1 {
-        let row = format_row(&rows[0]);
-        let _ = writeln!(out, "{rel_path}:{row}");
+        out.push_str(rel_path);
+        out.push(':');
+        write_row(out, &rows[0]);
+        out.push('\n');
         return;
     }
     let path_len = rel_path.len();
@@ -1202,29 +1478,53 @@ fn render_file_group(out: &mut String, rel_path: &str, group: &FileGroup<'_>) {
     if use_group {
         let _ = writeln!(out, "{rel_path}:");
         for row in &rows {
-            let formatted = format_row(row);
-            let _ = writeln!(out, "  {formatted}");
+            out.push_str("  ");
+            write_row(out, row);
+            out.push('\n');
         }
     } else {
         for row in &rows {
-            let formatted = format_row(row);
-            let _ = writeln!(out, "{rel_path}:{formatted}");
+            out.push_str(rel_path);
+            out.push(':');
+            write_row(out, row);
+            out.push('\n');
         }
     }
 }
 
-fn render_groups(groups: &[FileGroup<'_>], prefix: Option<&str>) -> String {
-    let mut out = String::new();
-    if let Some(base) = prefix {
-        let _ = writeln!(out, "base: {base}");
+fn render_groups(groups: &[FileGroup<'_>], prefix: BodyPrefix<'_>) -> String {
+    let est: usize = groups.iter().map(|g| g.hits.len() * 64 + 32).sum();
+    let mut out = String::with_capacity(est);
+    match prefix {
+        BodyPrefix::None => {}
+        BodyPrefix::Full(base) => {
+            let _ = writeln!(out, "base: {base}");
+        }
+        BodyPrefix::Partial(base) => {
+            let _ = writeln!(out, "base: … = {base}");
+        }
     }
+    let mut partial_buf = String::new();
     for group in groups {
         match prefix {
-            Some(base) => {
+            BodyPrefix::Full(base) => {
                 let rel = group.file.strip_prefix(base).unwrap_or(group.file);
                 render_file_group(&mut out, rel, group);
             }
-            None => {
+            BodyPrefix::Partial(base) => {
+                if display_path(group.file) == group.file
+                    && let Some(rel) = group.file.strip_prefix(base)
+                {
+                    partial_buf.clear();
+                    partial_buf.push_str("…/");
+                    partial_buf.push_str(rel);
+                    render_file_group(&mut out, &partial_buf, group);
+                } else {
+                    let shown_path = display_path(group.file);
+                    render_file_group(&mut out, &shown_path, group);
+                }
+            }
+            BodyPrefix::None => {
                 let shown_path = display_path(group.file);
                 render_file_group(&mut out, &shown_path, group);
             }
@@ -1235,9 +1535,14 @@ fn render_groups(groups: &[FileGroup<'_>], prefix: Option<&str>) -> String {
 
 fn render_body(hits: &[Hit]) -> String {
     let groups = group_by_file(hits);
-    let plain = render_groups(&groups, None);
+    let plain = render_groups(&groups, BodyPrefix::None);
     if let Some(prefix) = hoistable_prefix(&groups) {
-        let hoisted = render_groups(&groups, Some(&prefix));
+        let hoisted = render_groups(&groups, BodyPrefix::Full(prefix));
+        if hoisted.len() < plain.len() {
+            return hoisted;
+        }
+    } else if let Some(prefix) = partial_hoistable_prefix(&groups) {
+        let hoisted = render_groups(&groups, BodyPrefix::Partial(prefix));
         if hoisted.len() < plain.len() {
             return hoisted;
         }
@@ -1819,5 +2124,174 @@ fn a() {
             assert_eq!(visited, expected_coords, "budget={budget}");
             assert!(pages >= 2, "budget={budget}, pages={pages}");
         }
+    }
+
+    #[test]
+    fn deep_partial_prefix_hoisting_and_contiguous_range_collapse_stay_within_budget() {
+        let deep = "packages/platform/services/billing/v2/handlers";
+        let contiguous = format!(
+            "fn init() {{\n{}    let unique = retry_budget(99);\n}}\n",
+            [
+                "    retry_budget(1);\n",
+                "    retry_budget(1);\n",
+                "\tretry_budget(1);\n",
+                "    retry_budget(1);\n",
+                "    retry_budget(1);\n",
+                "    retry_budget(1);\n",
+            ]
+            .join("")
+        );
+        let mut files: Vec<(String, String)> = vec![
+            ("Cargo.toml".into(), "retry_budget = 3\n".into()),
+            (format!("{deep}/batch_01.rs"), contiguous),
+        ];
+        for i in 2..=7 {
+            files.push((
+                format!("{deep}/batch_{i:02}.rs"),
+                format!("pub fn run_{i}() {{ retry_budget({i}); }}\n"),
+            ));
+        }
+        files.push((
+            "tests/e2e.rs".into(),
+            "fn test_all() { retry_budget(0); }\n".into(),
+        ));
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect();
+        let (_dir, ws, index) = temp_workspace(&refs);
+        let in_scope: Vec<&String> = index.files.keys().collect();
+        let found = scan(&ws, &index, &in_scope, "retry_budget", false, None, 50);
+        assert_eq!(found.total, 15);
+        assert_eq!(found.files, 9);
+
+        let full_req = test_request("retry_budget", 50, 4096);
+        let page = Page {
+            request: &full_req,
+            found: &found,
+            search: "0123abcd",
+            index: &index,
+        };
+        let compact = page.text(String::new());
+        let flat = baseline_flat(&found.page);
+        assert!(
+            compact.starts_with(&format!("base: … = {deep}/\n")),
+            "{compact}"
+        );
+        assert!(
+            compact.contains("Cargo.toml:1: retry_budget = 3\n"),
+            "{compact}"
+        );
+        assert!(
+            compact.contains("…/batch_01.rs:\n  2-7 (6×): retry_budget(1);\n  8: let unique = retry_budget(99);\n"),
+            "{compact}"
+        );
+        assert!(
+            compact.contains("…/batch_07.rs:1: pub fn run_7() { retry_budget(7); }\n"),
+            "{compact}"
+        );
+        assert!(
+            compact.contains("tests/e2e.rs:1: fn test_all() { retry_budget(0); }\n"),
+            "{compact}"
+        );
+        assert!(
+            compact.len() * 100 <= flat.len() * 55,
+            "expected >=45% savings from partial deep hoist + range collapse: {} vs {}\n{compact}",
+            compact.len(),
+            flat.len()
+        );
+
+        // Tight budget paging round-trip across partial hoist + contiguous collapse visits
+        // every hit exactly once without exceeding budget.
+        let expected: Vec<(String, usize)> = found
+            .page
+            .iter()
+            .map(|h| (h.file.clone(), h.line))
+            .collect();
+        let mut after: Option<(String, usize)> = None;
+        let mut visited = Vec::new();
+        loop {
+            let after_ref = after.as_ref().map(|(f, l)| (f.as_str(), *l));
+            let f = scan(&ws, &index, &in_scope, "retry_budget", false, after_ref, 50);
+            let mut req = test_request("retry_budget", 50, 320);
+            req.after_given = after.is_some();
+            let p = Page {
+                request: &req,
+                found: &f,
+                search: "0123abcd",
+                index: &index,
+            };
+            let text = p.text(String::new());
+            assert!(text.len() <= 320, "len={}\n{text}", text.len());
+            if let Some(c_str) = text
+                .split_whitespace()
+                .find_map(|w| w.strip_prefix("--after="))
+            {
+                let cursor = Cursor::parse(c_str).unwrap();
+                let stop_idx = f
+                    .page
+                    .iter()
+                    .position(|h| {
+                        short_hash(&[h.file.as_bytes()], 6) == cursor.file && h.line == cursor.line
+                    })
+                    .unwrap();
+                for hit in &f.page[..=stop_idx] {
+                    visited.push((hit.file.clone(), hit.line));
+                }
+                after = Some((f.page[stop_idx].file.clone(), cursor.line));
+            } else {
+                for hit in &f.page {
+                    visited.push((hit.file.clone(), hit.line));
+                }
+                break;
+            }
+        }
+        assert_eq!(visited, expected);
+    }
+
+    #[test]
+    fn ascii_case_insensitive_fast_scan_handles_crlf_utf8_and_cursor_resumption() {
+        let (_dir, ws, index) = temp_workspace(&[
+            (
+                "a.txt",
+                "first\r\nCAFÉ_Token once Café_TOKEN twice\r\nplain\r\n",
+            ),
+            ("b.txt", "no match here\njust filler\n"),
+            ("c.txt", "line1\n  caFé_tOkEn final"),
+        ]);
+        let in_scope: Vec<&String> = index.files.keys().collect();
+        let term = "café_token";
+        // Notice UTF-8 `É` (U+00C9) != `é` (U+00E9) under ASCII case folding, matching
+        // `to_ascii_lowercase()` semantics: only `Café_TOKEN` and `caFé_tOkEn` match!
+        let found = scan(&ws, &index, &in_scope, term, true, None, 10);
+        assert_eq!(found.total, 2);
+        assert_eq!(found.files, 2);
+        assert_eq!(found.page.len(), 2);
+        assert_eq!(found.page[0].file, "a.txt");
+        assert_eq!(found.page[0].line, 2);
+        assert_eq!(found.page[0].text, "CAFÉ_Token once Café_TOKEN twice");
+        assert_eq!(found.page[1].file, "c.txt");
+        assert_eq!(found.page[1].line, 2);
+        assert_eq!(found.page[1].text, "caFé_tOkEn final");
+
+        // Resuming after `a.txt:2` counts 1 before and returns only `c.txt:2`.
+        let resumed = scan(&ws, &index, &in_scope, term, true, Some(("a.txt", 2)), 10);
+        assert_eq!(resumed.total, 2);
+        assert_eq!(resumed.before, 1);
+        assert_eq!(resumed.page.len(), 1);
+        assert_eq!(resumed.page[0].file, "c.txt");
+        assert_eq!(resumed.page[0].line, 2);
+
+        // Quoted spaces inside a single file stay separate under collapse_file_hits.
+        let hits = [
+            Hit::from_line("q.rs".into(), 1, "assert_eq!(s, \"a  b\");", 0, 9),
+            Hit::from_line("q.rs".into(), 2, "assert_eq!(s, \"a  b\");", 0, 9),
+            Hit::from_line("q.rs".into(), 3, "assert_eq!(s, \"a b\");", 0, 9),
+        ];
+        let body = render_body(&hits);
+        assert_eq!(
+            body,
+            "q.rs:1, 2 (2×): assert_eq!(s, \"a  b\");\nq.rs:3: assert_eq!(s, \"a b\");\n"
+        );
     }
 }
