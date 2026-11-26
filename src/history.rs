@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -179,6 +180,11 @@ fn valid_run_id(id: &str) -> bool {
     })
 }
 
+/// Largest `record.json` kept in memory while sorting `records`. Larger files
+/// stream their completion stamp and re-stream on demand so `resume` (`.take(5)`)
+/// never buffers huge diagnostic records for runs it will not read.
+const INLINE_RECORD_CAP: u64 = 64 * 1024;
+
 /// Recorded runs ordered by completion time, newest first unless `oldest`.
 /// A record that cannot be read is skipped with a warning naming its run, so
 /// the others stay readable. The iterator never yields an error.
@@ -194,15 +200,17 @@ pub fn records(
     }
     enum Source {
         /// Raw `record.json` bytes already read from disk, decoded lazily when
-        /// the caller consumes this entry so each file is read at most once.
+        /// the caller consumes this entry so small files are opened at most once.
         Json(Vec<u8>),
+        /// Oversized `record.json` whose stamp was streamed; decoded on demand.
+        OnDisk,
         /// Unfinished run directory that has `stdout` but no `record.json`.
         Unfinished,
     }
     let path = workspace.state.join("runs");
     let mut entries = Vec::new();
     if path.exists() {
-        for entry in fs::read_dir(path)? {
+        for entry in fs::read_dir(&path)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
                 continue;
@@ -210,8 +218,8 @@ pub fn records(
             let id = entry.file_name().to_string_lossy().into_owned();
             let directory = entry.path();
             let record = directory.join("record.json");
-            let bytes = match fs::read(&record) {
-                Ok(bytes) => bytes,
+            let file = match fs::File::open(&record) {
+                Ok(file) => file,
                 // A run that Justless could not finish has streams but may lack a
                 // record. It sorts by the last write to its output.
                 Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -227,53 +235,76 @@ pub fn records(
                     continue;
                 }
             };
-            // Records stored before completion times existed sort by modification time.
-            let completed =
-                match serde_json::from_slice::<Stamp>(&bytes).context("decode run record") {
+            let meta = file.metadata().ok();
+            let fallback_ms = || {
+                meta.as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .map_or(0, millis)
+            };
+            if meta.as_ref().is_some_and(|m| m.len() <= INLINE_RECORD_CAP) {
+                let mut bytes = Vec::with_capacity(meta.as_ref().map_or(0, |m| m.len() as usize));
+                if let Err(e) = io::Read::read_to_end(&mut &file, &mut bytes) {
+                    skipped(&id, &anyhow::Error::new(e).context("read run record"));
+                    continue;
+                }
+                let completed =
+                    match serde_json::from_slice::<Stamp>(&bytes).context("decode run record") {
+                        Ok(stamp) if stamp.completed_ms > 0 => stamp.completed_ms,
+                        Ok(_) => fallback_ms(),
+                        Err(error) => {
+                            skipped(&id, &error);
+                            continue;
+                        }
+                    };
+                entries.push((completed, id, Source::Json(bytes)));
+            } else {
+                let completed = match serde_json::from_reader::<_, Stamp>(BufReader::new(file))
+                    .context("decode run record")
+                {
                     Ok(stamp) if stamp.completed_ms > 0 => stamp.completed_ms,
-                    Ok(_) => fs::metadata(&record)
-                        .and_then(|meta| meta.modified())
-                        .map_or(0, millis),
+                    Ok(_) => fallback_ms(),
                     Err(error) => {
                         skipped(&id, &error);
                         continue;
                     }
                 };
-            entries.push((completed, id, Source::Json(bytes)));
+                entries.push((completed, id, Source::OnDisk));
+            }
         }
     }
     entries.sort_unstable_by(|a, b| {
         let order = a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1));
         if oldest { order } else { order.reverse() }
     });
-    Ok(entries.into_iter().filter_map(|(completed, id, source)| {
-        let loaded = match source {
-            Source::Json(bytes) => decode_run(&id, &bytes, completed),
-            Source::Unfinished => capture::load(workspace, &id).map(|(_, mut run)| {
-                if run.completed_ms == 0 {
-                    run.completed_ms = completed;
+    Ok(entries
+        .into_iter()
+        .filter_map(move |(completed, id, source)| {
+            let loaded = match source {
+                Source::Json(bytes) => decode_run(&id, &bytes, completed),
+                Source::OnDisk => {
+                    decode_run_file(&id, &path.join(&id).join("record.json"), completed)
                 }
-                if run.family.is_empty() {
-                    run.family = "legacy".into();
+                Source::Unfinished => capture::load(workspace, &id).map(|(_, mut run)| {
+                    if run.completed_ms == 0 {
+                        run.completed_ms = completed;
+                    }
+                    if run.family.is_empty() {
+                        run.family = "legacy".into();
+                    }
+                    run
+                }),
+            };
+            match loaded {
+                Ok(run) => Some(Ok(run)),
+                Err(error) => {
+                    skipped(&id, &error);
+                    None
                 }
-                run
-            }),
-        };
-        match loaded {
-            Ok(run) => Some(Ok(run)),
-            Err(error) => {
-                skipped(&id, &error);
-                None
             }
-        }
-    }))
+        }))
 }
 
-fn decode_run(id: &str, bytes: &[u8], completed: u64) -> Result<Run> {
-    if !valid_run_id(id) {
-        anyhow::bail!("invalid run ID");
-    }
-    let mut run: Run = serde_json::from_slice(bytes).context("decode run record")?;
+fn finalize_run(id: &str, mut run: Run, completed: u64) -> Result<Run> {
     if run.id != id {
         anyhow::bail!("run record does not match its directory");
     }
@@ -284,6 +315,23 @@ fn decode_run(id: &str, bytes: &[u8], completed: u64) -> Result<Run> {
         run.family = "legacy".into();
     }
     Ok(run)
+}
+
+fn decode_run(id: &str, bytes: &[u8], completed: u64) -> Result<Run> {
+    if !valid_run_id(id) {
+        anyhow::bail!("invalid run ID");
+    }
+    let run: Run = serde_json::from_slice(bytes).context("decode run record")?;
+    finalize_run(id, run, completed)
+}
+
+fn decode_run_file(id: &str, path: &Path, completed: u64) -> Result<Run> {
+    if !valid_run_id(id) {
+        anyhow::bail!("invalid run ID");
+    }
+    let file = fs::File::open(path).context("read run record")?;
+    let run: Run = serde_json::from_reader(BufReader::new(file)).context("decode run record")?;
+    finalize_run(id, run, completed)
 }
 
 /// A later request that printed part of a run's output again.
@@ -728,8 +776,8 @@ struct Read {
 }
 
 fn get<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+    match fs::File::open(path) {
+        Ok(file) => Ok(serde_json::from_reader(BufReader::new(file))?),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(T::default()),
         Err(e) => Err(e.into()),
     }
@@ -738,7 +786,10 @@ fn get<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T> {
 /// Reads state for a report, warning about a damaged file instead of failing.
 fn get_or_warn<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
     get(path).unwrap_or_else(|error| {
-        eprintln!("justless: ignored unreadable {}: {error:#}", path.display());
+        eprintln!(
+            "justless: ignored unreadable {}: {error:#} (run `justless doctor` to check local state)",
+            path.display()
+        );
         T::default()
     })
 }
@@ -825,22 +876,37 @@ impl ArchiveRecalls {
 }
 
 /// How many archived tool results `justless recall` printed since `since_ms`,
-/// and their bytes.
+/// and their bytes. Streams line by line so long logs stay O(1) in memory and
+/// truncated lines are skipped cleanly.
 pub(crate) fn archive_recalls(state: &Path, since_ms: u64) -> ArchiveRecalls {
-    let Ok(text) = fs::read_to_string(state.join(ARCHIVE_RECALLS)) else {
+    let Ok(file) = fs::File::open(state.join(ARCHIVE_RECALLS)) else {
         return ArchiveRecalls::default();
     };
-    text.lines()
-        .filter_map(|line| serde_json::from_str::<ArchiveRecall>(line).ok())
-        .filter(|recall| recall.ms >= since_ms)
-        .fold(ArchiveRecalls::default(), |mut total, recall| {
-            total.count += 1;
-            total.bytes += recall.bytes;
-            if recall.proxy {
-                total.proxy_bytes += recall.bytes;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut total = ArchiveRecalls::default();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(recall) = serde_json::from_str::<ArchiveRecall>(trimmed)
+                    && recall.ms >= since_ms
+                {
+                    total.count += 1;
+                    total.bytes += recall.bytes;
+                    if recall.proxy {
+                        total.proxy_bytes += recall.bytes;
+                    }
+                }
             }
-            total
-        })
+        }
+    }
+    total
 }
 
 /// Records that the agent was shown lines `from..=to` of the workspace file
@@ -1091,6 +1157,8 @@ struct FamilyStats {
     #[serde(flatten)]
     totals: Totals,
     reopened_runs: u64,
+    reopen_percent: f64,
+    estimated_tokens_net_saved: i64,
     full_reads: u64,
     targeted_lookups: u64,
     /// Lines of these runs that `history TEXT`, `lookup --logs` or `pack` printed.
@@ -1098,6 +1166,96 @@ struct FamilyStats {
     unchanged_runs: u64,
     /// Runs whose printed preview and footer were larger than the raw output.
     grown_runs: u64,
+}
+
+/// How a captured run's output was presented to the agent, derived strictly from
+/// fields already stored in `record.json`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewKind {
+    StructuredView,
+    TestSummary,
+    DiffSummary,
+    PlanSummary,
+    Unchanged,
+    ClippedPreview,
+    Verbatim,
+}
+
+impl ViewKind {
+    const COUNT: usize = 7;
+    const ALL: [Self; Self::COUNT] = [
+        Self::StructuredView,
+        Self::TestSummary,
+        Self::DiffSummary,
+        Self::PlanSummary,
+        Self::Unchanged,
+        Self::ClippedPreview,
+        Self::Verbatim,
+    ];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::StructuredView => "structured",
+            Self::TestSummary => "tests",
+            Self::DiffSummary => "diff",
+            Self::PlanSummary => "plan",
+            Self::Unchanged => "unchanged",
+            Self::ClippedPreview => "preview",
+            Self::Verbatim => "verbatim",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::StructuredView => "structured view",
+            Self::TestSummary => "test summary",
+            Self::DiffSummary => "diff summary",
+            Self::PlanSummary => "plan summary",
+            Self::Unchanged => "unchanged rerun",
+            Self::ClippedPreview => "clipped preview",
+            Self::Verbatim => "verbatim",
+        }
+    }
+}
+
+fn classify_view(
+    unchanged: bool,
+    replaced: Option<&str>,
+    summary_kind: &str,
+    raw_bytes: u64,
+    shown: u64,
+) -> ViewKind {
+    if unchanged {
+        ViewKind::Unchanged
+    } else if replaced.is_some() {
+        match summary_kind {
+            "tests" => ViewKind::TestSummary,
+            "diff" => ViewKind::DiffSummary,
+            "plan" => ViewKind::PlanSummary,
+            _ => ViewKind::StructuredView,
+        }
+    } else if shown < raw_bytes {
+        ViewKind::ClippedPreview
+    } else {
+        ViewKind::Verbatim
+    }
+}
+
+#[derive(Default, Serialize)]
+struct ViewStats {
+    kind: &'static str,
+    #[serde(skip)]
+    label: &'static str,
+    runs: u64,
+    #[serde(flatten)]
+    totals: Totals,
+    reopened_runs: u64,
+    reopen_percent: f64,
+    estimated_tokens_net_saved: i64,
 }
 
 #[derive(Default, Serialize)]
@@ -1151,8 +1309,12 @@ fn percent(part: u64, whole: u64) -> f64 {
 
 /// The UTC calendar date for a Unix timestamp in milliseconds.
 pub fn utc_date(ms: u64) -> String {
+    utc_date_from_day(ms / 86_400_000)
+}
+
+fn utc_date_from_day(day: u64) -> String {
     // Civil-from-days conversion for the proleptic Gregorian calendar.
-    let z = (ms / 86_400_000) as i64 + 719_468;
+    let z = day as i64 + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
@@ -1212,6 +1374,12 @@ struct SummaryRecord {
     _source_digests: serde::de::IgnoredAny,
 }
 
+#[derive(Default, Deserialize)]
+struct SummaryKind {
+    #[serde(default)]
+    kind: String,
+}
+
 /// Lightweight projection of `capture::Run` for `stats`, validating all
 /// required `Run` fields while skipping unused collections with zero allocations.
 #[derive(Deserialize)]
@@ -1231,6 +1399,10 @@ struct StatsRecord {
     footer_bytes: usize,
     #[serde(default)]
     redaction: Option<crate::redact::Found>,
+    #[serde(default)]
+    replaced: Option<String>,
+    #[serde(default)]
+    summary: SummaryKind,
     #[serde(rename = "diagnostics")]
     _diagnostics: serde::de::IgnoredAny,
     #[serde(rename = "source_digests")]
@@ -1243,13 +1415,17 @@ fn add_run_estimate(
     raw_bytes: u64,
     shown: u64,
     replayed_bytes: u64,
-) {
+) -> Option<(crate::tokens::Content, i64, i64)> {
     let initial = net_bytes(raw_bytes, shown, 0);
     let net = net_bytes(raw_bytes, shown, replayed_bytes);
     // An uncompacted run with zero initial and zero net savings adds (0, 0) to
     // its bucket, so skip opening and classifying its archived streams.
     if initial != 0 || net != 0 {
-        estimate.add(crate::tokens::run_content(directory), initial, net);
+        let content = crate::tokens::run_content(directory);
+        estimate.add(content, initial, net);
+        Some((content, initial, net))
+    } else {
+        None
     }
 }
 
@@ -1266,8 +1442,11 @@ pub(crate) fn summary(workspace: &Workspace, since_ms: u64) -> Summary {
         if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
-        let id = entry.file_name().to_string_lossy().into_owned();
-        if !valid_run_id(&id) {
+        let name = entry.file_name();
+        let Some(id) = name.to_str() else {
+            continue;
+        };
+        if !valid_run_id(id) {
             continue;
         }
         let directory = entry.path();
@@ -1279,10 +1458,12 @@ pub(crate) fn summary(workspace: &Workspace, since_ms: u64) -> Summary {
                     if since_ms > 0 && modified.saturating_add(RECORD_SLACK_MS) < since_ms {
                         continue;
                     }
-                    let Ok(bytes) = fs::read(&record_path) else {
+                    let Ok(file) = fs::File::open(&record_path) else {
                         continue;
                     };
-                    let Ok(record) = serde_json::from_slice::<SummaryRecord>(&bytes) else {
+                    let Ok(record) =
+                        serde_json::from_reader::<_, SummaryRecord>(BufReader::new(file))
+                    else {
                         continue;
                     };
                     if record.id != id {
@@ -1317,7 +1498,7 @@ pub(crate) fn summary(workspace: &Workspace, since_ms: u64) -> Summary {
         let shown = (preview_bytes + footer_bytes) as u64;
         let later = recalls.replayed(&directory);
         totals.add(raw_bytes, shown, later);
-        add_run_estimate(&mut estimate, &directory, raw_bytes, shown, later.bytes());
+        let _ = add_run_estimate(&mut estimate, &directory, raw_bytes, shown, later.bytes());
         runs += 1;
     }
     Summary {
@@ -1330,15 +1511,44 @@ pub(crate) fn summary(workspace: &Workspace, since_ms: u64) -> Summary {
     }
 }
 
-pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) -> Result<()> {
-    let since = now_ms().saturating_sub(days.saturating_mul(86_400_000));
+struct StatsData {
+    count: u64,
+    skipped_runs: u64,
+    totals: Totals,
+    estimate: crate::tokens::Estimate,
+    replayed: Replayed,
+    secrets: u64,
+    unredacted: u64,
+    commands: Vec<FamilyStats>,
+    views: Vec<ViewStats>,
+    timeline: BTreeMap<u64, DayStats>,
+}
+
+#[derive(Default)]
+struct FamilyAccum {
+    stats: FamilyStats,
+    estimate: crate::tokens::Estimate,
+}
+
+#[derive(Default)]
+struct ViewAccum {
+    runs: u64,
+    totals: Totals,
+    reopened_runs: u64,
+    estimate: crate::tokens::Estimate,
+}
+
+/// Single-pass streaming scan of `.justless/runs/` for `stats`.
+fn collect_stats(workspace: &Workspace, since: u64) -> Result<StatsData> {
     let mut count = 0u64;
+    let mut skipped_runs = 0u64;
     let mut totals = Totals::default();
     let mut estimate = crate::tokens::Estimate::default();
     let mut replayed = Replayed::default();
     let (mut secrets, mut unredacted) = (0u64, 0u64);
-    let mut families: BTreeMap<String, FamilyStats> = BTreeMap::new();
-    let mut timeline: BTreeMap<String, DayStats> = BTreeMap::new();
+    let mut families: BTreeMap<String, FamilyAccum> = BTreeMap::new();
+    let mut view_accums: [ViewAccum; ViewKind::COUNT] = Default::default();
+    let mut timeline: BTreeMap<u64, DayStats> = BTreeMap::new();
     let runs_path = workspace.state.join("runs");
     if runs_path.exists() {
         for entry in fs::read_dir(&runs_path)? {
@@ -1349,27 +1559,41 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
             let id = entry.file_name().to_string_lossy().into_owned();
             let directory = entry.path();
             let record_path = directory.join("record.json");
-            let (raw_bytes, preview_bytes, footer_bytes, completed_ms, family, unchanged, found) =
-                match fs::read(&record_path) {
-                    Ok(bytes) => match serde_json::from_slice::<StatsRecord>(&bytes)
-                        .context("decode run record")
-                    {
+            if !valid_run_id(&id) {
+                if record_path.exists() || directory.join("stdout").exists() {
+                    skipped(&id, &anyhow::anyhow!("invalid run ID"));
+                    skipped_runs += 1;
+                }
+                continue;
+            }
+            let (
+                raw_bytes,
+                preview_bytes,
+                footer_bytes,
+                completed_ms,
+                family,
+                unchanged,
+                found,
+                replaced,
+                summary_kind,
+            ) = match fs::File::open(&record_path) {
+                Ok(file) => {
+                    let parsed = serde_json::from_reader::<_, StatsRecord>(BufReader::new(&file))
+                        .context("decode run record");
+                    match parsed {
                         Ok(record) => {
-                            if !valid_run_id(&id) {
-                                skipped(&id, &anyhow::anyhow!("invalid run ID"));
-                                continue;
-                            }
                             if record.id != id {
                                 skipped(
                                     &id,
                                     &anyhow::anyhow!("run record does not match its directory"),
                                 );
+                                skipped_runs += 1;
                                 continue;
                             }
                             let completed = if record.completed_ms > 0 {
                                 record.completed_ms
                             } else {
-                                fs::metadata(&record_path)
+                                file.metadata()
                                     .and_then(|meta| meta.modified())
                                     .map_or(0, millis)
                             };
@@ -1386,30 +1610,41 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
                                 family,
                                 record.unchanged,
                                 record.redaction.map_or(0, |found| found.count),
+                                record.replaced,
+                                record.summary.kind,
                             )
                         }
                         Err(error) => {
                             skipped(&id, &error);
+                            skipped_runs += 1;
                             continue;
                         }
-                    },
-                    Err(e) if e.kind() == ErrorKind::NotFound => {
-                        let Ok(modified) =
-                            fs::metadata(directory.join("stdout")).and_then(|meta| meta.modified())
-                        else {
-                            continue;
-                        };
-                        if !valid_run_id(&id) {
-                            skipped(&id, &anyhow::anyhow!("invalid run ID"));
-                            continue;
-                        }
-                        (0, 0, 0, millis(modified), "unknown".into(), false, 0)
                     }
-                    Err(e) => {
-                        skipped(&id, &anyhow::Error::new(e).context("read run record"));
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    let Ok(modified) =
+                        fs::metadata(directory.join("stdout")).and_then(|meta| meta.modified())
+                    else {
                         continue;
-                    }
-                };
+                    };
+                    (
+                        0,
+                        0,
+                        0,
+                        millis(modified),
+                        "unknown".into(),
+                        false,
+                        0,
+                        None,
+                        String::new(),
+                    )
+                }
+                Err(e) => {
+                    skipped(&id, &anyhow::Error::new(e).context("read run record"));
+                    skipped_runs += 1;
+                    continue;
+                }
+            };
             // Count everything the agent received, including the footer.
             let shown = (preview_bytes + footer_bytes) as u64;
             count += 1;
@@ -1417,29 +1652,115 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
             let c: Recalls = get_or_warn(&directory.join("recalls.json"));
             let later = c.replayed(&directory);
             totals.add(raw_bytes, shown, later);
-            add_run_estimate(&mut estimate, &directory, raw_bytes, shown, later.bytes());
+            let classified =
+                add_run_estimate(&mut estimate, &directory, raw_bytes, shown, later.bytes());
             replayed.add(later);
             unredacted += c.unredacted;
-            let f = families.entry(family.clone()).or_default();
-            f.family = family;
-            f.runs += 1;
-            f.totals.add(raw_bytes, shown, later);
-            f.reopened_runs += u64::from(c.full > 0);
-            f.full_reads += c.full;
-            f.targeted_lookups += c.range + c.search + c.context;
-            f.excerpts += c.excerpts;
-            f.unchanged_runs += u64::from(unchanged);
-            f.grown_runs += u64::from(shown > raw_bytes);
+
+            let view = classify_view(
+                unchanged,
+                replaced.as_deref(),
+                &summary_kind,
+                raw_bytes,
+                shown,
+            );
+            let v = &mut view_accums[view.index()];
+            v.runs += 1;
+            v.totals.add(raw_bytes, shown, later);
+            v.reopened_runs += u64::from(c.full > 0);
+            if let Some((content, initial, net)) = classified {
+                v.estimate.add(content, initial, net);
+            }
+
+            let f = if let Some(existing) = families.get_mut(family.as_str()) {
+                existing
+            } else {
+                let key = family.clone();
+                families.entry(key).or_insert_with(|| FamilyAccum {
+                    stats: FamilyStats {
+                        family,
+                        ..Default::default()
+                    },
+                    estimate: crate::tokens::Estimate::default(),
+                })
+            };
+            f.stats.runs += 1;
+            f.stats.totals.add(raw_bytes, shown, later);
+            f.stats.reopened_runs += u64::from(c.full > 0);
+            f.stats.full_reads += c.full;
+            f.stats.targeted_lookups += c.range + c.search + c.context;
+            f.stats.excerpts += c.excerpts;
+            f.stats.unchanged_runs += u64::from(unchanged);
+            f.stats.grown_runs += u64::from(shown > raw_bytes);
+            if let Some((content, initial, net)) = classified {
+                f.estimate.add(content, initial, net);
+            }
+
             // Retrievals are not timed, so they count on the day their run completed.
             if completed_ms >= since && completed_ms > 0 {
-                let date = utc_date(completed_ms);
-                let d = timeline.entry(date.clone()).or_default();
-                d.date = date;
+                let day = completed_ms / 86_400_000;
+                let d = timeline.entry(day).or_insert_with(|| DayStats {
+                    date: utc_date_from_day(day),
+                    ..Default::default()
+                });
                 d.runs += 1;
                 d.totals.add(raw_bytes, shown, later);
             }
         }
     }
+    let mut commands: Vec<FamilyStats> = families
+        .into_values()
+        .map(|mut accum| {
+            accum.stats.reopen_percent =
+                rounded(percent(accum.stats.reopened_runs, accum.stats.runs));
+            accum.stats.estimated_tokens_net_saved = accum.estimate.net_tokens();
+            accum.stats
+        })
+        .collect();
+    commands.sort_unstable_by(|a, b| {
+        b.totals
+            .net_saved_bytes
+            .cmp(&a.totals.net_saved_bytes)
+            .then_with(|| a.family.cmp(&b.family))
+    });
+    let mut views: Vec<ViewStats> = ViewKind::ALL
+        .into_iter()
+        .filter_map(|kind| {
+            let accum = std::mem::take(&mut view_accums[kind.index()]);
+            (accum.runs > 0).then(|| ViewStats {
+                kind: kind.key(),
+                label: kind.label(),
+                runs: accum.runs,
+                reopen_percent: rounded(percent(accum.reopened_runs, accum.runs)),
+                reopened_runs: accum.reopened_runs,
+                estimated_tokens_net_saved: accum.estimate.net_tokens(),
+                totals: accum.totals,
+            })
+        })
+        .collect();
+    views.sort_unstable_by(|a, b| {
+        b.totals
+            .net_saved_bytes
+            .cmp(&a.totals.net_saved_bytes)
+            .then_with(|| a.kind.cmp(b.kind))
+    });
+    Ok(StatsData {
+        count,
+        skipped_runs,
+        totals,
+        estimate,
+        replayed,
+        secrets,
+        unredacted,
+        commands,
+        views,
+        timeline,
+    })
+}
+
+pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) -> Result<()> {
+    let since = now_ms().saturating_sub(days.saturating_mul(86_400_000));
+    let data = collect_stats(workspace, since)?;
     let activity: Activity = get_or_warn(&workspace.state.join("activity.json"));
     let recalls = archive_recalls(&workspace.state, since);
     let proxy = crate::proxy::report(workspace, since, recalls.proxy_bytes)?;
@@ -1448,19 +1769,13 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
     let usage = sessions
         .then(|| crate::tokens::sessions(&workspace.root, since))
         .flatten();
+    let count = data.count;
     let (raw, preview, saved, net) = (
-        totals.raw_bytes,
-        totals.preview_bytes,
-        totals.initial(),
-        totals.net_saved_bytes,
+        data.totals.raw_bytes,
+        data.totals.preview_bytes,
+        data.totals.initial(),
+        data.totals.net_saved_bytes,
     );
-    let mut commands: Vec<_> = families.into_values().collect();
-    commands.sort_by(|a, b| {
-        b.totals
-            .net_saved_bytes
-            .cmp(&a.totals.net_saved_bytes)
-            .then(a.family.cmp(&b.family))
-    });
     let outlines = OutlinesSummary::from_activity(&activity.outlines);
     let deltas = DeltasSummary::from_activity(&activity.deltas);
     let observations = observations_summary(workspace);
@@ -1469,28 +1784,30 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
         // `saved_*` and `estimated_tokens_saved` are savings at first preview.
         let mut report = serde_json::json!({
             "runs": count,
+            "skipped_runs": data.skipped_runs,
             "raw_bytes": raw,
             "preview_bytes": preview,
             "saved_bytes": saved,
             "saved_percent": rounded(percent(saved, raw)),
-            "estimated_tokens_saved": estimate.saved_tokens(),
-            "replayed_bytes": replayed.measured,
-            "estimated_replay_bytes": replayed.estimated,
-            "estimated_replays": replayed.estimated_replays,
-            "unmeasured_retrievals": replayed.unmeasured,
+            "estimated_tokens_saved": data.estimate.saved_tokens(),
+            "replayed_bytes": data.replayed.measured,
+            "estimated_replay_bytes": data.replayed.estimated,
+            "estimated_replays": data.replayed.estimated_replays,
+            "unmeasured_retrievals": data.replayed.unmeasured,
             "net_saved_bytes": net,
             "net_saved_percent": rounded(signed_percent(net, raw)),
-            "estimated_tokens_net_saved": estimate.net_tokens(),
+            "estimated_tokens_net_saved": data.estimate.net_tokens(),
             "token_estimate": crate::tokens::method(),
-            "estimate_by_content": estimate.json(),
-            "days": timeline.into_values().collect::<Vec<_>>(),
-            "commands": commands,
+            "estimate_by_content": data.estimate.json(),
+            "days": data.timeline.into_values().collect::<Vec<_>>(),
+            "commands": data.commands,
+            "views": data.views,
             "repeated_source_reads": activity.repeat_reads,
             "changed_since_read": deltas.json(),
             "source_outlines": outlines.json(),
             "observations": observations.json(&recalls),
-            "redacted_secrets": secrets,
-            "unredacted_replays": unredacted,
+            "redacted_secrets": data.secrets,
+            "unredacted_replays": data.unredacted,
             "hook_pass_through": activity.bypasses,
             "proxy": proxy.as_ref().map(|p| p.json()),
             "archive_recalls": recalls.json(),
@@ -1507,8 +1824,14 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
     if count == 0 {
         let justless = workspace.justless();
         println!(
-            "No captured runs yet. Run a command with `{justless} run -- COMMAND` or install hooks with `{justless} init --hooks`."
+            "No captured runs yet. Run a command with `{justless} run -- COMMAND`, install hooks with `{justless} init --hooks`, or check setup with `{justless} doctor`."
         );
+        if data.skipped_runs > 0 {
+            println!(
+                "Skipped {} unreadable run record(s); run `{justless} doctor` to check local state.",
+                data.skipped_runs
+            );
+        }
     } else {
         println!(
             "Kept {} of {} command output out of context at first preview ({:.1}%) across {count} run(s)",
@@ -1521,47 +1844,55 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
             signed_bytes(net),
             signed_percent(net, raw)
         );
-        if replayed.bytes() == 0 && replayed.unmeasured == 0 {
+        if data.replayed.bytes() == 0 && data.replayed.unmeasured == 0 {
             println!("No run output was retrieved again, so {net_saved}");
         } else {
-            let estimate = if replayed.estimated_replays > 0 {
+            let estimate = if data.replayed.estimated_replays > 0 {
                 format!(
                     " and about {} estimated for {} whole replay(s) recorded without their size",
-                    human_bytes(replayed.estimated),
-                    replayed.estimated_replays
+                    human_bytes(data.replayed.estimated),
+                    data.replayed.estimated_replays
                 )
             } else {
                 String::new()
             };
             println!(
                 "Later replays and lookups printed {} of run output again{estimate}, so {net_saved}",
-                human_bytes(replayed.measured)
+                human_bytes(data.replayed.measured)
             );
         }
-        if replayed.unmeasured > 0 {
+        if data.replayed.unmeasured > 0 {
             println!(
                 "{} earlier range, search or context request(s) were recorded without their size and are not subtracted",
-                replayed.unmeasured
+                data.replayed.unmeasured
             );
         }
         println!(
             "≈{} tokens saved at first preview, ≈{} net (estimated at {})",
-            estimate.saved_tokens(),
-            estimate.net_tokens(),
-            estimate.basis()
+            data.estimate.saved_tokens(),
+            data.estimate.net_tokens(),
+            data.estimate.basis()
         );
-        if secrets > 0 {
-            println!("Redacted {secrets} secret(s) in captured output");
+        if data.secrets > 0 {
+            println!("Redacted {} secret(s) in captured output", data.secrets);
         }
-        if !timeline.is_empty() {
+        if data.skipped_runs > 0 {
+            println!(
+                "Skipped {} unreadable run record(s); run `{} doctor` to check local state.",
+                data.skipped_runs,
+                workspace.justless()
+            );
+        }
+        if !data.timeline.is_empty() {
             println!("\nLast {days} day(s), UTC, with retrievals on the day their run completed");
-            let peak = timeline
+            let peak = data
+                .timeline
                 .values()
                 .map(|d| d.totals.net_saved_bytes)
                 .max()
                 .unwrap_or(0)
                 .max(1) as u64;
-            for d in timeline.values() {
+            for d in data.timeline.values() {
                 let t = &d.totals;
                 let bar = t.net_saved_bytes.max(0) as u64;
                 let width = (bar * 20).div_ceil(peak) as usize;
@@ -1579,17 +1910,20 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
             }
         }
         println!("\nBy command, most net savings first");
-        let wide = commands
+        let wide = data
+            .commands
             .iter()
             .map(|f| f.family.chars().count())
             .max()
             .unwrap_or(0)
             .min(28);
-        for f in &commands {
+        for f in &data.commands {
             let t = &f.totals;
             let mut notes = Vec::new();
             if f.reopened_runs > 0 {
                 notes.push(format!("{}/{} reopened in full", f.reopened_runs, f.runs));
+            } else {
+                notes.push("0 reopened".to_owned());
             }
             if f.targeted_lookups > 0 {
                 notes.push(format!("{} targeted lookup(s)", f.targeted_lookups));
@@ -1617,24 +1951,46 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
             }
             let family = crate::summary::short(&f.family, 28);
             println!(
-                "  {family:<wide$}  {:>4} run(s)  {:>9} → {:<9} {:>5.1}%  net {:>6.1}%{}",
+                "  {family:<wide$}  {:>4} run(s)  {:>9} → {:<9} {:>5.1}%  net {:>6.1}%  · {}",
                 f.runs,
                 human_bytes(t.raw_bytes),
                 human_bytes(t.preview_bytes),
                 percent(t.initial(), t.raw_bytes),
                 signed_percent(t.net_saved_bytes, t.raw_bytes),
-                if notes.is_empty() {
-                    String::new()
-                } else {
-                    format!("  · {}", notes.join(" · "))
-                }
+                notes.join(" · ")
             );
+        }
+        if !data.views.is_empty() {
+            println!("\nBy view, most net savings first");
+            let view_wide = data.views.iter().map(|v| v.label.len()).max().unwrap_or(0);
+            for v in &data.views {
+                let t = &v.totals;
+                let reopen = if v.reopened_runs > 0 {
+                    format!("{}/{} reopened in full", v.reopened_runs, v.runs)
+                } else {
+                    "0 reopened".to_owned()
+                };
+                let tokens = if v.estimated_tokens_net_saved != 0 {
+                    format!(" · ≈{} net tokens est.", v.estimated_tokens_net_saved)
+                } else {
+                    String::new()
+                };
+                println!(
+                    "  {:<view_wide$}  {:>4} run(s)  {:>9} → {:<9} {:>5.1}%  net {:>6.1}%  · {reopen}{tokens}",
+                    v.label,
+                    v.runs,
+                    human_bytes(t.raw_bytes),
+                    human_bytes(t.preview_bytes),
+                    percent(t.initial(), t.raw_bytes),
+                    signed_percent(t.net_saved_bytes, t.raw_bytes),
+                );
+            }
         }
         crate::adaptive::print_stats(workspace);
     }
-    let reopened: u64 = commands.iter().map(|f| f.reopened_runs).sum();
-    let targeted: u64 = commands.iter().map(|f| f.targeted_lookups).sum();
-    let excerpts: u64 = commands.iter().map(|f| f.excerpts).sum();
+    let reopened: u64 = data.commands.iter().map(|f| f.reopened_runs).sum();
+    let targeted: u64 = data.commands.iter().map(|f| f.targeted_lookups).sum();
+    let excerpts: u64 = data.commands.iter().map(|f| f.excerpts).sum();
     if count > 0 || activity.repeat_reads > 0 {
         println!(
             "\nRecovery: {reopened} run(s) reopened in full · {targeted} targeted lookup(s){} · {} repeated source-range read(s){}",
@@ -1644,8 +2000,8 @@ pub fn stats(workspace: &Workspace, days: u64, as_json: bool, sessions: bool) ->
                 String::new()
             },
             activity.repeat_reads,
-            if unredacted > 0 {
-                format!(" · {unredacted} unredacted replay(s)")
+            if data.unredacted > 0 {
+                format!(" · {} unredacted replay(s)", data.unredacted)
             } else {
                 String::new()
             }
@@ -1991,14 +2347,17 @@ fn has_any_run(workspace: &Workspace) -> bool {
         if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
-        let id = entry.file_name().to_string_lossy().into_owned();
-        if !valid_run_id(&id) {
+        let name = entry.file_name();
+        let Some(id) = name.to_str() else {
+            continue;
+        };
+        if !valid_run_id(id) {
             continue;
         }
         let directory = entry.path();
-        match fs::read(directory.join("record.json")) {
-            Ok(bytes) => {
-                if serde_json::from_slice::<SummaryRecord>(&bytes)
+        match fs::File::open(directory.join("record.json")) {
+            Ok(file) => {
+                if serde_json::from_reader::<_, SummaryRecord>(BufReader::new(file))
                     .is_ok_and(|record| record.id == id)
                 {
                     return true;
@@ -2217,12 +2576,19 @@ fn format_read_ranges(file: &str, ranges: &[(usize, usize)], stale: bool) -> Str
     let mut sorted = ranges.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
-    let spans: Vec<String> = sorted
-        .into_iter()
-        .map(|(from, to)| format!("{from}-{to}"))
-        .collect();
-    let suffix = if stale { " [source changed]" } else { "" };
-    format!("Read {file}:{}{suffix}", spans.join(", "))
+    let mut out =
+        String::with_capacity(6 + file.len() + sorted.len() * 12 + usize::from(stale) * 17);
+    let _ = write!(out, "Read {file}:");
+    for (i, (from, to)) in sorted.into_iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "{from}-{to}");
+    }
+    if stale {
+        out.push_str(" [source changed]");
+    }
+    out
 }
 
 fn current_cached(
@@ -2662,5 +3028,188 @@ mod tests {
             sum.estimate.json()["code"]["saved_bytes"],
             code_sample.len() as u64 - 100
         );
+    }
+
+    #[test]
+    fn stats_attributes_views_ranks_families_and_skips_corrupt_records() {
+        let (_dir, ws) = temp_workspace();
+        let runs_dir = ws.state.join("runs");
+        fs::create_dir_all(&runs_dir).unwrap();
+
+        // Corrupt, partial, mismatched-ID, and invalid-ID records must never panic
+        // and must be counted in `skipped_runs`.
+        for (id, body) in [
+            ("run-empty", ""),
+            (
+                "run-partial",
+                r#"{"id":"run-partial","status":0,"completed_ms":99999999999999}"#,
+            ),
+            (
+                "run-mismatch",
+                r#"{"id":"run-other","status":0,"raw_bytes":100,"preview_bytes":50,"diagnostics":[],"source_digests":{}}"#,
+            ),
+            (
+                "not-a-valid-run",
+                r#"{"id":"not-a-valid-run","status":0,"raw_bytes":100,"preview_bytes":50,"diagnostics":[],"source_digests":{}}"#,
+            ),
+        ] {
+            let d = runs_dir.join(id);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("record.json"), body).unwrap();
+        }
+
+        let now = now_ms();
+        let since = now.saturating_sub(7 * 86_400_000);
+        let write_run = |id: &str,
+                         family: &str,
+                         raw: u64,
+                         preview: usize,
+                         unchanged: bool,
+                         replaced: Option<&str>,
+                         summary_kind: &str| {
+            let d = runs_dir.join(id);
+            fs::create_dir_all(&d).unwrap();
+            let mut rec = serde_json::json!({
+                "id": id,
+                "status": 0,
+                "raw_bytes": raw,
+                "preview_bytes": preview,
+                "footer_bytes": 0,
+                "completed_ms": now - 1_000,
+                "family": family,
+                "unchanged": unchanged,
+                "summary": { "kind": summary_kind },
+                "diagnostics": [],
+                "source_digests": {},
+            });
+            if let Some(r) = replaced {
+                rec["replaced"] = serde_json::json!(r);
+            }
+            fs::write(d.join("record.json"), rec.to_string()).unwrap();
+            fs::write(d.join("stdout"), "INFO: synthetic log line\n".repeat(10)).unwrap();
+            fs::write(d.join("stderr"), "").unwrap();
+            d
+        };
+
+        // Structured lint view (biggest net saver: 19,000 net bytes, 0 reopened).
+        write_run("run-lint1", "mypy", 20_000, 1_000, false, Some("both"), "");
+        // Test summary: 2 runs, 1 reopened in full for 8,000 bytes (net: 20,000 - 2,000 - 8,000 = 10,000).
+        let t1 = write_run(
+            "run-test1",
+            "cargo test",
+            10_000,
+            1_000,
+            false,
+            Some("both"),
+            "tests",
+        );
+        recall(&t1, Retrieval::Full, Some(8_000));
+        write_run(
+            "run-test2",
+            "cargo test",
+            10_000,
+            1_000,
+            false,
+            Some("both"),
+            "tests",
+        );
+        // Diff summary + unchanged rerun.
+        write_run(
+            "run-diff1",
+            "git diff",
+            6_000,
+            1_000,
+            false,
+            Some("stdout"),
+            "diff",
+        );
+        write_run(
+            "run-diff2",
+            "git diff",
+            6_000,
+            200,
+            true,
+            Some("stdout"),
+            "diff",
+        );
+        // Clipped preview (no structured replacement) + verbatim small run.
+        write_run("run-cat1", "cat", 5_000, 2_000, false, None, "");
+        write_run("run-sh1", "sh", 100, 100, false, None, "");
+
+        let data = collect_stats(&ws, since).unwrap();
+        assert_eq!(data.count, 7);
+        assert_eq!(data.skipped_runs, 4);
+        assert_eq!(data.totals.raw_bytes, 57_100);
+        assert_eq!(data.totals.preview_bytes, 6_300);
+        assert_eq!(data.totals.replayed_bytes, 8_000);
+        assert_eq!(data.totals.net_saved_bytes, 42_800);
+
+        // Families are sorted strictly by net_saved_bytes descending.
+        let families: Vec<&str> = data.commands.iter().map(|f| f.family.as_str()).collect();
+        assert_eq!(
+            families,
+            vec!["mypy", "git diff", "cargo test", "cat", "sh"]
+        );
+        assert_eq!(data.commands[0].reopened_runs, 0);
+        assert_eq!(data.commands[0].reopen_percent, 0.0);
+        assert_eq!(data.commands[2].reopened_runs, 1);
+        assert_eq!(data.commands[2].reopen_percent, 50.0);
+        assert!(data.commands[0].estimated_tokens_net_saved > 0);
+
+        // Views attribute every run cleanly and sum exactly to overall totals.
+        let view_kinds: Vec<&str> = data.views.iter().map(|v| v.kind).collect();
+        assert_eq!(
+            view_kinds,
+            vec![
+                "structured",
+                "tests",
+                "unchanged",
+                "diff",
+                "preview",
+                "verbatim"
+            ]
+        );
+        assert_eq!(data.views.iter().map(|v| v.runs).sum::<u64>(), data.count);
+        assert_eq!(
+            data.views
+                .iter()
+                .map(|v| v.totals.net_saved_bytes)
+                .sum::<i64>(),
+            data.totals.net_saved_bytes
+        );
+        let test_view = data.views.iter().find(|v| v.kind == "tests").unwrap();
+        assert_eq!(test_view.runs, 2);
+        assert_eq!(test_view.reopened_runs, 1);
+        assert_eq!(test_view.reopen_percent, 50.0);
+        assert_eq!(
+            test_view.estimated_tokens_net_saved,
+            crate::tokens::Content::Logs.tokens_signed(10_000)
+        );
+        assert_eq!(data.timeline.len(), 1);
+    }
+
+    #[test]
+    fn archive_recalls_streams_jsonl_and_skips_corrupt_or_old_lines() {
+        let (_dir, ws) = temp_workspace();
+        ws.prepare_state().unwrap();
+        let now = now_ms();
+        let since = now.saturating_sub(10_000);
+        let log = format!(
+            "{{\"ms\":{},\"bytes\":999,\"proxy\":false}}\n\
+             \n\
+             {{\"ms\":{},\"bytes\":1200,\"proxy\":false}}\n\
+             {{\"ms\":{},\"bytes\":truncated\n\
+             {{\"ms\":{},\"bytes\":3400,\"proxy\":true}}\n",
+            now.saturating_sub(60_000),
+            now.saturating_sub(2_000),
+            now.saturating_sub(1_000),
+            now.saturating_sub(500),
+        );
+        fs::write(ws.state.join(ARCHIVE_RECALLS), log).unwrap();
+
+        let recalls = archive_recalls(&ws.state, since);
+        assert_eq!(recalls.count, 2);
+        assert_eq!(recalls.bytes, 4_600);
+        assert_eq!(recalls.proxy_bytes, 3_400);
     }
 }

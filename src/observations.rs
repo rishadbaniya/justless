@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::sync::LazyLock;
@@ -9,10 +9,11 @@ use clap::{Arg, ArgGroup, ArgMatches, Command};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::capture::{Counted, source_digest};
 use crate::history::{age, human_bytes, now_ms};
-use crate::workspace::{Workspace, private_dir, write_json};
+use crate::workspace::{Workspace, private_dir};
 
 pub fn commands() -> Vec<Command<'static>> {
     vec![
@@ -55,20 +56,55 @@ fn recover(ws: &Workspace, id: &str) -> Result<Value> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-pub(crate) fn archive(ws: &Workspace, value: &Value) -> Result<String> {
-    let id = source_digest(&serde_json::to_vec(value)?);
-    ws.prepare_state()?;
+fn verify_archived(ws: &Workspace, id: &str, meta: &fs::Metadata, expected: &[u8]) -> Result<()> {
+    ensure!(
+        meta.is_file(),
+        "expected a workspace file: .justless/observations/{id}.json"
+    );
+    ensure!(
+        meta.len() == expected.len() as u64,
+        "observation checksum mismatch"
+    );
+    let path = ws.source_path(&format!(".justless/observations/{id}.json"))?;
+    let existing = fs::read(path)?;
+    ensure!(existing == expected, "observation checksum mismatch");
+    Ok(())
+}
+
+/// Archives pre-serialized JSON `bytes` under their SHA-256 ID.
+///
+/// Idempotent fast-path: when `<id>.json` already exists on disk, verifies its
+/// containment, size and exact bytes without rewriting or re-parsing JSON.
+fn archive_serialized(ws: &Workspace, bytes: &[u8]) -> Result<String> {
+    let id = source_digest(bytes);
     let directory = ws.state.join("observations");
-    private_dir(&directory)?;
     let path = directory.join(format!("{id}.json"));
     match fs::symlink_metadata(&path) {
-        Ok(_) => {
-            recover(ws, &id)?;
+        Ok(meta) => {
+            verify_archived(ws, &id, &meta, bytes)?;
+            return Ok(id);
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => write_json(&path, value)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    Ok(id)
+    ws.prepare_state()?;
+    private_dir(&directory)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+    temporary.write_all(bytes)?;
+    match temporary.persist_noclobber(&path) {
+        Ok(_) => Ok(id),
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+            let meta = fs::symlink_metadata(&path)?;
+            verify_archived(ws, &id, &meta, bytes)?;
+            Ok(id)
+        }
+        Err(error) => Err(error.error.into()),
+    }
+}
+
+pub(crate) fn archive(ws: &Workspace, value: &Value) -> Result<String> {
+    let bytes = serde_json::to_vec(value)?;
+    archive_serialized(ws, &bytes)
 }
 
 /// An archived tool result, indexed by the tool_use ID the request carried it under.
@@ -237,13 +273,15 @@ pub(crate) fn archive_tool_use(
     ws.prepare_state()?;
     let directory = ws.state.join("tool-uses");
     private_dir(&directory)?;
+    let bytes = serde_json::to_vec(content)?;
+    let observation = archive_serialized(ws, &bytes)?;
     let entry = ToolUse {
         id: id.to_owned(),
-        observation: archive(ws, content)?,
+        observation,
         tool: call.tool.to_owned(),
         call: call.summary.to_owned(),
         input: input_text(call.input),
-        bytes: serde_json::to_vec(content)?.len() as u64,
+        bytes: bytes.len() as u64,
         is_error,
         first_seen_ms: now_ms(),
     };
@@ -263,10 +301,11 @@ fn tool_uses(ws: &Workspace) -> Result<Vec<ToolUse>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(entries),
         Err(error) => return Err(error.into()),
     };
-    for file in listing {
-        let path = file?.path();
+    for file in listing.flatten() {
+        let path = file.path();
         if path.extension().is_some_and(|e| e == "json")
-            && let Ok(entry) = serde_json::from_slice::<ToolUse>(&fs::read(&path)?)
+            && let Ok(bytes) = fs::read(&path)
+            && let Ok(entry) = serde_json::from_slice::<ToolUse>(&bytes)
         {
             entries.push(entry);
         }
@@ -1240,15 +1279,17 @@ fn outputs(request: &Value) -> Result<Vec<Output>> {
     Ok(out)
 }
 
-fn text_kind(value: &Value) -> Option<&str> {
+fn text_kind(value: &Value) -> Option<&'static str> {
     if value.is_string() {
         return Some("");
     }
     let parts = value.as_array()?;
-    let kind = parts.first()?["type"].as_str()?;
-    if !matches!(kind, "text" | "input_text" | "output_text") {
-        return None;
-    }
+    let kind = match parts.first()?["type"].as_str()? {
+        "text" => "text",
+        "input_text" => "input_text",
+        "output_text" => "output_text",
+        _ => return None,
+    };
     parts
         .iter()
         .all(|p| {
@@ -1310,9 +1351,66 @@ fn text_content(value: &Value) -> Option<Cow<'_, str>> {
     Some(Cow::Owned(joined))
 }
 
-fn content_digest(value: &Value) -> Option<String> {
-    let text = text_content(value)?;
-    Some(source_digest(text.as_bytes()))
+/// Streams a text result's UTF-8 content directly into SHA-256 without joining
+/// multi-part arrays or hex-encoding a temporary string.
+fn content_hash(value: &Value) -> Option<[u8; 32]> {
+    text_kind(value)?;
+    let mut hasher = Sha256::new();
+    if let Some(s) = value.as_str() {
+        hasher.update(s.as_bytes());
+    } else {
+        let parts = value.as_array()?;
+        for part in parts {
+            hasher.update(part["text"].as_str()?.as_bytes());
+        }
+    }
+    Some(hasher.finalize().into())
+}
+
+/// Checks whether a `text_kind`-validated value contains `needle` without
+/// serializing the JSON value.
+fn text_contains_char(value: &Value, needle: char) -> bool {
+    if let Some(s) = value.as_str() {
+        return s.contains(needle);
+    }
+    value.as_array().is_some_and(|parts| {
+        parts
+            .iter()
+            .any(|p| p["text"].as_str().is_some_and(|s| s.contains(needle)))
+    })
+}
+
+/// Counts serialized JSON bytes of `value` without allocating an intermediate buffer.
+fn json_len(value: &Value) -> Result<usize> {
+    struct Counter(usize);
+    impl Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
+}
+
+/// Exact serialized JSON length of a bare `[justless recall <64-hex>]` stub for `kind`.
+fn bare_stub_cost(kind: &str) -> usize {
+    let stub_text_len = PREFIX.len() + 64 + 1;
+    let cost = if kind.is_empty() {
+        2 + stub_text_len
+    } else {
+        // `[{"type":"<kind>","text":"<stub>"}]`
+        23 + kind.len() + stub_text_len
+    };
+    debug_assert_eq!(
+        cost,
+        json_len(&wrap_stub(kind, format!("{PREFIX}{}]", "0".repeat(64)))).unwrap()
+    );
+    cost
 }
 
 fn strip_ansi(text: &str) -> Cow<'_, str> {
@@ -1617,19 +1715,23 @@ static NONZERO_EXIT_LINE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 fn looks_like_error_result(text: &str, target: Option<&TargetKey>) -> bool {
-    if let Some(first) = text
-        .lines()
-        .map(strip_ansi)
-        .map(|l| l.trim().to_owned())
-        .find(|l| !l.is_empty())
-        && (first.starts_with("<tool_use_error>")
-            || first.starts_with("Encountered error in tool execution:")
-            || first.starts_with("Error: ENOENT")
-            || first.starts_with("Error: EACCES")
-            || first.starts_with("Error: EISDIR")
-            || first.starts_with("File does not exist")
-            || first.starts_with("No such file or directory")
-            || (text.len() < 512 && (first.starts_with("Error:") || first.starts_with("error:"))))
+    if let Some(first) = text.lines().find_map(|line| match strip_ansi(line) {
+        Cow::Borrowed(s) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then_some(Cow::Borrowed(trimmed))
+        }
+        Cow::Owned(s) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| Cow::Owned(trimmed.to_owned()))
+        }
+    }) && (first.starts_with("<tool_use_error>")
+        || first.starts_with("Encountered error in tool execution:")
+        || first.starts_with("Error: ENOENT")
+        || first.starts_with("Error: EACCES")
+        || first.starts_with("Error: EISDIR")
+        || first.starts_with("File does not exist")
+        || first.starts_with("No such file or directory")
+        || (text.len() < 512 && (first.starts_with("Error:") || first.starts_with("error:"))))
     {
         return true;
     }
@@ -1726,7 +1828,7 @@ fn build_stub(
         return Ok(bare);
     };
     let enriched = wrap_stub(kind, format!("{PREFIX}{id} · {cue}]"));
-    let enriched_bytes = serde_json::to_vec(&enriched)?.len();
+    let enriched_bytes = json_len(&enriched)?;
     if enriched_bytes < original_bytes
         && enriched_bytes.saturating_mul(100) < original_bytes.saturating_mul(MAX_ENRICHED_PERCENT)
     {
@@ -1735,7 +1837,7 @@ fn build_stub(
     }
     if superseded_target.is_some() && cue != "superseded" {
         let compact = wrap_stub(kind, format!("{PREFIX}{id} · superseded]"));
-        let compact_bytes = serde_json::to_vec(&compact)?.len();
+        let compact_bytes = json_len(&compact)?;
         if compact_bytes < original_bytes
             && compact_bytes.saturating_mul(100)
                 < original_bytes.saturating_mul(MAX_ENRICHED_PERCENT)
@@ -1789,14 +1891,21 @@ fn recall(ws: &Workspace, args: &ArgMatches, selection: &Selection) -> Result<(u
     // Plain recall prints text: a string, or the parts of an all-text array
     // joined without a separator. `--json` prints the typed value.
     if !as_json && text_kind(&value).is_some() {
-        let text = match value.as_array() {
-            Some(parts) => parts
+        if let Some(text) = value.as_str() {
+            return Ok((selection.print(text.as_bytes())?, false));
+        }
+        if let Some(parts) = value.as_array() {
+            if parts.len() == 1
+                && let Some(text) = parts[0]["text"].as_str()
+            {
+                return Ok((selection.print(text.as_bytes())?, false));
+            }
+            let text: String = parts
                 .iter()
                 .map(|part| part["text"].as_str().unwrap_or_default())
-                .collect::<String>(),
-            None => value.as_str().unwrap_or_default().to_owned(),
-        };
-        return Ok((selection.print(text.as_bytes())?, false));
+                .collect();
+            return Ok((selection.print(text.as_bytes())?, false));
+        }
     }
     ensure!(
         selection.whole(),
@@ -1814,12 +1923,12 @@ struct MaskOptions<'a> {
     keep_tools: Vec<&'a str>,
 }
 
-enum Change {
+enum Change<'a> {
     Restore(Value),
     Retire {
-        kind: String,
+        kind: &'static str,
         bytes: usize,
-        superseded: Option<TargetKey>,
+        superseded: Option<&'a TargetKey>,
     },
 }
 
@@ -1836,27 +1945,43 @@ fn mask_request(
             && !opts.pins.iter().any(|&s| s == c.call)
             && !opts.keep_tools.iter().any(|&s| s == c.tool)
     };
-    let mut digests: Vec<Option<String>> = Vec::new();
-    let mut last_occurrence: HashMap<String, usize> = HashMap::new();
+    let mut digests: Vec<Option<[u8; 32]>> = Vec::new();
+    let mut last_occurrence: HashMap<[u8; 32], usize> = HashMap::new();
     let mut superseded: Vec<bool> = Vec::new();
     if !opts.restore {
         digests.reserve(candidates.len());
         let mut valid_superseder = vec![false; candidates.len()];
+        let mut seen_targets: HashSet<&TargetKey> = HashSet::new();
+        let mut seen_read_paths: HashSet<&str> = HashSet::new();
         for (index, c) in candidates.iter().enumerate() {
             let value = request
                 .pointer(&c.path)
                 .filter(|value| marker(value).is_none());
-            let digest = value.and_then(content_digest);
-            if let Some(d) = &digest {
-                last_occurrence.insert(d.clone(), index);
+            let digest = value.and_then(content_hash);
+            if let Some(d) = digest {
+                last_occurrence.insert(d, index);
             }
             digests.push(digest);
-            if !c.protected
-                && c.target.is_some()
-                && let Some(text) = value.and_then(text_content)
-                && !looks_like_error_result(&text, c.target.as_ref())
-            {
-                valid_superseder[index] = true;
+            if let Some(target) = &c.target {
+                let could_supersede_earlier = seen_targets.contains(target)
+                    || matches!(
+                        target,
+                        TargetKey::Read {
+                            path,
+                            range: ReadRange::Whole,
+                        } if seen_read_paths.contains(path.as_str())
+                    );
+                if could_supersede_earlier
+                    && !c.protected
+                    && let Some(text) = value.and_then(text_content)
+                    && !looks_like_error_result(&text, Some(target))
+                {
+                    valid_superseder[index] = true;
+                }
+                seen_targets.insert(target);
+                if let TargetKey::Read { path, .. } = target {
+                    seen_read_paths.insert(path.as_str());
+                }
             }
         }
         // Scan backward to find the earliest later non-error call superseding each target.
@@ -1892,7 +2017,7 @@ fn mask_request(
             }
         }
     }
-    let mut changes: Vec<(&str, Change)> = Vec::new();
+    let mut changes: Vec<(&str, Change<'_>)> = Vec::new();
     let mut eligible_bytes: usize = 0;
     let mut saved_bytes: i128 = 0;
     for (index, c) in candidates.iter().enumerate() {
@@ -1920,31 +2045,26 @@ fn mask_request(
         if index >= cutoff && !is_duplicate && !is_superseded {
             continue;
         }
-        // The archive holds valid JSON, so a result with a lone surrogate stays.
-        if let Some(surrogates) = surrogates
-            && serde_json::to_string(value)?.contains(surrogates.marker)
-        {
-            continue;
-        }
         let Some(kind) = text_kind(value) else {
             continue;
         };
-        let bytes = serde_json::to_vec(value)?.len();
-        if bytes < opts.minimum {
+        // The archive holds valid JSON, so a result with a lone surrogate stays.
+        if let Some(surrogates) = surrogates
+            && text_contains_char(value, surrogates.marker)
+        {
             continue;
         }
-        let bare = wrap_stub(kind, format!("{PREFIX}{}]", "0".repeat(64)));
-        let cost = serde_json::to_vec(&bare)?.len();
-        if cost >= bytes {
+        let bytes = json_len(value)?;
+        if bytes < opts.minimum || bare_stub_cost(kind) >= bytes {
             continue;
         }
         eligible_bytes += bytes;
         changes.push((
             &c.path,
             Change::Retire {
-                kind: kind.to_owned(),
+                kind,
                 bytes,
-                superseded: is_superseded.then(|| c.target.clone()).flatten(),
+                superseded: is_superseded.then_some(c.target.as_ref()).flatten(),
             },
         ));
     }
@@ -1955,20 +2075,23 @@ fn mask_request(
     let mut redactor: Option<Option<&crate::redact::Redactor>> = None;
     for (path, change) in changes {
         let original = request.pointer_mut(path).context("missing result field")?;
-        let next = match change {
-            Change::Restore(value) => value,
+        let (before_bytes, next) = match change {
+            Change::Restore(value) => (json_len(original)?, value),
             Change::Retire {
                 kind,
                 bytes,
                 superseded,
             } => {
-                let id = archive(ws, original)?;
+                // Serialize once and archive BEFORE replacing so recall reproduces the exact original.
+                let serialized = serde_json::to_vec(original)?;
+                debug_assert_eq!(serialized.len(), bytes);
+                let id = archive_serialized(ws, &serialized)?;
                 let redactor = *redactor.get_or_insert_with(|| crate::redact::for_workspace(ws));
-                build_stub(original, &kind, &id, bytes, redactor, superseded.as_ref())?
+                let stub = build_stub(original, kind, &id, bytes, redactor, superseded)?;
+                (bytes, stub)
             }
         };
-        saved_bytes +=
-            serde_json::to_vec(original)?.len() as i128 - serde_json::to_vec(&next)?.len() as i128;
+        saved_bytes += before_bytes as i128 - json_len(&next)? as i128;
         *original = next;
     }
     Ok((count, saved_bytes))
@@ -3292,5 +3415,161 @@ mod tests {
             after_reread["messages"][2]["content"][0]["content"],
             stub_d0
         );
+    }
+
+    #[test]
+    fn archive_fast_path_skips_rewrite_on_duplicate_and_fails_closed_on_corruption() {
+        let (_dir, ws) = test_workspace();
+        let payload = json!([
+            {"type": "text", "text": "part one\n".repeat(120)},
+            {"type": "text", "text": "part two\n".repeat(120)},
+        ]);
+
+        let id = archive(&ws, &payload).unwrap();
+        assert_eq!(recover(&ws, &id).unwrap(), payload);
+
+        let blob_path = ws.state.join("observations").join(format!("{id}.json"));
+        let backdated = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        fs::File::options()
+            .write(true)
+            .open(&blob_path)
+            .unwrap()
+            .set_modified(backdated)
+            .unwrap();
+        let before = fs::symlink_metadata(&blob_path).unwrap();
+        let before_mtime = before.modified().unwrap();
+
+        // Archiving the identical payload again must skip rewriting the blob.
+        let id_again = archive(&ws, &payload).unwrap();
+        assert_eq!(id_again, id);
+        let after = fs::symlink_metadata(&blob_path).unwrap();
+        assert_eq!(after.modified().unwrap(), before_mtime);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(after.ino(), before.ino());
+        }
+        assert_eq!(recover(&ws, &id).unwrap(), payload);
+
+        // Archiving a tool_use with the same payload also reuses the blob without rewriting.
+        let call = ToolCall {
+            id: "toolu_fast_1",
+            tool: "Read",
+            summary: "src/lib.rs",
+            input: &json!({"file_path": "src/lib.rs"}),
+        };
+        assert!(archive_tool_use(&ws, &call, &payload, false).unwrap());
+        let after_tu = fs::symlink_metadata(&blob_path).unwrap();
+        assert_eq!(after_tu.modified().unwrap(), before_mtime);
+
+        // Same-length tampering must fail closed.
+        let mut raw = fs::read(&blob_path).unwrap();
+        let idx = raw.iter().position(|&b| b == b'p').unwrap();
+        raw[idx] = b'P';
+        fs::write(&blob_path, &raw).unwrap();
+        let err = archive(&ws, &payload).unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err:#}");
+
+        // Truncated/wrong-length corruption must also fail closed immediately.
+        fs::write(&blob_path, b"\"short\"").unwrap();
+        let err = archive(&ws, &payload).unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err:#}");
+    }
+
+    #[test]
+    fn mask_multipart_duplicates_and_superseded_results_stay_byte_exact_under_recall() {
+        let (_dir, ws) = test_workspace();
+        let part_a = "alpha line of build output\n".repeat(50);
+        let part_b = "beta line of build output\n".repeat(50);
+        let combined = format!("{part_a}{part_b}");
+        let read_v1 = "fn old_version() -> i32 { 1 }\n".repeat(60);
+        let read_v2 = "fn new_version() -> i32 { 2 }\n".repeat(60);
+        let err_read = "Error: ENOENT: no such file or directory, open 'src/lib.rs'";
+
+        let original = tool_messages_with_inputs(&[
+            // Multi-part array whose concatenated text equals c3's plain string.
+            (
+                "c0",
+                "Bash",
+                json!({"command": "echo build"}),
+                json!([
+                    {"type": "text", "text": part_a},
+                    {"type": "text", "text": part_b},
+                ]),
+                false,
+            ),
+            // Read of src/lib.rs superseded by c2 (and NOT broken by trailing error c4).
+            (
+                "c1",
+                "Read",
+                json!({"file_path": "src/lib.rs", "offset": 1, "limit": 20}),
+                json!(read_v1),
+                false,
+            ),
+            (
+                "c2",
+                "Read",
+                json!({"file_path": "src/lib.rs"}),
+                json!(read_v2),
+                false,
+            ),
+            (
+                "c3",
+                "Bash",
+                json!({"command": "echo build"}),
+                json!(combined),
+                false,
+            ),
+            // Non-supersedable error read on src/lib.rs must NOT supersede c2.
+            (
+                "c4",
+                "Read",
+                json!({"file_path": "src/lib.rs"}),
+                json!(err_read),
+                false,
+            ),
+        ]);
+
+        // keep=6 puts every turn inside the keep window; only c0 (duplicate of c3)
+        // and c1 (superseded by whole-file read c2) should retire.
+        let mut masked = original.clone();
+        let (changed, saved) = mask_request(&ws, &mut masked, None, &default_opts(6)).unwrap();
+        assert_eq!(changed, 2);
+        assert!(saved > 2_000, "saved={saved}");
+
+        let s0 = &masked["messages"][2]["content"][0]["content"];
+        let s1 = &masked["messages"][4]["content"][0]["content"];
+        let s2 = &masked["messages"][6]["content"][0]["content"];
+        let s3 = &masked["messages"][8]["content"][0]["content"];
+        let s4 = &masked["messages"][10]["content"][0]["content"];
+
+        let id0 = marker(s0).expect("multipart duplicate c0 retired");
+        let id1 = marker(s1).expect("superseded ranged read c1 retired");
+        assert_eq!(s2, &json!(read_v2), "c2 must stay verbatim after error c4");
+        assert_eq!(s3, &json!(combined), "latest duplicate c3 stays verbatim");
+        assert_eq!(s4, &json!(err_read));
+
+        // Exact typed recall for both multi-part array and plain string.
+        assert_eq!(
+            recover(&ws, id0).unwrap(),
+            original["messages"][2]["content"][0]["content"]
+        );
+        assert_eq!(recover(&ws, id1).unwrap(), json!(read_v1));
+
+        // Re-masking is a no-op and --restore reproduces the exact original request.
+        let mut remasked = masked.clone();
+        assert_eq!(
+            mask_request(&ws, &mut remasked, None, &default_opts(6))
+                .unwrap()
+                .0,
+            0
+        );
+        assert_eq!(remasked, masked);
+
+        let mut restored = masked.clone();
+        let mut restore_opts = default_opts(6);
+        restore_opts.restore = true;
+        mask_request(&ws, &mut restored, None, &restore_opts).unwrap();
+        assert_eq!(restored, original);
     }
 }
