@@ -93,18 +93,21 @@ pub fn format(words: &[&str], text: &str, max_bytes: usize) -> Option<String> {
         return None;
     }
     let kind = classify_words(words)?;
-    let lines: Vec<Cow<'_, str>> = text
-        .lines()
-        .map(|raw| {
-            let line = raw.strip_suffix('\r').unwrap_or(raw);
-            if line.contains('\x1b') {
-                crate::capture::ANSI.replace_all(line, "")
-            } else {
-                Cow::Borrowed(line)
-            }
-        })
-        .collect();
-    if lines.is_empty() || lines.iter().any(|l| l.len() >= MAX_LINE_BYTES) {
+    let has_ansi = text.contains('\x1b');
+    let mut lines: Vec<Cow<'_, str>> = Vec::with_capacity((text.len() / 48).clamp(16, 16_384));
+    for raw in text.lines() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let clean = if has_ansi && line.contains('\x1b') {
+            crate::capture::ANSI.replace_all(line, "")
+        } else {
+            Cow::Borrowed(line)
+        };
+        if clean.len() >= MAX_LINE_BYTES {
+            return None;
+        }
+        lines.push(clean);
+    }
+    if lines.is_empty() {
         return None;
     }
     let rendered = match kind {
@@ -377,14 +380,25 @@ fn classify_words(words: &[&str]) -> Option<ViewKind> {
     }
 }
 
-fn range_tag(first: usize, last: usize) -> String {
-    if first == last {
-        format!("[stdout:{first}]")
-    } else {
-        format!("[stdout:{first}-{last}]")
+#[derive(Clone, Copy)]
+struct RangeTag(usize, usize);
+
+impl std::fmt::Display for RangeTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0 == self.1 {
+            write!(f, "[stdout:{}]", self.0)
+        } else {
+            write!(f, "[stdout:{}-{}]", self.0, self.1)
+        }
     }
 }
 
+#[inline]
+fn range_tag(first: usize, last: usize) -> RangeTag {
+    RangeTag(first, last)
+}
+
+#[inline]
 fn indent_of(line: &str) -> usize {
     line.bytes().take_while(|&b| b == b' ').count()
 }
@@ -401,8 +415,100 @@ fn unquote_yaml(raw: &str) -> &str {
     }
 }
 
-fn collapse_spaces(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+fn collapse_spaces(s: &str) -> Cow<'_, str> {
+    let trimmed = s.trim();
+    if !trimmed.contains("  ")
+        && !trimmed.contains('\t')
+        && !trimmed.contains('\n')
+        && !trimmed.contains('\r')
+    {
+        return Cow::Borrowed(trimmed);
+    }
+    let mut out = String::with_capacity(trimmed.len());
+    for (idx, part) in trimmed.split_whitespace().enumerate() {
+        if idx > 0 {
+            out.push(' ');
+        }
+        out.push_str(part);
+    }
+    Cow::Owned(out)
+}
+
+#[inline]
+fn contains_ascii_icase(haystack: &str, needle_upper: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle_upper.as_bytes();
+    if n.is_empty() {
+        return true;
+    }
+    if h.len() < n.len() {
+        return false;
+    }
+    let first_hi = n[0];
+    let first_lo = first_hi.to_ascii_lowercase();
+    let limit = h.len() - n.len();
+    let mut i = 0;
+    while i <= limit {
+        let b = h[i];
+        if (b == first_hi || b == first_lo) && h[i..i + n.len()].eq_ignore_ascii_case(n) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+#[inline]
+fn ends_with_ascii_icase(haystack: &str, suffix: &str) -> bool {
+    haystack.len() >= suffix.len()
+        && haystack.as_bytes()[haystack.len() - suffix.len()..]
+            .eq_ignore_ascii_case(suffix.as_bytes())
+}
+
+/// Count top-level keys inside an inline YAML flow mapping (`{ k1: v1, k2: v2 }`)
+/// without allocating or retaining any values (safe for `Secret` data).
+fn count_yaml_flow_keys(raw: &str) -> usize {
+    let trimmed = raw.trim();
+    let Some(inner) = trimmed
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .map(str::trim)
+    else {
+        return 0;
+    };
+    if inner.is_empty() {
+        return 0;
+    }
+    let bytes = inner.as_bytes();
+    let mut count = 0usize;
+    let mut depth = 0usize;
+    let mut quote: u8 = 0;
+    let mut escaped = false;
+    let mut saw_colon_in_entry = false;
+    for &b in bytes {
+        if quote != 0 {
+            if escaped {
+                escaped = false;
+            } else if quote == b'"' && b == b'\\' {
+                escaped = true;
+            } else if b == quote {
+                quote = 0;
+            }
+            continue;
+        }
+        match b {
+            b'"' | b'\'' => quote = b,
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            b':' if depth == 0 && !saw_colon_in_entry => {
+                count += 1;
+                saw_colon_in_entry = true;
+            }
+            b',' if depth == 0 => saw_colon_in_entry = false,
+            _ => {}
+        }
+    }
+    count
 }
 
 fn clip(s: &str, max: usize) -> &str {
@@ -740,7 +846,7 @@ fn format_kube_diff(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -> Op
     let real_count = rendered.iter().filter(|r| !r.metadata_only).count();
     let meta_only_count = rendered.len() - real_count;
 
-    let mut header = String::new();
+    let mut header = String::with_capacity(128 + warnings.len() * 64);
     let _ = write!(header, "{label}: {} resource(s)", rendered.len());
     if meta_only_count > 0 {
         let _ = writeln!(
@@ -762,7 +868,19 @@ fn format_kube_diff(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -> Op
     }
 
     // Assemble full output: changed resources first, then compact one-line metadata-only entries.
-    let mut full = header.clone();
+    let estimated_full = header.len()
+        + rendered
+            .iter()
+            .map(|r| {
+                if r.metadata_only {
+                    96
+                } else {
+                    r.body.len() + 80
+                }
+            })
+            .sum::<usize>();
+    let mut full = String::with_capacity(estimated_full);
+    full.push_str(&header);
     for r in rendered.iter().filter(|r| !r.metadata_only) {
         let _ = writeln!(
             full,
@@ -907,12 +1025,12 @@ fn extract_diff_path(rest: &str) -> &str {
 
 fn identify_diff_resource(res: &DiffResource<'_>) -> String {
     // Prefer YAML fields when present in hunks; fall back to kubectl diff temp filename.
-    let mut kind: Option<String> = None;
-    let mut name: Option<String> = None;
-    let mut namespace: Option<String> = None;
-    let mut kind_fallback: Option<String> = None;
-    let mut name_fallback: Option<String> = None;
-    let mut ns_fallback: Option<String> = None;
+    let mut kind: Option<&str> = None;
+    let mut name: Option<&str> = None;
+    let mut namespace: Option<&str> = None;
+    let mut kind_fallback: Option<&str> = None;
+    let mut name_fallback: Option<&str> = None;
+    let mut ns_fallback: Option<&str> = None;
 
     for hunk in &res.hunks {
         let mut in_metadata = false;
@@ -930,10 +1048,10 @@ fn identify_diff_resource(res: &DiffResource<'_>) -> String {
                     if !v.is_empty() {
                         if prefix == '-' {
                             if kind_fallback.is_none() {
-                                kind_fallback = Some(v.to_owned());
+                                kind_fallback = Some(v);
                             }
                         } else if kind.is_none() {
-                            kind = Some(v.to_owned());
+                            kind = Some(v);
                         }
                     }
                 }
@@ -943,10 +1061,10 @@ fn identify_diff_resource(res: &DiffResource<'_>) -> String {
                     if !v.is_empty() {
                         if prefix == '-' {
                             if name_fallback.is_none() {
-                                name_fallback = Some(v.to_owned());
+                                name_fallback = Some(v);
                             }
                         } else if name.is_none() {
-                            name = Some(v.to_owned());
+                            name = Some(v);
                         }
                     }
                 } else if let Some(val) = trimmed.strip_prefix("namespace:") {
@@ -954,10 +1072,10 @@ fn identify_diff_resource(res: &DiffResource<'_>) -> String {
                     if !v.is_empty() {
                         if prefix == '-' {
                             if ns_fallback.is_none() {
-                                ns_fallback = Some(v.to_owned());
+                                ns_fallback = Some(v);
                             }
                         } else if namespace.is_none() {
-                            namespace = Some(v.to_owned());
+                            namespace = Some(v);
                         }
                     }
                 }
@@ -1154,14 +1272,19 @@ fn select_kept_context(lines: &[(usize, &str)], classes: &[DiffLineClass]) -> Ve
 // 2. `helm template` / `helm get manifest`
 // ============================================================================
 
-struct HelmManifestDoc {
+struct HelmManifestDoc<'a> {
     first_line: usize,
     last_line: usize,
-    source: Option<String>,
-    kind: String,
-    name: String,
-    namespace: Option<String>,
+    source: Option<&'a str>,
+    kind: &'a str,
+    name: &'a str,
+    namespace: Option<&'a str>,
     summary: String,
+}
+
+#[inline]
+fn is_helm_notes_header(trimmed: &str) -> bool {
+    trimmed == "NOTES:" || trimmed.starts_with("NOTES: ")
 }
 
 fn format_helm_manifest(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -> Option<String> {
@@ -1173,13 +1296,19 @@ fn format_helm_manifest(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -
     }
 
     let mut warnings: Vec<(usize, &str)> = Vec::new();
+    let mut notes: Vec<(usize, &str)> = Vec::new();
     let mut doc_ranges: Vec<(usize, usize)> = Vec::new();
     let mut cur_start: Option<usize> = None;
+    let mut in_notes = false;
 
-    for (idx, line) in lines.iter().enumerate() {
+    for (idx, cow) in lines.iter().enumerate() {
         let line_no = idx + 1;
+        let line = cow.as_ref();
         let trimmed = line.trim();
+        let ind = indent_of(line);
+
         if trimmed == "---" || trimmed.starts_with("--- ") {
+            in_notes = false;
             if let Some(start) = cur_start.take()
                 && line_no > start
             {
@@ -1188,6 +1317,38 @@ fn format_helm_manifest(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -
             cur_start = Some(line_no);
             continue;
         }
+
+        if in_notes {
+            if ind == 0
+                && (trimmed.starts_with("# Source:")
+                    || trimmed.starts_with("apiVersion:")
+                    || trimmed.starts_with("kind:"))
+            {
+                in_notes = false;
+                cur_start = Some(line_no);
+                continue;
+            }
+            if ind == 0 && is_warning_or_error(line) {
+                warnings.push((line_no, trimmed));
+                continue;
+            }
+            if !trimmed.is_empty() {
+                notes.push((line_no, line.trim_end()));
+            }
+            continue;
+        }
+
+        if ind == 0 && is_helm_notes_header(trimmed) {
+            if let Some(start) = cur_start.take()
+                && line_no > start
+            {
+                doc_ranges.push((start, line_no - 1));
+            }
+            in_notes = true;
+            notes.push((line_no, trimmed));
+            continue;
+        }
+
         if cur_start.is_none() {
             if trimmed.is_empty() {
                 continue;
@@ -1202,7 +1363,7 @@ fn format_helm_manifest(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -
             {
                 cur_start = Some(line_no);
             }
-        } else if is_warning_or_error(line) && indent_of(line) == 0 && !trimmed.contains(": ") {
+        } else if ind == 0 && is_warning_or_error(line) && !trimmed.starts_with("apiVersion:") {
             warnings.push((line_no, trimmed));
         }
     }
@@ -1210,14 +1371,20 @@ fn format_helm_manifest(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -
         doc_ranges.push((start, lines.len()));
     }
 
-    let mut docs: Vec<HelmManifestDoc> = Vec::new();
+    let mut docs: Vec<HelmManifestDoc<'_>> = Vec::with_capacity(doc_ranges.len());
     for (start, end) in doc_ranges {
-        // Trim trailing blank lines from the doc range so `[stdout:A-B]` is tight.
+        // Trim trailing blank and warning/error lines so `[stdout:A-B]` covers the YAML doc tightly.
         let mut tight_end = end;
-        while tight_end > start && lines[tight_end - 1].trim().is_empty() {
-            tight_end -= 1;
+        while tight_end > start {
+            let l = lines[tight_end - 1].as_ref();
+            let t = l.trim();
+            if t.is_empty() || (indent_of(l) == 0 && is_warning_or_error(l)) {
+                tight_end -= 1;
+            } else {
+                break;
+            }
         }
-        if let Some(doc) = parse_helm_doc(lines, start, tight_end, &mut warnings) {
+        if let Some(doc) = parse_helm_doc(lines, start, tight_end) {
             docs.push(doc);
         }
     }
@@ -1227,7 +1394,7 @@ fn format_helm_manifest(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -
     }
 
     // Check whether all namespaced resources share one namespace.
-    let namespaces: BTreeSet<&str> = docs.iter().filter_map(|d| d.namespace.as_deref()).collect();
+    let namespaces: BTreeSet<&str> = docs.iter().filter_map(|d| d.namespace).collect();
     let shared_ns = (namespaces.len() == 1)
         .then(|| namespaces.iter().next().copied())
         .flatten();
@@ -1235,79 +1402,116 @@ fn format_helm_manifest(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -
     // Group indices by Kind in operational priority order.
     let mut by_kind: BTreeMap<(usize, &str), Vec<usize>> = BTreeMap::new();
     for (idx, doc) in docs.iter().enumerate() {
-        let key = (kind_priority(&doc.kind), doc.kind.as_str());
+        let key = (kind_priority(doc.kind), doc.kind);
         by_kind.entry(key).or_default().push(idx);
     }
 
-    let mut kind_counts: Vec<String> = Vec::with_capacity(by_kind.len());
-    for ((_, kind), idxs) in &by_kind {
-        kind_counts.push(format!("{kind} ×{}", idxs.len()));
-    }
-
-    let mut header = String::new();
+    let mut header = String::with_capacity(128 + by_kind.len() * 20 + warnings.len() * 64);
     let _ = write!(header, "{label}: {} manifest(s)", docs.len());
     if let Some(ns) = shared_ns {
         let _ = write!(header, " (ns={ns})");
     }
-    let _ = writeln!(
-        header,
-        " [{}] {}",
-        kind_counts.join(", "),
-        range_tag(1, lines.len())
-    );
+    header.push_str(" [");
+    for (i, ((_, kind), idxs)) in by_kind.iter().enumerate() {
+        if i > 0 {
+            header.push_str(", ");
+        }
+        let _ = write!(header, "{kind} ×{}", idxs.len());
+    }
+    let _ = writeln!(header, "] {}", range_tag(1, lines.len()));
     for (n, warn) in &warnings {
         let _ = writeln!(header, "{warn} {}", range_tag(*n, *n));
+    }
+
+    let mut notes_block = String::new();
+    if !notes.is_empty() {
+        notes_block.reserve(notes.iter().map(|(_, l)| l.len() + 2).sum::<usize>() + 32);
+        let first_note = notes[0].0;
+        let last_note = notes[notes.len() - 1].0;
+        if notes.len() == 1 {
+            let _ = writeln!(
+                notes_block,
+                "{} {}",
+                notes[0].1,
+                range_tag(first_note, last_note)
+            );
+        } else {
+            let _ = writeln!(
+                notes_block,
+                "{} {}",
+                notes[0].1,
+                range_tag(first_note, last_note)
+            );
+            for &(_, note_line) in &notes[1..] {
+                notes_block.push_str(note_line);
+                notes_block.push('\n');
+            }
+        }
     }
 
     // Detect if multiple subcharts exist via `# Source: chart/...`.
     let chart_prefixes: BTreeSet<&str> = docs
         .iter()
-        .filter_map(|d| d.source.as_deref())
+        .filter_map(|d| d.source)
         .filter_map(|s| s.split('/').next())
         .collect();
     let show_chart_prefix = chart_prefixes.len() > 1;
 
-    let format_doc_line = |doc: &HelmManifestDoc| -> String {
-        let id = match (&doc.namespace, shared_ns) {
-            (Some(ns), None) => format!("{}/{ns}/{}", doc.kind, doc.name),
-            _ => format!("{}/{}", doc.kind, doc.name),
-        };
-        let mut line = String::from("  ");
-        line.push_str(&id);
+    let write_doc_line = |dst: &mut String, doc: &HelmManifestDoc<'_>| {
+        dst.push_str("  ");
+        match (doc.namespace, shared_ns) {
+            (Some(ns), None) => {
+                let _ = write!(dst, "{}/{ns}/{}", doc.kind, doc.name);
+            }
+            _ => {
+                let _ = write!(dst, "{}/{}", doc.kind, doc.name);
+            }
+        }
         if !doc.summary.is_empty() {
-            let _ = write!(line, " ({})", doc.summary);
+            let _ = write!(dst, " ({})", doc.summary);
         }
         if show_chart_prefix
-            && let Some(src) = &doc.source
+            && let Some(src) = doc.source
             && let Some(chart) = src.split('/').next()
         {
-            let _ = write!(line, " [{chart}]");
+            let _ = write!(dst, " [{chart}]");
         }
-        let _ = writeln!(line, " {}", range_tag(doc.first_line, doc.last_line));
-        line
+        let _ = writeln!(dst, " {}", range_tag(doc.first_line, doc.last_line));
     };
 
-    let mut full = header.clone();
+    let mut full =
+        String::with_capacity(header.len() + notes_block.len() + docs.len().saturating_mul(72));
+    full.push_str(&header);
     for idxs in by_kind.values() {
         for &idx in idxs {
-            full.push_str(&format_doc_line(&docs[idx]));
+            write_doc_line(&mut full, &docs[idx]);
         }
     }
+    full.push_str(&notes_block);
     if full.len() <= max_bytes {
         return Some(full);
     }
 
-    // Budgeted rendering: prioritize workloads/networking, fold overflow per kind.
-    let mut out = header;
+    // Budgeted rendering: preserve warnings + NOTES verbatim, prioritize workloads/networking,
+    // and fold overflow per kind.
+    let mut out = String::with_capacity(max_bytes.min(full.len()));
+    out.push_str(&header);
+    let notes_reserve = if out.len() + notes_block.len() <= max_bytes {
+        notes_block.len()
+    } else {
+        0
+    };
+    let mut line_buf = String::with_capacity(128);
     let mut remaining_kinds = by_kind.len();
     for ((_, kind), idxs) in &by_kind {
         remaining_kinds -= 1;
-        let reserve = remaining_kinds * 44 + 64;
+        let reserve = notes_reserve + remaining_kinds * 44 + 64;
         let mut shown = 0usize;
         for &idx in idxs {
-            let line = format_doc_line(&docs[idx]);
-            if out.len() + line.len() + reserve <= max_bytes {
-                out.push_str(&line);
+            line_buf.clear();
+            write_doc_line(&mut line_buf, &docs[idx]);
+            if out.len() + line_buf.len() + reserve <= max_bytes {
+                out.push_str(&line_buf);
                 shown += 1;
             } else {
                 break;
@@ -1325,15 +1529,20 @@ fn format_helm_manifest(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -
                 .map(|&i| docs[i].last_line)
                 .max()
                 .unwrap_or(first);
-            let fold = format!(
-                "  ... +{} more {kind} manifest(s) {}\n",
+            line_buf.clear();
+            let _ = writeln!(
+                line_buf,
+                "  ... +{} more {kind} manifest(s) {}",
                 omitted.len(),
                 range_tag(first, last)
             );
-            if out.len() + fold.len() <= max_bytes {
-                out.push_str(&fold);
+            if out.len() + line_buf.len() + notes_reserve <= max_bytes {
+                out.push_str(&line_buf);
             }
         }
+    }
+    if !notes_block.is_empty() && out.len() + notes_block.len() <= max_bytes {
+        out.push_str(&notes_block);
     }
     (out.len() <= max_bytes).then_some(out)
 }
@@ -1367,34 +1576,45 @@ fn parse_helm_doc<'a>(
     lines: &'a [Cow<'a, str>],
     start: usize,
     end: usize,
-    warnings: &mut Vec<(usize, &'a str)>,
-) -> Option<HelmManifestDoc> {
-    let mut source: Option<String> = None;
-    let mut api_version = String::new();
-    let mut kind = String::new();
-    let mut name = String::new();
-    let mut namespace: Option<String> = None;
-    let mut secret_type: Option<String> = None;
+) -> Option<HelmManifestDoc<'a>> {
+    let mut source: Option<&'a str> = None;
+    let mut api_version: &'a str = "";
+    let mut kind: &'a str = "";
+    let mut name: &'a str = "";
+    let mut namespace: Option<&'a str> = None;
+    let mut secret_type: Option<&'a str> = None;
 
-    // Kind-specific metadata collected during single pass.
-    let mut replicas: Option<String> = None;
-    let mut schedule: Option<String> = None;
-    let mut images: Vec<String> = Vec::new();
-    let mut svc_type: Option<String> = None;
-    let mut svc_ports: Vec<String> = Vec::new();
-    let mut ingress_hosts: Vec<String> = Vec::new();
+    // Kind-specific metadata collected during a single borrowed pass (zero per-line clones).
+    let mut replicas: Option<&'a str> = None;
+    let mut schedule: Option<&'a str> = None;
+    let mut job_completions: Option<&'a str> = None;
+    let mut job_parallelism: Option<&'a str> = None;
+    let mut host_network = false;
+    let mut vct_count: usize = 0;
+    let mut in_vct = false;
+    let mut vct_indent = 0usize;
+    let mut vct_item_indent: Option<usize> = None;
+    let mut images: Vec<&'a str> = Vec::new();
+    let mut svc_type: Option<&'a str> = None;
+    let mut svc_ports: Vec<&'a str> = Vec::new();
+    let mut ingress_hosts: Vec<&'a str> = Vec::new();
     let mut data_keys: usize = 0;
     let mut data_entry_indent: Option<usize> = None;
-    let mut hpa_min: Option<String> = None;
-    let mut hpa_max: Option<String> = None;
-    let mut hpa_target: Option<String> = None;
-    let mut pvc_storage: Option<String> = None;
-    let mut pvc_class: Option<String> = None;
+    let mut hpa_min: Option<&'a str> = None;
+    let mut hpa_max: Option<&'a str> = None;
+    let mut hpa_target: Option<&'a str> = None;
+    let mut pvc_storage: Option<&'a str> = None;
+    let mut pvc_class: Option<&'a str> = None;
     let mut rules_count: usize = 0;
     let mut rules_item_indent: Option<usize> = None;
-    let mut role_ref_name: Option<String> = None;
-    let mut crd_group: Option<String> = None;
-    let mut crd_kind: Option<String> = None;
+    let mut has_aggregation_rule = false;
+    let mut role_ref_name: Option<&'a str> = None;
+    let mut crd_group: Option<&'a str> = None;
+    let mut crd_kind: Option<&'a str> = None;
+    let mut sa_automount: Option<&'a str> = None;
+    let mut sa_pull_secrets: Vec<&'a str> = Vec::new();
+    let mut sa_secrets_count: usize = 0;
+    let mut sa_list_item_indent: Option<usize> = None;
 
     let mut top_section = "";
     let mut in_scale_target_ref = false;
@@ -1409,7 +1629,7 @@ fn parse_helm_doc<'a>(
             continue;
         }
         if let Some(src) = trimmed.strip_prefix("# Source:") {
-            source = Some(src.trim().to_owned());
+            source = Some(src.trim());
             continue;
         }
         if trimmed.starts_with('#') {
@@ -1417,23 +1637,62 @@ fn parse_helm_doc<'a>(
         }
 
         let ind = indent_of(raw);
+        // Handle indent-0 YAML sequence items under top-level lists (`rules:`, `imagePullSecrets:`, `secrets:`).
+        if ind == 0 && (trimmed == "-" || trimmed.starts_with("- ")) {
+            match top_section {
+                "rules" => {
+                    let item_ind = *rules_item_indent.get_or_insert(0);
+                    if item_ind == 0 {
+                        rules_count += 1;
+                    }
+                    continue;
+                }
+                "imagePullSecrets" => {
+                    if let Some(rest) = trimmed.strip_prefix("- ")
+                        && let Some(val) = rest.trim_start().strip_prefix("name:")
+                    {
+                        let v = unquote_yaml(val);
+                        if !v.is_empty() {
+                            sa_pull_secrets.push(v);
+                        }
+                    }
+                    continue;
+                }
+                "secrets" => {
+                    let item_ind = *sa_list_item_indent.get_or_insert(0);
+                    if item_ind == 0 {
+                        sa_secrets_count += 1;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
         if ind == 0 {
             if is_warning_or_error(raw) && !trimmed.starts_with("apiVersion:") {
-                warnings.push((line_no, trimmed));
                 continue;
             }
             data_entry_indent = None;
             rules_item_indent = None;
+            sa_list_item_indent = None;
             in_scale_target_ref = false;
             in_crd_names = false;
+            in_vct = false;
+            vct_item_indent = None;
             if let Some((k, v)) = trimmed.split_once(':') {
                 let key = unquote_yaml(k);
                 let val = unquote_yaml(v);
                 top_section = key;
                 match key {
-                    "apiVersion" => api_version = val.to_owned(),
-                    "kind" => kind = val.to_owned(),
-                    "type" if !val.is_empty() => secret_type = Some(val.to_owned()),
+                    "apiVersion" => api_version = val,
+                    "kind" => kind = val,
+                    "type" if !val.is_empty() => secret_type = Some(val),
+                    "automountServiceAccountToken" if !val.is_empty() => sa_automount = Some(val),
+                    "aggregationRule" => has_aggregation_rule = true,
+                    "data" | "binaryData" | "stringData" if v.trim().starts_with('{') => {
+                        data_keys += count_yaml_flow_keys(v);
+                    }
                     _ => {}
                 }
             }
@@ -1446,18 +1705,19 @@ fn parse_helm_doc<'a>(
                     if let Some(v) = trimmed.strip_prefix("name:") {
                         let v = unquote_yaml(v);
                         if !v.is_empty() {
-                            name = v.to_owned();
+                            name = v;
                         }
                     } else if let Some(v) = trimmed.strip_prefix("namespace:") {
                         let v = unquote_yaml(v);
                         if !v.is_empty() {
-                            namespace = Some(v.to_owned());
+                            namespace = Some(v);
                         }
                     }
                 }
             }
             "data" | "binaryData" | "stringData" => {
-                // Count ONLY direct keys of data/binaryData/stringData, ignoring block scalar bodies.
+                // Count ONLY direct keys of data/binaryData/stringData, ignoring block scalar bodies
+                // and NEVER retaining any values (especially for Secret manifests).
                 let entry_ind = *data_entry_indent.get_or_insert(ind);
                 if ind == entry_ind && trimmed.contains(':') {
                     data_keys += 1;
@@ -1469,13 +1729,28 @@ fn parse_helm_doc<'a>(
                     rules_count += 1;
                 }
             }
+            "imagePullSecrets" => {
+                let content = trimmed.strip_prefix("- ").unwrap_or(trimmed).trim_start();
+                if let Some(val) = content.strip_prefix("name:") {
+                    let v = unquote_yaml(val);
+                    if !v.is_empty() {
+                        sa_pull_secrets.push(v);
+                    }
+                }
+            }
+            "secrets" => {
+                let item_ind = *sa_list_item_indent.get_or_insert(ind);
+                if ind == item_ind && (trimmed == "-" || trimmed.starts_with("- ")) {
+                    sa_secrets_count += 1;
+                }
+            }
             "roleRef" => {
                 if ind == 2
                     && let Some(v) = trimmed.strip_prefix("name:")
                 {
                     let v = unquote_yaml(v);
                     if !v.is_empty() {
-                        role_ref_name = Some(v.to_owned());
+                        role_ref_name = Some(v);
                     }
                 }
             }
@@ -1486,44 +1761,64 @@ fn parse_helm_doc<'a>(
                 if in_crd_names && ind <= crd_names_indent {
                     in_crd_names = false;
                 }
+                if in_vct {
+                    if ind < vct_indent || (ind == vct_indent && !trimmed.starts_with('-')) {
+                        in_vct = false;
+                        vct_item_indent = None;
+                    } else if trimmed == "-" || trimmed.starts_with("- ") {
+                        let item_ind = *vct_item_indent.get_or_insert(ind);
+                        if ind == item_ind {
+                            vct_count += 1;
+                        }
+                    }
+                }
                 let content = trimmed.strip_prefix("- ").unwrap_or(trimmed).trim_start();
                 if let Some((k, v)) = content.split_once(':') {
                     let key = unquote_yaml(k);
                     let val = unquote_yaml(v);
-                    match (kind.as_str(), key, ind) {
-                        (_, "replicas", 2) if !val.is_empty() => replicas = Some(val.to_owned()),
-                        ("CronJob", "schedule", 2) if !val.is_empty() => {
-                            schedule = Some(val.to_owned())
+                    match (kind, key, ind) {
+                        (_, "replicas", 2) if !val.is_empty() => replicas = Some(val),
+                        ("StatefulSet", "volumeClaimTemplates", 2) => {
+                            in_vct = true;
+                            vct_indent = ind;
+                            vct_item_indent = None;
                         }
+                        ("DaemonSet", "hostNetwork", _) if val.eq_ignore_ascii_case("true") => {
+                            host_network = true;
+                        }
+                        ("Job", "completions", 2) if !val.is_empty() => {
+                            job_completions = Some(val);
+                        }
+                        ("Job", "parallelism", 2) if !val.is_empty() => {
+                            job_parallelism = Some(val);
+                        }
+                        ("CronJob", "schedule", 2) if !val.is_empty() => schedule = Some(val),
                         (
                             "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet" | "Job"
                             | "CronJob" | "Pod",
                             "image",
                             _,
                         ) if !val.is_empty() => {
-                            if !images.iter().any(|existing| existing == val) {
-                                images.push(val.to_owned());
+                            if !images.contains(&val) {
+                                images.push(val);
                             }
                         }
-                        ("Service", "type", 2) if !val.is_empty() => {
-                            svc_type = Some(val.to_owned())
-                        }
+                        ("Service", "type", 2) if !val.is_empty() => svc_type = Some(val),
                         ("Service", "port", _) if !val.is_empty() => {
-                            let p = format!(":{val}");
-                            if !svc_ports.contains(&p) {
-                                svc_ports.push(p);
+                            if !svc_ports.contains(&val) {
+                                svc_ports.push(val);
                             }
                         }
                         ("Ingress", "host", _) if !val.is_empty() => {
-                            if !ingress_hosts.iter().any(|h| h == val) {
-                                ingress_hosts.push(val.to_owned());
+                            if !ingress_hosts.contains(&val) {
+                                ingress_hosts.push(val);
                             }
                         }
                         ("HorizontalPodAutoscaler", "minReplicas", 2) if !val.is_empty() => {
-                            hpa_min = Some(val.to_owned());
+                            hpa_min = Some(val);
                         }
                         ("HorizontalPodAutoscaler", "maxReplicas", 2) if !val.is_empty() => {
-                            hpa_max = Some(val.to_owned());
+                            hpa_max = Some(val);
                         }
                         ("HorizontalPodAutoscaler", "scaleTargetRef", 2) => {
                             in_scale_target_ref = true;
@@ -1532,16 +1827,16 @@ fn parse_helm_doc<'a>(
                         ("HorizontalPodAutoscaler", "name", _)
                             if in_scale_target_ref && !val.is_empty() =>
                         {
-                            hpa_target = Some(val.to_owned());
+                            hpa_target = Some(val);
                         }
                         ("PersistentVolumeClaim", "storageClassName", 2) if !val.is_empty() => {
-                            pvc_class = Some(val.to_owned());
+                            pvc_class = Some(val);
                         }
                         ("PersistentVolumeClaim", "storage", _) if !val.is_empty() => {
-                            pvc_storage = Some(val.to_owned());
+                            pvc_storage = Some(val);
                         }
                         ("CustomResourceDefinition", "group", 2) if !val.is_empty() => {
-                            crd_group = Some(val.to_owned());
+                            crd_group = Some(val);
                         }
                         ("CustomResourceDefinition", "names", 2) => {
                             in_crd_names = true;
@@ -1550,7 +1845,7 @@ fn parse_helm_doc<'a>(
                         ("CustomResourceDefinition", "kind", _)
                             if in_crd_names && !val.is_empty() =>
                         {
-                            crd_kind = Some(val.to_owned());
+                            crd_kind = Some(val);
                         }
                         _ => {}
                     }
@@ -1564,94 +1859,177 @@ fn parse_helm_doc<'a>(
         return None;
     }
     if name.is_empty() {
-        name = "(unnamed)".to_owned();
+        name = "(unnamed)";
     }
 
-    let summary = match kind.as_str() {
+    let summary = match kind {
         "Deployment" | "StatefulSet" | "DaemonSet" | "ReplicaSet" | "Job" | "CronJob" | "Pod" => {
-            let mut parts = Vec::new();
+            let mut out = String::new();
+            let push_sep = |buf: &mut String| {
+                if !buf.is_empty() {
+                    buf.push_str(", ");
+                }
+            };
             if let Some(r) = replicas {
-                parts.push(format!("{r} replicas"));
+                let _ = write!(out, "{r} replicas");
+            }
+            if let Some(c) = job_completions {
+                push_sep(&mut out);
+                let _ = write!(out, "completions={c}");
+            }
+            if let Some(p) = job_parallelism
+                && p != "1"
+            {
+                push_sep(&mut out);
+                let _ = write!(out, "parallelism={p}");
             }
             if let Some(s) = schedule {
-                parts.push(format!("schedule={s}"));
+                push_sep(&mut out);
+                let _ = write!(out, "schedule={s}");
             }
             if images.len() == 1 {
-                parts.push(format!("image={}", images[0]));
+                push_sep(&mut out);
+                let _ = write!(out, "image={}", images[0]);
             } else if images.len() > 1 {
-                let head: Vec<&str> = images.iter().take(2).map(String::as_str).collect();
+                push_sep(&mut out);
                 let extra = images.len().saturating_sub(2);
+                let _ = write!(out, "images={}, {}", images[0], images[1]);
                 if extra > 0 {
-                    parts.push(format!("images={}, +{extra}", head.join(", ")));
-                } else {
-                    parts.push(format!("images={}", head.join(", ")));
+                    let _ = write!(out, ", +{extra}");
                 }
             }
-            parts.join(", ")
+            if vct_count > 0 {
+                push_sep(&mut out);
+                let unit = if vct_count == 1 {
+                    "pvc-template"
+                } else {
+                    "pvc-templates"
+                };
+                let _ = write!(out, "{vct_count} {unit}");
+            }
+            if host_network {
+                push_sep(&mut out);
+                out.push_str("hostNetwork");
+            }
+            out
         }
         "Service" => {
-            let mut parts = vec![svc_type.unwrap_or_else(|| "ClusterIP".to_owned())];
+            let mut out = String::from(svc_type.unwrap_or("ClusterIP"));
             if !svc_ports.is_empty() {
-                parts.push(svc_ports.join(","));
+                out.push(' ');
+                for (i, port) in svc_ports.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push(':');
+                    out.push_str(port);
+                }
             }
-            parts.join(" ")
+            out
         }
         "Ingress" => {
             if ingress_hosts.is_empty() {
                 String::new()
             } else {
-                let head: Vec<&str> = ingress_hosts.iter().take(3).map(String::as_str).collect();
+                let mut out = String::from("hosts=");
+                for (i, h) in ingress_hosts.iter().take(3).enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(h);
+                }
                 let extra = ingress_hosts.len().saturating_sub(3);
                 if extra > 0 {
-                    format!("hosts={}, +{extra}", head.join(", "))
-                } else {
-                    format!("hosts={}", head.join(", "))
+                    let _ = write!(out, ", +{extra}");
                 }
+                out
             }
         }
         "ConfigMap" => format!("{data_keys} keys"),
         "Secret" => {
             // Security: never emit Secret values, only type + key count.
-            match secret_type.as_deref() {
+            match secret_type {
                 Some(ty) if ty != "Opaque" => format!("{ty}, {data_keys} keys"),
                 _ => format!("{data_keys} keys"),
             }
         }
         "HorizontalPodAutoscaler" => {
-            let mut parts = Vec::new();
+            let mut out = String::new();
             if let Some(target) = hpa_target {
-                parts.push(format!("-> {target}"));
+                let _ = write!(out, "-> {target}");
             }
             match (hpa_min, hpa_max) {
-                (Some(mn), Some(mx)) => parts.push(format!("{mn}..{mx} replicas")),
-                (None, Some(mx)) => parts.push(format!("max {mx} replicas")),
+                (Some(mn), Some(mx)) => {
+                    if !out.is_empty() {
+                        out.push_str(", ");
+                    }
+                    let _ = write!(out, "{mn}..{mx} replicas");
+                }
+                (None, Some(mx)) => {
+                    if !out.is_empty() {
+                        out.push_str(", ");
+                    }
+                    let _ = write!(out, "max {mx} replicas");
+                }
                 _ => {}
             }
-            parts.join(", ")
+            out
         }
         "PersistentVolumeClaim" => {
-            let mut parts = Vec::new();
+            let mut out = String::new();
             if let Some(st) = pvc_storage {
-                parts.push(st);
+                out.push_str(st);
             }
             if let Some(sc) = pvc_class {
-                parts.push(format!("class={sc}"));
+                if !out.is_empty() {
+                    out.push_str(", ");
+                }
+                let _ = write!(out, "class={sc}");
             }
-            parts.join(", ")
+            out
+        }
+        "ServiceAccount" => {
+            let mut out = String::new();
+            let push_sep = |buf: &mut String| {
+                if !buf.is_empty() {
+                    buf.push_str(", ");
+                }
+            };
+            if let Some(am) = sa_automount {
+                let _ = write!(out, "automount={am}");
+            }
+            if sa_pull_secrets.len() == 1 {
+                push_sep(&mut out);
+                let _ = write!(out, "pullSecret={}", sa_pull_secrets[0]);
+            } else if sa_pull_secrets.len() > 1 {
+                push_sep(&mut out);
+                let _ = write!(out, "{} pullSecrets", sa_pull_secrets.len());
+            }
+            if sa_secrets_count > 0 {
+                push_sep(&mut out);
+                let unit = if sa_secrets_count == 1 {
+                    "secret"
+                } else {
+                    "secrets"
+                };
+                let _ = write!(out, "{sa_secrets_count} {unit}");
+            }
+            out
         }
         "Role" | "ClusterRole" if rules_count > 0 => format!("{rules_count} rules"),
+        "Role" | "ClusterRole" if has_aggregation_rule => "aggregated".to_owned(),
         "RoleBinding" | "ClusterRoleBinding" => {
             role_ref_name.map(|r| format!("-> {r}")).unwrap_or_default()
         }
         "CustomResourceDefinition" => match (crd_group, crd_kind) {
             (Some(g), Some(k)) => format!("{g}/{k}"),
-            (Some(g), None) => g,
-            (None, Some(k)) => k,
+            (Some(g), None) => g.to_owned(),
+            (None, Some(k)) => k.to_owned(),
             (None, None) => String::new(),
         },
         _ => {
             if !api_version.is_empty() && api_version != "v1" {
-                api_version.clone()
+                api_version.to_owned()
             } else {
                 String::new()
             }
@@ -1680,18 +2058,18 @@ struct S3Object<'a> {
 }
 
 #[derive(Default)]
-struct S3DirStats {
+struct S3DirStats<'a> {
     count: usize,
     total_bytes: u64,
-    extensions: BTreeMap<String, usize>,
+    extensions: BTreeMap<Cow<'a, str>, usize>,
     first_line: usize,
     last_line: usize,
-    first_name: String,
+    first_name: &'a str,
 }
 
 fn format_aws_s3_ls(lines: &[Cow<'_, str>], max_bytes: usize) -> Option<String> {
     let mut pre_dirs: Vec<(usize, &str)> = Vec::new();
-    let mut objects: Vec<S3Object<'_>> = Vec::new();
+    let mut objects: Vec<S3Object<'_>> = Vec::with_capacity(lines.len().min(4096));
     let mut buckets: Vec<(usize, &str)> = Vec::new();
     let mut warnings: Vec<(usize, &str)> = Vec::new();
     let mut non_empty = 0usize;
@@ -1710,39 +2088,43 @@ fn format_aws_s3_ls(lines: &[Cow<'_, str>], max_bytes: usize) -> Option<String> 
             recognized += 1;
             continue;
         }
-        if let Some(cap) = S3_PRE.captures(line) {
+        if trimmed.starts_with("PRE ")
+            && let Some(cap) = S3_PRE.captures(line)
+        {
             recognized += 1;
             pre_dirs.push((line_no, cap.get(1)?.as_str()));
             continue;
         }
-        if let Some(cap) = S3_OBJ_HUMAN.captures(trimmed) {
-            recognized += 1;
-            approx_size = true;
-            let num: f64 = cap.get(2)?.as_str().parse().ok()?;
-            let unit = cap.get(3)?.as_str();
-            let path = cap.get(4)?.as_str();
-            objects.push(S3Object {
-                line_no,
-                bytes: parse_human_s3_bytes(num, unit),
-                path,
-            });
-            continue;
-        }
-        if let Some(cap) = S3_OBJ_BYTES.captures(trimmed) {
-            recognized += 1;
-            let bytes: u64 = cap.get(2)?.as_str().parse().ok()?;
-            let path = cap.get(3)?.as_str();
-            objects.push(S3Object {
-                line_no,
-                bytes,
-                path,
-            });
-            continue;
-        }
-        if let Some(cap) = S3_BUCKET.captures(trimmed) {
-            recognized += 1;
-            buckets.push((line_no, cap.get(2)?.as_str()));
-            continue;
+        if trimmed.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+            if let Some(cap) = S3_OBJ_HUMAN.captures(trimmed) {
+                recognized += 1;
+                approx_size = true;
+                let num: f64 = cap.get(2)?.as_str().parse().ok()?;
+                let unit = cap.get(3)?.as_str();
+                let path = cap.get(4)?.as_str();
+                objects.push(S3Object {
+                    line_no,
+                    bytes: parse_human_s3_bytes(num, unit),
+                    path,
+                });
+                continue;
+            }
+            if let Some(cap) = S3_OBJ_BYTES.captures(trimmed) {
+                recognized += 1;
+                let bytes: u64 = cap.get(2)?.as_str().parse().ok()?;
+                let path = cap.get(3)?.as_str();
+                objects.push(S3Object {
+                    line_no,
+                    bytes,
+                    path,
+                });
+                continue;
+            }
+            if let Some(cap) = S3_BUCKET.captures(trimmed) {
+                recognized += 1;
+                buckets.push((line_no, cap.get(2)?.as_str()));
+                continue;
+            }
         }
         if is_warning_or_error(line) {
             warnings.push((line_no, trimmed));
@@ -1812,41 +2194,38 @@ fn parse_human_s3_bytes(val: f64, unit: &str) -> u64 {
     (val * mult).round() as u64
 }
 
-fn s3_prefix(path: &str, max_depth: Option<usize>) -> String {
+fn s3_prefix(path: &str, max_depth: Option<usize>) -> &str {
     let Some(last_slash) = path.rfind('/') else {
-        return "./".to_owned();
+        return "./";
     };
-    let dir = &path[..last_slash];
+    if last_slash == 0 {
+        return "./";
+    }
     match max_depth {
-        None => format!("{dir}/"),
+        None => &path[..=last_slash],
         Some(depth) => {
-            let mut parts = dir.split('/');
-            let mut out = String::new();
-            for _ in 0..depth {
-                let Some(part) = parts.next() else {
-                    break;
-                };
-                if !out.is_empty() {
-                    out.push('/');
+            if depth == 0 {
+                return "./";
+            }
+            let mut seen = 0usize;
+            for (idx, b) in path[..=last_slash].bytes().enumerate() {
+                if b == b'/' {
+                    seen += 1;
+                    if seen == depth {
+                        return if idx == 0 { "./" } else { &path[..=idx] };
+                    }
                 }
-                out.push_str(part);
             }
-            if out.is_empty() {
-                "./".to_owned()
-            } else {
-                out.push('/');
-                out
-            }
+            &path[..=last_slash]
         }
     }
 }
 
-fn s3_extension(path: &str) -> String {
+fn s3_extension(path: &str) -> Cow<'_, str> {
     let file = path.rsplit('/').next().unwrap_or(path);
     if file.is_empty() {
-        return "(dir)".to_owned();
+        return Cow::Borrowed("(dir)");
     }
-    let lower = file.to_ascii_lowercase();
     for compound in [
         ".tar.gz",
         ".tar.zst",
@@ -1855,8 +2234,8 @@ fn s3_extension(path: &str) -> String {
         ".csv.gz",
         ".ndjson.gz",
     ] {
-        if lower.ends_with(compound) {
-            return compound.to_owned();
+        if ends_with_ascii_icase(file, compound) {
+            return Cow::Borrowed(compound);
         }
     }
     if let Some(dot) = file.rfind('.')
@@ -1864,25 +2243,28 @@ fn s3_extension(path: &str) -> String {
         && dot + 1 < file.len()
     {
         let ext = &file[dot..];
-        if ext.len() <= 12 && ext[1..].chars().all(|c| c.is_ascii_alphanumeric()) {
-            return ext.to_ascii_lowercase();
+        if ext.len() <= 12 && ext[1..].bytes().all(|b| b.is_ascii_alphanumeric()) {
+            if ext.bytes().any(|b| b.is_ascii_uppercase()) {
+                return Cow::Owned(ext.to_ascii_lowercase());
+            }
+            return Cow::Borrowed(ext);
         }
     }
-    "(no ext)".to_owned()
+    Cow::Borrowed("(no ext)")
 }
 
-fn group_s3_objects(
-    objects: &[S3Object<'_>],
+fn group_s3_objects<'a>(
+    objects: &[S3Object<'a>],
     max_depth: Option<usize>,
-) -> BTreeMap<String, S3DirStats> {
-    let mut map: BTreeMap<String, S3DirStats> = BTreeMap::new();
+) -> BTreeMap<&'a str, S3DirStats<'a>> {
+    let mut map: BTreeMap<&'a str, S3DirStats<'a>> = BTreeMap::new();
     for obj in objects {
         let dir = s3_prefix(obj.path, max_depth);
         let ext = s3_extension(obj.path);
         let entry = map.entry(dir).or_insert_with(|| S3DirStats {
             first_line: obj.line_no,
             last_line: obj.line_no,
-            first_name: obj.path.rsplit('/').next().unwrap_or(obj.path).to_owned(),
+            first_name: obj.path.rsplit('/').next().unwrap_or(obj.path),
             ..Default::default()
         });
         entry.count += 1;
@@ -1897,7 +2279,7 @@ fn group_s3_objects(
 #[allow(clippy::too_many_arguments)]
 fn render_s3_listing(
     pre_dirs: &[(usize, &str)],
-    grouped: &BTreeMap<String, S3DirStats>,
+    grouped: &BTreeMap<&str, S3DirStats<'_>>,
     warnings: &[(usize, &str)],
     total_objects: usize,
     total_bytes: u64,
@@ -1906,7 +2288,9 @@ fn render_s3_listing(
     max_bytes: usize,
     allow_tail_fold: bool,
 ) -> Option<String> {
-    let mut out = String::new();
+    let mut out = String::with_capacity(
+        max_bytes.min(128 + pre_dirs.len() * 32 + grouped.len().saturating_mul(84)),
+    );
     let _ = write!(
         out,
         "aws s3 ls: {total_objects} object(s) ({tilde}{}) across {} prefix(es)",
@@ -1925,12 +2309,14 @@ fn render_s3_listing(
     // Preserve top-level `PRE dir/` entries verbatim.
     let pre_reserve = if grouped.is_empty() { 48 } else { 220 };
     let mut pre_shown = 0usize;
+    let mut line_buf = String::with_capacity(128);
     for &(n, dir) in pre_dirs {
-        let line = format!("PRE {dir} {}\n", range_tag(n, n));
-        if out.len() + line.len() + pre_reserve > max_bytes && allow_tail_fold {
+        line_buf.clear();
+        let _ = writeln!(line_buf, "PRE {dir} {}", range_tag(n, n));
+        if out.len() + line_buf.len() + pre_reserve > max_bytes && allow_tail_fold {
             break;
         }
-        out.push_str(&line);
+        out.push_str(&line_buf);
         pre_shown += 1;
     }
     if pre_shown < pre_dirs.len() {
@@ -1945,7 +2331,7 @@ fn render_s3_listing(
     }
 
     if !grouped.is_empty() {
-        let mut entries: Vec<(&String, &S3DirStats)> = grouped.iter().collect();
+        let mut entries: Vec<(&&str, &S3DirStats<'_>)> = grouped.iter().collect();
         if allow_tail_fold {
             // Order largest prefixes first when folding under tight budget.
             entries.sort_by(|a, b| {
@@ -1957,14 +2343,15 @@ fn render_s3_listing(
         }
         let mut shown = 0usize;
         for (dir, stats) in &entries {
-            let line = format_s3_dir_line(dir, stats, tilde);
-            if out.len() + line.len() + 72 > max_bytes {
+            line_buf.clear();
+            write_s3_dir_line(&mut line_buf, dir, stats, tilde);
+            if out.len() + line_buf.len() + 72 > max_bytes {
                 if !allow_tail_fold {
                     return None;
                 }
                 break;
             }
-            out.push_str(&line);
+            out.push_str(&line_buf);
             shown += 1;
         }
         if shown < entries.len() {
@@ -1973,14 +2360,16 @@ fn render_s3_listing(
             let rem_bytes: u64 = rem.iter().map(|(_, s)| s.total_bytes).sum();
             let first = rem.iter().map(|(_, s)| s.first_line).min().unwrap_or(1);
             let last = rem.iter().map(|(_, s)| s.last_line).max().unwrap_or(first);
-            let fold = format!(
-                "  ... +{} more prefix(es) ({rem_files} files, {tilde}{}) {}\n",
+            line_buf.clear();
+            let _ = writeln!(
+                line_buf,
+                "  ... +{} more prefix(es) ({rem_files} files, {tilde}{}) {}",
                 rem.len(),
                 human_bytes_bin(rem_bytes),
                 range_tag(first, last)
             );
-            if out.len() + fold.len() <= max_bytes {
-                out.push_str(&fold);
+            if out.len() + line_buf.len() <= max_bytes {
+                out.push_str(&line_buf);
             }
         }
     }
@@ -1988,29 +2377,35 @@ fn render_s3_listing(
     (out.len() <= max_bytes).then_some(out)
 }
 
-fn format_s3_dir_line(dir: &str, stats: &S3DirStats, tilde: &str) -> String {
-    let mut exts: Vec<(&String, &usize)> = stats.extensions.iter().collect();
-    exts.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-    let ext_summary: Vec<String> = exts
-        .iter()
-        .take(3)
-        .map(|(ext, count)| format!("{ext} ×{count}"))
-        .collect();
-    let ext_extra = exts.len().saturating_sub(3);
-    let ext_part = if stats.count == 1 && !stats.first_name.is_empty() {
-        format!("({})", stats.first_name)
-    } else if ext_extra > 0 {
-        format!("({}, +{ext_extra} types)", ext_summary.join(", "))
-    } else {
-        format!("({})", ext_summary.join(", "))
-    };
+fn write_s3_dir_line(dst: &mut String, dir: &str, stats: &S3DirStats<'_>, tilde: &str) {
     let noun = if stats.count == 1 { "file" } else { "files" };
-    format!(
-        "  {dir}  {} {noun}  {tilde}{}  {ext_part} {}\n",
+    let _ = write!(
+        dst,
+        "  {dir}  {} {noun}  {tilde}{}  (",
         stats.count,
         human_bytes_bin(stats.total_bytes),
-        range_tag(stats.first_line, stats.last_line)
-    )
+    );
+    if stats.count == 1 && !stats.first_name.is_empty() {
+        dst.push_str(stats.first_name);
+    } else {
+        let mut exts: Vec<(&str, usize)> = stats
+            .extensions
+            .iter()
+            .map(|(k, &v)| (k.as_ref(), v))
+            .collect();
+        exts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        for (i, (ext, count)) in exts.iter().take(3).enumerate() {
+            if i > 0 {
+                dst.push_str(", ");
+            }
+            let _ = write!(dst, "{ext} ×{count}");
+        }
+        let ext_extra = exts.len().saturating_sub(3);
+        if ext_extra > 0 {
+            let _ = write!(dst, ", +{ext_extra} types");
+        }
+    }
+    let _ = writeln!(dst, ") {}", range_tag(stats.first_line, stats.last_line));
 }
 
 fn format_s3_buckets(
@@ -2088,15 +2483,15 @@ fn format_s3_buckets(
 // 4. `gcloud ... list` / `az ... list` / `aws cloudformation describe-stack-events`
 // ============================================================================
 
-struct CloudRow {
+struct CloudRow<'a> {
     line_no: usize,
-    cells: Vec<String>,
+    cells: Vec<Cow<'a, str>>,
 }
 
-struct ParsedCloudTable {
-    headers: Vec<String>,
-    rows: Vec<CloudRow>,
-    warnings: Vec<(usize, String)>,
+struct ParsedCloudTable<'a> {
+    headers: Vec<Cow<'a, str>>,
+    rows: Vec<CloudRow<'a>>,
+    warnings: Vec<(usize, &'a str)>,
 }
 
 fn format_cloud_table(
@@ -2174,8 +2569,8 @@ fn format_cloud_table(
         return None;
     }
 
-    let mut unhealthy: Vec<&CloudRow> = Vec::new();
-    let mut healthy: Vec<&CloudRow> = Vec::new();
+    let mut unhealthy: Vec<&CloudRow<'_>> = Vec::new();
+    let mut healthy: Vec<&CloudRow<'_>> = Vec::with_capacity(parsed.rows.len());
 
     for row in &parsed.rows {
         if is_row_unhealthy(row, &status_cols, reason_col, table_kind) {
@@ -2185,8 +2580,10 @@ fn format_cloud_table(
         }
     }
 
-    let mut out = format!(
-        "{label}: {} row(s) ({} unhealthy/attention, {} healthy) {}\n",
+    let mut out = String::with_capacity(max_bytes.min(256 + unhealthy.len() * 112 + 256));
+    let _ = writeln!(
+        out,
+        "{label}: {} row(s) ({} unhealthy/attention, {} healthy) {}",
         parsed.rows.len(),
         unhealthy.len(),
         healthy.len(),
@@ -2201,13 +2598,16 @@ fn format_cloud_table(
     if !unhealthy.is_empty() {
         let _ = writeln!(out, "Attention ({}):", unhealthy.len());
         let mut shown = 0usize;
+        let mut line_buf = String::with_capacity(160);
         for row in &unhealthy {
-            let formatted = format_pinned_row(row, &parsed.headers, table_kind);
-            let line = format!("  {formatted} {}\n", range_tag(row.line_no, row.line_no));
-            if out.len() + line.len() + healthy_reserve > max_bytes {
+            line_buf.clear();
+            line_buf.push_str("  ");
+            write_pinned_row(&mut line_buf, row, &upper_headers, table_kind);
+            let _ = writeln!(line_buf, " {}", range_tag(row.line_no, row.line_no));
+            if out.len() + line_buf.len() + healthy_reserve > max_bytes {
                 break;
             }
-            out.push_str(&line);
+            out.push_str(&line_buf);
             shown += 1;
         }
         if shown < unhealthy.len() {
@@ -2227,10 +2627,12 @@ fn format_cloud_table(
     if !healthy.is_empty() {
         let detailed_groups =
             build_healthy_groups(&healthy, &status_cols, loc_col, type_col, name_col, true);
-        let mut candidate = String::new();
+        let mut candidate = String::with_capacity(detailed_groups.len() * 80 + 24);
         let _ = writeln!(candidate, "Healthy ({}):", healthy.len());
         for (key, stats) in &detailed_groups {
-            let _ = writeln!(candidate, "  {}", format_healthy_group(key, stats));
+            candidate.push_str("  ");
+            write_healthy_group(&mut candidate, key, stats);
+            candidate.push('\n');
         }
         if out.len() + candidate.len() <= max_bytes {
             out.push_str(&candidate);
@@ -2242,12 +2644,16 @@ fn format_cloud_table(
             let mut items: Vec<_> = coarse_groups.into_iter().collect();
             items.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(&b.0)));
             let mut shown = 0usize;
+            let mut line_buf = String::with_capacity(128);
             for (key, stats) in &items {
-                let line = format!("  {}\n", format_healthy_group(key, stats));
-                if out.len() + line.len() + 64 > max_bytes {
+                line_buf.clear();
+                line_buf.push_str("  ");
+                write_healthy_group(&mut line_buf, key, stats);
+                line_buf.push('\n');
+                if out.len() + line_buf.len() + 64 > max_bytes {
                     break;
                 }
-                out.push_str(&line);
+                out.push_str(&line_buf);
                 shown += 1;
             }
             if shown < items.len() {
@@ -2255,13 +2661,15 @@ fn format_cloud_table(
                 let rem_rows: usize = rem.iter().map(|(_, s)| s.count).sum();
                 let first = rem.iter().map(|(_, s)| s.first_line).min().unwrap_or(1);
                 let last = rem.iter().map(|(_, s)| s.last_line).max().unwrap_or(first);
-                let fold = format!(
-                    "  ... +{} more healthy group(s) ({rem_rows} rows) {}\n",
+                line_buf.clear();
+                let _ = writeln!(
+                    line_buf,
+                    "  ... +{} more healthy group(s) ({rem_rows} rows) {}",
                     rem.len(),
                     range_tag(first, last)
                 );
-                if out.len() + fold.len() <= max_bytes {
-                    out.push_str(&fold);
+                if out.len() + line_buf.len() <= max_bytes {
+                    out.push_str(&line_buf);
                 }
             }
         }
@@ -2270,82 +2678,97 @@ fn format_cloud_table(
     (out.len() <= max_bytes).then_some(out)
 }
 
-struct HealthyGroupStats {
+struct HealthyGroupStats<'a> {
     count: usize,
     first_line: usize,
     last_line: usize,
-    samples: Vec<String>,
+    samples: Vec<&'a str>,
 }
 
-fn build_healthy_groups(
-    rows: &[&CloudRow],
+fn build_healthy_groups<'a>(
+    rows: &[&'a CloudRow<'a>],
     status_cols: &[usize],
     loc_col: Option<usize>,
     type_col: Option<usize>,
     name_col: Option<usize>,
     detailed: bool,
-) -> BTreeMap<String, HealthyGroupStats> {
-    let mut map: BTreeMap<String, HealthyGroupStats> = BTreeMap::new();
+) -> BTreeMap<String, HealthyGroupStats<'a>> {
+    let mut map: BTreeMap<String, HealthyGroupStats<'a>> = BTreeMap::new();
+    let mut key_buf = String::with_capacity(64);
     for row in rows {
-        let status = status_label(row, status_cols);
-        let mut parts = vec![status];
+        key_buf.clear();
+        write_status_label(&mut key_buf, row, status_cols);
         if detailed {
-            if let Some(c) = loc_col
-                && let Some(v) = row.cells.get(c)
-                && !v.is_empty()
-            {
-                parts.push(v.clone());
-            }
-            if let Some(c) = type_col
-                && let Some(v) = row.cells.get(c)
-                && !v.is_empty()
-            {
-                parts.push(v.clone());
+            let loc = loc_col
+                .and_then(|c| row.cells.get(c))
+                .map(Cow::as_ref)
+                .filter(|v| !v.is_empty());
+            let ty = type_col
+                .and_then(|c| row.cells.get(c))
+                .map(Cow::as_ref)
+                .filter(|v| !v.is_empty());
+            match (loc, ty) {
+                (Some(l), Some(t)) => {
+                    let _ = write!(key_buf, " ({l}, {t})");
+                }
+                (Some(v), None) | (None, Some(v)) => {
+                    let _ = write!(key_buf, " ({v})");
+                }
+                (None, None) => {}
             }
         }
-        let key = if parts.len() == 1 {
-            parts.remove(0)
-        } else {
-            format!("{} ({})", parts[0], parts[1..].join(", "))
-        };
         let sample = name_col
             .and_then(|c| row.cells.get(c))
+            .map(Cow::as_ref)
             .filter(|v| !v.is_empty())
-            .cloned()
-            .or_else(|| row.cells.iter().find(|v| !v.is_empty()).cloned());
+            .or_else(|| row.cells.iter().map(Cow::as_ref).find(|v| !v.is_empty()));
 
-        let entry = map.entry(key).or_insert_with(|| HealthyGroupStats {
-            count: 0,
-            first_line: row.line_no,
-            last_line: row.line_no,
-            samples: Vec::new(),
-        });
-        entry.count += 1;
-        entry.first_line = entry.first_line.min(row.line_no);
-        entry.last_line = entry.last_line.max(row.line_no);
-        if let Some(s) = sample
-            && entry.samples.len() < 2
-            && !entry.samples.contains(&s)
-        {
-            entry.samples.push(s);
+        if let Some(entry) = map.get_mut(key_buf.as_str()) {
+            entry.count += 1;
+            entry.first_line = entry.first_line.min(row.line_no);
+            entry.last_line = entry.last_line.max(row.line_no);
+            if let Some(s) = sample
+                && entry.samples.len() < 2
+                && !entry.samples.contains(&s)
+            {
+                entry.samples.push(s);
+            }
+        } else {
+            let mut samples = Vec::with_capacity(2);
+            if let Some(s) = sample {
+                samples.push(s);
+            }
+            map.insert(
+                key_buf.clone(),
+                HealthyGroupStats {
+                    count: 1,
+                    first_line: row.line_no,
+                    last_line: row.line_no,
+                    samples,
+                },
+            );
         }
     }
     map
 }
 
-fn format_healthy_group(key: &str, stats: &HealthyGroupStats) -> String {
-    let sample_part = if stats.samples.is_empty() {
-        String::new()
-    } else if stats.count == 1 {
-        format!(" ({})", stats.samples[0])
-    } else {
-        format!(" (e.g. {})", stats.samples.join(", "))
-    };
-    format!(
-        "{key} ×{}{sample_part} {}",
-        stats.count,
-        range_tag(stats.first_line, stats.last_line)
-    )
+fn write_healthy_group(dst: &mut String, key: &str, stats: &HealthyGroupStats<'_>) {
+    let _ = write!(dst, "{key} ×{}", stats.count);
+    if !stats.samples.is_empty() {
+        if stats.count == 1 {
+            let _ = write!(dst, " ({})", stats.samples[0]);
+        } else {
+            dst.push_str(" (e.g. ");
+            for (i, s) in stats.samples.iter().enumerate() {
+                if i > 0 {
+                    dst.push_str(", ");
+                }
+                dst.push_str(s);
+            }
+            dst.push(')');
+        }
+    }
+    let _ = write!(dst, " {}", range_tag(stats.first_line, stats.last_line));
 }
 
 fn find_col(upper_headers: &[String], candidates: &[&str]) -> Option<usize> {
@@ -2386,24 +2809,58 @@ fn find_status_cols(upper_headers: &[String], kind: CloudTableKind) -> Vec<usize
     cols
 }
 
-fn status_label(row: &CloudRow, status_cols: &[usize]) -> String {
-    let vals: Vec<&str> = status_cols
-        .iter()
-        .filter_map(|&c| row.cells.get(c))
-        .map(String::as_str)
-        .filter(|v| !v.is_empty())
-        .collect();
-    if vals.is_empty() {
-        "OK".to_owned()
-    } else if vals == ["✔"] || vals == ["+"] {
-        "READY".to_owned()
-    } else {
-        vals.join(" / ")
+fn write_status_label(dst: &mut String, row: &CloudRow<'_>, status_cols: &[usize]) {
+    let mut count = 0usize;
+    let mut first = "";
+    for &c in status_cols {
+        if let Some(v) = row.cells.get(c)
+            && !v.is_empty()
+        {
+            if count == 0 {
+                first = v.as_ref();
+            } else {
+                if count == 1 {
+                    dst.push_str(first);
+                }
+                dst.push_str(" / ");
+                dst.push_str(v.as_ref());
+            }
+            count += 1;
+        }
+    }
+    if count == 0 {
+        dst.push_str("OK");
+    } else if count == 1 {
+        if first == "✔" || first == "+" {
+            dst.push_str("READY");
+        } else {
+            dst.push_str(first);
+        }
     }
 }
 
+fn is_healthy_cloud_status(val: &str) -> bool {
+    const HEALTHY: &[&str] = &[
+        "RUNNING",
+        "ACTIVE",
+        "READY",
+        "SUCCEEDED",
+        "SUCCESS",
+        "OK",
+        "AVAILABLE",
+        "ENABLED",
+        "HEALTHY",
+        "VM RUNNING",
+        "ONLINE",
+        "TRUE",
+        "✔",
+        "+",
+    ];
+    HEALTHY.iter().any(|h| val.eq_ignore_ascii_case(h))
+}
+
 fn is_row_unhealthy(
-    row: &CloudRow,
+    row: &CloudRow<'_>,
     status_cols: &[usize],
     reason_col: Option<usize>,
     kind: CloudTableKind,
@@ -2411,57 +2868,39 @@ fn is_row_unhealthy(
     if let Some(rc) = reason_col
         && let Some(reason) = row.cells.get(rc)
     {
-        let u = reason.to_ascii_uppercase();
-        if u.contains("FAIL")
-            || u.contains("ERROR")
-            || u.contains("DENIED")
-            || u.contains("EXCEEDED")
-            || u.contains("ROLLBACK")
-            || u.contains("CANCELLED")
-            || u.contains("CANCELED")
-            || u.contains("TIMEOUT")
+        let r = reason.as_ref();
+        if contains_ascii_icase(r, "FAIL")
+            || contains_ascii_icase(r, "ERROR")
+            || contains_ascii_icase(r, "DENIED")
+            || contains_ascii_icase(r, "EXCEEDED")
+            || contains_ascii_icase(r, "ROLLBACK")
+            || contains_ascii_icase(r, "CANCELLED")
+            || contains_ascii_icase(r, "CANCELED")
+            || contains_ascii_icase(r, "TIMEOUT")
         {
             return true;
         }
     }
 
     for &col in status_cols {
-        let val = row.cells.get(col).map_or("", String::as_str).trim();
+        let val = row.cells.get(col).map_or("", Cow::as_ref).trim();
         if val.is_empty() {
             continue;
         }
-        let upper = val.to_ascii_uppercase();
         match kind {
             CloudTableKind::AwsStackEvents => {
-                if upper.contains("FAILED")
-                    || upper.contains("ROLLBACK")
-                    || upper.contains("ERROR")
-                    || upper.contains("ABORT")
-                    || upper.contains("TIMEOUT")
-                    || upper.contains("CANCEL")
+                if contains_ascii_icase(val, "FAILED")
+                    || contains_ascii_icase(val, "ROLLBACK")
+                    || contains_ascii_icase(val, "ERROR")
+                    || contains_ascii_icase(val, "ABORT")
+                    || contains_ascii_icase(val, "TIMEOUT")
+                    || contains_ascii_icase(val, "CANCEL")
                 {
                     return true;
                 }
             }
             CloudTableKind::GcloudList | CloudTableKind::AzList => {
-                let healthy = matches!(
-                    upper.as_str(),
-                    "RUNNING"
-                        | "ACTIVE"
-                        | "READY"
-                        | "SUCCEEDED"
-                        | "SUCCESS"
-                        | "OK"
-                        | "AVAILABLE"
-                        | "ENABLED"
-                        | "HEALTHY"
-                        | "VM RUNNING"
-                        | "ONLINE"
-                        | "TRUE"
-                        | "✔"
-                        | "+"
-                );
-                if !healthy {
+                if !is_healthy_cloud_status(val) {
                     return true;
                 }
             }
@@ -2470,11 +2909,15 @@ fn is_row_unhealthy(
     false
 }
 
-fn format_pinned_row(row: &CloudRow, headers: &[String], kind: CloudTableKind) -> String {
+fn write_pinned_row(
+    dst: &mut String,
+    row: &CloudRow<'_>,
+    upper_headers: &[String],
+    kind: CloudTableKind,
+) {
     if kind == CloudTableKind::AwsStackEvents {
-        // Show Timestamp (if short), ResourceStatus, LogicalResourceId, ResourceType, and full Reason!
-        let upper: Vec<String> = headers.iter().map(|h| h.to_ascii_uppercase()).collect();
-        let mut parts: Vec<String> = Vec::new();
+        // Show ResourceStatus, LogicalResourceId, ResourceType, full Reason, and Timestamp!
+        let mut wrote = false;
         for names in [
             &["RESOURCESTATUS", "RESOURCE_STATUS", "STATUS"][..],
             &["LOGICALRESOURCEID", "LOGICAL_RESOURCE_ID", "NAME"][..],
@@ -2487,35 +2930,44 @@ fn format_pinned_row(row: &CloudRow, headers: &[String], kind: CloudTableKind) -
             ][..],
             &["TIMESTAMP"][..],
         ] {
-            if let Some(c) = find_col(&upper, names)
+            if let Some(c) = find_col(upper_headers, names)
                 && let Some(v) = row.cells.get(c)
                 && !v.is_empty()
             {
-                parts.push(collapse_spaces(v));
+                if wrote {
+                    dst.push_str("  ");
+                }
+                dst.push_str(&collapse_spaces(v));
+                wrote = true;
             }
         }
-        if !parts.is_empty() {
-            return parts.join("  ");
+        if wrote {
+            return;
         }
     }
-    row.cells
-        .iter()
-        .map(|c| collapse_spaces(c))
-        .filter(|c| !c.is_empty())
-        .collect::<Vec<_>>()
-        .join("  ")
+    let mut wrote = false;
+    for c in &row.cells {
+        let clean = collapse_spaces(c);
+        if !clean.is_empty() {
+            if wrote {
+                dst.push_str("  ");
+            }
+            dst.push_str(&clean);
+            wrote = true;
+        }
+    }
 }
 
 /// Parse AWS CLI `--output table` (`+---+`, `| ... |`).
-fn parse_aws_bordered_table(lines: &[Cow<'_, str>]) -> Option<ParsedCloudTable> {
+fn parse_aws_bordered_table<'a>(lines: &'a [Cow<'a, str>]) -> Option<ParsedCloudTable<'a>> {
     let mut warnings = Vec::new();
-    let mut headers: Vec<String> = Vec::new();
-    let mut rows: Vec<CloudRow> = Vec::new();
+    let mut headers: Vec<Cow<'a, str>> = Vec::new();
+    let mut rows: Vec<CloudRow<'a>> = Vec::new();
     let mut saw_border = false;
 
     for (idx, line) in lines.iter().enumerate() {
         let line_no = idx + 1;
-        let trimmed = line.trim();
+        let trimmed = line.as_ref().trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -2524,9 +2976,9 @@ fn parse_aws_bordered_table(lines: &[Cow<'_, str>]) -> Option<ParsedCloudTable> 
             continue;
         }
         if trimmed.starts_with('|') && trimmed.ends_with('|') {
-            let cells: Vec<String> = trimmed[1..trimmed.len() - 1]
+            let cells: Vec<Cow<'a, str>> = trimmed[1..trimmed.len() - 1]
                 .split('|')
-                .map(|c| c.trim().to_owned())
+                .map(|c| Cow::Borrowed(c.trim()))
                 .collect();
             // Skip single-cell title banner like `| DescribeStackEvents |`.
             if cells.len() == 1 {
@@ -2540,7 +2992,7 @@ fn parse_aws_bordered_table(lines: &[Cow<'_, str>]) -> Option<ParsedCloudTable> 
             continue;
         }
         if is_warning_or_error(line) {
-            warnings.push((line_no, trimmed.to_owned()));
+            warnings.push((line_no, trimmed));
         }
     }
 
@@ -2563,17 +3015,18 @@ fn is_aws_border_line(trimmed: &str) -> bool {
 /// Parse AWS CLI `--output text` for `cloudformation describe-stack-events`.
 /// Lines look like:
 /// `STACKEVENTS\t<EventId>\t<LogicalResourceId>\t<PhysicalResourceId>\t<ResourceStatus>\t[<ResourceStatusReason>]\t<ResourceType>\t<StackId>\t<StackName>\t<Timestamp>`
-fn parse_aws_stack_events_text(lines: &[Cow<'_, str>]) -> Option<ParsedCloudTable> {
+fn parse_aws_stack_events_text<'a>(lines: &'a [Cow<'a, str>]) -> Option<ParsedCloudTable<'a>> {
     let mut warnings = Vec::new();
-    let mut rows: Vec<CloudRow> = Vec::new();
+    let mut rows: Vec<CloudRow<'a>> = Vec::new();
 
     for (idx, line) in lines.iter().enumerate() {
         let line_no = idx + 1;
-        let trimmed = line.trim();
+        let raw = line.as_ref();
+        let trimmed = raw.trim();
         if trimmed.is_empty() {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("STACKEVENTS\t") {
+        if let Some(rest) = raw.strip_prefix("STACKEVENTS\t") {
             let fields: Vec<&str> = rest.split('\t').collect();
             if fields.len() < 5 {
                 continue;
@@ -2583,44 +3036,49 @@ fn parse_aws_stack_events_text(lines: &[Cow<'_, str>]) -> Option<ParsedCloudTabl
             let Some(si) = status_idx else {
                 continue;
             };
-            let logical_id = fields.get(1).copied().unwrap_or("").trim().to_owned();
-            let status = fields[si].trim().to_owned();
+            let logical_id = Cow::Borrowed(fields.get(1).copied().unwrap_or("").trim());
+            let status = Cow::Borrowed(fields[si].trim());
             let type_idx = fields[si + 1..]
                 .iter()
                 .position(|f| f.contains("::"))
                 .map(|off| si + 1 + off);
-            let resource_type = type_idx
-                .and_then(|ti| fields.get(ti))
-                .copied()
-                .unwrap_or("")
-                .trim()
-                .to_owned();
+            let resource_type = Cow::Borrowed(
+                type_idx
+                    .and_then(|ti| fields.get(ti))
+                    .copied()
+                    .unwrap_or("")
+                    .trim(),
+            );
             // Reason sits between status and resource_type when present.
             let reason = match type_idx {
-                Some(ti) if ti > si + 1 => fields[si + 1..ti]
-                    .iter()
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                _ => String::new(),
+                Some(ti) if ti == si + 2 => Cow::Borrowed(fields[si + 1].trim()),
+                Some(ti) if ti > si + 2 => Cow::Owned(
+                    fields[si + 1..ti]
+                        .iter()
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ),
+                _ => Cow::Borrowed(""),
             };
-            let timestamp = fields
-                .iter()
-                .rev()
-                .find(|f| f.contains('T') && f.len() >= 19 && f.as_bytes()[4] == b'-')
-                .copied()
-                .unwrap_or("")
-                .trim()
-                .to_owned();
+            let timestamp = Cow::Borrowed(
+                fields
+                    .iter()
+                    .rev()
+                    .find(|f| f.contains('T') && f.len() >= 19 && f.as_bytes()[4] == b'-')
+                    .copied()
+                    .unwrap_or("")
+                    .trim(),
+            );
             rows.push(CloudRow {
                 line_no,
                 cells: vec![timestamp, status, logical_id, resource_type, reason],
             });
             continue;
         }
-        if is_warning_or_error(line) {
-            warnings.push((line_no, trimmed.to_owned()));
+        if is_warning_or_error(raw) {
+            warnings.push((line_no, trimmed));
         }
     }
 
@@ -2629,11 +3087,11 @@ fn parse_aws_stack_events_text(lines: &[Cow<'_, str>]) -> Option<ParsedCloudTabl
     }
     Some(ParsedCloudTable {
         headers: vec![
-            "Timestamp".to_owned(),
-            "ResourceStatus".to_owned(),
-            "LogicalResourceId".to_owned(),
-            "ResourceType".to_owned(),
-            "ResourceStatusReason".to_owned(),
+            Cow::Borrowed("Timestamp"),
+            Cow::Borrowed("ResourceStatus"),
+            Cow::Borrowed("LogicalResourceId"),
+            Cow::Borrowed("ResourceType"),
+            Cow::Borrowed("ResourceStatusReason"),
         ],
         rows,
         warnings,
@@ -2651,16 +3109,16 @@ fn is_cfn_status_token(s: &str) -> bool {
 }
 
 /// Parse `az ... -o table` output with dashed column underline on row 2.
-fn parse_az_dashed_table(lines: &[Cow<'_, str>]) -> Option<ParsedCloudTable> {
+fn parse_az_dashed_table<'a>(lines: &'a [Cow<'a, str>]) -> Option<ParsedCloudTable<'a>> {
     let mut warnings = Vec::new();
     let mut header_idx = None;
     for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
+        let trimmed = line.as_ref().trim();
         if trimmed.is_empty() {
             continue;
         }
         if is_warning_or_error(line) {
-            warnings.push((idx + 1, trimmed.to_owned()));
+            warnings.push((idx + 1, trimmed));
             continue;
         }
         if let Some(next) = lines.get(idx + 1)
@@ -2678,18 +3136,19 @@ fn parse_az_dashed_table(lines: &[Cow<'_, str>]) -> Option<ParsedCloudTable> {
         return None;
     }
     let headers = slice_by_char_spans(lines[h_idx].as_ref(), &spans);
-    let mut rows = Vec::new();
+    let mut rows = Vec::with_capacity(lines.len().saturating_sub(h_idx + 2));
     for (offset, line) in lines[h_idx + 2..].iter().enumerate() {
         let line_no = h_idx + 3 + offset;
-        let trimmed = line.trim();
+        let raw = line.as_ref();
+        let trimmed = raw.trim();
         if trimmed.is_empty() {
             continue;
         }
-        if is_warning_or_error(line) {
-            warnings.push((line_no, trimmed.to_owned()));
+        if is_warning_or_error(raw) {
+            warnings.push((line_no, trimmed));
             continue;
         }
-        let cells = slice_by_char_spans(line, &spans);
+        let cells = slice_by_char_spans(raw, &spans);
         if cells.iter().any(|c| !c.is_empty()) {
             rows.push(CloudRow { line_no, cells });
         }
@@ -2733,19 +3192,20 @@ fn dash_char_spans(dash_line: &str) -> Vec<(usize, Option<usize>)> {
 
 /// Parse whitespace-aligned display tables (`gcloud ... list`, etc.) using char
 /// column positions so multi-byte glyphs like `✔` never skew column slicing.
-fn parse_columnar_table(lines: &[Cow<'_, str>]) -> Option<ParsedCloudTable> {
+fn parse_columnar_table<'a>(lines: &'a [Cow<'a, str>]) -> Option<ParsedCloudTable<'a>> {
     let mut warnings = Vec::new();
     let mut header_idx = None;
     for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
+        let raw = line.as_ref();
+        let trimmed = raw.trim();
         if trimmed.is_empty() {
             continue;
         }
-        if is_warning_or_error(line) {
-            warnings.push((idx + 1, trimmed.to_owned()));
+        if is_warning_or_error(raw) {
+            warnings.push((idx + 1, trimmed));
             continue;
         }
-        if looks_like_table_header(line) {
+        if looks_like_table_header(raw) {
             header_idx = Some(idx);
             break;
         }
@@ -2754,11 +3214,16 @@ fn parse_columnar_table(lines: &[Cow<'_, str>]) -> Option<ParsedCloudTable> {
     let h_idx = header_idx?;
     let header_line = lines[h_idx].as_ref();
 
-    let mut headers: Vec<String> = Vec::new();
+    let mut headers: Vec<Cow<'a, str>> = Vec::new();
     let mut starts: Vec<usize> = Vec::new();
+    let header_is_ascii = header_line.is_ascii();
     for m in TABLE_HEADER_COL.find_iter(header_line) {
-        let char_start = header_line[..m.start()].chars().count();
-        headers.push(m.as_str().to_owned());
+        let char_start = if header_is_ascii {
+            m.start()
+        } else {
+            header_line[..m.start()].chars().count()
+        };
+        headers.push(Cow::Borrowed(m.as_str()));
         starts.push(char_start);
     }
     if headers.len() < 2 {
@@ -2766,7 +3231,7 @@ fn parse_columnar_table(lines: &[Cow<'_, str>]) -> Option<ParsedCloudTable> {
     }
     // `gcloud run services list` leaves a leading glyph column (`✔` / `X`) with blank header.
     if starts[0] >= 2 {
-        headers.insert(0, "READY".to_owned());
+        headers.insert(0, Cow::Borrowed("READY"));
         starts.insert(0, 0);
     }
 
@@ -2775,18 +3240,19 @@ fn parse_columnar_table(lines: &[Cow<'_, str>]) -> Option<ParsedCloudTable> {
         spans.push((starts[i], starts.get(i + 1).copied()));
     }
 
-    let mut rows = Vec::new();
+    let mut rows = Vec::with_capacity(lines.len().saturating_sub(h_idx + 1));
     for (offset, line) in lines[h_idx + 1..].iter().enumerate() {
         let line_no = h_idx + 2 + offset;
-        let trimmed = line.trim();
+        let raw = line.as_ref();
+        let trimmed = raw.trim();
         if trimmed.is_empty() || trimmed.starts_with("Listed ") {
             continue;
         }
-        if is_warning_or_error(line) {
-            warnings.push((line_no, trimmed.to_owned()));
+        if is_warning_or_error(raw) {
+            warnings.push((line_no, trimmed));
             continue;
         }
-        let cells = slice_by_char_spans(line, &spans);
+        let cells = slice_by_char_spans(raw, &spans);
         if cells.iter().any(|c| !c.is_empty()) {
             rows.push(CloudRow { line_no, cells });
         }
@@ -2802,24 +3268,44 @@ fn parse_columnar_table(lines: &[Cow<'_, str>]) -> Option<ParsedCloudTable> {
 }
 
 fn looks_like_table_header(line: &str) -> bool {
-    let cols: Vec<&str> = TABLE_HEADER_COL
-        .find_iter(line)
-        .map(|m| m.as_str())
-        .collect();
-    if cols.len() < 2 {
-        return false;
+    let mut count = 0usize;
+    for m in TABLE_HEADER_COL.find_iter(line) {
+        let c = m.as_str();
+        let valid = c.bytes().any(|b| b.is_ascii_uppercase())
+            && c.bytes().all(|b| {
+                b.is_ascii_uppercase()
+                    || b.is_ascii_digit()
+                    || matches!(b, b'_' | b'-' | b' ' | b'/' | b'(' | b')')
+            });
+        if !valid {
+            return false;
+        }
+        count += 1;
     }
-    cols.iter().all(|c| {
-        c.chars().any(|ch| ch.is_ascii_uppercase())
-            && c.chars().all(|ch| {
-                ch.is_ascii_uppercase()
-                    || ch.is_ascii_digit()
-                    || matches!(ch, '_' | '-' | ' ' | '/' | '(' | ')')
-            })
-    })
+    count >= 2
 }
 
-fn slice_by_char_spans(line: &str, spans: &[(usize, Option<usize>)]) -> Vec<String> {
+fn slice_by_char_spans<'a>(line: &'a str, spans: &[(usize, Option<usize>)]) -> Vec<Cow<'a, str>> {
+    let mut cells = Vec::with_capacity(spans.len());
+    if line.is_ascii() {
+        let len = line.len();
+        for &(start, end) in spans {
+            let b_start = start.min(len);
+            let b_end = end.map_or(len, |e| e.min(len));
+            if b_start >= b_end {
+                cells.push(Cow::Borrowed(""));
+            } else {
+                let cell = line[b_start..b_end].trim();
+                if cell.len() > 512 {
+                    cells.push(Cow::Owned(format!("{}...", clip(cell, 509))));
+                } else {
+                    cells.push(Cow::Borrowed(cell));
+                }
+            }
+        }
+        return cells;
+    }
+
     let char_bytes: Vec<usize> = line.char_indices().map(|(b, _)| b).collect();
     let total_chars = char_bytes.len();
     let byte_at = |char_idx: usize| -> usize {
@@ -2830,20 +3316,18 @@ fn slice_by_char_spans(line: &str, spans: &[(usize, Option<usize>)]) -> Vec<Stri
         }
     };
 
-    let mut cells = Vec::with_capacity(spans.len());
     for &(start, end) in spans {
         let b_start = byte_at(start);
         let b_end = end.map_or(line.len(), byte_at);
         if b_start >= b_end {
-            cells.push(String::new());
+            cells.push(Cow::Borrowed(""));
         } else {
-            cells.push(line[b_start..b_end].trim().to_owned());
-        }
-    }
-    // Keep `clip` referenced cleanly for bounded formatting where needed.
-    for cell in &mut cells {
-        if cell.len() > 512 {
-            *cell = format!("{}...", clip(cell, 509));
+            let cell = line[b_start..b_end].trim();
+            if cell.len() > 512 {
+                cells.push(Cow::Owned(format!("{}...", clip(cell, 509))));
+            } else {
+                cells.push(Cow::Borrowed(cell));
+            }
         }
     }
     cells
@@ -3785,5 +4269,196 @@ spec:
             );
             assert!(pct >= 65.0, "{name} reduction too small: {pct:.1}%");
         }
+    }
+
+    #[test]
+    fn helm_template_preserves_notes_warnings_errors_summarizes_k8s_kinds_and_hides_secrets() {
+        let secret_val_a = ["c3VwZXIt", "c2VjcmV0", "LXBhc3M="].concat();
+        let secret_val_b = ["cGxhaW50ZXh0", "LXNlY3JldA=="].concat();
+        let secret_val_c = ["Zmxvdy1z", "ZWNyZXQ="].concat();
+        let raw = format!(
+            "\x1b[33mWARNING: chart uses deprecated API version\x1b[0m\n\
+---
+# Source: stack/templates/statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pg-primary
+  namespace: prod
+spec:
+  replicas: 3
+  serviceName: pg-headless
+  template:
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16.4
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: [\"ReadWriteOnce\"]
+        resources:
+          requests:
+            storage: 50Gi
+---
+# Source: stack/templates/daemonset.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-agent
+  namespace: prod
+spec:
+  template:
+    spec:
+      hostNetwork: true
+      containers:
+        - name: agent
+          image: ghcr.io/acme/node-agent:2.1.0
+---
+# Source: stack/templates/job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate
+  namespace: prod
+spec:
+  completions: 2
+  parallelism: 2
+  template:
+    spec:
+      containers:
+        - name: migrate
+          image: ghcr.io/acme/migrate:1.9.0
+---
+# Source: stack/templates/clusterrole.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: stack-reader
+rules:
+- apiGroups: [\"\"]
+  resources: [\"pods\", \"services\"]
+  verbs: [\"get\", \"list\", \"watch\"]
+- apiGroups: [\"apps\"]
+  resources: [\"deployments\", \"statefulsets\"]
+  verbs: [\"get\", \"list\"]
+---
+# Source: stack/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: stack-sa
+  namespace: prod
+automountServiceAccountToken: false
+imagePullSecrets:
+- name: ghcr-pull
+---
+# Source: stack/templates/secret-block.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-creds
+  namespace: prod
+type: kubernetes.io/tls
+data:
+  tls.crt: {secret_val_a}
+stringData:
+  api_token: |
+    {secret_val_b}
+    WARNING: must never leak secret block text
+---
+# Source: stack/templates/secret-flow.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: inline-creds
+  namespace: prod
+data: {{ KEY_A: \"{secret_val_c}\", KEY_B: \"{secret_val_a}\" }}
+Error: non-fatal template render hint
+NOTES:
+1. Verify rollout status:
+  kubectl -n prod rollout status statefulset/pg-primary
+2. Inspect logs if pods fail to start.
+"
+        );
+
+        let view = format(
+            &["helm", "template", "stack", "./charts/stack"],
+            &raw,
+            4_096,
+        )
+        .expect("helm template compacted");
+
+        // Verbatim WARNING:, Error:, and multi-line NOTES: with exact archive pointers.
+        assert!(
+            view.contains("WARNING: chart uses deprecated API version [stdout:1]"),
+            "{view}"
+        );
+        assert!(
+            view.contains("Error: non-fatal template render hint [stdout:"),
+            "{view}"
+        );
+        assert!(view.contains("NOTES: [stdout:"), "{view}");
+        assert!(
+            view.contains(
+                "1. Verify rollout status:\n  kubectl -n prod rollout status statefulset/pg-primary"
+            ),
+            "{view}"
+        );
+        assert!(
+            view.contains("2. Inspect logs if pods fail to start."),
+            "{view}"
+        );
+
+        // Concise summaries for StatefulSet / DaemonSet / Job / ClusterRole / ServiceAccount.
+        assert!(
+            view.contains("StatefulSet/pg-primary (3 replicas, image=postgres:16.4, 1 pvc-template) [stdout:2-27]"),
+            "{view}"
+        );
+        assert!(
+            view.contains("DaemonSet/node-agent (image=ghcr.io/acme/node-agent:2.1.0, hostNetwork) [stdout:28-41]"),
+            "{view}"
+        );
+        assert!(
+            view.contains("Job/db-migrate (completions=2, parallelism=2, image=ghcr.io/acme/migrate:1.9.0) [stdout:42-56]"),
+            "{view}"
+        );
+        assert!(
+            view.contains("ClusterRole/stack-reader (2 rules) [stdout:57-69]"),
+            "{view}"
+        );
+        assert!(
+            view.contains(
+                "ServiceAccount/stack-sa (automount=false, pullSecret=ghcr-pull) [stdout:70-79]"
+            ),
+            "{view}"
+        );
+
+        // Secret safety: key counts only, ZERO leaked values from data, stringData, or flow mappings.
+        assert!(
+            view.contains("Secret/app-creds (kubernetes.io/tls, 2 keys) [stdout:80-93]"),
+            "{view}"
+        );
+        assert!(
+            view.contains("Secret/inline-creds (2 keys) [stdout:94-101]"),
+            "{view}"
+        );
+        assert!(
+            view.contains("Error: non-fatal template render hint [stdout:102]"),
+            "{view}"
+        );
+        assert!(view.contains("NOTES: [stdout:103-106]"), "{view}");
+        assert!(!view.contains(&secret_val_a), "leaked secret A:\n{view}");
+        assert!(!view.contains(&secret_val_b), "leaked secret B:\n{view}");
+        assert!(!view.contains(&secret_val_c), "leaked secret C:\n{view}");
+        assert!(
+            !view.contains("must never leak secret block text"),
+            "leaked secret warning line:\n{view}"
+        );
+        assert!(!view.contains('\x1b'), "ANSI leaked:\n{view}");
     }
 }

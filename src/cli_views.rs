@@ -67,18 +67,21 @@ pub fn format(words: &[&str], text: &str, max_bytes: usize) -> Option<String> {
         return None;
     }
     let kind = classify_words(words)?;
-    let lines: Vec<Cow<'_, str>> = text
-        .lines()
-        .map(|raw| {
-            let line = raw.strip_suffix('\r').unwrap_or(raw);
-            if line.contains('\x1b') {
-                crate::capture::ANSI.replace_all(line, "")
-            } else {
-                Cow::Borrowed(line)
-            }
-        })
-        .collect();
-    if lines.is_empty() || lines.iter().any(|l| l.len() >= MAX_LINE_BYTES) {
+    let has_ansi = text.contains('\x1b');
+    let mut lines: Vec<Cow<'_, str>> = Vec::with_capacity((text.len() / 48).clamp(16, 16_384));
+    for raw in text.lines() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let clean = if has_ansi && line.contains('\x1b') {
+            crate::capture::ANSI.replace_all(line, "")
+        } else {
+            Cow::Borrowed(line)
+        };
+        if clean.len() >= MAX_LINE_BYTES {
+            return None;
+        }
+        lines.push(clean);
+    }
+    if lines.is_empty() {
         return None;
     }
     let rendered = match kind {
@@ -399,22 +402,37 @@ fn classify_pip(args: &[&str]) -> Option<ViewKind> {
     }
 }
 
-fn range_tag(first: usize, last: usize) -> String {
-    if first == last {
-        format!("[stdout:{first}]")
-    } else {
-        format!("[stdout:{first}-{last}]")
+#[derive(Clone, Copy)]
+struct RangeTag(usize, usize);
+
+impl std::fmt::Display for RangeTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0 == self.1 {
+            write!(f, "[stdout:{}]", self.0)
+        } else {
+            write!(f, "[stdout:{}-{}]", self.0, self.1)
+        }
     }
 }
 
+#[inline]
+fn range_tag(first: usize, last: usize) -> RangeTag {
+    RangeTag(first, last)
+}
+
+#[inline]
 fn indent_of(line: &str) -> usize {
     line.bytes().take_while(|&b| b == b' ').count()
 }
 
-fn tighten_spaces(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+fn tighten_spaces(s: &str) -> Cow<'_, str> {
+    let trimmed = s.trim();
+    if !trimmed.contains('\t') && !trimmed.contains("   ") {
+        return Cow::Borrowed(trimmed);
+    }
+    let mut out = String::with_capacity(trimmed.len());
     let mut space_run = 0usize;
-    for ch in s.trim().chars() {
+    for ch in trimmed.chars() {
         if ch == '\t' {
             if space_run < 2 && !out.is_empty() {
                 while space_run < 2 {
@@ -432,11 +450,50 @@ fn tighten_spaces(s: &str) -> String {
             out.push(ch);
         }
     }
-    out
+    Cow::Owned(out)
 }
 
-fn collapse_single_spaces(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+fn collapse_single_spaces(s: &str) -> Cow<'_, str> {
+    let trimmed = s.trim();
+    if !trimmed.contains("  ")
+        && !trimmed.contains('\t')
+        && !trimmed.contains('\n')
+        && !trimmed.contains('\r')
+    {
+        return Cow::Borrowed(trimmed);
+    }
+    let mut out = String::with_capacity(trimmed.len());
+    for (idx, part) in trimmed.split_whitespace().enumerate() {
+        if idx > 0 {
+            out.push(' ');
+        }
+        out.push_str(part);
+    }
+    Cow::Owned(out)
+}
+
+#[inline]
+fn contains_ascii_icase(haystack: &str, needle_lower: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle_lower.as_bytes();
+    if n.is_empty() {
+        return true;
+    }
+    if h.len() < n.len() {
+        return false;
+    }
+    let first_lo = n[0];
+    let first_hi = first_lo.to_ascii_uppercase();
+    let limit = h.len() - n.len();
+    let mut i = 0;
+    while i <= limit {
+        let b = h[i];
+        if (b == first_lo || b == first_hi) && h[i..i + n.len()].eq_ignore_ascii_case(n) {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 fn clip(s: &str, max: usize) -> &str {
@@ -547,18 +604,26 @@ fn format_kubectl_describe(lines: &[Cow<'_, str>], max_bytes: usize) -> Option<S
         })
         .collect();
 
-    let mut error_tail = String::new();
+    let mut error_tail = String::with_capacity(trailing_errors.len() * 64);
     for (n, err) in &trailing_errors {
         let _ = writeln!(error_tail, "{err} {}", range_tag(*n, *n));
     }
 
+    // Order unhealthy resources ahead of healthy ones (preserving input order within each group).
+    let mut ordered: Vec<usize> = (0..rendered.len()).collect();
+    if rendered.len() > 1 {
+        ordered.sort_by_key(|&i| (!rendered[i].0, i));
+    }
+
     // Try rendering all compacted resources first.
-    let mut full = String::new();
-    for (i, (_, _, _, _, body)) in rendered.iter().enumerate() {
-        if i > 0 {
+    let estimated_full: usize =
+        rendered.iter().map(|r| r.4.len() + 1).sum::<usize>() + error_tail.len();
+    let mut full = String::with_capacity(estimated_full);
+    for (pos, &i) in ordered.iter().enumerate() {
+        if pos > 0 {
             full.push('\n');
         }
-        full.push_str(body);
+        full.push_str(&rendered[i].4);
     }
     full.push_str(&error_tail);
     if full.len() <= max_bytes {
@@ -568,9 +633,7 @@ fn format_kubectl_describe(lines: &[Cow<'_, str>], max_bytes: usize) -> Option<S
     // Multiple resources exceeding budget: keep unhealthy resources first, then healthy,
     // folding overflow behind counts + exact `[stdout:A-B]` pointers.
     if rendered.len() > 1 {
-        let mut ordered: Vec<usize> = (0..rendered.len()).collect();
-        ordered.sort_by_key(|&i| (!rendered[i].0, i));
-        let mut out = String::new();
+        let mut out = String::with_capacity(max_bytes.min(full.len()));
         let unhealthy_count = rendered.iter().filter(|r| r.0).count();
         let _ = writeln!(
             out,
@@ -620,7 +683,7 @@ fn format_kubectl_describe(lines: &[Cow<'_, str>], max_bytes: usize) -> Option<S
 
     // Single huge resource still exceeding `max_bytes`: keep top identity + unhealthy
     // details and trim tail lines cleanly with `[stdout:A-B]`.
-    let (_, first, last, _, _) = &rendered[0];
+    let (_, first, last, _, _) = &rendered[ordered[0]];
     let avail = max_bytes.saturating_sub(error_tail.len());
     let mut trimmed = fit_lines_with_tail(&full, avail, *first, *last);
     trimmed.push_str(&error_tail);
@@ -636,7 +699,7 @@ fn fit_lines_with_tail(body: &str, max_bytes: usize, first: usize, last: usize) 
         return body.to_owned();
     }
     let cap = max_bytes.saturating_sub(footer.len());
-    let mut out = String::new();
+    let mut out = String::with_capacity(max_bytes);
     for line in body.split_inclusive('\n') {
         if out.len() + line.len() > cap {
             break;
@@ -651,24 +714,24 @@ fn fit_lines_with_tail(body: &str, max_bytes: usize, first: usize, last: usize) 
 }
 
 fn render_kube_resource(res: &KubeResource<'_>) -> (bool, String, String) {
-    let mut out = String::new();
+    let mut out = String::with_capacity(res.sections.len().saturating_mul(64) + 128);
     let mut unhealthy = false;
-    let mut name = String::new();
-    let mut namespace = String::new();
-    let mut status = String::new();
+    let mut name = "";
+    let mut namespace = "";
+    let mut status = "";
 
     for sec in &res.sections {
         match sec.key {
             "Name" => {
-                name = sec.inline_value.to_owned();
+                name = sec.inline_value;
                 let _ = writeln!(out, "Name: {}", sec.inline_value);
             }
             "Namespace" => {
-                namespace = sec.inline_value.to_owned();
+                namespace = sec.inline_value;
                 let _ = writeln!(out, "Namespace: {}", sec.inline_value);
             }
             "Status" | "Phase" => {
-                status = sec.inline_value.to_owned();
+                status = sec.inline_value;
                 if !matches!(
                     sec.inline_value,
                     "Running" | "Succeeded" | "Completed" | "Active" | "Bound" | "Ready"
@@ -680,7 +743,12 @@ fn render_kube_resource(res: &KubeResource<'_>) -> (bool, String, String) {
             "Node" | "IP" | "Controlled By" | "Replicas" | "StrategyType" | "Selector" | "Type"
             | "ClusterIP" | "External-IP" | "Port" | "TargetPort" | "Endpoints" | "Reason"
             | "Message" | "Nominated Node" | "Taints" => {
-                if sec.key == "Reason" || sec.key == "Message" {
+                if sec.key == "Reason"
+                    || sec.key == "Message"
+                    || (sec.key == "Replicas"
+                        && contains_ascii_icase(sec.inline_value, "unavailable")
+                        && !contains_ascii_icase(sec.inline_value, "0 unavailable"))
+                {
                     unhealthy = true;
                 }
                 if sec.body.is_empty() {
@@ -829,7 +897,7 @@ fn render_kube_resource(res: &KubeResource<'_>) -> (bool, String, String) {
         (false, false) => format!("{namespace}/{name} ({status})"),
         (true, false) => format!("{name} ({status})"),
         (false, true) => format!("{namespace}/{name}"),
-        (true, true) => name,
+        (true, true) => name.to_owned(),
     };
     (unhealthy, summary_name, out)
 }
@@ -949,9 +1017,10 @@ fn render_kube_containers(
     }
 
     let field_indent = name_indent + 2;
-    let mut out = String::new();
+    let mut out = String::with_capacity(blocks.len().saturating_mul(128) + 32);
     let _ = writeln!(out, "{section_name}:");
     let mut any_unhealthy = false;
+    let mut healthy_summary_buf = String::new();
 
     for block in &blocks {
         let mut image = "";
@@ -1017,22 +1086,24 @@ fn render_kube_containers(
             let state_label = if state.is_empty() { "Running" } else { state };
             let ready_label = ready.unwrap_or("True");
             let restarts = restart_count.unwrap_or(0);
-            let img_part = if image.is_empty() {
-                String::new()
-            } else {
-                format!(" ({image})")
-            };
+            let _ = write!(
+                healthy_summary_buf,
+                "  {}: {state_label}, Ready={ready_label}, Restarts={restarts}",
+                block.name
+            );
+            if !image.is_empty() {
+                let _ = write!(healthy_summary_buf, " ({image})");
+            }
             let _ = writeln!(
-                out,
-                "  {}: {state_label}, Ready={ready_label}, Restarts={restarts}{img_part} {}",
-                block.name,
+                healthy_summary_buf,
+                " {}",
                 range_tag(block.first_line, block.last_line)
             );
             continue;
         }
 
         // Unhealthy live container OR Pod Template container: preserve all critical state
-        // fields verbatim and fold noisy Environment/Mounts/huge Args sections.
+        // fields verbatim at top and fold noisy Environment/Mounts/huge Args sections.
         let _ = writeln!(
             out,
             "  {}: {}",
@@ -1120,6 +1191,7 @@ fn render_kube_containers(
             i += 1;
         }
     }
+    out.push_str(&healthy_summary_buf);
     (any_unhealthy, out)
 }
 
@@ -1143,7 +1215,7 @@ fn render_kube_conditions(sec: &KubeSection<'_>) -> (bool, String) {
     let mut healthy_first = 0usize;
     let mut healthy_last = 0usize;
     let mut healthy_count = 0usize;
-    let mut unhealthy_rows: Vec<(usize, String)> = Vec::new();
+    let mut unhealthy_rows: Vec<(usize, Cow<'_, str>)> = Vec::new();
 
     for &(line_no, line) in &sec.body {
         let trimmed = line.trim();
@@ -1172,7 +1244,7 @@ fn render_kube_conditions(sec: &KubeSection<'_>) -> (bool, String) {
         }
     }
 
-    let mut out = String::new();
+    let mut out = String::with_capacity(unhealthy_rows.len() * 64 + 48);
     if unhealthy_rows.is_empty() {
         if healthy_count > 0 {
             let _ = writeln!(
@@ -1205,7 +1277,7 @@ fn render_kube_events(sec: &KubeSection<'_>) -> (bool, String) {
     let mut normal_count = 0usize;
     let mut normal_first = 0usize;
     let mut normal_last = 0usize;
-    let mut warnings: Vec<(usize, usize, String)> = Vec::new();
+    let mut warnings: Vec<(usize, usize, Cow<'_, str>)> = Vec::new();
     let mut current_is_normal = false;
 
     for &(line_no, line) in &sec.body {
@@ -1232,14 +1304,15 @@ fn render_kube_events(sec: &KubeSection<'_>) -> (bool, String) {
             normal_last = line_no;
         } else if let Some(last) = warnings.last_mut() {
             last.1 = line_no;
-            last.2.push(' ');
-            last.2.push_str(trimmed);
+            let buf = last.2.to_mut();
+            buf.push(' ');
+            buf.push_str(trimmed);
         } else {
             warnings.push((line_no, line_no, tighten_spaces(trimmed)));
         }
     }
 
-    let mut out = String::new();
+    let mut out = String::with_capacity(warnings.len() * 96 + 48);
     if warnings.is_empty() && normal_count == 0 {
         return (false, out);
     }
@@ -1269,7 +1342,46 @@ enum CheckState {
     Pass,
 }
 
-fn classify_check_line(line: &str) -> Option<(CheckState, String)> {
+fn parse_check_status_word(word: &str) -> Option<CheckState> {
+    if word.eq_ignore_ascii_case("pass")
+        || word.eq_ignore_ascii_case("passed")
+        || word.eq_ignore_ascii_case("success")
+    {
+        Some(CheckState::Pass)
+    } else if word.eq_ignore_ascii_case("fail")
+        || word.eq_ignore_ascii_case("failed")
+        || word.eq_ignore_ascii_case("failure")
+        || word.eq_ignore_ascii_case("error")
+        || word.eq_ignore_ascii_case("timed_out")
+        || word.eq_ignore_ascii_case("startup_failure")
+        || word.eq_ignore_ascii_case("action_required")
+    {
+        Some(CheckState::Fail)
+    } else if word.eq_ignore_ascii_case("pending")
+        || word.eq_ignore_ascii_case("queued")
+        || word.eq_ignore_ascii_case("in_progress")
+        || word.eq_ignore_ascii_case("expected")
+        || word.eq_ignore_ascii_case("waiting")
+        || word.eq_ignore_ascii_case("requested")
+    {
+        Some(CheckState::Pending)
+    } else if word.eq_ignore_ascii_case("skipping")
+        || word.eq_ignore_ascii_case("skipped")
+        || word.eq_ignore_ascii_case("cancel")
+        || word.eq_ignore_ascii_case("cancelled")
+        || word.eq_ignore_ascii_case("canceled")
+        || word.eq_ignore_ascii_case("neutral")
+        || word.eq_ignore_ascii_case("stale")
+    {
+        Some(CheckState::Skipped)
+    } else {
+        None
+    }
+}
+
+/// Classify a `gh pr checks` line. For `Pass` rows, returns `Cow::Borrowed("")`
+/// without allocating/formatting the line since passing rows fold to a count.
+fn classify_check_line(line: &str) -> Option<(CheckState, Cow<'_, str>)> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return None;
@@ -1279,14 +1391,19 @@ fn classify_check_line(line: &str) -> Option<(CheckState, String)> {
         let state = match icon {
             "✓" | "✔" => Some(CheckState::Pass),
             "X" | "✗" | "×" | "!" => Some(CheckState::Fail),
-            "*" | "○" | "●" => Some(CheckState::Pending),
+            "*" | "○" | "●" | "⏳" => Some(CheckState::Pending),
             "-" => Some(CheckState::Skipped),
             _ => None,
         };
         if let Some(state) = state
             && !rest.trim().is_empty()
         {
-            return Some((state, tighten_spaces(trimmed)));
+            let formatted = if state == CheckState::Pass {
+                Cow::Borrowed("")
+            } else {
+                tighten_spaces(trimmed)
+            };
+            return Some((state, formatted));
         }
     }
     // Format B: TSV (`name\tstatus\tduration\turl`) or multi-space columns.
@@ -1295,29 +1412,24 @@ fn classify_check_line(line: &str) -> Option<(CheckState, String)> {
     } else {
         split_multi_space(trimmed)
     };
-    if cols.len() >= 2 {
-        let state = match cols[1].to_ascii_lowercase().as_str() {
-            "pass" | "passed" | "success" => Some(CheckState::Pass),
-            "fail" | "failed" | "failure" | "error" | "timed_out" | "startup_failure" => {
-                Some(CheckState::Fail)
-            }
-            "pending" | "queued" | "in_progress" | "expected" | "waiting" => {
-                Some(CheckState::Pending)
-            }
-            "skipping" | "skipped" | "cancel" | "cancelled" | "canceled" | "neutral" => {
-                Some(CheckState::Skipped)
-            }
-            _ => None,
-        };
-        if let Some(state) = state {
-            let compact = cols
-                .iter()
-                .filter(|c| !c.is_empty())
-                .copied()
-                .collect::<Vec<_>>()
-                .join("  ");
-            return Some((state, compact));
+    if cols.len() >= 2
+        && let Some(state) = parse_check_status_word(cols[1])
+    {
+        if state == CheckState::Pass {
+            return Some((state, Cow::Borrowed("")));
         }
+        let mut compact = String::with_capacity(trimmed.len());
+        let mut first = true;
+        for col in cols {
+            if !col.is_empty() {
+                if !first {
+                    compact.push_str("  ");
+                }
+                compact.push_str(col);
+                first = false;
+            }
+        }
+        return Some((state, Cow::Owned(compact)));
     }
     None
 }
@@ -1356,12 +1468,12 @@ fn format_gh_pr_checks(lines: &[Cow<'_, str>], max_bytes: usize) -> Option<Strin
     let mut passed_count = 0usize;
     let mut passed_first = 0usize;
     let mut passed_last = 0usize;
-    let mut attention: Vec<(CheckState, usize, String)> = Vec::new();
+    let mut attention: Vec<(CheckState, usize, Cow<'_, str>)> = Vec::new();
     let mut parsed = 0usize;
 
     for (idx, cow) in lines.iter().enumerate() {
         let line_no = idx + 1;
-        let trimmed = cow.trim();
+        let trimmed = cow.as_ref().trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -1390,7 +1502,9 @@ fn format_gh_pr_checks(lines: &[Cow<'_, str>], max_bytes: usize) -> Option<Strin
 
     attention.sort_by_key(|(state, line_no, _)| (*state, *line_no));
 
-    let mut out = String::new();
+    let mut out = String::with_capacity(
+        max_bytes.min(128 + header_lines.len() * 48 + attention.len().saturating_mul(96)),
+    );
     for h in &header_lines {
         let _ = writeln!(out, "{h}");
     }
@@ -1409,10 +1523,12 @@ fn format_gh_pr_checks(lines: &[Cow<'_, str>], max_bytes: usize) -> Option<Strin
     );
     let mut kept = 0usize;
     let reserve = pass_line.len() + 64;
+    let mut line_buf = String::with_capacity(128);
     for (_, line_no, formatted) in &attention {
-        let entry = format!("{formatted} {}\n", range_tag(*line_no, *line_no));
-        if out.len() + entry.len() + reserve <= max_bytes {
-            out.push_str(&entry);
+        line_buf.clear();
+        let _ = writeln!(line_buf, "{formatted} {}", range_tag(*line_no, *line_no));
+        if out.len() + line_buf.len() + reserve <= max_bytes {
+            out.push_str(&line_buf);
             kept += 1;
         } else {
             break;
@@ -1432,14 +1548,16 @@ fn format_gh_pr_checks(lines: &[Cow<'_, str>], max_bytes: usize) -> Option<Strin
     (out.len() <= max_bytes).then_some(out)
 }
 
-fn is_status_icon_line(trimmed: &str) -> Option<bool> {
+fn classify_status_icon_line(trimmed: &str) -> Option<CheckState> {
     let (icon, rest) = trimmed.split_once(char::is_whitespace)?;
     if rest.trim().is_empty() {
         return None;
     }
     match icon {
-        "✓" | "✔" => Some(true),
-        "X" | "✗" | "×" | "!" | "*" | "-" | "○" | "●" => Some(false),
+        "✓" | "✔" => Some(CheckState::Pass),
+        "X" | "✗" | "×" | "!" => Some(CheckState::Fail),
+        "*" | "○" | "●" | "⏳" => Some(CheckState::Pending),
+        "-" => Some(CheckState::Skipped),
         _ => None,
     }
 }
@@ -1449,8 +1567,8 @@ fn format_gh_run_view(lines: &[Cow<'_, str>], max_bytes: usize) -> Option<String
         line_no: usize,
         last_line: usize,
         text: &'a str,
-        passed: bool,
-        steps: Vec<(usize, &'a str, bool)>,
+        state: CheckState,
+        steps: Vec<(usize, &'a str, CheckState)>,
     }
 
     let mut lead: Vec<&str> = Vec::new();
@@ -1496,12 +1614,12 @@ fn format_gh_run_view(lines: &[Cow<'_, str>], max_bytes: usize) -> Option<String
             continue;
         }
         let ind = indent_of(line);
-        let Some(passed) = is_status_icon_line(trimmed) else {
-            // Non-icon line inside JOBS (e.g. wrapped annotation or error detail): keep in tail.
+        let Some(state) = classify_status_icon_line(trimmed) else {
+            // Non-icon line inside JOBS (e.g. wrapped annotation or error detail): keep as failure detail.
             if let Some(job) = jobs.last_mut() {
-                job.passed = false;
+                job.state = job.state.min(CheckState::Fail);
                 job.last_line = line_no;
-                job.steps.push((line_no, trimmed, false));
+                job.steps.push((line_no, trimmed, CheckState::Fail));
             }
             continue;
         };
@@ -1510,21 +1628,21 @@ fn format_gh_run_view(lines: &[Cow<'_, str>], max_bytes: usize) -> Option<String
                 line_no,
                 last_line: line_no,
                 text: trimmed,
-                passed,
+                state,
                 steps: Vec::new(),
             });
         } else if let Some(job) = jobs.last_mut() {
             job.last_line = line_no;
-            if !passed {
-                job.passed = false;
+            if state < job.state {
+                job.state = state;
             }
-            job.steps.push((line_no, trimmed, passed));
+            job.steps.push((line_no, trimmed, state));
         } else {
             jobs.push(RunJob {
                 line_no,
                 last_line: line_no,
                 text: trimmed,
-                passed,
+                state,
                 steps: Vec::new(),
             });
         }
@@ -1537,51 +1655,54 @@ fn format_gh_run_view(lines: &[Cow<'_, str>], max_bytes: usize) -> Option<String
         return None;
     }
 
-    let mut out = String::new();
+    let mut non_passing: Vec<&RunJob<'_>> = Vec::new();
+    let mut passed_count = 0usize;
+    let mut passed_first = usize::MAX;
+    let mut passed_last = 0usize;
+    for job in &jobs {
+        if job.state == CheckState::Pass {
+            passed_count += 1;
+            passed_first = passed_first.min(job.line_no);
+            passed_last = passed_last.max(job.last_line);
+        } else {
+            non_passing.push(job);
+        }
+    }
+    // Pin failing jobs first, then pending/in-progress, then skipped/cancelled.
+    non_passing.sort_by_key(|j| (j.state, j.line_no));
+
+    let mut lead_block = String::with_capacity(lead.len() * 64 + 16);
     for line in &lead {
-        let _ = writeln!(out, "{line}");
+        let _ = writeln!(lead_block, "{line}");
     }
     if saw_jobs_header {
-        let _ = writeln!(out, "JOBS");
+        lead_block.push_str("JOBS\n");
     }
 
-    let mut pass_run_count = 0usize;
-    let mut pass_run_first = 0usize;
-    let mut pass_run_last = 0usize;
-    let flush_pass_jobs =
-        |out: &mut String, count: &mut usize, first: &mut usize, last: &mut usize| {
-            if *count > 0 {
-                let unit = if *count == 1 { "job" } else { "jobs" };
-                let _ = writeln!(out, "✓ {count} passed {unit} {}", range_tag(*first, *last));
-                *count = 0;
-                *first = 0;
-                *last = 0;
-            }
-        };
+    let mut tail_block = String::with_capacity(tail.len() * 64);
+    for line in &tail {
+        let _ = writeln!(tail_block, "{line}");
+    }
 
-    for job in &jobs {
-        if job.passed {
-            pass_run_count += 1;
-            if pass_run_first == 0 {
-                pass_run_first = job.line_no;
-            }
-            pass_run_last = job.last_line;
-            continue;
-        }
-        flush_pass_jobs(
-            &mut out,
-            &mut pass_run_count,
-            &mut pass_run_first,
-            &mut pass_run_last,
-        );
+    let passed_summary = if passed_count > 0 {
+        let unit = if passed_count == 1 { "job" } else { "jobs" };
+        format!(
+            "✓ {passed_count} passed {unit} {}\n",
+            range_tag(passed_first, passed_last)
+        )
+    } else {
+        String::new()
+    };
+
+    let render_job = |dst: &mut String, job: &RunJob<'_>| {
         let _ = writeln!(
-            out,
+            dst,
             "{} {}",
             job.text,
             range_tag(job.line_no, job.last_line)
         );
         // Inside a non-passing job, collapse passing steps to counts + `[stdout:A-B]`
-        // and keep 100% of failing/cancelled/skipped steps verbatim.
+        // and keep 100% of failing/pending/cancelled/skipped steps verbatim.
         let mut step_pass = 0usize;
         let mut step_first = 0usize;
         let mut step_last = 0usize;
@@ -1594,38 +1715,79 @@ fn format_gh_run_view(lines: &[Cow<'_, str>], max_bytes: usize) -> Option<String
                 *l = 0;
             }
         };
-        for &(sno, stext, spassed) in &job.steps {
-            if spassed {
+        for &(sno, stext, sstate) in &job.steps {
+            if sstate == CheckState::Pass {
                 step_pass += 1;
                 if step_first == 0 {
                     step_first = sno;
                 }
                 step_last = sno;
             } else {
-                flush_steps(&mut out, &mut step_pass, &mut step_first, &mut step_last);
-                let _ = writeln!(out, "  {stext} {}", range_tag(sno, sno));
+                flush_steps(dst, &mut step_pass, &mut step_first, &mut step_last);
+                let _ = writeln!(dst, "  {stext} {}", range_tag(sno, sno));
             }
         }
-        flush_steps(&mut out, &mut step_pass, &mut step_first, &mut step_last);
-    }
-    flush_pass_jobs(
-        &mut out,
-        &mut pass_run_count,
-        &mut pass_run_first,
-        &mut pass_run_last,
+        flush_steps(dst, &mut step_pass, &mut step_first, &mut step_last);
+    };
+
+    let mut full = String::with_capacity(
+        lead_block.len()
+            + non_passing.len().saturating_mul(160)
+            + passed_summary.len()
+            + tail_block.len(),
     );
+    full.push_str(&lead_block);
+    for job in &non_passing {
+        render_job(&mut full, job);
+    }
+    full.push_str(&passed_summary);
+    full.push_str(&tail_block);
 
-    for line in &tail {
-        let _ = writeln!(out, "{line}");
+    if full.len() <= max_bytes {
+        return Some(full);
     }
 
-    if out.len() <= max_bytes {
+    // Over budget: preserve lead, failing/pending jobs first, passed summary, and tail ANNOTATIONS.
+    let mut out = String::with_capacity(max_bytes);
+    out.push_str(&lead_block);
+    let fixed_tail = passed_summary.len() + tail_block.len();
+    let reserve = fixed_tail + 64;
+    let mut job_buf = String::with_capacity(256);
+    let mut kept = 0usize;
+    for job in &non_passing {
+        job_buf.clear();
+        render_job(&mut job_buf, job);
+        if out.len() + job_buf.len() + reserve <= max_bytes {
+            out.push_str(&job_buf);
+            kept += 1;
+        } else {
+            break;
+        }
+    }
+    if kept < non_passing.len() {
+        let rest = &non_passing[kept..];
+        let first = rest.iter().map(|j| j.line_no).min().unwrap_or(1);
+        let last = rest.iter().map(|j| j.last_line).max().unwrap_or(first);
+        let _ = writeln!(
+            out,
+            "+{} more non-passing jobs {}",
+            rest.len(),
+            range_tag(first, last)
+        );
+    }
+    if out.len() + passed_summary.len() + tail_block.len() <= max_bytes {
+        out.push_str(&passed_summary);
+        out.push_str(&tail_block);
         return Some(out);
     }
-    // If still over budget, trim cleanly preserving header, failing jobs, and tail annotations.
+    if out.len() + tail_block.len() <= max_bytes {
+        out.push_str(&tail_block);
+        return Some(out);
+    }
+
     let first = jobs.first().map_or(1, |j| j.line_no);
     let last = lines.len();
-    let trimmed = fit_lines_with_tail(&out, max_bytes, first, last);
+    let trimmed = fit_lines_with_tail(&full, max_bytes, first, last);
     (trimmed.len() <= max_bytes).then_some(trimmed)
 }
 
@@ -1645,13 +1807,13 @@ fn format_forge_list(
     prioritize_failures: bool,
     max_bytes: usize,
 ) -> Option<String> {
-    let mut preamble: Vec<String> = Vec::new();
-    let mut header: Option<String> = None;
-    let mut rows: Vec<(usize, String)> = Vec::new();
+    let mut preamble: Vec<&str> = Vec::new();
+    let mut header: Option<Cow<'_, str>> = None;
+    let mut rows: Vec<(usize, Cow<'_, str>)> = Vec::with_capacity(lines.len().min(512));
 
     for (idx, cow) in lines.iter().enumerate() {
         let line_no = idx + 1;
-        let trimmed = cow.trim();
+        let trimmed = cow.as_ref().trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -1659,7 +1821,7 @@ fn format_forge_list(
             && header.is_none()
             && (trimmed.starts_with("Showing ") || trimmed.starts_with("showing "))
         {
-            preamble.push(trimmed.to_owned());
+            preamble.push(trimmed);
             continue;
         }
         let tightened = tighten_spaces(trimmed);
@@ -1675,7 +1837,7 @@ fn format_forge_list(
     }
 
     // First try keeping all tightened rows.
-    let mut full = String::new();
+    let mut full = String::with_capacity(raw_len.min(max_bytes + 256));
     for p in &preamble {
         let _ = writeln!(full, "{p}");
     }
@@ -1695,7 +1857,7 @@ fn format_forge_list(
 
     // Over budget: keep preamble, header, priority rows (failing runs when applicable),
     // and as many top rows as fit, folding the rest behind `+N more ... [stdout:A-B]`.
-    let mut out = String::new();
+    let mut out = String::with_capacity(max_bytes);
     if preamble.is_empty() {
         let _ = writeln!(out, "{label}: {} items", rows.len());
     } else {
@@ -1710,15 +1872,17 @@ fn format_forge_list(
     let reserve = 72usize;
     let mut kept_indices = vec![false; rows.len()];
     let mut kept_count = 0usize;
+    let mut line_buf = String::with_capacity(128);
 
     if prioritize_failures {
         for (i, (line_no, row)) in rows.iter().enumerate() {
             if !is_forge_failure_row(row) {
                 continue;
             }
-            let entry = format!("{row} {}\n", range_tag(*line_no, *line_no));
-            if out.len() + entry.len() + reserve <= max_bytes {
-                out.push_str(&entry);
+            line_buf.clear();
+            let _ = writeln!(line_buf, "{row} {}", range_tag(*line_no, *line_no));
+            if out.len() + line_buf.len() + reserve <= max_bytes {
+                out.push_str(&line_buf);
                 kept_indices[i] = true;
                 kept_count += 1;
             }
@@ -1728,9 +1892,10 @@ fn format_forge_list(
         if kept_indices[i] {
             continue;
         }
-        let entry = format!("{row}\n");
-        if out.len() + entry.len() + reserve <= max_bytes {
-            out.push_str(&entry);
+        let needed = row.len() + 1;
+        if out.len() + needed + reserve <= max_bytes {
+            out.push_str(row);
+            out.push('\n');
             kept_indices[i] = true;
             kept_count += 1;
         } else {
@@ -2445,7 +2610,7 @@ fn clean_bot_snippet_line(raw: &str) -> String {
         .trim()
         .trim_start_matches(['#', '>', '-', '*', '|', ' ', '\t'])
         .trim_end_matches(['|', ' ', '\t']);
-    collapse_single_spaces(trimmed)
+    collapse_single_spaces(trimmed).into_owned()
 }
 
 fn is_md_table_separator(trimmed: &str) -> bool {
@@ -3143,35 +3308,57 @@ impl Severity {
     /// Strict match for a standalone severity cell (e.g. box-art left column),
     /// avoiding false positives on field labels such as `"More info"`.
     fn parse_exact(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "critical" => Some(Self::Critical),
-            "high" => Some(Self::High),
-            "moderate" | "medium" => Some(Self::Moderate),
-            "low" => Some(Self::Low),
-            "info" => Some(Self::Info),
-            _ => None,
+        let t = raw.trim();
+        if t.eq_ignore_ascii_case("critical") {
+            Some(Self::Critical)
+        } else if t.eq_ignore_ascii_case("high") {
+            Some(Self::High)
+        } else if t.eq_ignore_ascii_case("moderate") || t.eq_ignore_ascii_case("medium") {
+            Some(Self::Moderate)
+        } else if t.eq_ignore_ascii_case("low") {
+            Some(Self::Low)
+        } else if t.eq_ignore_ascii_case("info") {
+            Some(Self::Info)
+        } else {
+            None
         }
     }
 
     fn parse(raw: &str) -> Option<Self> {
-        let low = raw.trim().to_ascii_lowercase();
-        if let Some(exact) = Self::parse_exact(&low) {
+        let t = raw.trim();
+        if let Some(exact) = Self::parse_exact(t) {
             return Some(exact);
         }
-        if low.contains("critical") {
+        if contains_ascii_icase(t, "critical") {
             Some(Self::Critical)
-        } else if low.contains("high") {
+        } else if contains_ascii_icase(t, "high") {
             Some(Self::High)
-        } else if low.contains("moderate") || low.contains("medium") {
+        } else if contains_ascii_icase(t, "moderate") || contains_ascii_icase(t, "medium") {
             Some(Self::Moderate)
-        } else if low.contains("low") {
+        } else if contains_ascii_icase(t, "low") {
             Some(Self::Low)
-        } else if low.contains("warn")
-            || low.contains("unmaintained")
-            || low.contains("yanked")
-            || low.contains("unsound")
+        } else if contains_ascii_icase(t, "warn")
+            || contains_ascii_icase(t, "unmaintained")
+            || contains_ascii_icase(t, "yanked")
+            || contains_ascii_icase(t, "unsound")
         {
             Some(Self::Warning)
+        } else if let Some(score) = t
+            .split_whitespace()
+            .next()
+            .and_then(|tok| tok.parse::<f32>().ok())
+            && score.is_finite()
+            && score > 0.0
+        {
+            if score >= 9.0 {
+                Some(Self::Critical)
+            } else if score >= 7.0 {
+                Some(Self::High)
+            } else if score >= 4.0 {
+                Some(Self::Moderate)
+            } else {
+                Some(Self::Low)
+            }
         } else {
             None
         }
@@ -3288,7 +3475,7 @@ fn format_security_audit(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) 
     .map(|(s, c)| format!("{c} {}", s.label()))
     .collect();
 
-    let mut out = String::new();
+    let mut out = String::with_capacity(max_bytes.min(groups.len().saturating_mul(128) + 256));
     let distinct = groups.len();
     if total_occurrences > distinct {
         let _ = writeln!(
@@ -3309,59 +3496,75 @@ fn format_security_audit(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) 
         );
     }
 
-    let footer: String = summary_tail.iter().map(|s| format!("{s}\n")).collect();
+    let mut footer = String::with_capacity(summary_tail.len() * 48);
+    for s in &summary_tail {
+        footer.push_str(s);
+        footer.push('\n');
+    }
     let reserve = footer.len() + 72;
 
-    let entries: Vec<(usize, usize, String)> = groups
-        .into_iter()
-        .map(|(k, g)| {
-            let id_part = if k.id.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", k.id)
-            };
-            let title_part = if k.title.is_empty() {
-                String::new()
-            } else {
-                format!(": {}", clip(&k.title, 120))
-            };
-            let fix_part = if k.patched.is_empty() {
-                String::new()
-            } else {
-                format!(" · fix: {}", clip(&k.patched, 64))
-            };
-            let paths_part = if g.count > 1 {
-                format!(" (×{} paths)", g.count)
-            } else {
-                String::new()
-            };
-            let line = format!(
-                "[{}] {}{id_part}{title_part}{fix_part}{paths_part} {}\n",
-                k.severity_tag,
-                k.package,
-                range_tag(g.first_line, g.last_line)
-            );
-            (g.first_line, g.last_line, line)
-        })
-        .collect();
-
     let mut kept = 0usize;
-    for (_, _, line) in &entries {
-        if out.len() + line.len() + reserve <= max_bytes {
-            out.push_str(line);
+    let mut omitted_count = 0usize;
+    let mut omitted_first = usize::MAX;
+    let mut omitted_last = 0usize;
+    let mut omitted_has_high_or_crit = false;
+    let mut line_buf = String::with_capacity(192);
+    let total_groups = groups.len();
+
+    for (idx, (k, g)) in groups.into_iter().enumerate() {
+        if omitted_count > 0 {
+            omitted_count += 1;
+            omitted_first = omitted_first.min(g.first_line);
+            omitted_last = omitted_last.max(g.last_line);
+            if matches!(k.severity, Severity::Critical | Severity::High) {
+                omitted_has_high_or_crit = true;
+            }
+            continue;
+        }
+        line_buf.clear();
+        let _ = write!(line_buf, "[{}] {}", k.severity_tag, k.package);
+        if !k.id.is_empty() {
+            let _ = write!(line_buf, " ({})", k.id);
+        }
+        if !k.title.is_empty() {
+            let _ = write!(line_buf, ": {}", clip(&k.title, 120));
+        }
+        if !k.patched.is_empty() {
+            let _ = write!(line_buf, " · fix: {}", clip(&k.patched, 64));
+        }
+        if g.count > 1 {
+            let _ = write!(line_buf, " (×{} paths)", g.count);
+        }
+        let _ = writeln!(line_buf, " {}", range_tag(g.first_line, g.last_line));
+
+        // When this is the final group, no folding note is needed so only reserve `footer.len()`.
+        let needed_reserve = if idx + 1 == total_groups {
+            footer.len()
+        } else {
+            reserve
+        };
+        if out.len() + line_buf.len() + needed_reserve <= max_bytes {
+            out.push_str(&line_buf);
             kept += 1;
         } else {
-            break;
+            omitted_count = 1;
+            omitted_first = g.first_line;
+            omitted_last = g.last_line;
+            if matches!(k.severity, Severity::Critical | Severity::High) {
+                omitted_has_high_or_crit = true;
+            }
         }
     }
-    if kept < entries.len() {
-        let first = entries[kept..].iter().map(|e| e.0).min().unwrap_or(1);
-        let last = entries[kept..].iter().map(|e| e.1).max().unwrap_or(first);
+    if omitted_count > 0 {
+        let kind_label = if omitted_has_high_or_crit {
+            "more advisories"
+        } else {
+            "lower-severity advisories"
+        };
         let _ = writeln!(
             out,
-            "+{} lower-severity advisories {}",
-            entries.len() - kept,
-            range_tag(first, last)
+            "+{omitted_count} {kind_label} {}",
+            range_tag(omitted_first, omitted_last)
         );
     }
     if out.len() + footer.len() <= max_bytes {
@@ -3629,7 +3832,7 @@ fn parse_npm_v7_audit(lines: &[Cow<'_, str>]) -> (Vec<Advisory>, Vec<String>) {
             && let Some(severity) = Severity::parse(sev_raw)
         {
             let first_line = i + 1;
-            let pkg_header = collapse_single_spaces(trimmed);
+            let pkg_header = collapse_single_spaces(trimmed).into_owned();
             let mut last_line = i + 2;
             let mut titles: Vec<(String, String)> = Vec::new();
             let mut fix = String::new();
@@ -3934,7 +4137,7 @@ fn format_terraform_state_list(
     let mut ranked: Vec<(String, StateGroup<'_>)> = groups.into_iter().collect();
     ranked.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(&b.0)));
 
-    let mut out = String::new();
+    let mut out = String::with_capacity(max_bytes.min(ranked.len().saturating_mul(56) + 64));
     let _ = writeln!(
         out,
         "{label}: {total} resources across {} {}",
@@ -3943,22 +4146,26 @@ fn format_terraform_state_list(
     );
     let reserve = 72usize;
     let mut kept = 0usize;
+    let mut line_buf = String::with_capacity(96);
     for (group, info) in &ranked {
-        let line = if info.count == 1 {
-            format!(
-                "  {} {}\n",
+        line_buf.clear();
+        if info.count == 1 {
+            let _ = writeln!(
+                line_buf,
+                "  {} {}",
                 info.single_addr,
                 range_tag(info.first, info.last)
-            )
+            );
         } else {
-            format!(
-                "  {group} ×{} {}\n",
+            let _ = writeln!(
+                line_buf,
+                "  {group} ×{} {}",
                 info.count,
                 range_tag(info.first, info.last)
-            )
-        };
-        if out.len() + line.len() + reserve <= max_bytes {
-            out.push_str(&line);
+            );
+        }
+        if out.len() + line_buf.len() + reserve <= max_bytes {
+            out.push_str(&line_buf);
             kept += 1;
         } else {
             break;
@@ -4050,20 +4257,20 @@ fn split_table_cells(line: &str) -> Vec<&str> {
 }
 
 fn format_outdated(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -> Option<String> {
-    struct OutdatedRow {
-        name: String,
-        current: String,
-        latest: String,
+    struct OutdatedRow<'a> {
+        name: &'a str,
+        current: &'a str,
+        latest: &'a str,
         bump: BumpKind,
         line_no: usize,
     }
 
     let mut header_cols: Option<(usize, usize, usize)> = None; // (name_idx, current_idx, latest_idx)
-    let mut rows: Vec<OutdatedRow> = Vec::new();
+    let mut rows: Vec<OutdatedRow<'_>> = Vec::with_capacity(lines.len().min(512));
 
     for (idx, cow) in lines.iter().enumerate() {
         let line_no = idx + 1;
-        let trimmed = cow.trim();
+        let trimmed = cow.as_ref().trim();
         if trimmed.is_empty()
             || is_box_border(trimmed)
             || trimmed
@@ -4081,12 +4288,11 @@ fn format_outdated(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -> Opt
         if header_cols.is_none() {
             let name_i = cells
                 .iter()
-                .position(|c| matches!(c.to_ascii_lowercase().as_str(), "package" | "name"));
+                .position(|c| c.eq_ignore_ascii_case("package") || c.eq_ignore_ascii_case("name"));
             let cur_i = cells.iter().position(|c| {
-                matches!(
-                    c.to_ascii_lowercase().as_str(),
-                    "current" | "project" | "version"
-                )
+                c.eq_ignore_ascii_case("current")
+                    || c.eq_ignore_ascii_case("project")
+                    || c.eq_ignore_ascii_case("version")
             });
             let lat_i = cells.iter().position(|c| c.eq_ignore_ascii_case("latest"));
             if let (Some(n), Some(c), Some(l)) = (name_i, cur_i, lat_i) {
@@ -4112,9 +4318,9 @@ fn format_outdated(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -> Opt
         }
         let bump = classify_bump(current, latest);
         rows.push(OutdatedRow {
-            name: name.to_owned(),
-            current: current.to_owned(),
-            latest: latest.to_owned(),
+            name,
+            current,
+            latest,
             bump,
             line_no,
         });
@@ -4124,11 +4330,11 @@ fn format_outdated(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -> Opt
         return None;
     }
 
-    let major: Vec<&OutdatedRow> = rows.iter().filter(|r| r.bump == BumpKind::Major).collect();
-    let minor: Vec<&OutdatedRow> = rows.iter().filter(|r| r.bump == BumpKind::Minor).collect();
-    let patch: Vec<&OutdatedRow> = rows.iter().filter(|r| r.bump == BumpKind::Patch).collect();
+    let major: Vec<&OutdatedRow<'_>> = rows.iter().filter(|r| r.bump == BumpKind::Major).collect();
+    let minor: Vec<&OutdatedRow<'_>> = rows.iter().filter(|r| r.bump == BumpKind::Minor).collect();
+    let patch: Vec<&OutdatedRow<'_>> = rows.iter().filter(|r| r.bump == BumpKind::Patch).collect();
 
-    let mut out = String::new();
+    let mut out = String::with_capacity(max_bytes.min(rows.len().saturating_mul(36) + 128));
     let _ = writeln!(
         out,
         "{label}: {} packages ({} major, {} minor, {} patch)",
@@ -4143,16 +4349,19 @@ fn format_outdated(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -> Opt
     if !major.is_empty() {
         let _ = writeln!(out, "Major ({}):", major.len());
         let mut kept_major = 0usize;
+        let mut line_buf = String::with_capacity(96);
         for row in &major {
-            let line = format!(
-                "  {} {} -> {} {}\n",
+            line_buf.clear();
+            let _ = writeln!(
+                line_buf,
+                "  {} {} -> {} {}",
                 row.name,
                 row.current,
                 row.latest,
                 range_tag(row.line_no, row.line_no)
             );
-            if out.len() + line.len() + reserve <= max_bytes {
-                out.push_str(&line);
+            if out.len() + line_buf.len() + reserve <= max_bytes {
+                out.push_str(&line_buf);
                 kept_major += 1;
             } else {
                 break;
@@ -4171,7 +4380,7 @@ fn format_outdated(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -> Opt
     }
 
     // 2. Pack minor and patch bumps compactly, folding overflow with exact `[stdout:A-B]`.
-    let append_packed = |out: &mut String, title: &str, group: &[&OutdatedRow]| {
+    let append_packed = |out: &mut String, title: &str, group: &[&OutdatedRow<'_>]| {
         if group.is_empty() {
             return;
         }
@@ -4194,26 +4403,32 @@ fn format_outdated(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -> Opt
             return;
         }
         out.push_str(&heading);
-        let mut current_line = String::from("  ");
+        let mut current_line = String::with_capacity(104);
+        current_line.push_str("  ");
         let mut kept = 0usize;
         for row in group {
-            let token = format!("{} {}->{}", row.name, row.current, row.latest);
+            let token_len = row.name.len() + 1 + row.current.len() + 2 + row.latest.len();
             let sep = if current_line.len() > 2 { ", " } else { "" };
-            if current_line.len() + sep.len() + token.len() > 96 && current_line.len() > 2 {
+            if current_line.len() + sep.len() + token_len > 96 && current_line.len() > 2 {
                 current_line.push('\n');
                 if out.len() + current_line.len() + reserve <= max_bytes {
                     out.push_str(&current_line);
-                    current_line = format!("  {token}");
+                    current_line.clear();
+                    let _ = write!(
+                        current_line,
+                        "  {} {}->{}",
+                        row.name, row.current, row.latest
+                    );
                     kept += 1;
                 } else {
                     current_line.clear();
                     break;
                 }
-            } else if out.len() + current_line.len() + sep.len() + token.len() + 1 + reserve
+            } else if out.len() + current_line.len() + sep.len() + token_len + 1 + reserve
                 <= max_bytes
             {
                 current_line.push_str(sep);
-                current_line.push_str(&token);
+                let _ = write!(current_line, "{} {}->{}", row.name, row.current, row.latest);
                 kept += 1;
             } else {
                 break;
@@ -4246,21 +4461,20 @@ fn format_outdated(lines: &[Cow<'_, str>], label: &str, max_bytes: usize) -> Opt
 
 fn format_pip_list(lines: &[Cow<'_, str>], raw_len: usize, max_bytes: usize) -> Option<String> {
     let mut saw_header = false;
-    let mut editable: Vec<(usize, String)> = Vec::new();
-    let mut packages: Vec<(usize, String)> = Vec::new();
+    let mut editable: Vec<(usize, Cow<'_, str>)> = Vec::new();
+    let mut packages: Vec<(usize, Cow<'_, str>)> = Vec::with_capacity(lines.len().min(512));
 
     for (idx, cow) in lines.iter().enumerate() {
         let line_no = idx + 1;
-        let trimmed = cow.trim();
+        let trimmed = cow.as_ref().trim();
         if trimmed.is_empty() {
             continue;
         }
         if !saw_header {
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() >= 2
-                && parts[0].eq_ignore_ascii_case("package")
-                && parts[1].eq_ignore_ascii_case("version")
-            {
+            let mut parts = trimmed.split_whitespace();
+            let first = parts.next().unwrap_or("");
+            let second = parts.next().unwrap_or("");
+            if first.eq_ignore_ascii_case("package") && second.eq_ignore_ascii_case("version") {
                 saw_header = true;
                 continue;
             }
@@ -4277,10 +4491,15 @@ fn format_pip_list(lines: &[Cow<'_, str>], raw_len: usize, max_bytes: usize) -> 
             // Editable install with local path: preserve verbatim at top.
             editable.push((
                 line_no,
-                format!("{}=={} ({})", parts[0], parts[1], parts[2..].join(" ")),
+                Cow::Owned(format!(
+                    "{}=={} ({})",
+                    parts[0],
+                    parts[1],
+                    parts[2..].join(" ")
+                )),
             ));
         } else {
-            packages.push((line_no, format!("{}=={}", parts[0], parts[1])));
+            packages.push((line_no, Cow::Owned(format!("{}=={}", parts[0], parts[1]))));
         }
     }
 
@@ -4292,24 +4511,24 @@ fn format_pip_list(lines: &[Cow<'_, str>], raw_len: usize, max_bytes: usize) -> 
 }
 
 fn format_pip_freeze(lines: &[Cow<'_, str>], raw_len: usize, max_bytes: usize) -> Option<String> {
-    let mut editable: Vec<(usize, String)> = Vec::new();
-    let mut packages: Vec<(usize, String)> = Vec::new();
+    let mut editable: Vec<(usize, Cow<'_, str>)> = Vec::new();
+    let mut packages: Vec<(usize, Cow<'_, str>)> = Vec::with_capacity(lines.len().min(512));
 
     for (idx, cow) in lines.iter().enumerate() {
         let line_no = idx + 1;
-        let trimmed = cow.trim();
+        let trimmed = cow.as_ref().trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         if trimmed.starts_with("-e ") || trimmed.contains(" @ ") {
-            editable.push((line_no, trimmed.to_owned()));
+            editable.push((line_no, Cow::Borrowed(trimmed)));
         } else if let Some((name, ver)) = trimmed.split_once("==")
             && !name.is_empty()
             && !ver.is_empty()
             && !name.contains(char::is_whitespace)
             && !ver.contains(char::is_whitespace)
         {
-            packages.push((line_no, trimmed.to_owned()));
+            packages.push((line_no, Cow::Borrowed(trimmed)));
         } else {
             return None;
         }
@@ -4324,13 +4543,13 @@ fn format_pip_freeze(lines: &[Cow<'_, str>], raw_len: usize, max_bytes: usize) -
 
 fn pack_package_list(
     label: &str,
-    editable: &[(usize, String)],
-    packages: &[(usize, String)],
+    editable: &[(usize, Cow<'_, str>)],
+    packages: &[(usize, Cow<'_, str>)],
     raw_len: usize,
     max_bytes: usize,
 ) -> Option<String> {
     let total = editable.len() + packages.len();
-    let mut out = String::new();
+    let mut out = String::with_capacity(max_bytes.min(raw_len));
     if editable.is_empty() {
         let _ = writeln!(out, "{label}: {total} packages");
     } else {
@@ -4341,22 +4560,25 @@ fn pack_package_list(
         );
     }
     let reserve = 72usize;
+    let mut line_buf = String::with_capacity(128);
     for (line_no, entry) in editable {
-        let line = format!("  {entry} {}\n", range_tag(*line_no, *line_no));
-        if out.len() + line.len() + reserve <= max_bytes {
-            out.push_str(&line);
+        line_buf.clear();
+        let _ = writeln!(line_buf, "  {entry} {}", range_tag(*line_no, *line_no));
+        if out.len() + line_buf.len() + reserve <= max_bytes {
+            out.push_str(&line_buf);
         }
     }
 
     // Build wrapped lines (~96 chars each) tracking first/last stdout line per packed row.
     let mut packed_rows: Vec<(usize, usize, String)> = Vec::new();
-    let mut cur = String::new();
+    let mut cur = String::with_capacity(104);
     let mut cur_first = 0usize;
     let mut cur_last = 0usize;
     for (line_no, pkg) in packages {
         let sep = if cur.is_empty() { "" } else { ", " };
         if !cur.is_empty() && cur.len() + sep.len() + pkg.len() > 96 {
             packed_rows.push((cur_first, cur_last, std::mem::take(&mut cur)));
+            cur.reserve(104);
             cur_first = *line_no;
             cur_last = *line_no;
             cur.push_str(pkg);
@@ -5385,6 +5607,218 @@ Extra automated report details line 3
                 1024
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn pins_failing_pending_and_critical_rows_at_top_with_ansi_parity() {
+        // 1. `gh run view`: scattered passing jobs around failing + pending jobs under ANSI escapes.
+        let mut run_raw =
+            String::from("\x1b[31mX\x1b[0m main CI · 4242\nTriggered via push 2m ago\n\nJOBS\n");
+        for i in 1..=6 {
+            let _ = writeln!(run_raw, "\x1b[32m✓\x1b[0m lint-{i:02} in 12s (ID {i}01)");
+            let _ = writeln!(run_raw, "  ✓ Checkout");
+            let _ = writeln!(run_raw, "  ✓ Run linter");
+        }
+        run_raw.push_str(
+            "\x1b[33m*\x1b[0m deploy-staging in 0s (ID 800)\n  ✓ Checkout\n  * Wait for approval\n",
+        );
+        for i in 7..=12 {
+            let _ = writeln!(run_raw, "\x1b[32m✓\x1b[0m unit-{i:02} in 45s (ID {i}01)");
+            let _ = writeln!(run_raw, "  ✓ Checkout");
+            let _ = writeln!(run_raw, "  ✓ Test");
+        }
+        run_raw.push_str(
+            "\x1b[31mX\x1b[0m e2e-suite in 3m10s (ID 900)\n  ✓ Checkout\n  X Run e2e\n  - Upload trace\n\nANNOTATIONS\nX Process completed with exit code 1.\n",
+        );
+
+        let rv = format(&["gh", "run", "view", "4242"], &run_raw, 1024).expect("gh run view");
+        assert!(!rv.contains('\x1b'), "ANSI leaked:\n{rv}");
+        let fail_pos = rv.find("X e2e-suite in 3m10s (ID 900)").unwrap();
+        let pend_pos = rv.find("* deploy-staging in 0s (ID 800)").unwrap();
+        let pass_pos = rv.find("✓ 12 passed jobs [stdout:5-43]").unwrap();
+        assert!(
+            fail_pos < pend_pos && pend_pos < pass_pos,
+            "expected fail < pending < passed:\n{rv}"
+        );
+        assert!(rv.contains("X Process completed with exit code 1."), "{rv}");
+
+        // 2. `gh pr checks`: ANSI parity + Fail -> Pending -> Skipped -> passed count.
+        let mut checks_raw = String::new();
+        for i in 1..=20 {
+            let _ = writeln!(
+                checks_raw,
+                "ci / ok-{i:02}\t\x1b[32mpass\x1b[0m\t{i}s\thttps://example.test/job/{i}"
+            );
+        }
+        checks_raw.push_str("ci / opt\tskipped\t0s\thttps://example.test/job/21\n");
+        checks_raw
+            .push_str("ci / deploy\t\x1b[33mqueued\x1b[0m\t0s\thttps://example.test/job/22\n");
+        checks_raw.push_str(
+            "ci / sec\t\x1b[31maction_required\x1b[0m\t5s\thttps://example.test/job/23\n",
+        );
+        let checks_view = format(&["gh", "pr", "checks", "7"], &checks_raw, 1024).unwrap();
+        assert!(!checks_view.contains('\x1b'), "ANSI leaked:\n{checks_view}");
+        let f_pos = checks_view.find("ci / sec  action_required").unwrap();
+        let p_pos = checks_view.find("ci / deploy  queued").unwrap();
+        let s_pos = checks_view.find("ci / opt  skipped").unwrap();
+        let ok_pos = checks_view.find("20 passed [stdout:1-20]").unwrap();
+        assert!(
+            f_pos < p_pos && p_pos < s_pos && s_pos < ok_pos,
+            "{checks_view}"
+        );
+
+        // 3. `kubectl describe` multi-pod: healthy pod before CrashLoopBackOff pod, and healthy sidecar before OOMKilled container.
+        let mut desc = String::from(
+            "\
+Name:         healthy-web-0
+Namespace:    prod
+Status:       Running
+Labels:       app=web
+              tier=frontend
+              version=v1
+Annotations:  a: 1
+              b: 2
+              c: 3
+Containers:
+  web:
+    Image:          nginx:1.27
+    State:          Running
+    Ready:          True
+    Restart Count:  0
+    Environment:
+      A: 1
+      B: 2
+      C: 3
+      D: 4
+Conditions:
+  Type              Status
+  Initialized       True
+  Ready             True
+  ContainersReady   True
+  PodScheduled      True
+Events:             <none>
+
+Name:         broken-api-0
+Namespace:    prod
+Status:       Running
+Containers:
+  envoy:
+    Image:          envoyproxy/envoy:v1.31
+    State:          Running
+    Ready:          True
+    Restart Count:  0
+    Environment:
+      LOG_LEVEL: info
+      ADMIN_PORT: 9901
+      CLUSTER: prod
+      REGION: us-east-1
+  api:
+    Image:          ghcr.io/acme/api:2.0
+    State:          Waiting
+      Reason:       CrashLoopBackOff
+    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137
+    Ready:          False
+    Restart Count:  6
+    Environment:
+",
+        );
+        for i in 0..15 {
+            let _ = writeln!(desc, "      VAR_{i:02}: val-{i:02}");
+        }
+        desc.push_str(
+            "Conditions:\n  Type   Status\n  Ready  False\nEvents:\n  Type     Reason   Age  From     Message\n  ----     ------   ---  ----     -------\n  Normal   Pulled   5m   kubelet  Pulled image\n  Warning  BackOff  1m   kubelet  Back-off restarting failed container api\n",
+        );
+        let dview = format(&["kubectl", "describe", "pods", "-n", "prod"], &desc, 4096).unwrap();
+        let broken_pos = dview.find("Name: broken-api-0").unwrap();
+        let healthy_pos = dview.find("Name: healthy-web-0").unwrap();
+        assert!(
+            broken_pos < healthy_pos,
+            "unhealthy pod must be pinned ahead of healthy pod:\n{dview}"
+        );
+        let api_pos = dview.find("  api: [stdout:").unwrap();
+        let envoy_pos = dview.find("  envoy: Running, Ready=True").unwrap();
+        assert!(
+            api_pos < envoy_pos,
+            "unhealthy container must be pinned ahead of healthy sidecar:\n{dview}"
+        );
+        assert!(
+            dview.contains("CrashLoopBackOff") && dview.contains("OOMKilled"),
+            "{dview}"
+        );
+
+        // 4. Security audit: ANSI + numeric CVSS critical/high pinned ahead of repeated warnings under tight budget.
+        let mut audit = String::new();
+        for i in 0..12 {
+            let _ = write!(
+                audit,
+                "Crate:     legacy-{i:02}\nVersion:   0.1.{i}\nWarning:   unmaintained\nTitle:     Unmaintained helper crate {i:02}\nID:        RUSTSEC-2023-{i:04}\nDependency tree:\nlegacy-{i:02} 0.1.{i}\n└── app 1.0.0\n\n"
+            );
+        }
+        audit.push_str(
+            "\x1b[31mCrate:\x1b[0m     auth-core\nVersion:   1.2.3\nTitle:     Authentication bypass\nID:        RUSTSEC-2026-0099\nSeverity:  9.8\nSolution:  Upgrade to >=1.2.4\nDependency tree:\nauth-core 1.2.3\n└── app 1.0.0\n\nerror: 1 vulnerability found!\nwarning: 12 allowed warnings found\n",
+        );
+        let aview = format(&["cargo", "audit"], &audit, 640).expect("cargo audit compacted");
+        assert!(!aview.contains('\x1b'), "ANSI leaked:\n{aview}");
+        let crit_pos = aview
+            .find("[critical] auth-core 1.2.3 (RUSTSEC-2026-0099)")
+            .expect("critical advisory preserved");
+        assert!(
+            aview.contains("lower-severity advisories [stdout:"),
+            "expected lower-severity tail fold under tight budget:\n{aview}"
+        );
+        assert!(
+            crit_pos < aview.find("lower-severity advisories").unwrap(),
+            "{aview}"
+        );
+    }
+
+    #[test]
+    fn ansi_and_plain_fast_paths_have_byte_parity_and_tight_run_view_preserves_annotations() {
+        let mut plain_checks = String::new();
+        let mut ansi_checks = String::new();
+        for i in 1..=16 {
+            let _ = writeln!(
+                plain_checks,
+                "✓  build-{i:02}  12s  https://example.test/{i}"
+            );
+            let _ = writeln!(
+                ansi_checks,
+                "\x1b[32m✓\x1b[0m  build-{i:02}  12s  https://example.test/{i}"
+            );
+        }
+        plain_checks.push_str("X  test-e2e  2m  https://example.test/17\n");
+        ansi_checks.push_str("\x1b[31mX\x1b[0m  test-e2e  2m  https://example.test/17\n");
+        plain_checks.push_str("*  deploy  0s  https://example.test/18\n");
+        ansi_checks.push_str("\x1b[33m*\x1b[0m  deploy  0s  https://example.test/18\n");
+
+        let plain_out = format(&["gh", "pr", "checks", "99"], &plain_checks, 1024).unwrap();
+        let ansi_out = format(&["gh", "pr", "checks", "99"], &ansi_checks, 1024).unwrap();
+        assert_eq!(plain_out, ansi_out, "ANSI vs plain parity mismatch");
+
+        // Tight budget on `gh run view` with multiple failing jobs must still pin failing jobs + ANNOTATIONS.
+        let mut run_raw = String::from("X main Release · 777\n\nJOBS\n");
+        for i in 1..=10 {
+            let _ = writeln!(run_raw, "✓ build-{i:02} in 30s (ID {i})");
+        }
+        for i in 1..=8 {
+            let _ = writeln!(run_raw, "X failing-suite-{i:02} in 1m (ID 90{i})");
+            let _ = writeln!(run_raw, "  ✓ Setup");
+            let _ = writeln!(run_raw, "  X Run suite {i:02}");
+        }
+        run_raw.push_str("\nANNOTATIONS\nX Fatal assertion in suite 01\n");
+
+        let tight = format(&["gh", "run", "view", "777"], &run_raw, 420).unwrap();
+        assert!(tight.len() <= 420, "len={}: {tight}", tight.len());
+        assert!(
+            tight.contains("X failing-suite-01 in 1m (ID 901)"),
+            "{tight}"
+        );
+        assert!(
+            tight.contains("X Fatal assertion in suite 01"),
+            "ANNOTATIONS lost under tight budget:\n{tight}"
         );
     }
 }

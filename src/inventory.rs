@@ -2,18 +2,109 @@
 use crate::filters::Profile;
 use crate::summary::{Item, Summary};
 use regex::Regex;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::sync::LazyLock;
 
 static COLUMN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\S(?:[^\t ]| [^\t ])*").unwrap());
 
 const MAX_HEALTHY_GROUP_LINES: usize = 24;
 
+#[inline]
+fn strip_ansi(text: &str) -> Cow<'_, str> {
+    if text.contains('\x1b') {
+        crate::capture::ANSI.replace_all(text, "")
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+#[inline]
+fn starts_with_ascii_icase(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+#[inline]
+fn contains_ascii_icase(haystack: &str, needle_lower: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle_lower.as_bytes();
+    if n.is_empty() {
+        return true;
+    }
+    if h.len() < n.len() {
+        return false;
+    }
+    let first_lo = n[0];
+    let first_hi = first_lo.to_ascii_uppercase();
+    let limit = h.len() - n.len();
+    let mut i = 0;
+    while i <= limit {
+        let b = h[i];
+        if (b == first_lo || b == first_hi) && h[i..i + n.len()].eq_ignore_ascii_case(n) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Severity rank for pinning critical container/pod/node/workload issues first.
+/// Lower rank prints first; equal ranks preserve original stdout line order.
+fn issue_severity_tier(detail: &str) -> u8 {
+    if contains_ascii_icase(detail, "crashloopbackoff")
+        || contains_ascii_icase(detail, "imagepullbackoff")
+        || contains_ascii_icase(detail, "errimagepull")
+        || contains_ascii_icase(detail, "oomkilled")
+        || contains_ascii_icase(detail, "oomkilling")
+        || contains_ascii_icase(detail, "createcontainerconfigerror")
+        || contains_ascii_icase(detail, "createcontainererror")
+        || contains_ascii_icase(detail, "invalidimagename")
+        || contains_ascii_icase(detail, "runcontainererror")
+        || contains_ascii_icase(detail, "unhealthy")
+        || contains_ascii_icase(detail, "error")
+        || contains_ascii_icase(detail, "failed")
+        || contains_ascii_icase(detail, "backoff")
+        || contains_ascii_icase(detail, "notready")
+        || starts_with_ascii_icase(detail, "dead")
+        || starts_with_ascii_icase(detail, "restarting")
+    {
+        return 0;
+    }
+    if starts_with_ascii_icase(detail, "exited (") && !starts_with_ascii_icase(detail, "exited (0)")
+    {
+        return 0;
+    }
+    if starts_with_ascii_icase(detail, "running ")
+        && let Some(rest) = detail.strip_prefix("Running ready=")
+        && let Some((ratio_tok, _)) = rest.split_once(' ')
+        && let Some((actual, desired)) = ratio(ratio_tok)
+        && actual == desired
+        && actual != 0
+    {
+        return 2;
+    }
+    1
+}
+
+#[derive(Clone, Copy)]
+struct StdoutRef(usize, usize);
+
+impl std::fmt::Display for StdoutRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0 == self.1 {
+            write!(f, "[stdout:{}]", self.0)
+        } else {
+            write!(f, "[stdout:{}-{}]", self.0, self.1)
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct GroupKey {
     namespace: String,
     prefix: String,
-    status: String,
+    status: Cow<'static, str>,
 }
 
 #[derive(Clone, Debug)]
@@ -24,18 +115,33 @@ struct HealthyGroup {
     first_name: String,
 }
 
-struct ObservedRow {
-    name: String,
-    namespace: Option<String>,
-    bare_name: String,
-    group_fallback: Option<String>,
-    healthy_status: String,
-    issue: Option<String>,
+struct ObservedRow<'a> {
+    namespace: Option<&'a str>,
+    bare_name: &'a str,
+    group_fallback: Option<&'a str>,
+    healthy_status: Cow<'static, str>,
+    issue: Option<Cow<'a, str>>,
+}
+
+#[derive(Default)]
+struct ColIndices {
+    name: Option<usize>,
+    namespace: Option<usize>,
+    service: Option<usize>,
+    status: Option<usize>,
+    ready: Option<usize>,
+    restarts: Option<usize>,
+    desired: Option<usize>,
+    current: Option<usize>,
+    updated: Option<usize>,
+    available: Option<usize>,
+    completions: Option<usize>,
 }
 
 pub struct Inventory {
     kind: Profile,
     header: Vec<(String, usize)>,
+    cols: ColIndices,
     count: usize,
     examples: Vec<String>,
     healthy_groups: BTreeMap<GroupKey, HealthyGroup>,
@@ -47,33 +153,57 @@ impl Inventory {
         Self {
             kind,
             header: Vec::new(),
+            cols: ColIndices::default(),
             count: 0,
-            examples: vec![],
+            examples: Vec::with_capacity(4),
             healthy_groups: BTreeMap::new(),
-            issues: vec![],
+            issues: Vec::new(),
         }
     }
 
+    fn cache_cols(&mut self) {
+        let name_col = if self.kind == Profile::Containers {
+            "NAMES"
+        } else {
+            "NAME"
+        };
+        self.cols = ColIndices {
+            name: col_index(&self.header, name_col),
+            namespace: col_index(&self.header, "NAMESPACE"),
+            service: col_index(&self.header, "SERVICE"),
+            status: col_index(&self.header, "STATUS"),
+            ready: col_index(&self.header, "READY"),
+            restarts: col_index(&self.header, "RESTARTS"),
+            desired: col_index(&self.header, "DESIRED"),
+            current: col_index(&self.header, "CURRENT"),
+            updated: col_index(&self.header, "UP-TO-DATE"),
+            available: col_index(&self.header, "AVAILABLE"),
+            completions: col_index(&self.header, "COMPLETIONS"),
+        };
+    }
+
     pub fn observe(&mut self, line: &str, n: usize) -> bool {
-        let line = line.trim_end();
+        let clean = strip_ansi(line);
+        let line = clean.trim_end();
         if line.is_empty() {
             return true;
         }
         if self.header.is_empty() {
             if matches!(self.kind, Profile::Containers | Profile::ComposeContainers) {
                 self.header = parse_header(line);
+                self.cache_cols();
                 return match self.kind {
                     Profile::Containers => {
                         self.header
                             .first()
                             .is_some_and(|(h, _)| h == "CONTAINER ID")
-                            && self.col("STATUS").is_some()
-                            && self.col("NAMES").is_some()
+                            && self.cols.status.is_some()
+                            && self.cols.name.is_some()
                     }
                     Profile::ComposeContainers => {
                         self.header.first().is_some_and(|(h, _)| h == "NAME")
-                            && self.col("SERVICE").is_some()
-                            && self.col("STATUS").is_some()
+                            && self.cols.service.is_some()
+                            && self.cols.status.is_some()
                     }
                     _ => false,
                 };
@@ -82,6 +212,7 @@ impl Inventory {
                 .split_ascii_whitespace()
                 .map(|s| (s.to_owned(), 0))
                 .collect();
+            self.cache_cols();
             let columns: &[&str] = match self.kind {
                 Profile::Pods => &["NAME", "READY", "STATUS", "RESTARTS"],
                 Profile::Deployments => &["NAME", "READY", "UP-TO-DATE", "AVAILABLE"],
@@ -110,24 +241,29 @@ impl Inventory {
             return false;
         };
         self.count += 1;
+        let full_name = || match row.namespace {
+            Some(ns) => format!("{ns}/{}", row.bare_name),
+            None => row.bare_name.to_owned(),
+        };
         if let Some(reason) = row.issue {
             if self.issues.len() >= 2048 {
                 return false;
             }
-            self.issues.push(Item::new(&row.name, &reason, n));
+            let name = full_name();
+            self.issues.push(Item::new(&name, reason.as_ref(), n));
         } else {
             if self.examples.len() < 4 {
-                self.examples.push(row.name.clone());
+                self.examples.push(full_name());
             }
             if matches!(
                 self.kind,
                 Profile::Pods | Profile::Containers | Profile::ComposeContainers
             ) {
-                let prefix = replica_prefix(&row.bare_name)
-                    .or(row.group_fallback)
-                    .unwrap_or(row.bare_name);
+                let prefix = replica_prefix(row.bare_name)
+                    .or_else(|| row.group_fallback.map(|s| format!("{s} (service)")))
+                    .unwrap_or_else(|| row.bare_name.to_owned());
                 let key = GroupKey {
-                    namespace: row.namespace.unwrap_or_default(),
+                    namespace: row.namespace.unwrap_or("").to_owned(),
                     prefix,
                     status: row.healthy_status,
                 };
@@ -142,7 +278,7 @@ impl Inventory {
                         count: 1,
                         first: n,
                         last: n,
-                        first_name: row.name,
+                        first_name: full_name(),
                     });
             }
         }
@@ -153,22 +289,18 @@ impl Inventory {
         col_index(&self.header, name)
     }
 
-    fn container(&self, line: &str) -> Option<ObservedRow> {
-        let field = |key| {
-            let i = self.col(key)?;
-            if line.contains('\t') {
+    fn container<'a>(&self, line: &'a str) -> Option<ObservedRow<'a>> {
+        let has_tab = line.contains('\t');
+        let field = |col_idx: Option<usize>| -> Option<&'a str> {
+            let i = col_idx?;
+            if has_tab {
                 return line.split('\t').nth(i).map(str::trim);
             }
             let start = self.header[i].1;
             let end = self.header.get(i + 1).map(|(_, end)| *end);
             slice_cols(line, start, end).map(str::trim)
         };
-        let name_col = if self.kind == Profile::ComposeContainers {
-            "NAME"
-        } else {
-            "NAMES"
-        };
-        let name = field(name_col)?;
+        let name = field(self.cols.name)?;
         if name.is_empty()
             || !name
                 .bytes()
@@ -176,19 +308,24 @@ impl Inventory {
         {
             return None;
         }
-        let status = field("STATUS")?;
-        let lower = status.to_ascii_lowercase();
-        let mut healthy_status = String::new();
-        let issue = if lower.starts_with("up ") {
-            let issue = lower.split_once('(').and_then(|(_, s)| {
+        let status = field(self.cols.status)?;
+        let mut healthy_status = Cow::Borrowed("");
+        let issue = if status.eq_ignore_ascii_case("up") || starts_with_ascii_icase(status, "up ") {
+            let issue = status.split_once('(').and_then(|(_, s)| {
                 let health = s.trim_end_matches(')');
-                (health != "healthy").then(|| health.to_owned())
+                (!health.eq_ignore_ascii_case("healthy")).then(|| {
+                    if health.bytes().any(|b| b.is_ascii_uppercase()) {
+                        Cow::Owned(health.to_ascii_lowercase())
+                    } else {
+                        Cow::Borrowed(health)
+                    }
+                })
             });
             if issue.is_none() {
-                healthy_status = if lower.contains("(healthy)") {
-                    "Up (healthy)".to_owned()
+                healthy_status = if contains_ascii_icase(status, "(healthy)") {
+                    Cow::Borrowed("Up (healthy)")
                 } else {
-                    "Up".to_owned()
+                    Cow::Borrowed("Up")
                 };
             }
             issue
@@ -200,138 +337,167 @@ impl Inventory {
             "removing",
             "removal",
             "paused",
+            "oomkilled",
+            "error",
+            "unhealthy",
+            "crashloopbackoff",
         ]
         .iter()
-        .any(|s| lower.starts_with(s))
+        .any(|s| starts_with_ascii_icase(status, s))
         {
-            Some(
-                status
-                    .split_once(')')
-                    .map(|(s, _)| format!("{s})"))
-                    .unwrap_or_else(|| status.to_string()),
-            )
+            Some(match status.split_once(')') {
+                Some((s, _)) => Cow::Owned(format!("{s})")),
+                None => Cow::Borrowed(status),
+            })
         } else {
             return None;
         };
         let group_fallback = if self.kind == Profile::ComposeContainers {
-            field("SERVICE")
-                .filter(|s| !s.is_empty())
-                .map(|s| format!("{s} (service)"))
+            field(self.cols.service).filter(|s| !s.is_empty())
         } else {
             None
         };
         Some(ObservedRow {
-            name: name.to_owned(),
             namespace: None,
-            bare_name: name.to_owned(),
+            bare_name: name,
             group_fallback,
             healthy_status,
             issue,
         })
     }
 
-    fn kubernetes(&self, line: &str) -> Option<ObservedRow> {
-        let values: Vec<_> = line.split_ascii_whitespace().collect();
-        let get = |col| values.get(self.col(col)?).copied();
-        let bare = get("NAME")?;
-        let namespace = match self.col("NAMESPACE") {
-            Some(i) => Some((*values.get(i)?).to_owned()),
+    fn kubernetes<'a>(&self, line: &'a str) -> Option<ObservedRow<'a>> {
+        let mut stack = [""; 16];
+        let mut len = 0usize;
+        let mut overflow: Option<Vec<&'a str>> = None;
+        for tok in line.split_ascii_whitespace() {
+            if let Some(vec) = overflow.as_mut() {
+                vec.push(tok);
+            } else if len < stack.len() {
+                stack[len] = tok;
+                len += 1;
+            } else {
+                let mut v = Vec::with_capacity(24);
+                v.extend_from_slice(&stack);
+                v.push(tok);
+                overflow = Some(v);
+            }
+        }
+        let values: &[&'a str] = match overflow.as_deref() {
+            Some(v) => v,
+            None => &stack[..len],
+        };
+        let get = |col_idx: Option<usize>| values.get(col_idx?).copied();
+        let bare = get(self.cols.name)?;
+        let namespace = match self.cols.namespace {
+            Some(i) => Some(*values.get(i)?),
             None => None,
         };
-        let name = match &namespace {
-            Some(ns) => format!("{ns}/{bare}"),
-            None => bare.to_string(),
-        };
-        let mut healthy_status = String::new();
+        let mut healthy_status = Cow::Borrowed("");
         let issue = match self.kind {
             Profile::Nodes => {
-                let s = get("STATUS")?;
-                (s != "Ready").then(|| s.to_string())
+                let s = get(self.cols.status)?;
+                (s != "Ready").then_some(Cow::Borrowed(s))
             }
             Profile::Pods => {
-                let ready = get("READY")?;
+                let ready = get(self.cols.ready)?;
                 let (actual, desired) = ratio(ready)?;
-                let status = get("STATUS")?;
-                let restarts: usize = get("RESTARTS")?.parse().ok()?;
+                let status = get(self.cols.status)?;
+                let restarts: usize = get(self.cols.restarts)?.parse().ok()?;
                 let ok = status == "Completed"
                     || status == "Succeeded"
                     || (status == "Running" && actual == desired && actual != 0);
                 if ok && restarts == 0 {
-                    healthy_status = if status == "Running" {
-                        format!("{ready} {status}")
-                    } else {
-                        status.to_owned()
+                    healthy_status = match (status, ready) {
+                        ("Running", "1/1") => Cow::Borrowed("1/1 Running"),
+                        ("Running", "2/2") => Cow::Borrowed("2/2 Running"),
+                        ("Running", "3/3") => Cow::Borrowed("3/3 Running"),
+                        ("Running", _) => Cow::Owned(format!("{ready} Running")),
+                        ("Completed", _) => Cow::Borrowed("Completed"),
+                        ("Succeeded", _) => Cow::Borrowed("Succeeded"),
+                        _ => Cow::Owned(status.to_owned()),
                     };
                 }
-                (!ok || restarts > 0).then(|| format!("{status} ready={ready} restarts={restarts}"))
+                (!ok || restarts > 0)
+                    .then(|| Cow::Owned(format!("{status} ready={ready} restarts={restarts}")))
             }
             Profile::StatefulSets | Profile::Deployments => {
-                let ready = get("READY")?;
+                let ready = get(self.cols.ready)?;
                 let (actual, desired) = ratio(ready)?;
                 if self.kind == Profile::Deployments {
-                    let updated: usize = get("UP-TO-DATE")?.parse().ok()?;
-                    let available: usize = get("AVAILABLE")?.parse().ok()?;
-                    (actual != desired || updated != desired || available != desired)
-                        .then(|| format!("ready={ready} updated={updated} available={available}"))
+                    let updated: usize = get(self.cols.updated)?.parse().ok()?;
+                    let available: usize = get(self.cols.available)?.parse().ok()?;
+                    (actual != desired || updated != desired || available != desired).then(|| {
+                        Cow::Owned(format!(
+                            "ready={ready} updated={updated} available={available}"
+                        ))
+                    })
                 } else {
-                    (actual != desired).then(|| format!("ready={ready}"))
+                    (actual != desired).then(|| Cow::Owned(format!("ready={ready}")))
                 }
             }
             Profile::DaemonSets => {
-                let desired: usize = get("DESIRED")?.parse().ok()?;
-                let current: usize = get("CURRENT")?.parse().ok()?;
-                let ready: usize = get("READY")?.parse().ok()?;
-                let updated: usize = get("UP-TO-DATE")?.parse().ok()?;
-                let available: usize = get("AVAILABLE")?.parse().ok()?;
+                let desired: usize = get(self.cols.desired)?.parse().ok()?;
+                let current: usize = get(self.cols.current)?.parse().ok()?;
+                let ready: usize = get(self.cols.ready)?.parse().ok()?;
+                let updated: usize = get(self.cols.updated)?.parse().ok()?;
+                let available: usize = get(self.cols.available)?.parse().ok()?;
                 (current != desired
                     || ready != desired
                     || updated != desired
                     || available != desired)
                     .then(|| {
-                        format!(
+                        Cow::Owned(format!(
                             "desired={desired} current={current} ready={ready} updated={updated} available={available}"
-                        )
+                        ))
                     })
             }
             Profile::ReplicaSets => {
-                let desired: usize = get("DESIRED")?.parse().ok()?;
-                let current: usize = get("CURRENT")?.parse().ok()?;
-                let ready: usize = get("READY")?.parse().ok()?;
-                (current != desired || ready != desired)
-                    .then(|| format!("desired={desired} current={current} ready={ready}"))
+                let desired: usize = get(self.cols.desired)?.parse().ok()?;
+                let current: usize = get(self.cols.current)?.parse().ok()?;
+                let ready: usize = get(self.cols.ready)?.parse().ok()?;
+                (current != desired || ready != desired).then(|| {
+                    Cow::Owned(format!("desired={desired} current={current} ready={ready}"))
+                })
             }
             Profile::Jobs => {
-                let completions = get("COMPLETIONS")?;
+                let completions = get(self.cols.completions)?;
                 let (done, total) = ratio(completions)?;
-                let status = get("STATUS");
+                let status = get(self.cols.status);
                 let bad_status = status.is_some_and(|s| s != "Complete");
                 (done != total || bad_status).then(|| match status {
-                    Some(s) => format!("{s} completions={completions}"),
-                    None => format!("completions={completions}"),
+                    Some(s) => Cow::Owned(format!("{s} completions={completions}")),
+                    None => Cow::Owned(format!("completions={completions}")),
                 })
             }
             _ => return None,
         };
         Some(ObservedRow {
-            name,
             namespace,
-            bare_name: bare.to_owned(),
+            bare_name: bare,
             group_fallback: None,
             healthy_status,
             issue,
         })
     }
 
-    pub fn finish(self) -> Summary {
+    pub fn finish(mut self) -> Summary {
         if self.header.is_empty() {
             return Summary::default();
         }
-        let mut outcomes = vec![format!(
+        // Pin critical CrashLoopBackOff/ImagePullBackOff/OOMKilled/Error/Unhealthy rows first,
+        // preserving exact input line order within each severity tier.
+        self.issues
+            .sort_by_key(|item| issue_severity_tier(&item.detail));
+
+        let mut outcomes =
+            Vec::with_capacity(2 + self.healthy_groups.len().min(MAX_HEALTHY_GROUP_LINES) + 2);
+        outcomes.push(format!(
             "{}: {} listed, {} need attention",
             self.kind.label(),
             self.count,
             self.issues.len()
-        )];
+        ));
         let has_replica_groups = self.healthy_groups.values().any(|g| g.count >= 2);
         if has_replica_groups {
             let mut multi: Vec<(&GroupKey, &HealthyGroup)> = self
@@ -350,17 +516,21 @@ impl Inventory {
 
             outcomes.push("Healthy groups:".to_owned());
             for (key, group) in multi.iter().take(MAX_HEALTHY_GROUP_LINES) {
-                let label = if key.namespace.is_empty() {
-                    key.prefix.clone()
-                } else {
-                    format!("{}/{}", key.namespace, key.prefix)
-                };
-                outcomes.push(format!(
-                    "  {label} ×{} · {} {}",
+                let mut line = String::with_capacity(64);
+                line.push_str("  ");
+                if !key.namespace.is_empty() {
+                    line.push_str(&key.namespace);
+                    line.push('/');
+                }
+                let _ = write!(
+                    line,
+                    "{} ×{} · {} {}",
+                    key.prefix,
                     group.count,
                     key.status,
                     stdout_ref(group.first, group.last)
-                ));
+                );
+                outcomes.push(line);
             }
             if multi.len() > MAX_HEALTHY_GROUP_LINES {
                 let rest = &multi[MAX_HEALTHY_GROUP_LINES..];
@@ -376,18 +546,19 @@ impl Inventory {
             if !singles.is_empty() {
                 let first = singles.iter().map(|g| g.first).min().unwrap_or(1);
                 let last = singles.iter().map(|g| g.last).max().unwrap_or(first);
-                let preview: Vec<&str> = singles
-                    .iter()
-                    .take(3)
-                    .map(|g| g.first_name.as_str())
-                    .collect();
-                let ellipsis = if singles.len() > 3 { ", …" } else { "" };
-                outcomes.push(format!(
-                    "  +{} other healthy: {}{ellipsis} {}",
-                    singles.len(),
-                    preview.join(", "),
-                    stdout_ref(first, last)
-                ));
+                let mut line = String::with_capacity(80);
+                let _ = write!(line, "  +{} other healthy: ", singles.len());
+                for (idx, g) in singles.iter().take(3).enumerate() {
+                    if idx > 0 {
+                        line.push_str(", ");
+                    }
+                    line.push_str(&g.first_name);
+                }
+                if singles.len() > 3 {
+                    line.push_str(", …");
+                }
+                let _ = write!(line, " {}", stdout_ref(first, last));
+                outcomes.push(line);
             }
         } else if !self.examples.is_empty() {
             outcomes.push(format!("Other examples: {}", self.examples.join(", ")));
@@ -493,12 +664,9 @@ fn col_index(header: &[(String, usize)], name: &str) -> Option<usize> {
     header.iter().position(|(label, _)| label == name)
 }
 
-fn stdout_ref(first: usize, last: usize) -> String {
-    if first == last {
-        format!("[stdout:{first}]")
-    } else {
-        format!("[stdout:{first}-{last}]")
-    }
+#[inline]
+fn stdout_ref(first: usize, last: usize) -> StdoutRef {
+    StdoutRef(first, last)
 }
 
 fn fit_smaller(report: String, raw_len: usize, max_bytes: usize) -> Option<String> {
@@ -525,9 +693,16 @@ fn slice_cols(line: &str, start_col: usize, end_col: Option<usize>) -> Option<&s
 
 /// True when character column `start_col` lands cleanly on a boundary (start of
 /// line, past line end, or immediately preceded by whitespace).
+#[inline]
 fn clean_col_boundary(line: &str, start_col: usize) -> bool {
     if start_col == 0 {
         return true;
+    }
+    if line.is_ascii() {
+        return line
+            .as_bytes()
+            .get(start_col - 1)
+            .is_none_or(|b| b.is_ascii_whitespace());
     }
     match line.chars().nth(start_col - 1) {
         None => true,
@@ -555,14 +730,16 @@ fn ratio(value: &str) -> Option<(usize, usize)> {
 }
 
 /// Format `kubectl get events` output: keep 100% of `Warning` / non-Normal
-/// events verbatim (deduplicating identical `(object, reason, message)` with
-/// counts and `[stdout:...]` pointers) and fold routine `Normal` events by
-/// reason with counts and exact archive line ranges.
+/// events verbatim (pinning critical crash/pull/OOM/error/unhealthy warnings
+/// first and deduplicating identical `(object, reason, message)` with counts
+/// and `[stdout:...]` pointers) and fold routine `Normal` events by reason
+/// with counts and exact archive line ranges.
 pub fn events(text: &str, max_bytes: usize) -> Option<String> {
     if max_bytes == 0 || text.is_empty() {
         return None;
     }
-    let mut lines = text.lines().enumerate();
+    let clean = strip_ansi(text);
+    let mut lines = clean.lines().enumerate();
     let mut header = Vec::new();
     for (_, raw) in &mut lines {
         let trimmed = raw.trim_end_matches('\r').trim_end();
@@ -579,16 +756,16 @@ pub fn events(text: &str, max_bytes: usize) -> Option<String> {
     let ns_idx = col_index(&header, "NAMESPACE");
     let has_last_seen = col_index(&header, "LAST SEEN").is_some();
 
-    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-    struct WarnKey {
-        namespace: String,
-        kind: String,
-        object: String,
-        reason: String,
-        message: String,
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct WarnKey<'a> {
+        namespace: &'a str,
+        kind: &'a str,
+        object: &'a str,
+        reason: &'a str,
+        message: &'a str,
     }
-    struct WarnGroup {
-        key: WarnKey,
+    struct WarnGroup<'a> {
+        key: WarnKey<'a>,
         count: usize,
         first: usize,
         last: usize,
@@ -599,12 +776,32 @@ pub fn events(text: &str, max_bytes: usize) -> Option<String> {
         last: usize,
     }
 
+    let event_warning_tier = |key: &WarnKey<'_>| -> u8 {
+        if !key.kind.eq_ignore_ascii_case("warning")
+            || contains_ascii_icase(key.reason, "crashloopbackoff")
+            || contains_ascii_icase(key.reason, "imagepullbackoff")
+            || contains_ascii_icase(key.reason, "errimagepull")
+            || contains_ascii_icase(key.reason, "oomkill")
+            || contains_ascii_icase(key.reason, "backoff")
+            || contains_ascii_icase(key.reason, "unhealthy")
+            || contains_ascii_icase(key.reason, "failed")
+            || contains_ascii_icase(key.reason, "error")
+            || contains_ascii_icase(key.message, "oomkill")
+            || contains_ascii_icase(key.message, "crashloopbackoff")
+            || contains_ascii_icase(key.message, "imagepullbackoff")
+        {
+            0
+        } else {
+            1
+        }
+    };
+
     let mut total = 0usize;
     let mut warn_total = 0usize;
     let mut normal_total = 0usize;
-    let mut warn_index: BTreeMap<WarnKey, usize> = BTreeMap::new();
-    let mut warnings: Vec<WarnGroup> = Vec::new();
-    let mut normals: BTreeMap<String, NormalGroup> = BTreeMap::new();
+    let mut warn_index: BTreeMap<WarnKey<'_>, usize> = BTreeMap::new();
+    let mut warnings: Vec<WarnGroup<'_>> = Vec::new();
+    let mut normals: BTreeMap<&str, NormalGroup> = BTreeMap::new();
 
     for (idx, raw) in lines {
         let line_no = idx + 1;
@@ -652,7 +849,7 @@ pub fn events(text: &str, max_bytes: usize) -> Option<String> {
                 g.first = g.first.min(line_no);
                 g.last = g.last.max(line_no);
             } else {
-                warn_index.insert(key.clone(), warnings.len());
+                warn_index.insert(key, warnings.len());
                 warnings.push(WarnGroup {
                     key,
                     count: 1,
@@ -667,50 +864,50 @@ pub fn events(text: &str, max_bytes: usize) -> Option<String> {
         return None;
     }
 
-    let mut head = String::new();
+    // Pin critical Error/OOM/CrashLoop/ImagePull/BackOff/Unhealthy/Failed warnings first.
+    warnings.sort_by_key(|w| event_warning_tier(&w.key));
+
+    let mut head = String::with_capacity(96 + warnings.len().saturating_mul(112));
     if warn_total > warnings.len() {
-        head.push_str(&format!(
-            "kubectl get events: {total} listed, {warn_total} warning/non-normal ({} unique), {normal_total} normal\n",
+        let _ = writeln!(
+            head,
+            "kubectl get events: {total} listed, {warn_total} warning/non-normal ({} unique), {normal_total} normal",
             warnings.len()
-        ));
+        );
     } else {
-        head.push_str(&format!(
-            "kubectl get events: {total} listed, {warn_total} warning/non-normal, {normal_total} normal\n"
-        ));
+        let _ = writeln!(
+            head,
+            "kubectl get events: {total} listed, {warn_total} warning/non-normal, {normal_total} normal"
+        );
     }
     for w in &warnings {
-        let target = if w.key.namespace.is_empty() {
-            w.key.object.clone()
-        } else {
-            format!("{} {}", w.key.namespace, w.key.object)
-        };
-        let mult = if w.count > 1 {
-            format!(" ×{}", w.count)
-        } else {
-            String::new()
-        };
-        head.push_str(&format!(
-            "{} {} {target}{mult}: {} {}\n",
-            w.key.kind,
-            w.key.reason,
-            w.key.message,
-            stdout_ref(w.first, w.last)
-        ));
+        let _ = write!(head, "{} {} ", w.key.kind, w.key.reason);
+        if !w.key.namespace.is_empty() {
+            head.push_str(w.key.namespace);
+            head.push(' ');
+        }
+        head.push_str(w.key.object);
+        if w.count > 1 {
+            let _ = write!(head, " ×{}", w.count);
+        }
+        let _ = writeln!(head, ": {} {}", w.key.message, stdout_ref(w.first, w.last));
     }
 
-    let mut normal_list: Vec<(&String, &NormalGroup)> = normals.iter().collect();
+    let mut normal_list: Vec<(&str, &NormalGroup)> = normals.iter().map(|(&r, g)| (r, g)).collect();
     normal_list.sort_by(|(ra, ga), (rb, gb)| gb.count.cmp(&ga.count).then_with(|| ra.cmp(rb)));
 
     // Try full multi-line Normal breakdown first.
-    let mut full = head.clone();
+    let mut full = String::with_capacity(head.len() + normal_list.len().saturating_mul(40) + 24);
+    full.push_str(&head);
     if !normal_list.is_empty() {
         full.push_str("Normal events:\n");
         for (reason, g) in &normal_list {
-            full.push_str(&format!(
-                "  {reason} ×{} {}\n",
+            let _ = writeln!(
+                full,
+                "  {reason} ×{} {}",
                 g.count,
                 stdout_ref(g.first, g.last)
-            ));
+            );
         }
     }
     if let Some(out) = fit_smaller(full, text.len(), max_bytes) {
@@ -727,41 +924,43 @@ pub fn events(text: &str, max_bytes: usize) -> Option<String> {
             .max()
             .unwrap_or(n_first);
         let range = stdout_ref(n_first, n_last);
-        let mut compact = head.clone();
-        let parts: Vec<String> = normal_list
-            .iter()
-            .map(|(r, g)| format!("{r} ×{}", g.count))
-            .collect();
-        compact.push_str(&format!(
-            "Normal events ({normal_total}): {} {range}\n",
-            parts.join(", ")
-        ));
+        let mut compact = String::with_capacity(head.len() + normal_list.len() * 18 + 48);
+        compact.push_str(&head);
+        let _ = write!(compact, "Normal events ({normal_total}): ");
+        for (idx, (r, g)) in normal_list.iter().enumerate() {
+            if idx > 0 {
+                compact.push_str(", ");
+            }
+            let _ = write!(compact, "{r} ×{}", g.count);
+        }
+        let _ = writeln!(compact, " {range}");
         if let Some(out) = fit_smaller(compact, text.len(), max_bytes) {
             return Some(out);
         }
 
         let mut minimal = head;
-        minimal.push_str(&format!(
-            "Normal events: {normal_total} across {} reason(s) {range}\n",
+        let _ = writeln!(
+            minimal,
+            "Normal events: {normal_total} across {} reason(s) {range}",
             normal_list.len()
-        ));
+        );
         return fit_smaller(minimal, text.len(), max_bytes);
     }
 
     None
 }
 
-struct EventRow {
-    namespace: String,
-    event_type: String,
-    reason: String,
-    object: String,
-    message: String,
+struct EventRow<'a> {
+    namespace: &'a str,
+    event_type: &'a str,
+    reason: &'a str,
+    object: &'a str,
+    message: &'a str,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn parse_event_row(
-    line: &str,
+fn parse_event_row<'a>(
+    line: &'a str,
     header: &[(String, usize)],
     ns_idx: Option<usize>,
     has_last_seen: bool,
@@ -769,7 +968,7 @@ fn parse_event_row(
     reason_idx: usize,
     object_idx: usize,
     message_idx: usize,
-) -> Option<EventRow> {
+) -> Option<EventRow<'a>> {
     // Primary path: fixed-width column slicing.
     if let (Some(event_type), Some(reason), Some(object), Some(message)) = (
         slice_header_col(line, header, type_idx),
@@ -783,11 +982,11 @@ fn parse_event_row(
         };
         if valid_event_tokens(event_type, reason, object) && !message.is_empty() {
             return Some(EventRow {
-                namespace: namespace.to_owned(),
-                event_type: event_type.to_owned(),
-                reason: reason.to_owned(),
-                object: object.to_owned(),
-                message: message.to_owned(),
+                namespace,
+                event_type,
+                reason,
+                object,
+                message,
             });
         }
     }
@@ -798,9 +997,9 @@ fn parse_event_row(
     let namespace = if ns_idx.is_some() {
         let (tok, tail) = split_first_token(rest)?;
         rest = tail;
-        tok.to_owned()
+        tok
     } else {
-        String::new()
+        ""
     };
     if has_last_seen {
         let (_dur, tail) = split_first_token(rest)?;
@@ -820,10 +1019,10 @@ fn parse_event_row(
     }
     Some(EventRow {
         namespace,
-        event_type: event_type.to_owned(),
-        reason: reason.to_owned(),
-        object: object.to_owned(),
-        message: message.to_owned(),
+        event_type,
+        reason,
+        object,
+        message,
     })
 }
 
@@ -859,7 +1058,8 @@ pub fn helm_list(text: &str, max_bytes: usize) -> Option<String> {
     if max_bytes == 0 || text.is_empty() {
         return None;
     }
-    let mut lines = text.lines().enumerate();
+    let clean = strip_ansi(text);
+    let mut lines = clean.lines().enumerate();
     let mut header_raw = "";
     for (_, raw) in &mut lines {
         let trimmed = raw.trim_end_matches('\r').trim_end();
@@ -890,25 +1090,25 @@ pub fn helm_list(text: &str, max_bytes: usize) -> Option<String> {
     let chart_idx = col_index(&header, "CHART")?;
     let app_idx = col_index(&header, "APP VERSION");
 
-    struct AttentionRelease {
-        namespace: String,
-        name: String,
-        status: String,
-        revision: String,
-        chart: String,
-        app_version: String,
+    struct AttentionRelease<'a> {
+        namespace: &'a str,
+        name: &'a str,
+        status: &'a str,
+        revision: &'a str,
+        chart: &'a str,
+        app_version: &'a str,
         line: usize,
     }
-    struct NsDeployed {
+    struct NsDeployed<'a> {
         count: usize,
         first: usize,
         last: usize,
-        charts: BTreeMap<String, usize>,
+        charts: BTreeMap<&'a str, usize>,
     }
 
     let mut total = 0usize;
-    let mut attention: Vec<AttentionRelease> = Vec::new();
-    let mut deployed_by_ns: BTreeMap<String, NsDeployed> = BTreeMap::new();
+    let mut attention: Vec<AttentionRelease<'_>> = Vec::new();
+    let mut deployed_by_ns: BTreeMap<&str, NsDeployed<'_>> = BTreeMap::new();
 
     for (idx, raw) in lines {
         let line_no = idx + 1;
@@ -928,7 +1128,7 @@ pub fn helm_list(text: &str, max_bytes: usize) -> Option<String> {
                     g.count += 1;
                     g.first = g.first.min(line_no);
                     g.last = g.last.max(line_no);
-                    *g.charts.entry(row.chart.clone()).or_insert(0) += 1;
+                    *g.charts.entry(row.chart).or_insert(0) += 1;
                 })
                 .or_insert_with(|| {
                     let mut charts = BTreeMap::new();
@@ -957,30 +1157,26 @@ pub fn helm_list(text: &str, max_bytes: usize) -> Option<String> {
         return None;
     }
 
-    let mut head = String::new();
+    let mut head = String::with_capacity(64 + attention.len().saturating_mul(84));
     if attention.is_empty() {
-        head.push_str(&format!("helm list: {total} listed, all deployed\n"));
+        let _ = writeln!(head, "helm list: {total} listed, all deployed");
     } else {
-        head.push_str(&format!(
-            "helm list: {total} listed, {} need attention\n",
+        let _ = writeln!(
+            head,
+            "helm list: {total} listed, {} need attention",
             attention.len()
-        ));
+        );
     }
     for item in &attention {
-        let app = if item.app_version.is_empty() {
-            String::new()
-        } else {
-            format!(" app={}", item.app_version)
-        };
-        head.push_str(&format!(
-            "{}/{} {} rev={} chart={}{app} {}\n",
-            item.namespace,
-            item.name,
-            item.status,
-            item.revision,
-            item.chart,
-            stdout_ref(item.line, item.line)
-        ));
+        let _ = write!(
+            head,
+            "{}/{} {} rev={} chart={}",
+            item.namespace, item.name, item.status, item.revision, item.chart
+        );
+        if !item.app_version.is_empty() {
+            let _ = write!(head, " app={}", item.app_version);
+        }
+        let _ = writeln!(head, " {}", stdout_ref(item.line, item.line));
     }
 
     let deployed_total: usize = deployed_by_ns.values().map(|g| g.count).sum();
@@ -988,36 +1184,31 @@ pub fn helm_list(text: &str, max_bytes: usize) -> Option<String> {
         return fit_smaller(head, text.len(), max_bytes);
     }
 
-    let mut ns_list: Vec<(&String, &NsDeployed)> = deployed_by_ns.iter().collect();
+    let mut ns_list: Vec<(&str, &NsDeployed<'_>)> =
+        deployed_by_ns.iter().map(|(&ns, g)| (ns, g)).collect();
     ns_list.sort_by(|(na, ga), (nb, gb)| gb.count.cmp(&ga.count).then_with(|| na.cmp(nb)));
 
-    let mut full = head.clone();
+    let mut full = String::with_capacity(head.len() + ns_list.len().saturating_mul(80) + 24);
+    full.push_str(&head);
     full.push_str("Deployed releases:\n");
-    for (ns, g) in &ns_list {
-        let mut charts: Vec<(&String, &usize)> = g.charts.iter().collect();
+    for &(ns, g) in &ns_list {
+        let mut charts: Vec<(&str, usize)> = g.charts.iter().map(|(&c, &n)| (c, n)).collect();
         charts.sort_by(|(ca, na), (cb, nb)| nb.cmp(na).then_with(|| ca.cmp(cb)));
-        let shown: Vec<String> = charts
-            .iter()
-            .take(4)
-            .map(|(chart, count)| {
-                if **count > 1 {
-                    format!("{chart} ×{count}")
-                } else {
-                    (*chart).clone()
-                }
-            })
-            .collect();
-        let more = if charts.len() > 4 {
-            format!(" +{} more", charts.len() - 4)
-        } else {
-            String::new()
-        };
-        full.push_str(&format!(
-            "  {ns} ({} deployed): {}{more} {}\n",
-            g.count,
-            shown.join(", "),
-            stdout_ref(g.first, g.last)
-        ));
+        let _ = write!(full, "  {ns} ({} deployed): ", g.count);
+        for (idx, &(chart, count)) in charts.iter().take(4).enumerate() {
+            if idx > 0 {
+                full.push_str(", ");
+            }
+            if count > 1 {
+                let _ = write!(full, "{chart} ×{count}");
+            } else {
+                full.push_str(chart);
+            }
+        }
+        if charts.len() > 4 {
+            let _ = write!(full, " +{} more", charts.len() - 4);
+        }
+        let _ = writeln!(full, " {}", stdout_ref(g.first, g.last));
     }
     if let Some(out) = fit_smaller(full, text.len(), max_bytes) {
         return Some(out);
@@ -1026,42 +1217,40 @@ pub fn helm_list(text: &str, max_bytes: usize) -> Option<String> {
     // Compact fallback for tight `max_bytes`: one line summarizing all deployed namespaces.
     let first = ns_list.iter().map(|(_, g)| g.first).min().unwrap_or(1);
     let last = ns_list.iter().map(|(_, g)| g.last).max().unwrap_or(first);
-    let ns_parts: Vec<String> = ns_list
-        .iter()
-        .take(6)
-        .map(|(ns, g)| format!("{ns} ×{}", g.count))
-        .collect();
-    let more_ns = if ns_list.len() > 6 {
-        format!(" +{} more ns", ns_list.len() - 6)
-    } else {
-        String::new()
-    };
-    let mut compact = head.clone();
-    compact.push_str(&format!(
-        "Deployed ({deployed_total}): {}{more_ns} {}\n",
-        ns_parts.join(", "),
-        stdout_ref(first, last)
-    ));
+    let mut compact = String::with_capacity(head.len() + 128);
+    compact.push_str(&head);
+    let _ = write!(compact, "Deployed ({deployed_total}): ");
+    for (idx, &(ns, g)) in ns_list.iter().take(6).enumerate() {
+        if idx > 0 {
+            compact.push_str(", ");
+        }
+        let _ = write!(compact, "{ns} ×{}", g.count);
+    }
+    if ns_list.len() > 6 {
+        let _ = write!(compact, " +{} more ns", ns_list.len() - 6);
+    }
+    let _ = writeln!(compact, " {}", stdout_ref(first, last));
     if let Some(out) = fit_smaller(compact, text.len(), max_bytes) {
         return Some(out);
     }
 
     let mut minimal = head;
-    minimal.push_str(&format!(
-        "Deployed: {deployed_total} release(s) across {} namespace(s) {}\n",
+    let _ = writeln!(
+        minimal,
+        "Deployed: {deployed_total} release(s) across {} namespace(s) {}",
         ns_list.len(),
         stdout_ref(first, last)
-    ));
+    );
     fit_smaller(minimal, text.len(), max_bytes)
 }
 
-struct HelmRow {
-    namespace: String,
-    name: String,
-    revision: String,
-    status: String,
-    chart: String,
-    app_version: String,
+struct HelmRow<'a> {
+    namespace: &'a str,
+    name: &'a str,
+    revision: &'a str,
+    status: &'a str,
+    chart: &'a str,
+    app_version: &'a str,
 }
 
 fn split_tabs(line: &str, multi_tab: bool) -> Vec<&str> {
@@ -1076,8 +1265,8 @@ fn split_tabs(line: &str, multi_tab: bool) -> Vec<&str> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn parse_helm_row(
-    line: &str,
+fn parse_helm_row<'a>(
+    line: &'a str,
     header: &[(String, usize)],
     tab_mode: bool,
     multi_tab: bool,
@@ -1087,7 +1276,7 @@ fn parse_helm_row(
     status_idx: usize,
     chart_idx: usize,
     app_idx: Option<usize>,
-) -> Option<HelmRow> {
+) -> Option<HelmRow<'a>> {
     let valid = |name: &str, ns: &str, rev: &str, status: &str, chart: &str| {
         !name.is_empty()
             && !name.contains(char::is_whitespace)
@@ -1109,13 +1298,13 @@ fn parse_helm_row(
         let status = *cells.get(status_idx)?;
         let chart = *cells.get(chart_idx)?;
         let app = app_idx.and_then(|i| cells.get(i).copied()).unwrap_or("");
-        return valid(name, ns, rev, status, chart).then(|| HelmRow {
-            namespace: ns.to_owned(),
-            name: name.to_owned(),
-            revision: rev.to_owned(),
-            status: status.to_owned(),
-            chart: chart.to_owned(),
-            app_version: app.to_owned(),
+        return valid(name, ns, rev, status, chart).then_some(HelmRow {
+            namespace: ns,
+            name,
+            revision: rev,
+            status,
+            chart,
+            app_version: app,
         });
     }
 
@@ -1132,12 +1321,12 @@ fn parse_helm_row(
             .and_then(|i| slice_header_col(line, header, i))
             .unwrap_or("");
         return Some(HelmRow {
-            namespace: ns.to_owned(),
-            name: name.to_owned(),
-            revision: rev.to_owned(),
-            status: status.to_owned(),
-            chart: chart.to_owned(),
-            app_version: app.to_owned(),
+            namespace: ns,
+            name,
+            revision: rev,
+            status,
+            chart,
+            app_version: app,
         });
     }
 
@@ -1152,12 +1341,12 @@ fn parse_helm_row(
         let app = app_idx.and_then(|i| cells.get(i).copied()).unwrap_or("");
         if valid(name, ns, rev, status, chart) {
             return Some(HelmRow {
-                namespace: ns.to_owned(),
-                name: name.to_owned(),
-                revision: rev.to_owned(),
-                status: status.to_owned(),
-                chart: chart.to_owned(),
-                app_version: app.to_owned(),
+                namespace: ns,
+                name,
+                revision: rev,
+                status,
+                chart,
+                app_version: app,
             });
         }
     }
@@ -1172,7 +1361,8 @@ pub fn images(text: &str, max_bytes: usize) -> Option<String> {
     if max_bytes == 0 || text.is_empty() {
         return None;
     }
-    let mut lines = text.lines().enumerate();
+    let clean = strip_ansi(text);
+    let mut lines = clean.lines().enumerate();
     let mut header = Vec::new();
     for (_, raw) in &mut lines {
         let trimmed = raw.trim_end_matches('\r').trim_end();
@@ -1188,25 +1378,25 @@ pub fn images(text: &str, max_bytes: usize) -> Option<String> {
     let size_idx = col_index(&header, "SIZE")?;
     let digest_idx = col_index(&header, "DIGEST");
 
-    struct RepoGroup {
-        tags: Vec<String>,
-        ids: BTreeSet<String>,
-        first_id: String,
-        first_size_raw: String,
-        unique_bytes: BTreeMap<String, u64>,
+    struct RepoGroup<'a> {
+        tags: Vec<&'a str>,
+        ids: BTreeSet<&'a str>,
+        first_id: &'a str,
+        first_size_raw: Cow<'a, str>,
+        unique_bytes: BTreeMap<&'a str, u64>,
         count: usize,
         first: usize,
         last: usize,
     }
 
     let mut total = 0usize;
-    let mut all_unique_bytes: BTreeMap<String, u64> = BTreeMap::new();
+    let mut all_unique_bytes: BTreeMap<&str, u64> = BTreeMap::new();
     let mut dangling_count = 0usize;
     let mut dangling_first = usize::MAX;
     let mut dangling_last = 0usize;
-    let mut dangling_ids: Vec<(String, String)> = Vec::new();
-    let mut dangling_unique_bytes: BTreeMap<String, u64> = BTreeMap::new();
-    let mut repos: BTreeMap<String, RepoGroup> = BTreeMap::new();
+    let mut dangling_ids: Vec<(&str, Cow<'_, str>)> = Vec::with_capacity(3);
+    let mut dangling_unique_bytes: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut repos: BTreeMap<&str, RepoGroup<'_>> = BTreeMap::new();
 
     for (idx, raw) in lines {
         let line_no = idx + 1;
@@ -1219,14 +1409,14 @@ pub fn images(text: &str, max_bytes: usize) -> Option<String> {
         )?;
         total += 1;
         if let Some(bytes) = row.size_bytes {
-            all_unique_bytes.entry(row.id.clone()).or_insert(bytes);
+            all_unique_bytes.entry(row.id).or_insert(bytes);
         }
         if row.repo == "<none>" && row.tag == "<none>" {
             dangling_count += 1;
             dangling_first = dangling_first.min(line_no);
             dangling_last = dangling_last.max(line_no);
             if dangling_ids.len() < 3 {
-                dangling_ids.push((row.id.clone(), row.size_raw.clone()));
+                dangling_ids.push((row.id, row.size_raw));
             }
             if let Some(bytes) = row.size_bytes {
                 dangling_unique_bytes.entry(row.id).or_insert(bytes);
@@ -1238,18 +1428,18 @@ pub fn images(text: &str, max_bytes: usize) -> Option<String> {
                     g.count += 1;
                     g.first = g.first.min(line_no);
                     g.last = g.last.max(line_no);
-                    g.tags.push(row.tag.clone());
-                    g.ids.insert(row.id.clone());
+                    g.tags.push(row.tag);
+                    g.ids.insert(row.id);
                     if let Some(bytes) = row.size_bytes {
-                        g.unique_bytes.entry(row.id.clone()).or_insert(bytes);
+                        g.unique_bytes.entry(row.id).or_insert(bytes);
                     }
                 })
                 .or_insert_with(|| {
                     let mut ids = BTreeSet::new();
-                    ids.insert(row.id.clone());
+                    ids.insert(row.id);
                     let mut unique_bytes = BTreeMap::new();
                     if let Some(bytes) = row.size_bytes {
-                        unique_bytes.insert(row.id.clone(), bytes);
+                        unique_bytes.insert(row.id, bytes);
                     }
                     RepoGroup {
                         tags: vec![row.tag],
@@ -1270,8 +1460,10 @@ pub fn images(text: &str, max_bytes: usize) -> Option<String> {
     }
 
     let total_bytes: u64 = all_unique_bytes.values().sum();
-    let mut head = format!(
-        "docker images: {total} listed ({} repos, {dangling_count} dangling, {})\n",
+    let mut head = String::with_capacity(160);
+    let _ = writeln!(
+        head,
+        "docker images: {total} listed ({} repos, {dangling_count} dangling, {})",
         repos.len(),
         format_decimal_bytes(total_bytes)
     );
@@ -1279,66 +1471,91 @@ pub fn images(text: &str, max_bytes: usize) -> Option<String> {
         let d_bytes: u64 = dangling_unique_bytes.values().sum();
         if dangling_count == 1 {
             let (id, size_raw) = &dangling_ids[0];
-            head.push_str(&format!(
-                "dangling (<none>:<none>): 1 image ({id}, {size_raw}) {}\n",
+            let _ = writeln!(
+                head,
+                "dangling (<none>:<none>): 1 image ({id}, {size_raw}) {}",
                 stdout_ref(dangling_first, dangling_last)
-            ));
+            );
         } else {
-            let id_sample: Vec<&str> = dangling_ids.iter().map(|(id, _)| id.as_str()).collect();
-            let ellipsis = if dangling_count > id_sample.len() {
-                ", …"
-            } else {
-                ""
-            };
-            head.push_str(&format!(
-                "dangling (<none>:<none>): {dangling_count} images, {} (ids: {}{ellipsis}) {}\n",
+            let _ = write!(
+                head,
+                "dangling (<none>:<none>): {dangling_count} images, {} (ids: ",
                 format_decimal_bytes(d_bytes),
-                id_sample.join(", "),
-                stdout_ref(dangling_first, dangling_last)
-            ));
+            );
+            for (idx, (id, _)) in dangling_ids.iter().enumerate() {
+                if idx > 0 {
+                    head.push_str(", ");
+                }
+                head.push_str(id);
+            }
+            if dangling_count > dangling_ids.len() {
+                head.push_str(", …");
+            }
+            let _ = writeln!(head, ") {}", stdout_ref(dangling_first, dangling_last));
         }
     }
 
-    let mut multi: Vec<(&String, &RepoGroup)> =
-        repos.iter().filter(|(_, g)| g.count >= 2).collect();
+    let mut multi: Vec<(&str, &RepoGroup<'_>)> = repos
+        .iter()
+        .filter(|(_, g)| g.count >= 2)
+        .map(|(&r, g)| (r, g))
+        .collect();
     multi.sort_by(|(ra, ga), (rb, gb)| gb.count.cmp(&ga.count).then_with(|| ra.cmp(rb)));
 
-    let mut singles: Vec<(&String, &RepoGroup)> =
-        repos.iter().filter(|(_, g)| g.count == 1).collect();
+    let mut singles: Vec<(&str, &RepoGroup<'_>)> = repos
+        .iter()
+        .filter(|(_, g)| g.count == 1)
+        .map(|(&r, g)| (r, g))
+        .collect();
     singles.sort_by_key(|(_, g)| g.first);
 
-    let format_multi = |repo: &str, g: &RepoGroup| {
-        let shown: Vec<&str> = g.tags.iter().take(3).map(String::as_str).collect();
-        let ellipsis = if g.tags.len() > 3 { ", …" } else { "" };
+    let write_multi = |dst: &mut String, repo: &str, g: &RepoGroup<'_>| {
         let bytes: u64 = g.unique_bytes.values().sum();
-        let size_note = if g.ids.len() == 1 {
-            format!("1 id {}, {}", g.first_id, format_decimal_bytes(bytes))
+        let _ = write!(dst, "{repo} ({} tags: ", g.count);
+        for (idx, tag) in g.tags.iter().take(3).enumerate() {
+            if idx > 0 {
+                dst.push_str(", ");
+            }
+            dst.push_str(tag);
+        }
+        if g.tags.len() > 3 {
+            dst.push_str(", …");
+        }
+        if g.ids.len() == 1 {
+            let _ = writeln!(
+                dst,
+                "; 1 id {}, {}) {}",
+                g.first_id,
+                format_decimal_bytes(bytes),
+                stdout_ref(g.first, g.last)
+            );
         } else {
-            format!("{} ids, {}", g.ids.len(), format_decimal_bytes(bytes))
-        };
-        format!(
-            "{repo} ({} tags: {}{ellipsis}; {size_note}) {}\n",
-            g.count,
-            shown.join(", "),
-            stdout_ref(g.first, g.last)
-        )
+            let _ = writeln!(
+                dst,
+                "; {} ids, {}) {}",
+                g.ids.len(),
+                format_decimal_bytes(bytes),
+                stdout_ref(g.first, g.last)
+            );
+        }
     };
 
-    let format_single = |repo: &str, g: &RepoGroup| {
-        format!(
-            "{repo}:{} ({}, {}) {}\n",
+    let write_single = |dst: &mut String, repo: &str, g: &RepoGroup<'_>| {
+        let _ = writeln!(
+            dst,
+            "{repo}:{} ({}, {}) {}",
             g.tags[0],
             g.first_id,
             g.first_size_raw,
             stdout_ref(g.first, g.last)
-        )
+        );
     };
 
-    let sum_unique = |slice: &[(&String, &RepoGroup)]| -> u64 {
+    let sum_unique = |slice: &[(&str, &RepoGroup<'_>)]| -> u64 {
         let mut seen: BTreeMap<&str, u64> = BTreeMap::new();
         for (_, g) in slice {
-            for (id, &bytes) in &g.unique_bytes {
-                seen.entry(id.as_str()).or_insert(bytes);
+            for (&id, &bytes) in &g.unique_bytes {
+                seen.entry(id).or_insert(bytes);
             }
         }
         seen.values().sum()
@@ -1346,24 +1563,28 @@ pub fn images(text: &str, max_bytes: usize) -> Option<String> {
 
     // Pass 1: full multi-tag groups + all single-tag images (up to 16 before folding tail).
     let single_limit = 16usize;
-    let mut full = head.clone();
-    for (repo, g) in &multi {
-        full.push_str(&format_multi(repo, g));
+    let mut full = String::with_capacity(
+        head.len() + (multi.len() + singles.len().min(single_limit)).saturating_mul(84) + 64,
+    );
+    full.push_str(&head);
+    for &(repo, g) in &multi {
+        write_multi(&mut full, repo, g);
     }
-    for (repo, g) in singles.iter().take(single_limit) {
-        full.push_str(&format_single(repo, g));
+    for &(repo, g) in singles.iter().take(single_limit) {
+        write_single(&mut full, repo, g);
     }
     if singles.len() > single_limit {
         let rest = &singles[single_limit..];
         let rest_bytes = sum_unique(rest);
         let first = rest.iter().map(|(_, g)| g.first).min().unwrap_or(1);
         let last = rest.iter().map(|(_, g)| g.last).max().unwrap_or(first);
-        full.push_str(&format!(
-            "+{} other image(s) ({}) {}\n",
+        let _ = writeln!(
+            full,
+            "+{} other image(s) ({}) {}",
             rest.len(),
             format_decimal_bytes(rest_bytes),
             stdout_ref(first, last)
-        ));
+        );
     }
     if let Some(out) = fit_smaller(full, text.len(), max_bytes) {
         return Some(out);
@@ -1386,10 +1607,12 @@ pub fn images(text: &str, max_bytes: usize) -> Option<String> {
         String::new()
     };
     let tail_reserve = singles_summary.len() + 64;
-    for (repo, g) in &multi {
-        let line = format_multi(repo, g);
-        if compact.len() + line.len() + tail_reserve <= max_bytes {
-            compact.push_str(&line);
+    let mut line_buf = String::with_capacity(128);
+    for &(repo, g) in &multi {
+        line_buf.clear();
+        write_multi(&mut line_buf, repo, g);
+        if compact.len() + line_buf.len() + tail_reserve <= max_bytes {
+            compact.push_str(&line_buf);
             shown_multi += 1;
         } else {
             break;
@@ -1400,33 +1623,34 @@ pub fn images(text: &str, max_bytes: usize) -> Option<String> {
         let rest_tags: usize = rest.iter().map(|(_, g)| g.count).sum();
         let first = rest.iter().map(|(_, g)| g.first).min().unwrap_or(1);
         let last = rest.iter().map(|(_, g)| g.last).max().unwrap_or(first);
-        compact.push_str(&format!(
-            "+{} more repo(s) ({rest_tags} tags) {}\n",
+        let _ = writeln!(
+            compact,
+            "+{} more repo(s) ({rest_tags} tags) {}",
             rest.len(),
             stdout_ref(first, last)
-        ));
+        );
     }
     compact.push_str(&singles_summary);
     fit_smaller(compact, text.len(), max_bytes)
 }
 
-struct ImageRow {
-    repo: String,
-    tag: String,
-    id: String,
-    size_raw: String,
+struct ImageRow<'a> {
+    repo: &'a str,
+    tag: &'a str,
+    id: &'a str,
+    size_raw: Cow<'a, str>,
     size_bytes: Option<u64>,
 }
 
-fn parse_image_row(
-    line: &str,
+fn parse_image_row<'a>(
+    line: &'a str,
     header: &[(String, usize)],
     repo_idx: usize,
     tag_idx: usize,
     digest_idx: Option<usize>,
     id_idx: usize,
     size_idx: usize,
-) -> Option<ImageRow> {
+) -> Option<ImageRow<'a>> {
     let valid = |repo: &str, tag: &str, id: &str, size: &str| {
         !repo.is_empty()
             && !repo.contains(char::is_whitespace)
@@ -1446,11 +1670,11 @@ fn parse_image_row(
     ) && valid(repo, tag, id, size)
     {
         return Some(ImageRow {
-            repo: repo.to_owned(),
-            tag: tag.to_owned(),
-            id: id.to_owned(),
+            repo,
+            tag,
+            id,
             size_bytes: parse_size_bytes(size),
-            size_raw: size.to_owned(),
+            size_raw: Cow::Borrowed(size),
         });
     }
 
@@ -1463,11 +1687,11 @@ fn parse_image_row(
         let size = cells[size_idx];
         if valid(repo, tag, id, size) {
             return Some(ImageRow {
-                repo: repo.to_owned(),
-                tag: tag.to_owned(),
-                id: id.to_owned(),
+                repo,
+                tag,
+                id,
                 size_bytes: parse_size_bytes(size),
-                size_raw: size.to_owned(),
+                size_raw: Cow::Borrowed(size),
             });
         }
     }
@@ -1481,19 +1705,19 @@ fn parse_image_row(
         let id = tokens[expected_id_tok];
         // Handle both `245MB` and Podman's `256 MB`.
         let last_one = *tokens.last()?;
-        let size_candidate = if parse_size_bytes(last_one).is_some() {
-            last_one.to_owned()
+        let size_candidate: Cow<'a, str> = if parse_size_bytes(last_one).is_some() {
+            Cow::Borrowed(last_one)
         } else if tokens.len() >= expected_id_tok + 3 {
-            format!("{} {}", tokens[tokens.len() - 2], last_one)
+            Cow::Owned(format!("{} {}", tokens[tokens.len() - 2], last_one))
         } else {
             return None;
         };
         if valid(repo, tag, id, &size_candidate) {
             let size_bytes = parse_size_bytes(&size_candidate);
             return Some(ImageRow {
-                repo: repo.to_owned(),
-                tag: tag.to_owned(),
-                id: id.to_owned(),
+                repo,
+                tag,
+                id,
                 size_raw: size_candidate,
                 size_bytes,
             });
@@ -1625,20 +1849,37 @@ pub fn resources(kind: &str, text: &str, max_bytes: usize) -> Option<String> {
     if max_bytes == 0 || text.is_empty() {
         return None;
     }
-    let normalized = kind.trim().to_ascii_lowercase();
+    let clean = strip_ansi(text);
+    let raw_len = text.len();
+    let normalized = kind.trim();
     let base = normalized.split('.').next().unwrap_or("");
-    match base {
-        "svc" | "service" | "services" => services_table(text, max_bytes),
-        "ing" | "ingress" | "ingresses" => ingresses_table(text, max_bytes),
-        "pvc" | "pvcs" | "persistentvolumeclaim" | "persistentvolumeclaims" => {
-            pvcs_table(text, max_bytes)
-        }
-        "cj" | "cronjob" | "cronjobs" => cronjobs_table(text, max_bytes),
-        _ => None,
+    if base.eq_ignore_ascii_case("svc")
+        || base.eq_ignore_ascii_case("service")
+        || base.eq_ignore_ascii_case("services")
+    {
+        services_table(&clean, raw_len, max_bytes)
+    } else if base.eq_ignore_ascii_case("ing")
+        || base.eq_ignore_ascii_case("ingress")
+        || base.eq_ignore_ascii_case("ingresses")
+    {
+        ingresses_table(&clean, raw_len, max_bytes)
+    } else if base.eq_ignore_ascii_case("pvc")
+        || base.eq_ignore_ascii_case("pvcs")
+        || base.eq_ignore_ascii_case("persistentvolumeclaim")
+        || base.eq_ignore_ascii_case("persistentvolumeclaims")
+    {
+        pvcs_table(&clean, raw_len, max_bytes)
+    } else if base.eq_ignore_ascii_case("cj")
+        || base.eq_ignore_ascii_case("cronjob")
+        || base.eq_ignore_ascii_case("cronjobs")
+    {
+        cronjobs_table(&clean, raw_len, max_bytes)
+    } else {
+        None
     }
 }
 
-fn services_table(text: &str, max_bytes: usize) -> Option<String> {
+fn services_table(text: &str, raw_len: usize, max_bytes: usize) -> Option<String> {
     let mut lines = text.lines().enumerate();
     let mut header = Vec::new();
     for (_, raw) in &mut lines {
@@ -1658,26 +1899,27 @@ fn services_table(text: &str, max_bytes: usize) -> Option<String> {
     let ports_idx = col_index(&header, "PORT(S)")?;
     let ns_idx = col_index(&header, "NAMESPACE");
 
-    struct HighlightSvc {
+    struct HighlightSvc<'a> {
         pending: bool,
-        label: String,
-        svc_type: String,
-        external: String,
-        ports: String,
+        ns: &'a str,
+        name: &'a str,
+        svc_type: &'a str,
+        external: &'a str,
+        ports: &'a str,
         line: usize,
     }
-    struct InternalGroup {
+    struct InternalGroup<'a> {
         count: usize,
         first: usize,
         last: usize,
-        samples: Vec<String>,
+        samples: Vec<&'a str>,
     }
 
     let mut total = 0usize;
     let mut pending_count = 0usize;
     let mut external_count = 0usize;
-    let mut highlights: Vec<HighlightSvc> = Vec::new();
-    let mut internal: BTreeMap<(String, String), InternalGroup> = BTreeMap::new();
+    let mut highlights: Vec<HighlightSvc<'_>> = Vec::new();
+    let mut internal: BTreeMap<(&str, &str), InternalGroup<'_>> = BTreeMap::new();
 
     for (idx, raw) in lines {
         let line_no = idx + 1;
@@ -1691,13 +1933,8 @@ fn services_table(text: &str, max_bytes: usize) -> Option<String> {
         let external = *values.get(ext_idx)?;
         let ports = *values.get(ports_idx)?;
         let ns = match ns_idx {
-            Some(i) => (*values.get(i)?).to_owned(),
-            None => String::new(),
-        };
-        let label = if ns.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{ns}/{name}")
+            Some(i) => *values.get(i)?,
+            None => "",
         };
         total += 1;
 
@@ -1715,28 +1952,29 @@ fn services_table(text: &str, max_bytes: usize) -> Option<String> {
             }
             highlights.push(HighlightSvc {
                 pending: is_pending,
-                label,
-                svc_type: svc_type.to_owned(),
-                external: external.to_owned(),
-                ports: ports.to_owned(),
+                ns,
+                name,
+                svc_type,
+                external,
+                ports,
                 line: line_no,
             });
         } else {
             internal
-                .entry((ns, svc_type.to_owned()))
+                .entry((ns, svc_type))
                 .and_modify(|g| {
                     g.count += 1;
                     g.first = g.first.min(line_no);
                     g.last = g.last.max(line_no);
                     if g.samples.len() < 3 {
-                        g.samples.push(name.to_owned());
+                        g.samples.push(name);
                     }
                 })
                 .or_insert_with(|| InternalGroup {
                     count: 1,
                     first: line_no,
                     last: line_no,
-                    samples: vec![name.to_owned()],
+                    samples: vec![name],
                 });
         }
     }
@@ -1748,53 +1986,59 @@ fn services_table(text: &str, max_bytes: usize) -> Option<String> {
     // Show pending services first, then external endpoints.
     highlights.sort_by_key(|s| (!s.pending, s.line));
 
-    let mut head = format!(
-        "kubectl get services: {total} listed, {pending_count} pending, {external_count} external\n"
+    let mut head = String::with_capacity(80 + highlights.len().saturating_mul(84));
+    let _ = writeln!(
+        head,
+        "kubectl get services: {total} listed, {pending_count} pending, {external_count} external"
     );
     for svc in &highlights {
         let tag = if svc.pending { "attention" } else { "external" };
-        let ports = if svc.ports == "<none>" {
-            String::new()
-        } else {
-            format!(" ports={}", svc.ports)
-        };
-        head.push_str(&format!(
-            "{tag}: {} {} external={}{ports} {}\n",
-            svc.label,
-            svc.svc_type,
-            svc.external,
-            stdout_ref(svc.line, svc.line)
-        ));
+        let _ = write!(head, "{tag}: ");
+        if !svc.ns.is_empty() {
+            head.push_str(svc.ns);
+            head.push('/');
+        }
+        let _ = write!(
+            head,
+            "{} {} external={}",
+            svc.name, svc.svc_type, svc.external
+        );
+        if svc.ports != "<none>" {
+            let _ = write!(head, " ports={}", svc.ports);
+        }
+        let _ = writeln!(head, " {}", stdout_ref(svc.line, svc.line));
     }
 
     if internal.is_empty() {
-        return fit_smaller(head, text.len(), max_bytes);
+        return fit_smaller(head, raw_len, max_bytes);
     }
 
-    let mut groups: Vec<(&(String, String), &InternalGroup)> = internal.iter().collect();
+    let mut groups: Vec<((&str, &str), &InternalGroup<'_>)> =
+        internal.iter().map(|(&k, g)| (k, g)).collect();
     groups.sort_by(|(ka, ga), (kb, gb)| gb.count.cmp(&ga.count).then_with(|| ka.cmp(kb)));
 
-    let mut full = head.clone();
+    let mut full = String::with_capacity(head.len() + groups.len().saturating_mul(72) + 24);
+    full.push_str(&head);
     full.push_str("Internal services:\n");
-    for ((ns, svc_type), g) in &groups {
-        let scope = if ns.is_empty() {
-            svc_type.clone()
-        } else {
-            format!("{ns}: {svc_type}")
-        };
-        let ellipsis = if g.count > g.samples.len() {
-            ", …"
-        } else {
-            ""
-        };
-        full.push_str(&format!(
-            "  {scope} ×{} ({}{ellipsis}) {}\n",
-            g.count,
-            g.samples.join(", "),
-            stdout_ref(g.first, g.last)
-        ));
+    for &((ns, svc_type), g) in &groups {
+        full.push_str("  ");
+        if !ns.is_empty() {
+            full.push_str(ns);
+            full.push_str(": ");
+        }
+        let _ = write!(full, "{svc_type} ×{} (", g.count);
+        for (idx, s) in g.samples.iter().enumerate() {
+            if idx > 0 {
+                full.push_str(", ");
+            }
+            full.push_str(s);
+        }
+        if g.count > g.samples.len() {
+            full.push_str(", …");
+        }
+        let _ = writeln!(full, ") {}", stdout_ref(g.first, g.last));
     }
-    if let Some(out) = fit_smaller(full, text.len(), max_bytes) {
+    if let Some(out) = fit_smaller(full, raw_len, max_bytes) {
         return Some(out);
     }
 
@@ -1802,15 +2046,16 @@ fn services_table(text: &str, max_bytes: usize) -> Option<String> {
     let first = groups.iter().map(|(_, g)| g.first).min().unwrap_or(1);
     let last = groups.iter().map(|(_, g)| g.last).max().unwrap_or(first);
     let mut compact = head;
-    compact.push_str(&format!(
-        "Internal services: {internal_total} across {} group(s) {}\n",
+    let _ = writeln!(
+        compact,
+        "Internal services: {internal_total} across {} group(s) {}",
         groups.len(),
         stdout_ref(first, last)
-    ));
-    fit_smaller(compact, text.len(), max_bytes)
+    );
+    fit_smaller(compact, raw_len, max_bytes)
 }
 
-fn ingresses_table(text: &str, max_bytes: usize) -> Option<String> {
+fn ingresses_table(text: &str, raw_len: usize, max_bytes: usize) -> Option<String> {
     let mut lines = text.lines().enumerate();
     let mut header = Vec::new();
     for (_, raw) in &mut lines {
@@ -1828,17 +2073,17 @@ fn ingresses_table(text: &str, max_bytes: usize) -> Option<String> {
     let class_idx = col_index(&header, "CLASS");
     let ns_idx = col_index(&header, "NAMESPACE");
 
-    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-    struct IngGroupKey {
-        ns: String,
-        class: String,
-        address: String,
-        ports: String,
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct IngGroupKey<'a> {
+        ns: &'a str,
+        class: &'a str,
+        address: &'a str,
+        ports: &'a str,
     }
 
     let mut total = 0usize;
-    let mut missing_addr: Vec<IngressRow> = Vec::new();
-    let mut by_endpoint: BTreeMap<IngGroupKey, Vec<IngressRow>> = BTreeMap::new();
+    let mut missing_addr: Vec<IngressRow<'_>> = Vec::new();
+    let mut by_endpoint: BTreeMap<IngGroupKey<'_>, Vec<IngressRow<'_>>> = BTreeMap::new();
 
     for (idx, raw) in lines {
         let line_no = idx + 1;
@@ -1857,10 +2102,10 @@ fn ingresses_table(text: &str, max_bytes: usize) -> Option<String> {
             missing_addr.push(row);
         } else {
             let key = IngGroupKey {
-                ns: row.ns.clone(),
-                class: row.class.clone(),
-                address: row.address.clone(),
-                ports: row.ports.clone(),
+                ns: row.ns,
+                class: row.class,
+                address: row.address,
+                ports: row.ports,
             };
             by_endpoint.entry(key).or_default().push(row);
         }
@@ -1870,74 +2115,85 @@ fn ingresses_table(text: &str, max_bytes: usize) -> Option<String> {
         return None;
     }
 
-    let mut head = format!(
-        "kubectl get ingresses: {total} listed, {} missing address\n",
+    let mut head = String::with_capacity(80 + missing_addr.len().saturating_mul(96));
+    let _ = writeln!(
+        head,
+        "kubectl get ingresses: {total} listed, {} missing address",
         missing_addr.len()
     );
     for ing in &missing_addr {
-        let label = if ing.ns.is_empty() {
-            ing.name.clone()
-        } else {
-            format!("{}/{}", ing.ns, ing.name)
-        };
-        let class = if ing.class.is_empty() || ing.class == "<none>" {
-            String::new()
-        } else {
-            format!(" class={}", ing.class)
-        };
-        head.push_str(&format!(
-            "attention: {label}{class} hosts={} address=<none> ports={} {}\n",
+        head.push_str("attention: ");
+        if !ing.ns.is_empty() {
+            head.push_str(ing.ns);
+            head.push('/');
+        }
+        head.push_str(ing.name);
+        if !ing.class.is_empty() && ing.class != "<none>" {
+            let _ = write!(head, " class={}", ing.class);
+        }
+        let _ = writeln!(
+            head,
+            " hosts={} address=<none> ports={} {}",
             ing.hosts,
             ing.ports,
             stdout_ref(ing.line, ing.line)
-        ));
+        );
     }
 
-    let mut groups: Vec<(&IngGroupKey, &Vec<IngressRow>)> = by_endpoint.iter().collect();
+    let mut groups: Vec<(IngGroupKey<'_>, &Vec<IngressRow<'_>>)> =
+        by_endpoint.iter().map(|(&k, v)| (k, v)).collect();
     groups.sort_by(|(ka, ra), (kb, rb)| rb.len().cmp(&ra.len()).then_with(|| ka.cmp(kb)));
 
-    let mut full = head.clone();
-    for (key, rows) in &groups {
+    let mut full = String::with_capacity(head.len() + groups.len().saturating_mul(96));
+    full.push_str(&head);
+    for &(key, rows) in &groups {
         if rows.len() <= 3 {
-            for ing in *rows {
-                let label = if ing.ns.is_empty() {
-                    ing.name.clone()
-                } else {
-                    format!("{}/{}", ing.ns, ing.name)
-                };
-                full.push_str(&format!(
-                    "external: {label} hosts={} addr={} ports={} {}\n",
+            for ing in rows {
+                full.push_str("external: ");
+                if !ing.ns.is_empty() {
+                    full.push_str(ing.ns);
+                    full.push('/');
+                }
+                let _ = writeln!(
+                    full,
+                    "{} hosts={} addr={} ports={} {}",
+                    ing.name,
                     ing.hosts,
                     ing.address,
                     ing.ports,
                     stdout_ref(ing.line, ing.line)
-                ));
+                );
             }
         } else {
             let first = rows.iter().map(|r| r.line).min().unwrap_or(1);
             let last = rows.iter().map(|r| r.line).max().unwrap_or(first);
-            let scope = if key.ns.is_empty() {
-                String::new()
-            } else {
-                format!("{} ", key.ns)
-            };
-            let class = if key.class.is_empty() || key.class == "<none>" {
-                String::new()
-            } else {
-                format!("{} → ", key.class)
-            };
-            let hosts: Vec<&str> = rows.iter().take(3).map(|r| r.hosts.as_str()).collect();
-            full.push_str(&format!(
-                "external: {scope}({class}{}, ports {}) ×{}: {}, … {}\n",
+            full.push_str("external: ");
+            if !key.ns.is_empty() {
+                full.push_str(key.ns);
+                full.push(' ');
+            }
+            full.push('(');
+            if !key.class.is_empty() && key.class != "<none>" {
+                full.push_str(key.class);
+                full.push_str(" → ");
+            }
+            let _ = write!(
+                full,
+                "{}, ports {}) ×{}: ",
                 key.address,
                 key.ports,
-                rows.len(),
-                hosts.join(", "),
-                stdout_ref(first, last)
-            ));
+                rows.len()
+            );
+            for (idx, r) in rows.iter().take(3).enumerate() {
+                if idx > 0 {
+                    full.push_str(", ");
+                }
+                full.push_str(r.hosts);
+            }
+            let _ = writeln!(full, ", … {}", stdout_ref(first, last));
         }
     }
-    if let Some(out) = fit_smaller(full, text.len(), max_bytes) {
+    if let Some(out) = fit_smaller(full, raw_len, max_bytes) {
         return Some(out);
     }
 
@@ -1954,19 +2210,20 @@ fn ingresses_table(text: &str, max_bytes: usize) -> Option<String> {
             .max()
             .unwrap_or(first);
         let mut compact = head;
-        compact.push_str(&format!(
-            "External ingresses: {ext_total} across {} endpoint group(s) {}\n",
+        let _ = writeln!(
+            compact,
+            "External ingresses: {ext_total} across {} endpoint group(s) {}",
             groups.len(),
             stdout_ref(first, last)
-        ));
-        return fit_smaller(compact, text.len(), max_bytes);
+        );
+        return fit_smaller(compact, raw_len, max_bytes);
     }
     None
 }
 
 #[allow(clippy::too_many_arguments)]
-fn parse_ingress_row(
-    line: &str,
+fn parse_ingress_row<'a>(
+    line: &'a str,
     header: &[(String, usize)],
     ns_idx: Option<usize>,
     name_idx: usize,
@@ -1975,7 +2232,7 @@ fn parse_ingress_row(
     addr_idx: usize,
     ports_idx: usize,
     line_no: usize,
-) -> Option<IngressRow> {
+) -> Option<IngressRow<'a>> {
     if let (Some(name), Some(hosts), Some(address), Some(ports)) = (
         slice_header_col(line, header, name_idx),
         slice_header_col(line, header, hosts_idx),
@@ -1994,12 +2251,12 @@ fn parse_ingress_row(
             .and_then(|i| slice_header_col(line, header, i))
             .unwrap_or("");
         return Some(IngressRow {
-            ns: ns.to_owned(),
-            name: name.to_owned(),
-            class: class.to_owned(),
-            hosts: hosts.to_owned(),
-            address: address.to_owned(),
-            ports: ports.to_owned(),
+            ns,
+            name,
+            class,
+            hosts,
+            address,
+            ports,
             line: line_no,
         });
     }
@@ -2013,12 +2270,12 @@ fn parse_ingress_row(
         let class = class_idx.map_or("", |i| cells[i]);
         if !name.is_empty() && !name.contains(char::is_whitespace) && !hosts.is_empty() {
             return Some(IngressRow {
-                ns: ns.to_owned(),
-                name: name.to_owned(),
-                class: class.to_owned(),
-                hosts: hosts.to_owned(),
-                address: address.to_owned(),
-                ports: ports.to_owned(),
+                ns,
+                name,
+                class,
+                hosts,
+                address,
+                ports,
                 line: line_no,
             });
         }
@@ -2026,17 +2283,17 @@ fn parse_ingress_row(
     None
 }
 
-struct IngressRow {
-    ns: String,
-    name: String,
-    class: String,
-    hosts: String,
-    address: String,
-    ports: String,
+struct IngressRow<'a> {
+    ns: &'a str,
+    name: &'a str,
+    class: &'a str,
+    hosts: &'a str,
+    address: &'a str,
+    ports: &'a str,
     line: usize,
 }
 
-fn pvcs_table(text: &str, max_bytes: usize) -> Option<String> {
+fn pvcs_table(text: &str, raw_len: usize, max_bytes: usize) -> Option<String> {
     let mut lines = text.lines().enumerate();
     let mut header = Vec::new();
     for (_, raw) in &mut lines {
@@ -2055,34 +2312,35 @@ fn pvcs_table(text: &str, max_bytes: usize) -> Option<String> {
     let class_idx = col_index(&header, "STORAGECLASS");
     let ns_idx = col_index(&header, "NAMESPACE");
 
-    struct AttentionPvc {
-        label: String,
-        status: String,
-        capacity: String,
-        storage_class: String,
-        volume: String,
+    struct AttentionPvc<'a> {
+        ns: &'a str,
+        name: &'a str,
+        status: &'a str,
+        capacity: &'a str,
+        storage_class: &'a str,
+        volume: &'a str,
         line: usize,
     }
-    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-    struct BoundKey {
-        ns: String,
-        storage_class: String,
-        access_modes: String,
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct BoundKey<'a> {
+        ns: &'a str,
+        storage_class: &'a str,
+        access_modes: &'a str,
     }
-    struct BoundGroup {
+    struct BoundGroup<'a> {
         count: usize,
         first: usize,
         last: usize,
-        uniform_cap: Option<String>,
+        uniform_cap: Option<&'a str>,
         mixed_cap: bool,
         total_bytes: u64,
         all_parsed_bytes: bool,
-        samples: Vec<String>,
+        samples: Vec<&'a str>,
     }
 
     let mut total = 0usize;
-    let mut attention: Vec<AttentionPvc> = Vec::new();
-    let mut bound: BTreeMap<BoundKey, BoundGroup> = BTreeMap::new();
+    let mut attention: Vec<AttentionPvc<'_>> = Vec::new();
+    let mut bound: BTreeMap<BoundKey<'_>, BoundGroup<'_>> = BTreeMap::new();
 
     for (idx, raw) in lines {
         let line_no = idx + 1;
@@ -2094,29 +2352,24 @@ fn pvcs_table(text: &str, max_bytes: usize) -> Option<String> {
             line, &header, ns_idx, name_idx, status_idx, vol_idx, cap_idx, mode_idx, class_idx,
         )?;
         total += 1;
-        let label = if row.ns.is_empty() {
-            row.name.clone()
-        } else {
-            format!("{}/{}", row.ns, row.name)
-        };
         if row.status == "Bound" {
             let key = BoundKey {
                 ns: row.ns,
                 storage_class: if row.storage_class.is_empty() {
-                    "<default>".to_owned()
+                    "<default>"
                 } else {
                     row.storage_class
                 },
                 access_modes: row.access_modes,
             };
-            let parsed_bytes = parse_k8s_quantity(&row.capacity);
+            let parsed_bytes = parse_k8s_quantity(row.capacity);
             bound
                 .entry(key)
                 .and_modify(|g| {
                     g.count += 1;
                     g.first = g.first.min(line_no);
                     g.last = g.last.max(line_no);
-                    if g.uniform_cap.as_deref() != Some(row.capacity.as_str()) {
+                    if g.uniform_cap != Some(row.capacity) {
                         g.mixed_cap = true;
                     }
                     match parsed_bytes {
@@ -2124,7 +2377,7 @@ fn pvcs_table(text: &str, max_bytes: usize) -> Option<String> {
                         None => g.all_parsed_bytes = false,
                     }
                     if g.samples.len() < 3 {
-                        g.samples.push(row.name.clone());
+                        g.samples.push(row.name);
                     }
                 })
                 .or_insert_with(|| BoundGroup {
@@ -2139,7 +2392,8 @@ fn pvcs_table(text: &str, max_bytes: usize) -> Option<String> {
                 });
         } else {
             attention.push(AttentionPvc {
-                label,
+                ns: row.ns,
+                name: row.name,
                 status: row.status,
                 capacity: row.capacity,
                 storage_class: row.storage_class,
@@ -2153,73 +2407,73 @@ fn pvcs_table(text: &str, max_bytes: usize) -> Option<String> {
         return None;
     }
 
-    let mut head = format!(
-        "kubectl get pvc: {total} listed, {} need attention\n",
+    let mut head = String::with_capacity(64 + attention.len().saturating_mul(84));
+    let _ = writeln!(
+        head,
+        "kubectl get pvc: {total} listed, {} need attention",
         attention.len()
     );
     for pvc in &attention {
-        let mut details = String::new();
+        if !pvc.ns.is_empty() {
+            head.push_str(pvc.ns);
+            head.push('/');
+        }
+        let _ = write!(head, "{} {}", pvc.name, pvc.status);
         if !pvc.capacity.is_empty() {
-            details.push_str(&format!(" capacity={}", pvc.capacity));
+            let _ = write!(head, " capacity={}", pvc.capacity);
         }
         if !pvc.storage_class.is_empty() {
-            details.push_str(&format!(" class={}", pvc.storage_class));
+            let _ = write!(head, " class={}", pvc.storage_class);
         }
         if !pvc.volume.is_empty() {
-            details.push_str(&format!(" vol={}", pvc.volume));
+            let _ = write!(head, " vol={}", pvc.volume);
         }
-        head.push_str(&format!(
-            "{} {}{details} {}\n",
-            pvc.label,
-            pvc.status,
-            stdout_ref(pvc.line, pvc.line)
-        ));
+        let _ = writeln!(head, " {}", stdout_ref(pvc.line, pvc.line));
     }
 
     if bound.is_empty() {
-        return fit_smaller(head, text.len(), max_bytes);
+        return fit_smaller(head, raw_len, max_bytes);
     }
 
-    let mut groups: Vec<(&BoundKey, &BoundGroup)> = bound.iter().collect();
+    let mut groups: Vec<(BoundKey<'_>, &BoundGroup<'_>)> =
+        bound.iter().map(|(&k, g)| (k, g)).collect();
     groups.sort_by(|(ka, ga), (kb, gb)| gb.count.cmp(&ga.count).then_with(|| ka.cmp(kb)));
 
-    let mut full = head.clone();
+    let mut full = String::with_capacity(head.len() + groups.len().saturating_mul(84) + 24);
+    full.push_str(&head);
     full.push_str("Bound PVCs:\n");
-    for (key, g) in &groups {
-        let scope = if key.ns.is_empty() {
-            key.storage_class.clone()
-        } else {
-            format!("{}: {}", key.ns, key.storage_class)
-        };
-        let mode = if key.access_modes.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", key.access_modes)
-        };
-        let cap_note = if !g.mixed_cap {
-            g.uniform_cap
-                .as_deref()
-                .filter(|c| !c.is_empty())
-                .map(|c| format!(" {c}"))
-                .unwrap_or_default()
+    for &(key, g) in &groups {
+        full.push_str("  ");
+        if !key.ns.is_empty() {
+            full.push_str(key.ns);
+            full.push_str(": ");
+        }
+        full.push_str(key.storage_class);
+        if !key.access_modes.is_empty() {
+            full.push(' ');
+            full.push_str(key.access_modes);
+        }
+        if !g.mixed_cap {
+            if let Some(c) = g.uniform_cap.filter(|c| !c.is_empty()) {
+                full.push(' ');
+                full.push_str(c);
+            }
         } else if g.all_parsed_bytes && g.total_bytes > 0 {
-            format!(" (total {})", format_k8s_quantity(g.total_bytes))
-        } else {
-            String::new()
-        };
-        let ellipsis = if g.count > g.samples.len() {
-            ", …"
-        } else {
-            ""
-        };
-        full.push_str(&format!(
-            "  {scope}{mode}{cap_note} ×{} ({}{ellipsis}) {}\n",
-            g.count,
-            g.samples.join(", "),
-            stdout_ref(g.first, g.last)
-        ));
+            let _ = write!(full, " (total {})", format_k8s_quantity(g.total_bytes));
+        }
+        let _ = write!(full, " ×{} (", g.count);
+        for (idx, s) in g.samples.iter().enumerate() {
+            if idx > 0 {
+                full.push_str(", ");
+            }
+            full.push_str(s);
+        }
+        if g.count > g.samples.len() {
+            full.push_str(", …");
+        }
+        let _ = writeln!(full, ") {}", stdout_ref(g.first, g.last));
     }
-    if let Some(out) = fit_smaller(full, text.len(), max_bytes) {
+    if let Some(out) = fit_smaller(full, raw_len, max_bytes) {
         return Some(out);
     }
 
@@ -2227,27 +2481,28 @@ fn pvcs_table(text: &str, max_bytes: usize) -> Option<String> {
     let first = groups.iter().map(|(_, g)| g.first).min().unwrap_or(1);
     let last = groups.iter().map(|(_, g)| g.last).max().unwrap_or(first);
     let mut compact = head;
-    compact.push_str(&format!(
-        "Bound PVCs: {bound_total} across {} group(s) {}\n",
+    let _ = writeln!(
+        compact,
+        "Bound PVCs: {bound_total} across {} group(s) {}",
         groups.len(),
         stdout_ref(first, last)
-    ));
-    fit_smaller(compact, text.len(), max_bytes)
+    );
+    fit_smaller(compact, raw_len, max_bytes)
 }
 
-struct PvcRow {
-    ns: String,
-    name: String,
-    status: String,
-    volume: String,
-    capacity: String,
-    access_modes: String,
-    storage_class: String,
+struct PvcRow<'a> {
+    ns: &'a str,
+    name: &'a str,
+    status: &'a str,
+    volume: &'a str,
+    capacity: &'a str,
+    access_modes: &'a str,
+    storage_class: &'a str,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn parse_pvc_row(
-    line: &str,
+fn parse_pvc_row<'a>(
+    line: &'a str,
     header: &[(String, usize)],
     ns_idx: Option<usize>,
     name_idx: usize,
@@ -2256,7 +2511,7 @@ fn parse_pvc_row(
     cap_idx: usize,
     mode_idx: Option<usize>,
     class_idx: Option<usize>,
-) -> Option<PvcRow> {
+) -> Option<PvcRow<'a>> {
     if let (Some(name), Some(status), Some(vol), Some(cap)) = (
         slice_header_col(line, header, name_idx),
         slice_header_col(line, header, status_idx),
@@ -2278,13 +2533,13 @@ fn parse_pvc_row(
             .and_then(|i| slice_header_col(line, header, i))
             .unwrap_or("");
         return Some(PvcRow {
-            ns: ns.to_owned(),
-            name: name.to_owned(),
-            status: status.to_owned(),
-            volume: vol.to_owned(),
-            capacity: cap.to_owned(),
-            access_modes: access_modes.to_owned(),
-            storage_class: storage_class.to_owned(),
+            ns,
+            name,
+            status,
+            volume: vol,
+            capacity: cap,
+            access_modes,
+            storage_class,
         });
     }
     let cells: Vec<&str> = COLUMN.find_iter(line).map(|m| m.as_str()).collect();
@@ -2297,20 +2552,20 @@ fn parse_pvc_row(
             && !status.contains(char::is_whitespace)
         {
             return Some(PvcRow {
-                ns: ns_idx.map_or("", |i| cells[i]).to_owned(),
-                name: name.to_owned(),
-                status: status.to_owned(),
-                volume: cells[vol_idx].to_owned(),
-                capacity: cells[cap_idx].to_owned(),
-                access_modes: mode_idx.map_or("", |i| cells[i]).to_owned(),
-                storage_class: class_idx.map_or("", |i| cells[i]).to_owned(),
+                ns: ns_idx.map_or("", |i| cells[i]),
+                name,
+                status,
+                volume: cells[vol_idx],
+                capacity: cells[cap_idx],
+                access_modes: mode_idx.map_or("", |i| cells[i]),
+                storage_class: class_idx.map_or("", |i| cells[i]),
             });
         }
     }
     None
 }
 
-fn cronjobs_table(text: &str, max_bytes: usize) -> Option<String> {
+fn cronjobs_table(text: &str, raw_len: usize, max_bytes: usize) -> Option<String> {
     let mut lines = text.lines().enumerate();
     let mut header = Vec::new();
     for (_, raw) in &mut lines {
@@ -2328,24 +2583,25 @@ fn cronjobs_table(text: &str, max_bytes: usize) -> Option<String> {
     let last_idx = col_index(&header, "LAST SCHEDULE");
     let ns_idx = col_index(&header, "NAMESPACE");
 
-    struct SuspendedJob {
-        label: String,
-        schedule: String,
+    struct SuspendedJob<'a> {
+        ns: &'a str,
+        name: &'a str,
+        schedule: &'a str,
         active: usize,
-        last_schedule: String,
+        last_schedule: &'a str,
         line: usize,
     }
-    struct ActiveNsGroup {
+    struct ActiveNsGroup<'a> {
         count: usize,
         active_sum: usize,
         first: usize,
         last: usize,
-        samples: Vec<String>,
+        samples: Vec<&'a str>,
     }
 
     let mut total = 0usize;
-    let mut suspended: Vec<SuspendedJob> = Vec::new();
-    let mut active_by_ns: BTreeMap<String, ActiveNsGroup> = BTreeMap::new();
+    let mut suspended: Vec<SuspendedJob<'_>> = Vec::new();
+    let mut active_by_ns: BTreeMap<&str, ActiveNsGroup<'_>> = BTreeMap::new();
 
     for (idx, raw) in lines {
         let line_no = idx + 1;
@@ -2365,13 +2621,9 @@ fn cronjobs_table(text: &str, max_bytes: usize) -> Option<String> {
         )?;
         total += 1;
         if row.suspended {
-            let label = if row.ns.is_empty() {
-                row.name
-            } else {
-                format!("{}/{}", row.ns, row.name)
-            };
             suspended.push(SuspendedJob {
-                label,
+                ns: row.ns,
+                name: row.name,
                 schedule: row.schedule,
                 active: row.active,
                 last_schedule: row.last_schedule,
@@ -2386,7 +2638,7 @@ fn cronjobs_table(text: &str, max_bytes: usize) -> Option<String> {
                     g.first = g.first.min(line_no);
                     g.last = g.last.max(line_no);
                     if g.samples.len() < 3 {
-                        g.samples.push(row.name.clone());
+                        g.samples.push(row.name);
                     }
                 })
                 .or_insert_with(|| ActiveNsGroup {
@@ -2403,59 +2655,58 @@ fn cronjobs_table(text: &str, max_bytes: usize) -> Option<String> {
         return None;
     }
 
-    let mut head = format!(
-        "kubectl get cronjobs: {total} listed, {} suspended\n",
+    let mut head = String::with_capacity(64 + suspended.len().saturating_mul(84));
+    let _ = writeln!(
+        head,
+        "kubectl get cronjobs: {total} listed, {} suspended",
         suspended.len()
     );
     for cj in &suspended {
-        let last = if cj.last_schedule.is_empty() {
-            String::new()
-        } else {
-            format!(" last={}", cj.last_schedule)
-        };
-        head.push_str(&format!(
-            "{} SUSPENDED schedule=\"{}\" active={}{last} {}\n",
-            cj.label,
-            cj.schedule,
-            cj.active,
-            stdout_ref(cj.line, cj.line)
-        ));
+        if !cj.ns.is_empty() {
+            head.push_str(cj.ns);
+            head.push('/');
+        }
+        let _ = write!(
+            head,
+            "{} SUSPENDED schedule=\"{}\" active={}",
+            cj.name, cj.schedule, cj.active
+        );
+        if !cj.last_schedule.is_empty() {
+            let _ = write!(head, " last={}", cj.last_schedule);
+        }
+        let _ = writeln!(head, " {}", stdout_ref(cj.line, cj.line));
     }
 
     if active_by_ns.is_empty() {
-        return fit_smaller(head, text.len(), max_bytes);
+        return fit_smaller(head, raw_len, max_bytes);
     }
 
-    let mut groups: Vec<(&String, &ActiveNsGroup)> = active_by_ns.iter().collect();
+    let mut groups: Vec<(&str, &ActiveNsGroup<'_>)> =
+        active_by_ns.iter().map(|(&ns, g)| (ns, g)).collect();
     groups.sort_by(|(na, ga), (nb, gb)| gb.count.cmp(&ga.count).then_with(|| na.cmp(nb)));
 
-    let mut full = head.clone();
+    let mut full = String::with_capacity(head.len() + groups.len().saturating_mul(72) + 24);
+    full.push_str(&head);
     full.push_str("Active cronjobs:\n");
-    for (ns, g) in &groups {
-        let ellipsis = if g.count > g.samples.len() {
-            ", …"
-        } else {
-            ""
-        };
-        if ns.is_empty() {
-            full.push_str(&format!(
-                "  ×{} ({} running; {}{ellipsis}) {}\n",
-                g.count,
-                g.active_sum,
-                g.samples.join(", "),
-                stdout_ref(g.first, g.last)
-            ));
-        } else {
-            full.push_str(&format!(
-                "  {ns}: ×{} ({} running; {}{ellipsis}) {}\n",
-                g.count,
-                g.active_sum,
-                g.samples.join(", "),
-                stdout_ref(g.first, g.last)
-            ));
+    for &(ns, g) in &groups {
+        full.push_str("  ");
+        if !ns.is_empty() {
+            full.push_str(ns);
+            full.push_str(": ");
         }
+        let _ = write!(full, "×{} ({} running; ", g.count, g.active_sum);
+        for (idx, s) in g.samples.iter().enumerate() {
+            if idx > 0 {
+                full.push_str(", ");
+            }
+            full.push_str(s);
+        }
+        if g.count > g.samples.len() {
+            full.push_str(", …");
+        }
+        let _ = writeln!(full, ") {}", stdout_ref(g.first, g.last));
     }
-    if let Some(out) = fit_smaller(full, text.len(), max_bytes) {
+    if let Some(out) = fit_smaller(full, raw_len, max_bytes) {
         return Some(out);
     }
 
@@ -2464,26 +2715,27 @@ fn cronjobs_table(text: &str, max_bytes: usize) -> Option<String> {
     let first = groups.iter().map(|(_, g)| g.first).min().unwrap_or(1);
     let last = groups.iter().map(|(_, g)| g.last).max().unwrap_or(first);
     let mut compact = head;
-    compact.push_str(&format!(
-        "Active cronjobs: {active_total} ({running_total} running) across {} namespace(s) {}\n",
+    let _ = writeln!(
+        compact,
+        "Active cronjobs: {active_total} ({running_total} running) across {} namespace(s) {}",
         groups.len(),
         stdout_ref(first, last)
-    ));
-    fit_smaller(compact, text.len(), max_bytes)
+    );
+    fit_smaller(compact, raw_len, max_bytes)
 }
 
-struct CronJobRow {
-    ns: String,
-    name: String,
-    schedule: String,
+struct CronJobRow<'a> {
+    ns: &'a str,
+    name: &'a str,
+    schedule: &'a str,
     suspended: bool,
     active: usize,
-    last_schedule: String,
+    last_schedule: &'a str,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn parse_cronjob_row(
-    line: &str,
+fn parse_cronjob_row<'a>(
+    line: &'a str,
     header: &[(String, usize)],
     ns_idx: Option<usize>,
     name_idx: usize,
@@ -2491,11 +2743,15 @@ fn parse_cronjob_row(
     suspend_idx: usize,
     active_idx: usize,
     last_idx: Option<usize>,
-) -> Option<CronJobRow> {
-    let parse_bool = |s: &str| match s.to_ascii_lowercase().as_str() {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
+) -> Option<CronJobRow<'a>> {
+    let parse_bool = |s: &str| {
+        if s.eq_ignore_ascii_case("true") {
+            Some(true)
+        } else if s.eq_ignore_ascii_case("false") {
+            Some(false)
+        } else {
+            None
+        }
     };
 
     if let (Some(name), Some(schedule), Some(suspend), Some(active_str)) = (
@@ -2516,12 +2772,12 @@ fn parse_cronjob_row(
             .and_then(|i| slice_header_col(line, header, i))
             .unwrap_or("");
         return Some(CronJobRow {
-            ns: ns.to_owned(),
-            name: name.to_owned(),
-            schedule: schedule.to_owned(),
+            ns,
+            name,
+            schedule,
             suspended,
             active,
-            last_schedule: last_schedule.to_owned(),
+            last_schedule,
         });
     }
 
@@ -2533,12 +2789,12 @@ fn parse_cronjob_row(
         let active: usize = cells[active_idx].parse().ok()?;
         if !name.is_empty() && !name.contains(char::is_whitespace) && !schedule.is_empty() {
             return Some(CronJobRow {
-                ns: ns_idx.map_or("", |i| cells[i]).to_owned(),
-                name: name.to_owned(),
-                schedule: schedule.to_owned(),
+                ns: ns_idx.map_or("", |i| cells[i]),
+                name,
+                schedule,
                 suspended,
                 active,
-                last_schedule: last_idx.map_or("", |i| cells[i]).to_owned(),
+                last_schedule: last_idx.map_or("", |i| cells[i]),
             });
         }
     }
@@ -3565,5 +3821,140 @@ mod tests {
             "{tight_helm}"
         );
         assert!(tight_helm.contains("[stdout:2-25]"), "{tight_helm}");
+    }
+
+    #[test]
+    fn pins_crashloop_oom_imagepull_error_unhealthy_warning_first_with_ansi_fast_path() {
+        // 1. `kubectl get pods` with ANSI escapes + lower-severity issues appearing BEFORE critical crashes.
+        let mut pods = String::from(
+            "\x1b[1mNAMESPACE   NAME                   READY   STATUS             RESTARTS      AGE\x1b[0m\n",
+        );
+        for i in 0..8 {
+            pods.push_str(&format!(
+                "prod        web-7f9b8c-a{i}k2p       1/1     \x1b[32mRunning\x1b[0m            0             2d\n"
+            ));
+        }
+        pods.push_str(
+            "prod        web-7f9b8c-rst01       1/1     Running            2 (10m ago)   1d\n",
+        );
+        pods.push_str(
+            "prod        ml-job-0               0/1     Pending            0             4m\n",
+        );
+        pods.push_str(
+            "prod        pay-4a2e-crash         0/1     \x1b[31mCrashLoopBackOff\x1b[0m   9 (1m ago)    25m\n",
+        );
+        pods.push_str(
+            "prod        img-9d1a-pull          0/1     \x1b[31mImagePullBackOff\x1b[0m   0             6m\n",
+        );
+        pods.push_str(
+            "prod        agg-5e1a-oom           0/1     \x1b[31mOOMKilled\x1b[0m          4 (2m ago)    40m\n",
+        );
+        pods.push_str(
+            "prod        init-8c2f-err          0/1     \x1b[31mError\x1b[0m              1             9m\n",
+        );
+
+        let mut inv = Inventory::new(Profile::Pods);
+        for (i, line) in pods.lines().enumerate() {
+            assert!(inv.observe(line, i + 1), "row {}: {line}", i + 1);
+        }
+        let summary = inv.finish();
+        let names: Vec<&str> = summary.items.iter().map(|it| it.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "prod/pay-4a2e-crash",
+                "prod/img-9d1a-pull",
+                "prod/agg-5e1a-oom",
+                "prod/init-8c2f-err",
+                "prod/ml-job-0",
+                "prod/web-7f9b8c-rst01",
+            ]
+        );
+        let rendered = summary.render(None, 0).expect("pods rendered");
+        assert!(!rendered.contains('\x1b'), "ANSI leaked:\n{rendered}");
+        assert!(
+            rendered.contains(
+                "prod/pay-4a2e-crash CrashLoopBackOff ready=0/1 restarts=9 [stdout:12-12]"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("prod/agg-5e1a-oom OOMKilled ready=0/1 restarts=4 [stdout:14-14]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("prod/web-7f9b8c-* ×8 · 1/1 Running [stdout:2-9]"),
+            "{rendered}"
+        );
+
+        // 2. `docker ps` with ANSI escapes pins unhealthy + Exited (137) ahead of Paused/Created.
+        let mut ps = String::from(
+            "CONTAINER ID   IMAGE       COMMAND      CREATED      STATUS                       PORTS      NAMES\n",
+        );
+        for i in 1..=6 {
+            ps.push_str(&format!(
+                "aa11bb22cc{i:02}   api:1.0     \"./api\"      2h ago       \x1b[32mUp 2 hours (healthy)\x1b[0m         8080/tcp   api-{i}\n"
+            ));
+        }
+        ps.push_str(
+            "dd11ee22ff01   cache:7     \"redis\"      2h ago       Up 1 hour (Paused)           6379/tcp   cache-1\n",
+        );
+        ps.push_str(
+            "dd11ee22ff02   db:16       \"postgres\"   3h ago       \x1b[31mUp 2 minutes (unhealthy)\x1b[0m     5432/tcp   db-1\n",
+        );
+        ps.push_str(
+            "dd11ee22ff03   worker:1    \"./work\"     1h ago       \x1b[31mExited (137) 1 minute ago\x1b[0m               worker-1\n",
+        );
+        let mut inv = Inventory::new(Profile::Containers);
+        for (i, line) in ps.lines().enumerate() {
+            assert!(inv.observe(line, i + 1), "row {}: {line}", i + 1);
+        }
+        let summary = inv.finish();
+        let names: Vec<&str> = summary.items.iter().map(|it| it.name.as_str()).collect();
+        assert_eq!(names, ["db-1", "worker-1", "cache-1"]);
+        let rendered = summary.render(None, 0).expect("docker ps rendered");
+        assert!(
+            rendered.contains("db-1 unhealthy [stdout:9-9]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("worker-1 Exited (137) [stdout:10-10]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("api-* ×6 · Up (healthy) [stdout:2-7]"),
+            "{rendered}"
+        );
+
+        // 3. `kubectl get events` with ANSI escapes pins critical OOMKilling/Unhealthy before minor warnings and Normal rows.
+        let mut ev =
+            String::from("LAST SEEN   TYPE      REASON            OBJECT        MESSAGE\n");
+        for i in 0..8 {
+            ev.push_str(&format!(
+                "5m          \x1b[32mNormal\x1b[0m    Scheduled         pod/web-{i}     Successfully assigned default/web-{i} to node-1\n"
+            ));
+        }
+        ev.push_str(
+            "4m          \x1b[33mWarning\x1b[0m   DNSConfigForming  pod/web-0     Search line limits were exceeded\n",
+        );
+        ev.push_str(
+            "1m          \x1b[31mWarning\x1b[0m   OOMKilling        node/node-1   Memory cgroup out of memory: Killed process 4412\n",
+        );
+        ev.push_str(
+            "30s         \x1b[31mWarning\x1b[0m   Unhealthy         pod/db-0      Readiness probe failed: connection refused\n",
+        );
+        let ev_out = events(&ev, 4096).expect("events compacted");
+        assert!(!ev_out.contains('\x1b'), "ANSI leaked:\n{ev_out}");
+        let oom_pos = ev_out.find("Warning OOMKilling node/node-1:").unwrap();
+        let unhealth_pos = ev_out.find("Warning Unhealthy pod/db-0:").unwrap();
+        let dns_pos = ev_out.find("Warning DNSConfigForming pod/web-0:").unwrap();
+        let norm_pos = ev_out.find("Normal events:").unwrap();
+        assert!(
+            oom_pos < dns_pos && unhealth_pos < dns_pos && dns_pos < norm_pos,
+            "{ev_out}"
+        );
+        assert!(ev_out.contains("[stdout:11]"), "{ev_out}");
+        assert!(ev_out.contains("[stdout:12]"), "{ev_out}");
+        assert!(ev_out.contains("Scheduled ×8 [stdout:2-9]"), "{ev_out}");
     }
 }
