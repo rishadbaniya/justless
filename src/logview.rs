@@ -1184,7 +1184,181 @@ fn extract_json_ts(map: &Map<String, Value>) -> Option<Cow<'_, str>> {
     None
 }
 
-fn extract_json_level(map: &Map<String, Value>) -> (Option<Cow<'static, str>>, Severity) {
+struct JsonLevel {
+    label: Option<Cow<'static, str>>,
+    severity: Severity,
+    recognized: bool,
+}
+
+fn match_named_level(t: &str) -> Option<(Cow<'static, str>, Severity)> {
+    if t.eq_ignore_ascii_case("info")
+        || t.eq_ignore_ascii_case("inf")
+        || t.eq_ignore_ascii_case("i")
+    {
+        return Some((Cow::Borrowed("INFO"), Severity::Routine));
+    }
+    if t.eq_ignore_ascii_case("debug")
+        || t.eq_ignore_ascii_case("dbg")
+        || t.eq_ignore_ascii_case("d")
+    {
+        return Some((Cow::Borrowed("DEBUG"), Severity::Routine));
+    }
+    if t.eq_ignore_ascii_case("trace")
+        || t.eq_ignore_ascii_case("trc")
+        || t.eq_ignore_ascii_case("t")
+    {
+        return Some((Cow::Borrowed("TRACE"), Severity::Routine));
+    }
+    if t.eq_ignore_ascii_case("warn")
+        || t.eq_ignore_ascii_case("warning")
+        || t.eq_ignore_ascii_case("wrn")
+        || t.eq_ignore_ascii_case("w")
+    {
+        return Some((Cow::Borrowed("WARN"), Severity::Warning));
+    }
+    if t.eq_ignore_ascii_case("error")
+        || t.eq_ignore_ascii_case("err")
+        || t.eq_ignore_ascii_case("erro")
+        || t.eq_ignore_ascii_case("e")
+    {
+        return Some((Cow::Borrowed("ERROR"), Severity::Error));
+    }
+    if t.eq_ignore_ascii_case("fatal")
+        || t.eq_ignore_ascii_case("fata")
+        || t.eq_ignore_ascii_case("f")
+    {
+        return Some((Cow::Borrowed("FATAL"), Severity::Error));
+    }
+    if t.eq_ignore_ascii_case("crit") {
+        return Some((Cow::Borrowed("CRIT"), Severity::Error));
+    }
+    if t.eq_ignore_ascii_case("critical") {
+        return Some((Cow::Borrowed("CRITICAL"), Severity::Error));
+    }
+    if t.eq_ignore_ascii_case("panic") {
+        return Some((Cow::Borrowed("PANIC"), Severity::Error));
+    }
+    if t.eq_ignore_ascii_case("dpanic") {
+        return Some((Cow::Borrowed("DPANIC"), Severity::Error));
+    }
+    if t.eq_ignore_ascii_case("emerg") {
+        return Some((Cow::Borrowed("EMERG"), Severity::Error));
+    }
+    if t.eq_ignore_ascii_case("emergency") {
+        return Some((Cow::Borrowed("EMERGENCY"), Severity::Error));
+    }
+    if t.eq_ignore_ascii_case("alert") {
+        return Some((Cow::Borrowed("ALERT"), Severity::Error));
+    }
+    if t.eq_ignore_ascii_case("severe") {
+        return Some((Cow::Borrowed("SEVERE"), Severity::Error));
+    }
+    if t.eq_ignore_ascii_case("notice") {
+        return Some((Cow::Borrowed("NOTICE"), Severity::Routine));
+    }
+    if t.eq_ignore_ascii_case("log") {
+        return Some((Cow::Borrowed("LOG"), Severity::Routine));
+    }
+    None
+}
+
+fn parse_level_num(v: u64, syslog_scale: bool) -> Option<(Cow<'static, str>, Severity)> {
+    if syslog_scale {
+        // RFC 5424 syslog severity scale: 0..=3 Error, 4 Warning, 5..=7 Routine.
+        return match v {
+            0 => Some((Cow::Borrowed("EMERG"), Severity::Error)),
+            1 => Some((Cow::Borrowed("ALERT"), Severity::Error)),
+            2 => Some((Cow::Borrowed("CRIT"), Severity::Error)),
+            3 => Some((Cow::Borrowed("ERROR"), Severity::Error)),
+            4 => Some((Cow::Borrowed("WARN"), Severity::Warning)),
+            5 => Some((Cow::Borrowed("NOTICE"), Severity::Routine)),
+            6 => Some((Cow::Borrowed("INFO"), Severity::Routine)),
+            7 => Some((Cow::Borrowed("DEBUG"), Severity::Routine)),
+            _ => None,
+        };
+    }
+    // Pino / Bunyan numeric log levels.
+    Some(match v {
+        0..=15 => (Cow::Borrowed("TRACE"), Severity::Routine),
+        16..=25 => (Cow::Borrowed("DEBUG"), Severity::Routine),
+        26..=35 => (Cow::Borrowed("INFO"), Severity::Routine),
+        36..=45 => (Cow::Borrowed("WARN"), Severity::Warning),
+        46..=55 => (Cow::Borrowed("ERROR"), Severity::Error),
+        _ => (Cow::Borrowed("FATAL"), Severity::Error),
+    })
+}
+
+fn parse_level_str(t: &str, syslog_scale: bool) -> Option<(Cow<'static, str>, Severity)> {
+    if let Ok(v) = t.parse::<u64>() {
+        return parse_level_num(v, syslog_scale);
+    }
+    if let Some(found) = match_named_level(t) {
+        return Some(found);
+    }
+    // Go `log/slog` extended levels such as `"ERROR+4"`, `"WARN+1"`, `"DEBUG-4"`.
+    if let Some((base, offset)) = t.split_once(['+', '-'])
+        && !offset.is_empty()
+        && offset.bytes().all(|b| b.is_ascii_digit())
+        && let Some((_, sev)) = match_named_level(base.trim())
+    {
+        return Some((Cow::Owned(t.to_ascii_uppercase()), sev));
+    }
+    None
+}
+
+fn extract_json_level_value(val: &Value, syslog_scale: bool) -> Option<JsonLevel> {
+    match val {
+        Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                return None;
+            }
+            if let Some((label, severity)) = parse_level_str(t, syslog_scale) {
+                Some(JsonLevel {
+                    label: Some(label),
+                    severity,
+                    recognized: true,
+                })
+            } else {
+                Some(JsonLevel {
+                    label: Some(Cow::Owned(t.to_ascii_uppercase())),
+                    severity: Severity::Routine,
+                    recognized: false,
+                })
+            }
+        }
+        Value::Number(n) => {
+            let v = n.as_u64()?;
+            let (label, severity) = parse_level_num(v, syslog_scale)?;
+            Some(JsonLevel {
+                label: Some(label),
+                severity,
+                recognized: true,
+            })
+        }
+        Value::Object(inner) => {
+            // Nested level objects (e.g. `{"level":{"name":"ERROR"}}` or `{"level":{"label":"warn"}}`).
+            let mut fallback = None;
+            for key in ["name", "label", "level", "severity", "value"] {
+                if let Some(nested) = inner.get(key)
+                    && let Some(found) = extract_json_level_value(nested, syslog_scale)
+                {
+                    if found.recognized {
+                        return Some(found);
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(found);
+                    }
+                }
+            }
+            fallback
+        }
+        _ => None,
+    }
+}
+
+fn extract_json_level(map: &Map<String, Value>) -> JsonLevel {
+    let mut fallback: Option<JsonLevel> = None;
     for key in [
         "level",
         "severity",
@@ -1192,85 +1366,41 @@ fn extract_json_level(map: &Map<String, Value>) -> (Option<Cow<'static, str>>, S
         "log.level",
         "levelname",
         "priority",
+        "PRIORITY",
     ] {
-        if let Some(val) = map.get(key) {
-            match val {
-                Value::String(s) if !s.is_empty() => {
-                    let t = s.trim();
-                    if t.eq_ignore_ascii_case("info") || t.eq_ignore_ascii_case("inf") {
-                        return (Some(Cow::Borrowed("INFO")), Severity::Routine);
-                    }
-                    if t.eq_ignore_ascii_case("debug") || t.eq_ignore_ascii_case("dbg") {
-                        return (Some(Cow::Borrowed("DEBUG")), Severity::Routine);
-                    }
-                    if t.eq_ignore_ascii_case("trace") || t.eq_ignore_ascii_case("trc") {
-                        return (Some(Cow::Borrowed("TRACE")), Severity::Routine);
-                    }
-                    if t.eq_ignore_ascii_case("warn")
-                        || t.eq_ignore_ascii_case("warning")
-                        || t.eq_ignore_ascii_case("wrn")
-                    {
-                        return (Some(Cow::Borrowed("WARN")), Severity::Warning);
-                    }
-                    if t.eq_ignore_ascii_case("error")
-                        || t.eq_ignore_ascii_case("err")
-                        || t.eq_ignore_ascii_case("erro")
-                    {
-                        return (Some(Cow::Borrowed("ERROR")), Severity::Error);
-                    }
-                    if t.eq_ignore_ascii_case("fatal") || t.eq_ignore_ascii_case("fata") {
-                        return (Some(Cow::Borrowed("FATAL")), Severity::Error);
-                    }
-                    if t.eq_ignore_ascii_case("crit") {
-                        return (Some(Cow::Borrowed("CRIT")), Severity::Error);
-                    }
-                    if t.eq_ignore_ascii_case("critical") {
-                        return (Some(Cow::Borrowed("CRITICAL")), Severity::Error);
-                    }
-                    if t.eq_ignore_ascii_case("panic") {
-                        return (Some(Cow::Borrowed("PANIC")), Severity::Error);
-                    }
-                    if t.eq_ignore_ascii_case("dpanic") {
-                        return (Some(Cow::Borrowed("DPANIC")), Severity::Error);
-                    }
-                    if t.eq_ignore_ascii_case("emerg") {
-                        return (Some(Cow::Borrowed("EMERG")), Severity::Error);
-                    }
-                    if t.eq_ignore_ascii_case("emergency") {
-                        return (Some(Cow::Borrowed("EMERGENCY")), Severity::Error);
-                    }
-                    if t.eq_ignore_ascii_case("alert") {
-                        return (Some(Cow::Borrowed("ALERT")), Severity::Error);
-                    }
-                    if t.eq_ignore_ascii_case("severe") {
-                        return (Some(Cow::Borrowed("SEVERE")), Severity::Error);
-                    }
-                    if t.eq_ignore_ascii_case("notice") {
-                        return (Some(Cow::Borrowed("NOTICE")), Severity::Routine);
-                    }
-                    if t.eq_ignore_ascii_case("log") {
-                        return (Some(Cow::Borrowed("LOG")), Severity::Routine);
-                    }
-                    return (Some(Cow::Owned(t.to_ascii_uppercase())), Severity::Routine);
-                }
-                Value::Number(n) => {
-                    // Pino / Bunyan numeric log levels.
-                    if let Some(v) = n.as_u64() {
-                        return match v {
-                            0..=15 => (Some(Cow::Borrowed("TRACE")), Severity::Routine),
-                            16..=25 => (Some(Cow::Borrowed("DEBUG")), Severity::Routine),
-                            26..=35 => (Some(Cow::Borrowed("INFO")), Severity::Routine),
-                            36..=45 => (Some(Cow::Borrowed("WARN")), Severity::Warning),
-                            46..=55 => (Some(Cow::Borrowed("ERROR")), Severity::Error),
-                            _ => (Some(Cow::Borrowed("FATAL")), Severity::Error),
-                        };
-                    }
-                }
-                _ => {}
+        let syslog_scale = key.eq_ignore_ascii_case("priority");
+        if let Some(val) = map.get(key)
+            && let Some(found) = extract_json_level_value(val, syslog_scale)
+        {
+            if found.recognized {
+                return found;
+            }
+            if fallback.is_none() {
+                fallback = Some(found);
             }
         }
     }
-    (None, Severity::Routine)
+    // ECS / Datadog / Logstash nested `{"log": {"level": "error"}}` object.
+    if let Some(Value::Object(log_obj)) = map.get("log") {
+        for key in ["level", "severity", "lvl", "priority"] {
+            let syslog_scale = key == "priority";
+            if let Some(val) = log_obj.get(key)
+                && let Some(found) = extract_json_level_value(val, syslog_scale)
+            {
+                if found.recognized {
+                    return found;
+                }
+                if fallback.is_none() {
+                    fallback = Some(found);
+                }
+            }
+        }
+    }
+    fallback.unwrap_or(JsonLevel {
+        label: None,
+        severity: Severity::Routine,
+        recognized: false,
+    })
 }
 
 fn extract_json_string<'a>(map: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
@@ -1323,8 +1453,9 @@ fn handle_json_log(
     let service = prefix_service.or(json_service);
     let bucket = collector.note_service(service);
 
-    let (level_opt, mut severity) = extract_json_level(map);
-    let msg = extract_json_string(map, &["msg", "message", "event", "text"]);
+    let level = extract_json_level(map);
+    let mut severity = level.severity;
+    let msg = extract_json_string(map, &["msg", "message", "event", "text", "log", "body"]);
 
     // Check for non-empty error payload fields (`err`, `error`, `exception`, `stack`, etc.).
     let has_err_field = [
@@ -1355,11 +1486,17 @@ fn handle_json_log(
         severity = Severity::Error;
     }
 
-    // If no explicit level was set, infer severity from the message text.
-    if level_opt.is_none()
-        && let Some(m) = msg
-    {
-        severity = severity.max(classify_plain_severity(m, false));
+    // If no recognized explicit level was set, infer severity from the message text
+    // (or synthesized summary when no standard message key is present).
+    let mut synth_summary: Option<String> = None;
+    if !level.recognized {
+        if let Some(m) = msg {
+            severity = severity.max(classify_plain_severity(m, false));
+        } else {
+            let synth = synthesize_json_summary(map);
+            severity = severity.max(classify_plain_severity(&synth, false));
+            synth_summary = Some(synth);
+        }
     } else if severity == Severity::Routine
         && let Some(m) = msg
     {
@@ -1375,7 +1512,7 @@ fn handle_json_log(
         }
     }
 
-    let level_label = level_opt.unwrap_or(match severity {
+    let level_label = level.label.unwrap_or(match severity {
         Severity::Error => Cow::Borrowed("ERROR"),
         Severity::Warning => Cow::Borrowed("WARN"),
         Severity::Routine => Cow::Borrowed("INFO"),
@@ -1424,7 +1561,7 @@ fn handle_json_log(
             || format!("{level_label} {}", collapse_spaces_cow(m)),
         );
     } else {
-        let synth = synthesize_json_summary(map);
+        let synth = synth_summary.unwrap_or_else(|| synthesize_json_summary(map));
         append_normalized_template(&synth, &mut collector.scratch);
         collector.record_routine_from_scratch(
             stream,
@@ -1510,10 +1647,13 @@ fn format_json_error(
         "log.level",
         "levelname",
         "priority",
+        "PRIORITY",
         "msg",
         "message",
         "event",
         "text",
+        "log",
+        "body",
         "service",
         "service.name",
         "logger",
@@ -1878,8 +2018,8 @@ fn normalize_chunk(chunk: &str) -> Cow<'_, str> {
         }
     }
 
-    // Fast path: plain text with no digits and no `=`/`:` key-value IDs needs zero regexes.
-    if !has_digit && !has_eq && !has_colon {
+    // Fast path: plain text with no digits, no `=`/`:` key-value/IPv6 IDs, and no UUID-length dashes needs zero regexes.
+    if !has_digit && !has_eq && !has_colon && !(has_dash && chunk.len() >= 36) {
         return Cow::Borrowed(chunk);
     }
 
@@ -1888,18 +2028,17 @@ fn normalize_chunk(chunk: &str) -> Cow<'_, str> {
     if has_digit && has_colon && (has_dash || has_slash) {
         s = cow_replace(&INLINE_TS, s, "<ts>");
     }
-    if has_digit && has_dash && s.len() >= 36 {
+    if has_dash && s.len() >= 36 {
         s = cow_replace(&UUID_RE, s, "<id>");
     }
     if has_eq || has_colon {
         s = cow_replace(&KV_ID_RE, s, "${1}${2}<id>");
     }
+    if has_colon && (has_lbracket || (has_digit && s.contains("::ffff:"))) {
+        s = cow_replace(&IPV6_RE, s, "<ip>");
+    }
     if !has_digit {
         return s;
-    }
-
-    if has_colon && (has_lbracket || s.contains("::ffff:")) {
-        s = cow_replace(&IPV6_RE, s, "<ip>");
     }
     if has_dot {
         s = cow_replace(&IPV4_RE, s, "<ip>");
@@ -3376,6 +3515,75 @@ mod tests {
         assert!(
             out.contains("×50 INFO controller.go:<num>] synced pod default/worker-<id> in <dur>"),
             "{out}"
+        );
+    }
+
+    #[test]
+    fn json_syslog_priority_slog_nested_docker_and_all_hex_ipv6_uuid() {
+        let mut stdout = String::new();
+        // Routine burst so `format` compacts and proves errors stay pinned rather than collapsed.
+        for i in 1..=30 {
+            stdout.push_str(&format!(
+                r#"{{"ts":"2026-04-01T12:00:{:02}Z","priority":6,"msg":"heartbeat tick {i}"}}"#,
+                i % 60
+            ));
+            stdout.push('\n');
+        }
+        // RFC 5424 syslog priority 3 (Error) & 4 (Warning).
+        stdout.push_str(r#"{"priority":3,"msg":"syslog disk full"}"#);
+        stdout.push('\n');
+        stdout.push_str(r#"{"priority":4,"msg":"syslog high latency"}"#);
+        stdout.push('\n');
+        // Go slog extended level `"ERROR+4"`.
+        stdout.push_str(r#"{"level":"ERROR+4","msg":"slog critical db loss"}"#);
+        stdout.push('\n');
+        // Stringified numeric Pino level `"50"`.
+        stdout.push_str(r#"{"level":"50","msg":"stringified pino failure"}"#);
+        stdout.push('\n');
+        // Nested ECS `{"log":{"level":"error"}}` and object `{"level":{"name":"ERROR"}}`.
+        stdout.push_str(r#"{"log":{"level":"error"},"message":"ecs nested upstream timeout"}"#);
+        stdout.push('\n');
+        stdout.push_str(r#"{"level":{"name":"ERROR"},"msg":"object level failure"}"#);
+        stdout.push('\n');
+        // Short single-letter level `"E"` + unrecognized string level with plain ERROR message.
+        stdout.push_str(r#"{"level":"E","msg":"short level error"}"#);
+        stdout.push('\n');
+        stdout.push_str(r#"{"level":"custom","msg":"ERROR unrecognized level still classified"}"#);
+        stdout.push('\n');
+        // Docker `json-file` driver (`"log"` field) + OpenTelemetry (`"body"` field) + synthesized summary.
+        stdout.push_str(
+            r#"{"log":"ERROR docker container OOM\n","stream":"stderr","time":"2026-04-01T12:01:00Z"}"#,
+        );
+        stdout.push('\n');
+        stdout.push_str(r#"{"body":"ERROR otel exporter rejected span"}"#);
+        stdout.push('\n');
+        stdout.push_str(r#"{"detail":"FATAL: synthesized payload crash"}"#);
+        stdout.push('\n');
+
+        let out = format(&stdout, "", 8192).expect("structured JSON logs should compact");
+        assert!(out.contains("×30 INFO heartbeat tick <num>"), "{out}");
+        assert!(out.contains("ERROR syslog disk full"), "{out}");
+        assert!(out.contains("WARN syslog high latency"), "{out}");
+        assert!(out.contains("ERROR+4 slog critical db loss"), "{out}");
+        assert!(out.contains("ERROR stringified pino failure"), "{out}");
+        assert!(out.contains("ERROR ecs nested upstream timeout"), "{out}");
+        assert!(out.contains("ERROR object level failure"), "{out}");
+        assert!(out.contains("ERROR short level error"), "{out}");
+        assert!(
+            out.contains("ERROR unrecognized level still classified"),
+            "{out}"
+        );
+        assert!(out.contains("docker container OOM"), "{out}");
+        assert!(out.contains("otel exporter rejected span"), "{out}");
+        assert!(out.contains("synthesized payload crash"), "{out}");
+
+        // All-hex / colon-only IPv6 literals and all-`a-f` UUIDs normalize properly.
+        assert_eq!(normalize_chunk("[fe80::cafe]"), "<ip>");
+        assert_eq!(normalize_chunk("[dead::cafe]"), "<ip>");
+        assert_eq!(normalize_chunk("[::]"), "<ip>");
+        assert_eq!(
+            normalize_chunk("abcdefab-cdef-abcd-efab-cdefabcdefab"),
+            "<id>"
         );
     }
 }

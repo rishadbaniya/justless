@@ -2635,7 +2635,9 @@ fn parse_pub_deps(stdout: &str, is_flutter: bool) -> Option<ParsedTree> {
                     if !seen_versions.contains_key(node.name.as_str()) {
                         seen_versions.insert(node.name.clone(), node.version.clone());
                     }
-                    // Deduplicate repeated expanded transitive subtrees (depth >= 2).
+                    // Deduplicate repeated leaf transitive nodes (depth >= 2).
+                    // If expanded children follow under this node, its `deduped` flag is cleared below
+                    // so children are never attached underneath a `(...)`-marked parent.
                     let key_exists = seen_expanded
                         .get(node.name.as_str())
                         .is_some_and(|vers| vers.contains(node.version.as_str()));
@@ -2647,6 +2649,11 @@ fn parse_pub_deps(stdout: &str, is_flutter: bool) -> Option<ParsedTree> {
                             .or_default()
                             .insert(node.version.clone());
                     }
+                }
+                if let Some(&(_, parent_idx)) = stack.iter().rev().find(|&&(c, _)| c < col as isize)
+                    && nodes[parent_idx].deduped
+                {
+                    nodes[parent_idx].deduped = false;
                 }
                 push_node(
                     &mut nodes,
@@ -5767,5 +5774,40 @@ cli_tool 0.4.2
             ascii_out.contains("http_parser 4.0.2 (×2) [stdout:7-12]"),
             "{ascii_out}"
         );
+    }
+
+    #[test]
+    fn parse_pub_deps_never_attaches_children_under_deduped_parent() {
+        let raw = "\
+Dart SDK 3.5.4
+my_app 1.0.0
+├── shared 1.0.0
+│   └── leaf_a 0.1.0
+└── feature 2.0.0
+    └── shared 1.0.0
+        ├── leaf_a 0.1.0
+        └── leaf_b 0.2.0
+";
+        let tree = parse_pub_deps(raw, false).expect("pub deps should parse");
+        assert!(
+            tree.nodes
+                .iter()
+                .all(|n| !(n.deduped && !n.children.is_empty())),
+            "no deduped `(...)` node may hold expanded children: {:?}",
+            tree.nodes
+                .iter()
+                .map(|n| (&n.name, n.deduped, n.children.len()))
+                .collect::<Vec<_>>()
+        );
+        let shared_nodes: Vec<&TreeNode> =
+            tree.nodes.iter().filter(|n| n.name == "shared").collect();
+        assert_eq!(shared_nodes.len(), 2);
+        assert!(!shared_nodes[1].deduped);
+        assert_eq!(shared_nodes[1].children.len(), 2);
+        let leaf_a_nodes: Vec<&TreeNode> =
+            tree.nodes.iter().filter(|n| n.name == "leaf_a").collect();
+        assert_eq!(leaf_a_nodes.len(), 2);
+        assert!(leaf_a_nodes[1].deduped);
+        assert!(leaf_a_nodes[1].children.is_empty());
     }
 }

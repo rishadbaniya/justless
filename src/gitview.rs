@@ -379,9 +379,9 @@ fn compact_date(raw: &str) -> String {
     if bytes.len() >= 10
         && bytes[4] == b'-'
         && bytes[7] == b'-'
-        && is_digits(&s[..4], 4)
-        && is_digits(&s[5..7], 2)
-        && is_digits(&s[8..10], 2)
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
     {
         return s[..10].to_owned();
     }
@@ -3020,6 +3020,14 @@ mod tests {
             "2026-11-25"
         );
         assert_eq!(compact_date("2 hours ago"), "2 hours ago");
+    }
+
+    #[test]
+    fn compact_date_handles_multibyte_utf8_without_panicking() {
+        assert_eq!(compact_date("2026-11-日"), "2026-11-日");
+        assert_eq!(compact_date("2026-11-1日"), "2026-11-1日");
+        assert_eq!(compact_date("2026-11-🔥"), "2026-11-🔥");
+        assert_eq!(compact_date("2026-11-25日"), "2026-11-25");
     }
 
     #[test]

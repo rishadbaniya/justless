@@ -880,10 +880,8 @@ fn unquote_lock_scalar(value: &str) -> &str {
 
 fn split_npm_descriptor(spec: &str) -> Option<(&str, &str)> {
     let spec = unquote_lock_scalar(spec);
-    if spec.len() < 3 {
-        return None;
-    }
-    let at = spec[1..].find('@')? + 1;
+    let start = spec.chars().next()?.len_utf8();
+    let at = spec[start..].find('@')? + start;
     let name = &spec[..at];
     let rest = &spec[at + 1..];
     (!name.is_empty() && !rest.is_empty()).then_some((name, rest))
@@ -1977,10 +1975,13 @@ fn pubspec_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
         version: Option<String>,
         source_kind: Option<String>,
         desc_scalar: Option<String>,
+        desc_name: Option<String>,
         url: Option<String>,
         sha256: Option<String>,
         resolved_ref: Option<String>,
+        git_ref: Option<String>,
         path: Option<String>,
+        relative: Option<String>,
         in_description: bool,
     }
     let flush = |entry: PubspecEntry, packages: &mut BTreeMap<Key, Package>| -> Option<()> {
@@ -1989,26 +1990,75 @@ fn pubspec_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
         };
         let version = entry.version?;
         let source = match entry.source_kind.as_deref() {
-            Some("hosted") => Some(match entry.url {
-                Some(url) => format!("hosted:{url}"),
-                None => "hosted".to_owned(),
-            }),
-            Some("git") => Some(match entry.url {
-                Some(url) => format!("git:{url}"),
-                None => "git".to_owned(),
-            }),
-            Some("path") => Some(match entry.path {
-                Some(path) => format!("path:{path}"),
-                None => "path".to_owned(),
-            }),
-            Some("sdk") => Some(match entry.desc_scalar {
-                Some(sdk) => format!("sdk:{sdk}"),
-                None => "sdk".to_owned(),
-            }),
-            Some(other) => Some(other.to_owned()),
+            Some("hosted") => {
+                if entry.path.is_some() || entry.git_ref.is_some() || entry.relative.is_some() {
+                    return None;
+                }
+                let base = match (entry.url, entry.desc_name) {
+                    (Some(url), Some(dname)) => format!("hosted:{url}/{dname}"),
+                    (Some(url), None) => format!("hosted:{url}"),
+                    (None, Some(dname)) => format!("hosted:{dname}"),
+                    (None, None) => "hosted".to_owned(),
+                };
+                Some(base)
+            }
+            Some("git") => {
+                let mut s = match entry.url {
+                    Some(url) => format!("git:{url}"),
+                    None => "git".to_owned(),
+                };
+                if let Some(path) = entry.path {
+                    s.push('#');
+                    s.push_str(&path);
+                }
+                if let Some(git_ref) = entry.git_ref {
+                    s.push('@');
+                    s.push_str(&git_ref);
+                }
+                if let Some(dname) = entry.desc_name {
+                    s.push_str(";name=");
+                    s.push_str(&dname);
+                }
+                if let Some(rel) = entry.relative {
+                    s.push_str(";relative=");
+                    s.push_str(&rel);
+                }
+                Some(s)
+            }
+            Some("path") => {
+                if entry.url.is_some() || entry.git_ref.is_some() || entry.desc_name.is_some() {
+                    return None;
+                }
+                let mut s = match entry.path {
+                    Some(path) => format!("path:{path}"),
+                    None => "path".to_owned(),
+                };
+                if let Some(rel) = entry.relative {
+                    s.push_str(";relative=");
+                    s.push_str(&rel);
+                }
+                Some(s)
+            }
+            Some("sdk") => {
+                if entry.url.is_some()
+                    || entry.path.is_some()
+                    || entry.git_ref.is_some()
+                    || entry.relative.is_some()
+                {
+                    return None;
+                }
+                Some(match entry.desc_scalar.or(entry.desc_name) {
+                    Some(sdk) => format!("sdk:{sdk}"),
+                    None => "sdk".to_owned(),
+                })
+            }
+            Some(_) => return None,
             None => entry.url.or(entry.path),
         };
-        let checksum = entry.sha256.or(entry.resolved_ref);
+        let checksum = match (entry.sha256, entry.resolved_ref) {
+            (Some(sha), Some(rev)) => Some(format!("{sha} ({rev})")),
+            (sha, rev) => sha.or(rev),
+        };
         insert_merged(packages, name, version, source, checksum, BTreeSet::new())
     };
     let mut top = TopSection::None;
@@ -2041,9 +2091,23 @@ fn pubspec_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
         }
         match top {
             TopSection::Sdks => {
-                if !trimmed.contains(':') {
+                if indent != 2 {
                     return None;
                 }
+                let (k, v) = trimmed.split_once(':')?;
+                let sdk = unquote_lock_scalar(k);
+                let constraint = unquote_lock_scalar(v);
+                if sdk.is_empty() || constraint.is_empty() {
+                    return None;
+                }
+                insert_merged(
+                    &mut packages,
+                    format!("sdk:{sdk}"),
+                    constraint.to_owned(),
+                    Some("sdk-constraint".to_owned()),
+                    None,
+                    BTreeSet::new(),
+                )?;
             }
             TopSection::Packages => match indent {
                 2 => {
@@ -2071,23 +2135,63 @@ fn pubspec_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
                         }
                         "source" => {
                             let s = unquote_lock_scalar(val);
-                            if !s.is_empty() {
-                                cur.source_kind = Some(s.to_owned());
+                            if s.is_empty() {
+                                return None;
+                            }
+                            cur.source_kind = Some(s.to_owned());
+                        }
+                        "dependency" => {
+                            if unquote_lock_scalar(val).is_empty() {
+                                return None;
                             }
                         }
                         "description" => {
                             if val.is_empty() {
                                 cur.in_description = true;
                             } else if val.starts_with('{') && val.ends_with('}') {
-                                for (dk, dv) in parse_inline_yaml_map(val) {
+                                let pairs = parse_inline_yaml_map(val);
+                                if pairs.is_empty() && !val.trim_matches(['{', '}', ' ']).is_empty()
+                                {
+                                    return None;
+                                }
+                                for (dk, dv) in pairs {
                                     match dk.as_str() {
-                                        "url" if !dv.is_empty() => cur.url = Some(dv),
-                                        "sha256" if !dv.is_empty() => cur.sha256 = Some(dv),
-                                        "resolved-ref" if !dv.is_empty() => {
-                                            cur.resolved_ref = Some(dv)
+                                        "name" => {
+                                            if !dv.is_empty() {
+                                                cur.desc_name = Some(dv);
+                                            }
                                         }
-                                        "path" if !dv.is_empty() => cur.path = Some(dv),
-                                        _ => {}
+                                        "url" => {
+                                            if !dv.is_empty() {
+                                                cur.url = Some(dv);
+                                            }
+                                        }
+                                        "sha256" => {
+                                            if !dv.is_empty() {
+                                                cur.sha256 = Some(dv);
+                                            }
+                                        }
+                                        "resolved-ref" => {
+                                            if !dv.is_empty() {
+                                                cur.resolved_ref = Some(dv);
+                                            }
+                                        }
+                                        "ref" => {
+                                            if !dv.is_empty() {
+                                                cur.git_ref = Some(dv);
+                                            }
+                                        }
+                                        "path" => {
+                                            if !dv.is_empty() {
+                                                cur.path = Some(dv);
+                                            }
+                                        }
+                                        "relative" => {
+                                            if !dv.is_empty() {
+                                                cur.relative = Some(dv);
+                                            }
+                                        }
+                                        _ => return None,
                                     }
                                 }
                             } else {
@@ -2097,21 +2201,50 @@ fn pubspec_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
                                 }
                             }
                         }
-                        _ => {}
+                        _ => return None,
                     }
                 }
-                6.. if cur.in_description => {
+                6 if cur.in_description => {
                     let (k, v) = trimmed.split_once(':')?;
                     let key = unquote_lock_scalar(k);
                     let val = unquote_lock_scalar(v);
                     match key {
-                        "url" if !val.is_empty() => cur.url = Some(val.to_owned()),
-                        "sha256" if !val.is_empty() => cur.sha256 = Some(val.to_owned()),
-                        "resolved-ref" if !val.is_empty() => {
-                            cur.resolved_ref = Some(val.to_owned())
+                        "name" => {
+                            if !val.is_empty() {
+                                cur.desc_name = Some(val.to_owned());
+                            }
                         }
-                        "path" if !val.is_empty() => cur.path = Some(val.to_owned()),
-                        _ => {}
+                        "url" => {
+                            if !val.is_empty() {
+                                cur.url = Some(val.to_owned());
+                            }
+                        }
+                        "sha256" => {
+                            if !val.is_empty() {
+                                cur.sha256 = Some(val.to_owned());
+                            }
+                        }
+                        "resolved-ref" => {
+                            if !val.is_empty() {
+                                cur.resolved_ref = Some(val.to_owned());
+                            }
+                        }
+                        "ref" => {
+                            if !val.is_empty() {
+                                cur.git_ref = Some(val.to_owned());
+                            }
+                        }
+                        "path" => {
+                            if !val.is_empty() {
+                                cur.path = Some(val.to_owned());
+                            }
+                        }
+                        "relative" => {
+                            if !val.is_empty() {
+                                cur.relative = Some(val.to_owned());
+                            }
+                        }
+                        _ => return None,
                     }
                 }
                 _ => return None,
@@ -2205,11 +2338,26 @@ fn podfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
         CheckoutOptions,
         Other,
     }
+    #[derive(Default)]
+    struct PodExternal {
+        sources: BTreeMap<&'static str, String>,
+        pins: BTreeMap<&'static str, String>,
+    }
+    let insert_field =
+        |map: &mut BTreeMap<&'static str, String>, key: &'static str, val: String| -> Option<()> {
+            if let Some(prev) = map.get(key)
+                && prev != &val
+            {
+                return None;
+            }
+            map.insert(key, val);
+            Some(())
+        };
     let mut section = Section::None;
     let mut saw_pods = false;
     let mut pods: Vec<(String, String, BTreeSet<String>)> = Vec::new();
     let mut repos: BTreeMap<String, String> = BTreeMap::new();
-    let mut ext_sources: BTreeMap<String, String> = BTreeMap::new();
+    let mut ext_sources: BTreeMap<String, PodExternal> = BTreeMap::new();
     let mut checksums: BTreeMap<String, String> = BTreeMap::new();
     let mut current_repo: Option<String> = None;
     let mut current_ext_pod: Option<String> = None;
@@ -2259,39 +2407,60 @@ fn podfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
             Section::SpecRepos => match indent {
                 2 => {
                     let repo = unquote_lock_scalar(trimmed.strip_suffix(':')?);
-                    current_repo = (!repo.is_empty()).then(|| repo.to_owned());
+                    if repo.is_empty() {
+                        return None;
+                    }
+                    current_repo = Some(repo.to_owned());
                 }
                 4 => {
-                    if let (Some(repo), Some(pod)) = (&current_repo, trimmed.strip_prefix("- ")) {
-                        let pod = unquote_lock_scalar(pod);
-                        if !pod.is_empty() {
-                            repos.insert(pod.to_owned(), repo.clone());
-                        }
+                    let repo = current_repo.as_ref()?;
+                    let pod = unquote_lock_scalar(trimmed.strip_prefix("- ")?);
+                    if pod.is_empty() {
+                        return None;
                     }
+                    repos.insert(pod.to_owned(), repo.clone());
                 }
-                _ => {}
+                _ => return None,
             },
             Section::ExternalSources | Section::CheckoutOptions => match indent {
                 2 => {
                     let pod = unquote_lock_scalar(trimmed.strip_suffix(':')?);
-                    current_ext_pod = (!pod.is_empty()).then(|| pod.to_owned());
+                    if pod.is_empty() {
+                        return None;
+                    }
+                    current_ext_pod = Some(pod.to_owned());
                 }
                 4 => {
-                    if let (Some(pod), Some((k, v))) = (&current_ext_pod, trimmed.split_once(": "))
-                    {
-                        let val = unquote_lock_scalar(v);
-                        match k.trim() {
-                            ":git" if !val.is_empty() => {
-                                ext_sources.insert(pod.clone(), format!("git:{val}"));
-                            }
-                            ":path" if !val.is_empty() => {
-                                ext_sources.insert(pod.clone(), format!("path:{val}"));
-                            }
-                            _ => {}
+                    let pod = current_ext_pod.as_ref()?;
+                    let (k, v) = trimmed.split_once(": ")?;
+                    let key = unquote_lock_scalar(k);
+                    let val = unquote_lock_scalar(v);
+                    if val.is_empty() {
+                        return None;
+                    }
+                    let entry = ext_sources.entry(pod.clone()).or_default();
+                    match key {
+                        ":git" => insert_field(&mut entry.sources, "git", format!("git:{val}"))?,
+                        ":path" => insert_field(&mut entry.sources, "path", format!("path:{val}"))?,
+                        ":http" => insert_field(&mut entry.sources, "http", format!("http:{val}"))?,
+                        ":podspec" => {
+                            insert_field(&mut entry.sources, "podspec", format!("podspec:{val}"))?
                         }
+                        ":branch" => {
+                            insert_field(&mut entry.sources, "branch", format!("branch={val}"))?
+                        }
+                        ":tag" => insert_field(&mut entry.sources, "tag", format!("tag={val}"))?,
+                        ":commit" => {
+                            insert_field(&mut entry.pins, "commit", format!("commit={val}"))?
+                        }
+                        ":sha256" => {
+                            insert_field(&mut entry.pins, "sha256", format!("sha256={val}"))?
+                        }
+                        ":sha1" => insert_field(&mut entry.pins, "sha1", format!("sha1={val}"))?,
+                        _ => return None,
                     }
                 }
-                _ => {}
+                _ => return None,
             },
             Section::SpecChecksums if indent == 2 => {
                 let (k, v) = trimmed.split_once(':')?;
@@ -2314,13 +2483,33 @@ fn podfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
     let mut packages = BTreeMap::new();
     for (name, version, deps) in pods {
         let root = name.split('/').next().unwrap_or(&name);
-        let source = ext_sources.get(root).or_else(|| repos.get(root)).cloned();
-        let checksum = if let Some(hash) = checksums.get(&name) {
+        let ext = ext_sources.get(root);
+        let source = if let Some(ext) = ext
+            && !ext.sources.is_empty()
+        {
+            Some(ext.sources.values().cloned().collect::<Vec<_>>().join(" "))
+        } else {
+            repos.get(root).cloned()
+        };
+        let attach_root = name == root
+            || (!exact_names.contains(root) && attached_root_checksum.insert(root.to_owned()));
+        let spec_hash = if let Some(hash) = checksums.get(&name) {
             Some(hash.clone())
-        } else if !exact_names.contains(root) && attached_root_checksum.insert(root.to_owned()) {
+        } else if attach_root {
             checksums.get(root).cloned()
         } else {
             None
+        };
+        let ext_pins = attach_root
+            .then_some(ext)
+            .flatten()
+            .filter(|e| !e.pins.is_empty())
+            .map(|e| e.pins.values().cloned().collect::<Vec<_>>().join(", "));
+        let checksum = match (spec_hash, ext_pins) {
+            (Some(h), Some(pins)) => Some(format!("{h} ({pins})")),
+            (Some(h), None) => Some(h),
+            (None, Some(pins)) => Some(pins),
+            (None, None) => None,
         };
         insert_merged(&mut packages, name, version, source, checksum, deps)?;
     }
@@ -2377,34 +2566,108 @@ fn pipfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
         return Some(BTreeMap::new());
     }
     let root: serde_json::Value = serde_json::from_str(text).ok()?;
-    let meta = root.get("_meta")?.as_object()?;
-    meta.get("pipfile-spec")?.as_u64()?;
-    let default_map = root.get("default")?.as_object()?;
-    let mut sources_map: BTreeMap<&str, &str> = BTreeMap::new();
-    if let Some(sources) = meta.get("sources").and_then(serde_json::Value::as_array) {
-        for src in sources {
-            if let (Some(name), Some(url)) = (
-                src.get("name").and_then(serde_json::Value::as_str),
-                src.get("url").and_then(serde_json::Value::as_str),
-            ) {
-                sources_map.insert(name, url);
-            }
+    let root_obj = root.as_object()?;
+    for key in root_obj.keys() {
+        if !matches!(key.as_str(), "_meta" | "default" | "develop") {
+            return None;
         }
     }
-    let develop_map = match root.get("develop") {
+    let meta = root_obj.get("_meta")?.as_object()?;
+    meta.get("pipfile-spec")?.as_u64()?;
+    let default_map = root_obj.get("default")?.as_object()?;
+    let mut sources_map: BTreeMap<&str, String> = BTreeMap::new();
+    let mut default_source: Option<String> = None;
+    if let Some(sources_val) = meta.get("sources") {
+        let sources = sources_val.as_array()?;
+        for src in sources {
+            let obj = src.as_object()?;
+            for key in obj.keys() {
+                if !matches!(key.as_str(), "name" | "url" | "verify_ssl") {
+                    return None;
+                }
+            }
+            let name = obj.get("name")?.as_str()?;
+            let url = obj.get("url")?.as_str()?;
+            if name.is_empty() || url.is_empty() {
+                return None;
+            }
+            let verify_ssl = match obj.get("verify_ssl") {
+                Some(v) => v.as_bool()?,
+                None => true,
+            };
+            let encoded = if verify_ssl {
+                url.to_owned()
+            } else {
+                format!("{url} (verify_ssl=false)")
+            };
+            if default_source.is_none() {
+                default_source = Some(encoded.clone());
+            }
+            sources_map.insert(name, encoded);
+        }
+    }
+    let develop_map = match root_obj.get("develop") {
         Some(val) => Some(val.as_object()?),
         None => None,
     };
+    fn opt_str<'a>(
+        pkg: &'a serde_json::Map<String, serde_json::Value>,
+        key: &str,
+    ) -> Option<Option<&'a str>> {
+        match pkg.get(key) {
+            Some(v) => {
+                let s = v.as_str()?;
+                Some((!s.is_empty()).then_some(s))
+            }
+            None => Some(None),
+        }
+    }
     let mut packages = BTreeMap::new();
-    for map in [Some(default_map), develop_map].into_iter().flatten() {
+    for (scope, map) in [("default", Some(default_map)), ("develop", develop_map)] {
+        let Some(map) = map else {
+            continue;
+        };
         for (name, pkg_val) in map {
             let pkg = pkg_val.as_object()?;
-            let git_ref = pkg
-                .get("ref")
-                .and_then(serde_json::Value::as_str)
-                .filter(|s| !s.is_empty());
-            let version = if let Some(ver) = pkg.get("version").and_then(serde_json::Value::as_str)
-            {
+            for key in pkg.keys() {
+                if !matches!(
+                    key.as_str(),
+                    "version"
+                        | "hashes"
+                        | "index"
+                        | "git"
+                        | "hg"
+                        | "svn"
+                        | "bzr"
+                        | "uri"
+                        | "file"
+                        | "path"
+                        | "ref"
+                        | "subdirectory"
+                        | "editable"
+                        | "markers"
+                        | "extras"
+                ) {
+                    return None;
+                }
+            }
+            let git_ref = opt_str(pkg, "ref")?;
+            let index = opt_str(pkg, "index")?;
+            let git = opt_str(pkg, "git")?;
+            let hg = opt_str(pkg, "hg")?;
+            let svn = opt_str(pkg, "svn")?;
+            let bzr = opt_str(pkg, "bzr")?;
+            let uri = opt_str(pkg, "uri")?;
+            let file = opt_str(pkg, "file")?;
+            let path = opt_str(pkg, "path")?;
+            let subdirectory = opt_str(pkg, "subdirectory")?;
+            let markers = opt_str(pkg, "markers")?;
+            let editable = match pkg.get("editable") {
+                Some(v) => Some(v.as_bool()?),
+                None => None,
+            };
+            let version_raw = opt_str(pkg, "version")?;
+            let version = if let Some(ver) = version_raw {
                 let v = ver.strip_prefix("==").unwrap_or(ver).trim();
                 if v.is_empty() {
                     return None;
@@ -2412,52 +2675,106 @@ fn pipfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
                 v.to_owned()
             } else if let Some(r) = git_ref {
                 short_rev(r).to_owned()
-            } else if pkg.get("path").is_some() || pkg.get("file").is_some() {
+            } else if path.is_some() || file.is_some() {
                 "local".to_owned()
+            } else if uri.is_some() {
+                "uri".to_owned()
+            } else if git.is_some() || hg.is_some() || svn.is_some() || bzr.is_some() {
+                "vcs".to_owned()
             } else {
                 return None;
             };
-            let source = if let Some(idx) = pkg
-                .get("index")
-                .and_then(serde_json::Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                Some(
+
+            let mut src_parts: Vec<String> = Vec::new();
+            if let Some(idx) = index {
+                src_parts.push(
                     sources_map
                         .get(idx)
-                        .copied()
-                        .map(str::to_owned)
+                        .cloned()
                         .unwrap_or_else(|| format!("index:{idx}")),
-                )
-            } else if let Some(url) = pkg
-                .get("git")
-                .and_then(serde_json::Value::as_str)
-                .filter(|s| !s.is_empty())
+                );
+            }
+            if let Some(url) = git {
+                src_parts.push(format!("git:{url}"));
+            }
+            if let Some(url) = hg {
+                src_parts.push(format!("hg:{url}"));
+            }
+            if let Some(url) = svn {
+                src_parts.push(format!("svn:{url}"));
+            }
+            if let Some(url) = bzr {
+                src_parts.push(format!("bzr:{url}"));
+            }
+            if let Some(u) = uri {
+                src_parts.push(format!("uri:{u}"));
+            }
+            if let Some(f) = file {
+                src_parts.push(format!("file:{f}"));
+            }
+            if let Some(p) = path {
+                src_parts.push(format!("path:{p}"));
+            }
+            // Attach default `_meta.sources[0]` to registry packages lacking explicit `"index"`.
+            if src_parts.is_empty()
+                && version_raw.is_some()
+                && let Some(def) = &default_source
             {
-                Some(format!("git:{url}"))
-            } else if let Some(file) = pkg
-                .get("file")
-                .and_then(serde_json::Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                Some(format!("file:{file}"))
+                src_parts.push(def.clone());
+            }
+            if let Some(sub) = subdirectory {
+                src_parts.push(format!("subdir:{sub}"));
+            }
+            if editable == Some(true) {
+                src_parts.push("editable=true".to_owned());
+            }
+            if let Some(extras_val) = pkg.get("extras") {
+                let arr = extras_val.as_array()?;
+                let mut extras: BTreeSet<&str> = BTreeSet::new();
+                for item in arr {
+                    let s = item.as_str()?;
+                    if !s.is_empty() {
+                        extras.insert(s);
+                    }
+                }
+                if !extras.is_empty() {
+                    src_parts.push(format!(
+                        "extras={}",
+                        extras.into_iter().collect::<Vec<_>>().join(",")
+                    ));
+                }
+            }
+            if let Some(m) = markers {
+                src_parts.push(format!("markers={m}"));
+            }
+            let source = if src_parts.is_empty() {
+                Some(format!("[{scope}]"))
             } else {
-                pkg.get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(|path| format!("path:{path}"))
+                Some(format!("{} [{scope}]", src_parts.join(" ")))
             };
-            let checksum =
-                if let Some(arr) = pkg.get("hashes").and_then(serde_json::Value::as_array) {
-                    let hashes: BTreeSet<&str> = arr
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    (!hashes.is_empty()).then(|| hashes.into_iter().collect::<Vec<_>>().join(", "))
+
+            let mut checksum_parts: Vec<String> = Vec::new();
+            if let Some(val) = pkg.get("hashes") {
+                let arr = val.as_array()?;
+                let mut hashes: BTreeSet<&str> = BTreeSet::new();
+                for item in arr {
+                    let s = item.as_str()?;
+                    if !s.is_empty() {
+                        hashes.insert(s);
+                    }
+                }
+                if !hashes.is_empty() {
+                    checksum_parts.push(hashes.into_iter().collect::<Vec<_>>().join(", "));
+                }
+            }
+            if let Some(r) = git_ref {
+                checksum_parts.push(if checksum_parts.is_empty() {
+                    r.to_owned()
                 } else {
-                    git_ref.map(str::to_owned)
-                };
+                    format!("ref:{r}")
+                });
+            }
+            let checksum = (!checksum_parts.is_empty()).then(|| checksum_parts.join(" ; "));
             insert_merged(
                 &mut packages,
                 name.clone(),
@@ -2908,8 +3225,19 @@ fn compare_pubspec_hunks(
                 )?;
                 in_block = false;
                 match trimmed {
-                    "packages:" | "packages: {}" | "sdks: {}" => in_sdks = false,
-                    "sdks:" => in_sdks = true,
+                    "packages:" | "packages: {}" => in_sdks = false,
+                    "sdks:" => {
+                        if kind != ' ' {
+                            return None;
+                        }
+                        in_sdks = true;
+                    }
+                    "sdks: {}" => {
+                        if kind != ' ' {
+                            return None;
+                        }
+                        in_sdks = false;
+                    }
                     _ if kind != ' ' => return None,
                     _ => {}
                 }
@@ -3008,8 +3336,13 @@ fn compare_podfile_hunks(
                 section = match trimmed {
                     "PODS:" => HunkSection::Pods,
                     "SPEC CHECKSUMS:" => HunkSection::SpecChecksums,
-                    "DEPENDENCIES:" | "SPEC REPOS:" => HunkSection::Ignored,
-                    "EXTERNAL SOURCES:" | "CHECKOUT OPTIONS:" => HunkSection::FailClosed,
+                    "DEPENDENCIES:" => HunkSection::Ignored,
+                    "SPEC REPOS:" | "EXTERNAL SOURCES:" | "CHECKOUT OPTIONS:" => {
+                        if kind != ' ' {
+                            return None;
+                        }
+                        HunkSection::FailClosed
+                    }
                     _ if trimmed.starts_with("PODFILE CHECKSUM:")
                         || trimmed.starts_with("COCOAPODS:")
                         || trimmed.starts_with("COCOAPODS PLUGINS:") =>
@@ -5445,5 +5778,285 @@ index 1111111..2222222 100644
         assert_eq!(plain_sec.len(), 1);
         assert_eq!(color_sec.len(), 1);
         assert_eq!(color_sec[0].text(), plain_sec[0].text());
+    }
+
+    #[test]
+    fn split_npm_descriptor_handles_multibyte_utf8_prefix() {
+        assert_eq!(split_npm_descriptor("é@1.0.0"), Some(("é", "1.0.0")));
+        assert_eq!(
+            split_npm_descriptor("@é/pkg@2.3.4"),
+            Some(("@é/pkg", "2.3.4"))
+        );
+        assert_eq!(split_npm_descriptor("é"), None);
+    }
+
+    #[test]
+    fn podfile_pubspec_and_pipfile_supply_chain_tamper_defenses() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 1. Podfile.lock: `:commit` swap flagged, `:http`/`:podspec` recorded,
+        //    unrecognized EXTERNAL SOURCES/CHECKOUT OPTIONS keys fail closed,
+        //    and `SPEC REPOS:` hijack fails closed in hunk fallback.
+        let pod_old = "\
+PODS:
+  - MyPod (1.0.0)
+  - ZipPod (2.0.0)
+
+EXTERNAL SOURCES:
+  MyPod:
+    :git: https://github.com/org/MyPod.git
+    :branch: main
+  ZipPod:
+    :http: https://example.com/ZipPod-2.0.0.zip
+    :sha256: aaaa
+
+CHECKOUT OPTIONS:
+  MyPod:
+    :git: https://github.com/org/MyPod.git
+    :commit: 1111111111111111111111111111111111111111
+
+SPEC CHECKSUMS:
+  MyPod: 9999999999999999999999999999999999999999
+  ZipPod: 8888888888888888888888888888888888888888
+";
+        let pod_new = "\
+PODS:
+  - MyPod (1.0.0)
+  - ZipPod (2.0.0)
+
+EXTERNAL SOURCES:
+  MyPod:
+    :git: https://github.com/org/MyPod.git
+    :branch: main
+  ZipPod:
+    :http: https://evil.example/ZipPod-2.0.0.zip
+    :sha256: aaaa
+
+CHECKOUT OPTIONS:
+  MyPod:
+    :git: https://github.com/org/MyPod.git
+    :commit: 2222222222222222222222222222222222222222
+
+SPEC CHECKSUMS:
+  MyPod: 9999999999999999999999999999999999999999
+  ZipPod: 8888888888888888888888888888888888888888
+";
+        let pod_changes = compare_format(LockFormat::Podfile, pod_old, pod_new).unwrap();
+        assert!(
+            pod_changes.flags.iter().any(|f| f
+                .contains("checksum changed on existing version MyPod 1.0.0")
+                && f.contains("commit=1111")
+                && f.contains("commit=2222")),
+            "{:?}",
+            pod_changes.flags
+        );
+        assert!(
+            pod_changes.flags.iter().any(|f| f
+                .contains("source changed on existing version ZipPod 2.0.0")
+                && f.contains("http:https://evil.example/ZipPod-2.0.0.zip")),
+            "{:?}",
+            pod_changes.flags
+        );
+        let pod_unknown = "\
+PODS:
+  - MyPod (1.0.0)
+
+EXTERNAL SOURCES:
+  MyPod:
+    :git: https://github.com/org/MyPod.git
+    :submodules: true
+";
+        assert!(podfile_packages(pod_unknown).is_none());
+
+        let spec_repo_hijack = "\
+diff --git a/ios/Podfile.lock b/ios/Podfile.lock
+index 1111111..2222222 100644
+--- a/ios/Podfile.lock
++++ b/ios/Podfile.lock
+@@ -10,4 +10,4 @@
+ SPEC REPOS:
+-  trunk:
++  https://evil.example/specs.git:
+     - Alamofire
+";
+        assert!(sections(spec_repo_hijack, dir.path()).is_empty());
+
+        // 2. pubspec.lock: `description.path`, `description.name`, `ref`, `relative`,
+        //    `sdks:` changes tracked, and unrecognized description keys fail closed.
+        let pub_old = "\
+packages:
+  my_git:
+    dependency: \"direct main\"
+    description:
+      path: \"packages/safe\"
+      ref: main
+      resolved-ref: \"abc123\"
+      url: \"https://github.com/org/repo.git\"
+    source: git
+    version: \"1.0.0\"
+  aliased:
+    dependency: \"direct main\"
+    description:
+      name: safe_pkg
+      sha256: \"aaa\"
+      url: \"https://pub.dev\"
+    source: hosted
+    version: \"1.0.0\"
+sdks:
+  dart: \">=3.2.0 <4.0.0\"
+";
+        let pub_new = "\
+packages:
+  my_git:
+    dependency: \"direct main\"
+    description:
+      path: \"packages/evil\"
+      ref: main
+      resolved-ref: \"abc123\"
+      url: \"https://github.com/org/repo.git\"
+    source: git
+    version: \"1.0.0\"
+  aliased:
+    dependency: \"direct main\"
+    description:
+      name: evil_pkg
+      sha256: \"aaa\"
+      url: \"https://pub.dev\"
+    source: hosted
+    version: \"1.0.0\"
+sdks:
+  dart: \">=3.5.0 <4.0.0\"
+";
+        let pub_changes = compare_format(LockFormat::Pubspec, pub_old, pub_new).unwrap();
+        assert!(
+            pub_changes.flags.iter().any(|f| f
+                .contains("source changed on existing version my_git 1.0.0")
+                && f.contains("packages/safe")
+                && f.contains("packages/evil")),
+            "{:?}",
+            pub_changes.flags
+        );
+        assert!(
+            pub_changes.flags.iter().any(|f| f
+                .contains("source changed on existing version aliased 1.0.0")
+                && f.contains("safe_pkg")
+                && f.contains("evil_pkg")),
+            "{:?}",
+            pub_changes.flags
+        );
+        assert!(
+            pub_changes
+                .updated
+                .iter()
+                .any(|u| u == "sdk:dart >=3.2.0 <4.0.0 -> >=3.5.0 <4.0.0"),
+            "{:?}",
+            pub_changes.updated
+        );
+        let pub_unknown = "\
+packages:
+  foo:
+    dependency: \"direct main\"
+    description:
+      name: foo
+      url: \"https://pub.dev\"
+      unexpected_key: \"evil\"
+    source: hosted
+    version: \"1.0.0\"
+";
+        assert!(pubspec_packages(pub_unknown).is_none());
+
+        // 3. Pipfile.lock: `verify_ssl: false`, default-index hijack without explicit `"index"`,
+        //    `"hashes": []` + `"ref"` swap, `develop -> default` promotion, and unknown keys.
+        let pip_old = r#"{
+  "_meta": {
+    "pipfile-spec": 6,
+    "sources": [
+      { "name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": true }
+    ]
+  },
+  "default": {
+    "implicit_idx": {
+      "hashes": ["sha256:aaa"],
+      "version": "==1.0.0"
+    },
+    "git_empty_hashes": {
+      "git": "https://github.com/org/lib.git",
+      "hashes": [],
+      "ref": "aaaaaaaaaaaaaaaaaaaa",
+      "subdirectory": "pkg_a",
+      "version": "==1.0.0"
+    }
+  },
+  "develop": {
+    "dev_only": {
+      "hashes": ["sha256:bbb"],
+      "index": "pypi",
+      "version": "==2.0.0"
+    }
+  }
+}"#;
+        let pip_new = r#"{
+  "_meta": {
+    "pipfile-spec": 6,
+    "sources": [
+      { "name": "pypi", "url": "https://evil.example/simple", "verify_ssl": false }
+    ]
+  },
+  "default": {
+    "implicit_idx": {
+      "hashes": ["sha256:aaa"],
+      "version": "==1.0.0"
+    },
+    "git_empty_hashes": {
+      "git": "https://github.com/org/lib.git",
+      "hashes": [],
+      "ref": "bbbbbbbbbbbbbbbbbbbb",
+      "subdirectory": "pkg_b",
+      "version": "==1.0.0"
+    },
+    "dev_only": {
+      "hashes": ["sha256:bbb"],
+      "index": "pypi",
+      "version": "==2.0.0"
+    }
+  },
+  "develop": {}
+}"#;
+        let pip_changes = compare_format(LockFormat::Pipfile, pip_old, pip_new).unwrap();
+        assert!(
+            pip_changes.flags.iter().any(|f| f
+                .contains("source changed on existing version implicit_idx 1.0.0")
+                && f.contains("https://evil.example/simple (verify_ssl=false)")),
+            "{:?}",
+            pip_changes.flags
+        );
+        assert!(
+            pip_changes.flags.iter().any(|f| f
+                .contains("checksum changed on existing version git_empty_hashes 1.0.0")
+                && f.contains("aaaaaaaaaaaaaaaaaaaa -> bbbbbbbbbbbbbbbbbbbb")),
+            "{:?}",
+            pip_changes.flags
+        );
+        assert!(
+            pip_changes.flags.iter().any(|f| f
+                .contains("source changed on existing version git_empty_hashes 1.0.0")
+                && f.contains("subdir:pkg_a")
+                && f.contains("subdir:pkg_b")),
+            "{:?}",
+            pip_changes.flags
+        );
+        assert!(
+            pip_changes.flags.iter().any(|f| f
+                .contains("source changed on existing version dev_only 2.0.0")
+                && f.contains("[develop]")
+                && f.contains("[default]")),
+            "{:?}",
+            pip_changes.flags
+        );
+        let pip_unknown = r#"{
+  "_meta": { "pipfile-spec": 6 },
+  "default": { "foo": { "version": "==1.0.0", "evil_hook": "rm -rf /" } }
+}"#;
+        assert!(pipfile_packages(pip_unknown).is_none());
     }
 }

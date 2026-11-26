@@ -701,7 +701,9 @@ impl Scan {
             if trimmed.starts_with("stack backtrace:") {
                 self.panic_lines = 0;
                 failure.in_backtrace = true;
-            } else if trimmed.starts_with("note:") {
+            } else if trimmed.starts_with("note: run with ")
+                || (failure.saw_panic && trimmed.starts_with("note:"))
+            {
                 self.panic_lines = 0;
             } else {
                 let loc = extract_rust_location(trimmed);
@@ -760,6 +762,7 @@ impl Scan {
             failure.last = n;
         } else if !failure.saw_panic && failure.detail_lines.len() < 3 {
             if trimmed.starts_with("Error: ")
+                || trimmed.starts_with("note: test did not panic")
                 || (RUST_DIAG_HEADER.is_match(trimmed) && trimmed.starts_with("error"))
             {
                 if failure.detail_lines.is_empty() {
@@ -1074,7 +1077,9 @@ impl Scan {
                 if trimmed.starts_with("stack backtrace:") {
                     failure.stopped = true;
                     failure.in_backtrace = true;
-                } else if trimmed.starts_with("note:") {
+                } else if trimmed.starts_with("note: run with ")
+                    || (failure.saw_panic && trimmed.starts_with("note:"))
+                {
                     failure.stopped = true;
                 } else if failure.excerpt.len() < 6
                     && (failure.saw_panic || failure.excerpt.len() < 3)
@@ -2370,6 +2375,75 @@ test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; 
         assert!(
             !doc_rendered.contains("rust_begin_unwind"),
             "{doc_rendered}"
+        );
+    }
+
+    #[test]
+    fn should_panic_did_not_panic_note_preserved_in_nextest_and_grouped_cargo_test() {
+        // 1. `cargo nextest run` with a failing `#[should_panic]` test.
+        let nx = "\
+    Starting 2 tests across 1 binary
+        PASS [   0.002s] billing::tests ok_case
+        FAIL [   0.004s] billing::tests rejects_negative_amount
+--- STDOUT:              billing::tests rejects_negative_amount ---
+note: test did not panic as expected
+------------
+     Summary [   0.010s] 2 tests run: 1 passed, 1 failed, 0 skipped
+";
+        let nx_rendered = nextest_totals(&[(nx, Stream::Stderr)])
+            .expect("nextest should_panic totals")
+            .render();
+        assert!(
+            nx_rendered.contains("note: test did not panic as expected"),
+            "nextest must preserve should_panic failure note:\n{nx_rendered}"
+        );
+
+        // 2. Grouped `cargo test` where a shared normalized panic activates grouping alongside
+        //    failing `#[should_panic]` tests.
+        let out = "\
+\nrunning 4 tests
+test panics_temp_a ... FAILED
+test panics_temp_b ... FAILED
+test should_panic_a ... FAILED
+test should_panic_b ... FAILED
+
+failures:
+
+---- panics_temp_a stdout ----
+thread 'panics_temp_a' panicked at src/lib.rs:12:5:
+missing file /tmp/.tmpAa11Bb/config.toml
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- panics_temp_b stdout ----
+thread 'panics_temp_b' panicked at src/lib.rs:12:5:
+missing file /tmp/.tmpCc22Dd/config.toml
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- should_panic_a stdout ----
+note: test did not panic as expected
+
+---- should_panic_b stdout ----
+note: test did not panic as expected
+
+failures:
+    panics_temp_a
+    panics_temp_b
+    should_panic_a
+    should_panic_b
+
+test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+";
+        let err = "     Running unittests src/lib.rs (target/debug/deps/billing-11223344)\n";
+        let grouped = totals(&[(out, Stream::Stdout), (err, Stream::Stderr)])
+            .expect("grouped cargo test totals")
+            .render();
+        assert!(
+            grouped.contains("2 test(s): should_panic_a note: test did not panic as expected"),
+            "grouped cargo test must preserve should_panic failure reason:\n{grouped}"
+        );
+        assert!(
+            !grouped.contains("RUST_BACKTRACE=1"),
+            "backtrace hint must still be excluded:\n{grouped}"
         );
     }
 }

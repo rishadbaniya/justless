@@ -1739,6 +1739,12 @@ fn is_rust_runtime_shim(symbol: &str) -> bool {
     let sym = symbol
         .trim_start_matches(['<', '&', '('])
         .trim_start_matches("mut ");
+    if sym.starts_with("__rustc::") || sym.starts_with("__rust_") {
+        return true;
+    }
+    if sym.contains("::") {
+        return false;
+    }
     sym.starts_with("__rust")
         || sym.starts_with("rust_begin_unwind")
         || sym.starts_with("rust_panic")
@@ -1779,29 +1785,47 @@ fn is_rust_external_symbol(symbol: &str) -> bool {
         "addr2line::",
         "object::",
         "tokio::",
-        "tokio_",
+        "tokio_util::",
+        "tokio_stream::",
+        "tokio_runtime::",
         "hyper::",
-        "hyper_",
-        "actix_",
+        "hyper_util::",
+        "actix_web::",
+        "actix_rt::",
+        "actix_http::",
+        "actix_service::",
         "tower::",
-        "tower_",
+        "tower_http::",
+        "tower_service::",
+        "tower_layer::",
         "axum::",
-        "axum_",
+        "axum_core::",
         "tonic::",
         "futures::",
-        "futures_",
+        "futures_core::",
+        "futures_util::",
+        "futures_executor::",
+        "futures_channel::",
+        "futures_sink::",
+        "futures_io::",
         "mio::",
         "h2::",
         "serde::",
-        "serde_",
+        "serde_json::",
+        "serde_yaml::",
+        "serde_urlencoded::",
         "sqlx::",
-        "sqlx_",
+        "sqlx_core::",
+        "sqlx_postgres::",
+        "sqlx_mysql::",
+        "sqlx_sqlite::",
         "diesel::",
         "reqwest::",
         "tracing::",
-        "tracing_",
+        "tracing_core::",
+        "tracing_subscriber::",
         "rayon::",
-        "rayon_",
+        "rayon_core::",
         "rustls::",
         "ring::",
         "warp::",
@@ -1809,10 +1833,14 @@ fn is_rust_external_symbol(symbol: &str) -> bool {
         "poem::",
         "async_std::",
         "smol::",
-        "crossbeam_",
-        "parking_lot",
+        "crossbeam_channel::",
+        "crossbeam_deque::",
+        "crossbeam_epoch::",
+        "crossbeam_utils::",
+        "parking_lot::",
+        "parking_lot_core::",
         "clap::",
-        "clap_",
+        "clap_builder::",
         "anyhow::",
     ];
     PREFIXES.iter().any(|p| sym.starts_with(p))
@@ -2317,5 +2345,45 @@ mod tests {
         ));
         assert!(!is_inline_frame("#1 Heading (notes)"));
         assert!(!is_inline_frame("#42 fix login bug (WIP)"));
+    }
+
+    #[test]
+    fn rust_workspace_crates_with_common_prefixes_stay_pinned_verbatim() {
+        let trace = concat!(
+            "thread 'main' panicked at src/lib.rs:42:5:\n",
+            "boom\n",
+            "stack backtrace:\n",
+            "   0: rust_begin_unwind\n",
+            "             at library/std/src/panicking.rs:665:5\n",
+            "   1: core::panicking::panic_fmt\n",
+            "             at library/core/src/panicking.rs:76:14\n",
+            "   2: std::panicking::begin_panic_handler\n",
+            "             at library/std/src/panicking.rs:661:13\n",
+            "   3: rust_panic_hook::install\n",
+            "             at ./src/lib.rs:42:5\n",
+            "   4: axum_api::handler\n",
+            "   5: tokio_worker::run\n",
+            "   6: sqlx_repo::load_order\n",
+            "   7: serde_models::Order::decode\n",
+            "   8: clap_cli::parse_args\n",
+            "   9: tokio::runtime::task::core::Core<T,S>::poll\n",
+            "  10: tokio_util::task::TaskTracker::spawn\n",
+            "  11: axum_core::extract::from_request\n",
+            "  12: std::rt::lang_start_internal\n",
+            "  13: _start\n",
+        );
+        let out = collapse(trace, Some(Path::new("/work")), Some("stderr"))
+            .expect("rust trace with external runs should collapse external frames");
+        assert!(
+            out.contains("   3: rust_panic_hook::install\n             at ./src/lib.rs:42:5\n"),
+            "{out}"
+        );
+        assert!(out.contains("   4: axum_api::handler\n"), "{out}");
+        assert!(out.contains("   5: tokio_worker::run\n"), "{out}");
+        assert!(out.contains("   6: sqlx_repo::load_order\n"), "{out}");
+        assert!(out.contains("   7: serde_models::Order::decode\n"), "{out}");
+        assert!(out.contains("   8: clap_cli::parse_args\n"), "{out}");
+        assert!(!out.contains("tokio_util::task::TaskTracker"), "{out}");
+        assert!(!out.contains("axum_core::extract::from_request"), "{out}");
     }
 }
