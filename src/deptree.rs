@@ -2,8 +2,8 @@
 //!
 //! Compacts verbose dependency listings from `cargo tree` (forward, `-i`
 //! inverted, and `-d` duplicates), `npm ls`, `pnpm list`/`ls`, `yarn list`,
-//! `pipdeptree`, `go mod graph`, `mvn dependency:tree`, and `gradle
-//! dependencies`.
+//! `pipdeptree`, `go mod graph`, `mvn dependency:tree`, `gradle
+//! dependencies`, and `dart pub deps` / `flutter pub deps`.
 //!
 //! Contracts preserved:
 //! - Fail closed (return `None`) on JSON, custom tables, machine-oriented
@@ -17,6 +17,7 @@
 //!   reverse path group, or graph hub so the caller can expand verbatim with
 //!   `justless log`.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -112,6 +113,10 @@ pub fn format(tool: &str, args: &[String], stdout: &str, budget: usize) -> Optio
             let tree = parse_gradle_tree(stdout)?;
             render_forward_tree(&tree, raw_len, budget)?
         }
+        ToolKind::PubDeps { is_flutter } => {
+            let tree = parse_pub_deps(stdout, is_flutter)?;
+            render_forward_tree(&tree, raw_len, budget)?
+        }
     };
 
     fit_smaller(report, raw_len, budget)
@@ -132,6 +137,9 @@ enum ToolKind {
     GoModGraph,
     MvnDependencyTree,
     GradleDependencies,
+    PubDeps {
+        is_flutter: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +149,7 @@ enum DisplayStyle {
     Pip,
     Maven,
     Gradle,
+    Pub,
 }
 
 #[derive(Clone, Debug)]
@@ -223,6 +232,8 @@ fn detect_tool(tool: &str, args: &[String]) -> Option<ToolKind> {
         "go" => detect_go_mod_graph(rest),
         "mvn" | "mvnw" | "mvnd" => detect_mvn_tree(rest),
         "gradle" | "gradlew" => detect_gradle_deps(rest),
+        "dart" => detect_pub_deps(rest, false),
+        "flutter" => detect_pub_deps(rest, true),
         _ => None,
     }
 }
@@ -523,6 +534,93 @@ fn detect_gradle_deps(args: &[&str]) -> Option<ToolKind> {
     has_task.then_some(ToolKind::GradleDependencies)
 }
 
+fn detect_pub_deps(mut args: &[&str], is_flutter: bool) -> Option<ToolKind> {
+    // Allow safe leading flags before `pub` (e.g. `flutter --no-color pub deps`).
+    let mut saw_pub = false;
+    while let Some((&arg, tail)) = args.split_first() {
+        if arg == "pub" {
+            saw_pub = true;
+            args = tail;
+            break;
+        }
+        if matches!(
+            arg,
+            "--no-color"
+                | "--color"
+                | "--suppress-analytics"
+                | "--disable-analytics"
+                | "--no-version-check"
+                | "-v"
+                | "--verbose"
+        ) || arg.starts_with("--directory=")
+        {
+            args = tail;
+        } else if matches!(arg, "-C" | "--directory") && !tail.is_empty() {
+            args = &tail[1..];
+        } else {
+            return None;
+        }
+    }
+    if !saw_pub {
+        return None;
+    }
+    // Skip `pub` options before `deps` (e.g. `dart pub -C packages/app deps`).
+    let mut saw_deps = false;
+    while let Some((&arg, tail)) = args.split_first() {
+        if arg == "deps" {
+            saw_deps = true;
+            args = tail;
+            break;
+        }
+        if matches!(arg, "--no-color" | "--color" | "-v" | "--verbose")
+            || arg.starts_with("--directory=")
+        {
+            args = tail;
+        } else if matches!(arg, "-C" | "--directory") && !tail.is_empty() {
+            args = &tail[1..];
+        } else {
+            return None;
+        }
+    }
+    if !saw_deps {
+        return None;
+    }
+    // Reject machine/non-tree output modes (`--json`, `--executables`, `--style=compact`/`list`, `-h`).
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        if arg == "--" {
+            break;
+        }
+        if matches!(arg, "--json" | "-h" | "--help" | "--executables") {
+            return None;
+        }
+        if let Some(style) = arg
+            .strip_prefix("--style=")
+            .or_else(|| arg.strip_prefix("-s="))
+        {
+            if style != "tree" {
+                return None;
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(arg, "-s" | "--style") {
+            if args.get(i + 1).copied() != Some("tree") {
+                return None;
+            }
+            i += 2;
+            continue;
+        }
+        if matches!(arg, "-C" | "--directory") {
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    Some(ToolKind::PubDeps { is_flutter })
+}
+
 // ---------------------------------------------------------------------------
 // Generic text helpers
 // ---------------------------------------------------------------------------
@@ -549,15 +647,20 @@ fn looks_like_json(trimmed: &str) -> bool {
 }
 
 /// Strip ANSI CSI escape sequences so colored tool output parses identically.
-fn strip_ansi(line: &str) -> String {
+/// Returns `Cow::Borrowed` with zero allocation on the common plain-text fast path.
+fn strip_ansi(line: &str) -> Cow<'_, str> {
     if !line.contains('\x1b') {
-        return line.to_owned();
+        return Cow::Borrowed(line);
     }
     let bytes = line.as_bytes();
     let mut out = String::with_capacity(line.len());
     let mut i = 0;
+    let mut seg_start = 0;
     while i < bytes.len() {
         if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'[') {
+            if i > seg_start {
+                out.push_str(&line[seg_start..i]);
+            }
             i += 2;
             while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
                 i += 1;
@@ -565,13 +668,15 @@ fn strip_ansi(line: &str) -> String {
             if i < bytes.len() {
                 i += 1;
             }
+            seg_start = i;
             continue;
         }
-        let ch = line[i..].chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
+        i += 1;
     }
-    out
+    if seg_start < bytes.len() {
+        out.push_str(&line[seg_start..]);
+    }
+    Cow::Owned(out)
 }
 
 /// Parse leading tree gutter (`' '`, `'│'`, `'|'`) + branch connector
@@ -636,7 +741,7 @@ fn utf8_branch_len(s: &str) -> Option<usize> {
 fn ascii_branch_len(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let first = *bytes.first()?;
-    if !matches!(first, b'+' | b'|' | b'`' | b'\\') {
+    if !matches!(first, b'+' | b'|' | b'`' | b'\\' | b'\'') {
         return None;
     }
     let mut dashes = 0usize;
@@ -645,7 +750,8 @@ fn ascii_branch_len(s: &str) -> Option<usize> {
         dashes += 1;
         i += 1;
     }
-    if dashes >= 1 && bytes.get(i) == Some(&b' ') {
+    let min_dashes = if first == b'\'' { 2 } else { 1 };
+    if dashes >= min_dashes && bytes.get(i) == Some(&b' ') {
         Some(i + 1)
     } else {
         None
@@ -2073,11 +2179,15 @@ fn parse_mvn_node(raw: &str, line: usize) -> Option<(TreeNode, Option<String>)> 
         return None;
     }
 
-    let parts: Vec<&str> = s.split(':').collect();
-    let (group, artifact, version, scope) = match parts.as_slice() {
-        [g, a, _pkg, v] => (*g, *a, *v, None),
-        [g, a, _pkg, v, sc] => (*g, *a, *v, Some(*sc)),
-        [g, a, _pkg, _cls, v, sc] => (*g, *a, *v, Some(*sc)),
+    let mut parts = s.split(':');
+    let group = parts.next()?;
+    let artifact = parts.next()?;
+    let _pkg = parts.next()?;
+    let fourth = parts.next()?;
+    let (version, scope) = match (parts.next(), parts.next(), parts.next()) {
+        (None, None, None) => (fourth, None),
+        (Some(sc), None, None) => (fourth, Some(sc)),
+        (Some(v), Some(sc), None) => (v, Some(sc)),
         _ => return None,
     };
     if group.is_empty() || artifact.is_empty() || version.is_empty() {
@@ -2378,17 +2488,15 @@ fn parse_gradle_node(raw: &str, line: usize) -> Option<(TreeNode, Option<String>
         (s, None)
     };
 
-    let parts: Vec<&str> = lhs.split(':').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let group = parts[0].trim();
-    let artifact = parts[1].trim();
+    let mut parts = lhs.split(':');
+    let group = parts.next()?.trim();
+    let artifact = parts.next()?.trim();
     if group.is_empty() || artifact.is_empty() {
         return None;
     }
+    let third = parts.next();
 
-    let (version, requested_version) = match (parts.get(2).copied(), resolved_arrow) {
+    let (version, requested_version) = match (third, resolved_arrow) {
         (Some(req), Some(res)) => {
             let req_clean = req.trim();
             let req_opt = (!req_clean.is_empty() && req_clean != res).then(|| req_clean.to_owned());
@@ -2419,7 +2527,408 @@ fn parse_gradle_node(raw: &str, line: usize) -> Option<(TreeNode, Option<String>
 }
 
 // ---------------------------------------------------------------------------
-// Parser 6: go mod graph
+// Parser 6: dart pub deps / flutter pub deps
+// ---------------------------------------------------------------------------
+
+fn parse_pub_deps(stdout: &str, is_flutter: bool) -> Option<ParsedTree> {
+    let mut nodes: Vec<TreeNode> = Vec::new();
+    let mut roots: Vec<usize> = Vec::new();
+    let mut stack: Vec<(isize, usize)> = Vec::new();
+    let mut active_sections: HashMap<usize, String> = HashMap::new();
+    let mut problems: Vec<ProblemLine> = Vec::new();
+    let mut sdk_headers: Vec<String> = Vec::new();
+    let mut seen_versions: HashMap<String, String> = HashMap::new();
+    let mut seen_expanded: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut pub_section: Option<Option<&'static str>> = None;
+    let mut in_warning_block = false;
+    let mut saw_flutter_sdk = false;
+    let mut tree_lines = 0usize;
+    let mut connector_lines = 0usize;
+    let mut unparsed = 0usize;
+    let mut max_depth = 0usize;
+
+    for (idx, raw) in stdout.lines().enumerate() {
+        if idx >= MAX_LINES {
+            return None;
+        }
+        let line_no = idx + 1;
+        let clean = strip_ansi(raw);
+        let line = clean.trim_end();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            in_warning_block = false;
+            continue;
+        }
+
+        // SDK banners: `Dart SDK 3.5.4`, `Flutter SDK 3.24.5`.
+        if is_pub_sdk_header(trimmed) {
+            in_warning_block = false;
+            if trimmed.starts_with("Flutter SDK ") {
+                saw_flutter_sdk = true;
+            }
+            if !sdk_headers.iter().any(|h| h == trimmed) {
+                sdk_headers.push(trimmed.to_owned());
+            }
+            continue;
+        }
+
+        // Standalone version conflict / override warnings (preserved verbatim).
+        if is_pub_standalone_problem(trimmed) {
+            in_warning_block = trimmed.starts_with("Warning:")
+                || trimmed.starts_with("WARNING:")
+                || trimmed.starts_with("Error:")
+                || trimmed.starts_with("ERROR:")
+                || trimmed.starts_with("Overridden dependencies:")
+                || trimmed.starts_with("Because ")
+                || trimmed.starts_with("So, because ");
+            problems.push(ProblemLine {
+                text: trimmed.to_owned(),
+                line: line_no,
+            });
+            continue;
+        }
+        if in_warning_block
+            && (line.starts_with(' ')
+                || trimmed.starts_with("! ")
+                || trimmed.starts_with("- ")
+                || trimmed.starts_with("* "))
+            && split_tree_prefix(line, false).is_none()
+        {
+            problems.push(ProblemLine {
+                text: trimmed.to_owned(),
+                line: line_no,
+            });
+            continue;
+        }
+        in_warning_block = false;
+
+        // Optional pub section headers (`dependencies:`, `dev dependencies:`, `dependency overrides:`).
+        if !line.starts_with(' ')
+            && let Some(sec) = parse_pub_section(trimmed)
+        {
+            pub_section = Some(sec);
+            continue;
+        }
+
+        // Tree connector line (`├── `, `└── `, `|-- `, `'-- `, `+-- `, `\-- `).
+        if let Some((col, rest)) = split_tree_prefix(line, false) {
+            if stack.is_empty() {
+                unparsed += 1;
+                continue;
+            }
+            if let Some((mut node, inline_prob)) =
+                parse_pub_node(rest.trim(), &seen_versions, line_no)
+            {
+                if let Some(msg) = inline_prob {
+                    problems.push(ProblemLine {
+                        text: msg,
+                        line: line_no,
+                    });
+                }
+                if col == 0
+                    && node.section.is_none()
+                    && let Some(sec) = pub_section
+                {
+                    node.section = sec.map(str::to_owned);
+                }
+                if !node.version.is_empty() {
+                    if !seen_versions.contains_key(node.name.as_str()) {
+                        seen_versions.insert(node.name.clone(), node.version.clone());
+                    }
+                    // Deduplicate repeated expanded transitive subtrees (depth >= 2).
+                    let key_exists = seen_expanded
+                        .get(node.name.as_str())
+                        .is_some_and(|vers| vers.contains(node.version.as_str()));
+                    if col > 0 && !node.deduped && key_exists {
+                        node.deduped = true;
+                    } else if !key_exists {
+                        seen_expanded
+                            .entry(node.name.clone())
+                            .or_default()
+                            .insert(node.version.clone());
+                    }
+                }
+                push_node(
+                    &mut nodes,
+                    &mut roots,
+                    &mut stack,
+                    &mut active_sections,
+                    col as isize,
+                    node,
+                    &mut max_depth,
+                );
+                tree_lines += 1;
+                connector_lines += 1;
+                continue;
+            }
+            unparsed += 1;
+            continue;
+        }
+
+        // Root package line at column 0: `my_app 1.2.0+1`.
+        if !line.starts_with(' ')
+            && let Some((node, inline_prob)) = parse_pub_node(trimmed, &seen_versions, line_no)
+            && !node.version.is_empty()
+            && !node.deduped
+        {
+            if let Some(msg) = inline_prob {
+                problems.push(ProblemLine {
+                    text: msg,
+                    line: line_no,
+                });
+            }
+            stack.clear();
+            active_sections.clear();
+            pub_section = None;
+            push_node(
+                &mut nodes,
+                &mut roots,
+                &mut stack,
+                &mut active_sections,
+                -1,
+                node,
+                &mut max_depth,
+            );
+            tree_lines += 1;
+            continue;
+        }
+
+        unparsed += 1;
+    }
+
+    if roots.is_empty() || connector_lines == 0 {
+        return None;
+    }
+    if sdk_headers.is_empty() && connector_lines < 2 {
+        return None;
+    }
+    if unparsed > (tree_lines / 15).max(2) {
+        return None;
+    }
+
+    let tool_label = if is_flutter || saw_flutter_sdk {
+        "flutter pub deps"
+    } else {
+        "dart pub deps"
+    }
+    .to_owned();
+
+    let project_title = (!sdk_headers.is_empty()).then(|| sdk_headers.join(", "));
+
+    Some(ParsedTree {
+        tool_label,
+        style: DisplayStyle::Pub,
+        roots,
+        nodes,
+        problems,
+        config_roots: false,
+        package_forest: false,
+        project_title,
+        empty_configs: 0,
+        tree_lines,
+        max_depth,
+    })
+}
+
+fn is_pub_sdk_header(trimmed: &str) -> bool {
+    let rest = trimmed
+        .strip_prefix("Dart SDK ")
+        .or_else(|| trimmed.strip_prefix("Flutter SDK "));
+    rest.is_some_and(|v| v.as_bytes().first().is_some_and(u8::is_ascii_digit))
+}
+
+fn is_pub_standalone_problem(trimmed: &str) -> bool {
+    trimmed.starts_with("Warning:")
+        || trimmed.starts_with("WARNING:")
+        || trimmed.starts_with("Error:")
+        || trimmed.starts_with("ERROR:")
+        || trimmed.starts_with("Because ")
+        || trimmed.starts_with("So, because ")
+        || trimmed.starts_with("! ")
+        || trimmed.starts_with("Overridden dependencies:")
+        || trimmed.contains("version solving failed")
+        || (trimmed.starts_with("Note:")
+            && (trimmed.contains("override")
+                || trimmed.contains("pinned")
+                || trimmed.contains("conflict")
+                || trimmed.contains("discontinued")
+                || trimmed.contains("retracted")))
+}
+
+fn parse_pub_section(trimmed: &str) -> Option<Option<&'static str>> {
+    match trimmed {
+        "dependencies:" => Some(None),
+        "dev dependencies:" | "dev_dependencies:" => Some(Some("dev")),
+        "dependency overrides:" | "dependency_overrides:" => Some(Some("override")),
+        "transitive dependencies:" => Some(Some("transitive")),
+        "transitive dev dependencies:" => Some(Some("dev")),
+        _ => None,
+    }
+}
+
+fn parse_pub_node(
+    raw: &str,
+    seen_versions: &HashMap<String, String>,
+    line: usize,
+) -> Option<(TreeNode, Option<String>)> {
+    let mut s = raw.trim();
+    if s.is_empty() || s.contains('\t') {
+        return None;
+    }
+
+    let mut deduped = false;
+    let mut section: Option<String> = None;
+    let mut status_tag: Option<String> = None;
+    let mut problem: Option<String> = None;
+
+    // Leading `! ` marker denotes overridden / pinned / conflicting dependency in pub output.
+    if let Some(after_bang) = s.strip_prefix("! ") {
+        problem = Some(raw.trim().to_owned());
+        status_tag = Some("overridden".to_owned());
+        s = after_bang.trim_start();
+    }
+
+    // Peel trailing parenthetical or bracket annotations from right to left.
+    loop {
+        if let Some(before) = s.strip_suffix(" (*)") {
+            deduped = true;
+            s = before.trim_end();
+        } else if let Some(before) = s.strip_suffix(" [dev]") {
+            section = Some("dev".to_owned());
+            s = before.trim_end();
+        } else if let Some(before) = s.strip_suffix(" (dev)") {
+            section = Some("dev".to_owned());
+            s = before.trim_end();
+        } else if let Some(before) = s.strip_suffix(" [override]") {
+            problem = Some(raw.trim().to_owned());
+            status_tag = Some("overridden".to_owned());
+            s = before.trim_end();
+        } else if s.ends_with(')')
+            && let Some(open) = s.rfind(" (")
+        {
+            let inner = &s[open + 2..s.len() - 1];
+            let lower = inner.to_ascii_lowercase();
+            if lower.contains("overrid") {
+                problem = Some(raw.trim().to_owned());
+                status_tag = Some("overridden".to_owned());
+                s = s[..open].trim_end();
+            } else if lower.contains("conflict") || lower.contains("incompat") {
+                problem = Some(raw.trim().to_owned());
+                status_tag = Some("conflict".to_owned());
+                s = s[..open].trim_end();
+            } else if lower.contains("discontinued") {
+                problem = Some(raw.trim().to_owned());
+                status_tag = Some("discontinued".to_owned());
+                s = s[..open].trim_end();
+            } else if lower.contains("retracted") {
+                problem = Some(raw.trim().to_owned());
+                status_tag = Some("retracted".to_owned());
+                s = s[..open].trim_end();
+            } else if lower.contains("available")
+                || lower.starts_with("from ")
+                || inner.contains('/')
+                || inner.contains('\\')
+            {
+                s = s[..open].trim_end();
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    // Pub's native ellipsis dedup form: `collection...` or `collection ...`.
+    if let Some(before_dots) = s.strip_suffix("...") {
+        let name = before_dots.trim_end();
+        if !is_valid_pub_name(name) {
+            return None;
+        }
+        let version = seen_versions.get(name).cloned().unwrap_or_default();
+        return Some((
+            TreeNode {
+                name: name.to_owned(),
+                version,
+                requested_version: None,
+                section,
+                deduped: true,
+                proc_macro: false,
+                constraint: false,
+                status_tag,
+                workspace_path: None,
+                line,
+                subtree_last_line: line,
+                children: Vec::new(),
+            },
+            problem,
+        ));
+    }
+
+    // Optional version arrow `<name> <req> -> <resolved>`.
+    let (lhs, resolved_arrow) = if let Some((l, r)) = s.split_once(" -> ") {
+        (l.trim(), Some(r.trim()))
+    } else {
+        (s, None)
+    };
+
+    let mut parts = lhs.split_whitespace();
+    let name = parts.next()?;
+    if !is_valid_pub_name(name) {
+        return None;
+    }
+    let ver_tok = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if !is_pub_version(ver_tok) {
+        return None;
+    }
+
+    let (version, requested_version) = match resolved_arrow {
+        Some(res) if is_pub_version(res) => {
+            let req = (ver_tok != res).then(|| ver_tok.to_owned());
+            (res.to_owned(), req)
+        }
+        Some(_) => return None,
+        None => (ver_tok.to_owned(), None),
+    };
+
+    Some((
+        TreeNode {
+            name: name.to_owned(),
+            version,
+            requested_version,
+            section,
+            deduped,
+            proc_macro: false,
+            constraint: false,
+            status_tag,
+            workspace_path: None,
+            line,
+            subtree_last_line: line,
+            children: Vec::new(),
+        },
+        problem,
+    ))
+}
+
+fn is_valid_pub_name(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn is_pub_version(s: &str) -> bool {
+    s.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+}
+
+// ---------------------------------------------------------------------------
+// Parser 7: go mod graph
 // ---------------------------------------------------------------------------
 
 fn parse_go_mod_graph(stdout: &str) -> Option<ParsedGoGraph> {
@@ -2530,7 +3039,7 @@ struct DuplicateEntry {
 
 fn collect_tree_duplicates(tree: &ParsedTree) -> Vec<DuplicateEntry> {
     // Key by normalized package name (PEP 503 for pip, exact otherwise).
-    let mut by_pkg: BTreeMap<String, (String, BTreeMap<String, usize>)> = BTreeMap::new();
+    let mut by_pkg: BTreeMap<Cow<'_, str>, (&str, BTreeMap<&str, usize>)> = BTreeMap::new();
     for (idx, node) in tree.nodes.iter().enumerate() {
         if tree.config_roots && tree.roots.contains(&idx) {
             continue;
@@ -2538,17 +3047,17 @@ fn collect_tree_duplicates(tree: &ParsedTree) -> Vec<DuplicateEntry> {
         if node.version.is_empty() || node.constraint {
             continue;
         }
-        let key = if tree.style == DisplayStyle::Pip {
-            node.name.to_ascii_lowercase().replace('_', "-")
+        let key: Cow<'_, str> = if tree.style == DisplayStyle::Pip {
+            Cow::Owned(node.name.to_ascii_lowercase().replace('_', "-"))
         } else {
-            node.name.clone()
+            Cow::Borrowed(node.name.as_str())
         };
         let entry = by_pkg
             .entry(key)
-            .or_insert_with(|| (node.name.clone(), BTreeMap::new()));
+            .or_insert_with(|| (node.name.as_str(), BTreeMap::new()));
         entry
             .1
-            .entry(node.version.clone())
+            .entry(node.version.as_str())
             .and_modify(|first| *first = (*first).min(node.line))
             .or_insert(node.line);
     }
@@ -2556,10 +3065,13 @@ fn collect_tree_duplicates(tree: &ParsedTree) -> Vec<DuplicateEntry> {
     let mut dups = Vec::new();
     for (_key, (display_name, vers)) in by_pkg {
         if vers.len() >= 2 {
-            let mut list: Vec<(String, usize)> = vers.into_iter().collect();
+            let mut list: Vec<(String, usize)> = vers
+                .into_iter()
+                .map(|(v, line)| (v.to_owned(), line))
+                .collect();
             list.sort_by(|(va, _), (vb, _)| version_cmp(va, vb));
             dups.push(DuplicateEntry {
-                name: display_name,
+                name: display_name.to_owned(),
                 versions: list,
             });
         }
@@ -2658,7 +3170,7 @@ fn format_pkg_ver(name: &str, version: &str, style: DisplayStyle) -> String {
         return name.to_owned();
     }
     match style {
-        DisplayStyle::Cargo => format!("{name} {version}"),
+        DisplayStyle::Cargo | DisplayStyle::Pub => format!("{name} {version}"),
         DisplayStyle::Js => format!("{name}@{version}"),
         DisplayStyle::Pip => format!("{name}=={version}"),
         DisplayStyle::Maven | DisplayStyle::Gradle => format!("{name}:{version}"),
@@ -2667,7 +3179,11 @@ fn format_pkg_ver(name: &str, version: &str, style: DisplayStyle) -> String {
 
 fn format_direct_node_label(node: &TreeNode, style: DisplayStyle) -> String {
     let mut s = if let Some(req) = &node.requested_version {
-        format!("{}:{req} -> {}", node.name, node.version)
+        if style == DisplayStyle::Pub {
+            format!("{} {req} -> {}", node.name, node.version)
+        } else {
+            format!("{}:{req} -> {}", node.name, node.version)
+        }
     } else {
         format_pkg_ver(&node.name, &node.version, style)
     };
@@ -2691,6 +3207,7 @@ fn format_direct_node_label(node: &TreeNode, style: DisplayStyle) -> String {
     if node.deduped {
         match style {
             DisplayStyle::Js => s.push_str(" (deduped)"),
+            DisplayStyle::Pub => s.push_str(" (...)"),
             _ => s.push_str(" (*)"),
         }
     }
@@ -2753,22 +3270,80 @@ fn collect_shared_hubs(tree: &ParsedTree) -> Vec<(String, usize)> {
         .collect()
 }
 
+/// Collect repeated Dart/Flutter pub subtrees with exact first-definition `[stdout:A-B]` refs.
+fn collect_pub_repeated_subtrees(tree: &ParsedTree) -> Vec<(String, usize, usize, usize)> {
+    struct SubtreeStat {
+        count: usize,
+        has_children: bool,
+        first_line: usize,
+        last_line: usize,
+    }
+    let mut stats: HashMap<(&str, &str), SubtreeStat> = HashMap::new();
+    for (idx, n) in tree.nodes.iter().enumerate() {
+        if tree.roots.contains(&idx)
+            || n.status_tag.as_deref() == Some("problem")
+            || n.name.is_empty()
+        {
+            continue;
+        }
+        let has_children = !n.children.is_empty();
+        stats
+            .entry((n.name.as_str(), n.version.as_str()))
+            .and_modify(|st| {
+                st.count += 1;
+                if has_children && !st.has_children {
+                    st.has_children = true;
+                    st.first_line = n.line;
+                    st.last_line = n.subtree_last_line;
+                }
+            })
+            .or_insert(SubtreeStat {
+                count: 1,
+                has_children,
+                first_line: n.line,
+                last_line: n.subtree_last_line,
+            });
+    }
+    let mut repeated: Vec<((&str, &str), SubtreeStat)> = stats
+        .into_iter()
+        .filter(|(_, st)| (st.has_children && st.count >= 2) || st.count >= 3)
+        .collect();
+    repeated.sort_by(|(ka, sa), (kb, sb)| {
+        sb.has_children
+            .cmp(&sa.has_children)
+            .then_with(|| sb.count.cmp(&sa.count))
+            .then_with(|| ka.cmp(kb))
+    });
+    repeated
+        .into_iter()
+        .take(5)
+        .map(|((name, ver), st)| {
+            (
+                format_pkg_ver(name, ver, tree.style),
+                st.count,
+                st.first_line,
+                st.last_line,
+            )
+        })
+        .collect()
+}
+
 /// Collect Gradle `requested -> resolved` conflict upgrades across the entire tree
 /// (including deep transitive nodes) so none are hidden when subtrees fold.
 fn collect_version_resolutions(tree: &ParsedTree) -> Vec<(String, String, String, usize)> {
-    let mut seen: BTreeMap<(String, String, String), usize> = BTreeMap::new();
+    let mut seen: BTreeMap<(&str, &str, &str), usize> = BTreeMap::new();
     for n in &tree.nodes {
         if let Some(req) = &n.requested_version
             && !n.version.is_empty()
             && req != &n.version
         {
-            seen.entry((n.name.clone(), req.clone(), n.version.clone()))
+            seen.entry((n.name.as_str(), req.as_str(), n.version.as_str()))
                 .and_modify(|first| *first = (*first).min(n.line))
                 .or_insert(n.line);
         }
     }
     seen.into_iter()
-        .map(|((name, req, res), line)| (name, req, res, line))
+        .map(|((name, req, res), line)| (name.to_owned(), req.to_owned(), res.to_owned(), line))
         .collect()
 }
 
@@ -2780,7 +3355,6 @@ fn render_forward_tree(tree: &ParsedTree, raw_len: usize, budget: usize) -> Opti
     let unique_pkgs = collect_unique_packages(tree);
     let deduped = count_deduped_nodes(tree);
     let dups = collect_tree_duplicates(tree);
-    let hubs = collect_shared_hubs(tree);
     let resolutions = if tree.style == DisplayStyle::Gradle {
         collect_version_resolutions(tree)
     } else {
@@ -2792,14 +3366,28 @@ fn render_forward_tree(tree: &ParsedTree, raw_len: usize, budget: usize) -> Opti
     let dups_multi = format_duplicates_multiline(&dups);
     let dups_inline = format_duplicates_inline(&dups);
     let resolutions_block = format_resolutions(&resolutions);
-    let hubs_line = if hubs.is_empty() {
-        String::new()
+    let hubs_line = if tree.style == DisplayStyle::Pub {
+        let repeated = collect_pub_repeated_subtrees(tree);
+        if repeated.is_empty() {
+            String::new()
+        } else {
+            let items: Vec<String> = repeated
+                .iter()
+                .map(|(lbl, c, first, last)| format!("{lbl} (×{c}) {}", stdout_ref(*first, *last)))
+                .collect();
+            format!("repeated subtrees: {}\n", items.join(", "))
+        }
     } else {
-        let items: Vec<String> = hubs
-            .iter()
-            .map(|(lbl, c)| format!("{lbl} (×{c})"))
-            .collect();
-        format!("shared hubs: {}\n", items.join(", "))
+        let hubs = collect_shared_hubs(tree);
+        if hubs.is_empty() {
+            String::new()
+        } else {
+            let items: Vec<String> = hubs
+                .iter()
+                .map(|(lbl, c)| format!("{lbl} (×{c})"))
+                .collect();
+            format!("shared hubs: {}\n", items.join(", "))
+        }
     };
 
     let direct_lines = build_forward_direct_lines(tree);
@@ -2906,6 +3494,12 @@ fn build_forward_header(tree: &ParsedTree, unique_pkgs: usize, deduped: usize) -
     if tree.roots.len() == 1 {
         let root = &tree.nodes[tree.roots[0]];
         let root_lbl = format_pkg_ver(&root.name, &root.version, tree.style);
+        if let Some(meta) = &tree.project_title {
+            return format!(
+                "{}: {root_lbl} ({meta}) · {unique_pkgs} unique packages ({tail})\n",
+                tree.tool_label
+            );
+        }
         return format!(
             "{}: {root_lbl} · {unique_pkgs} unique packages ({tail})\n",
             tree.tool_label
@@ -5009,5 +5603,169 @@ cli v0.1.0 (/ws/crates/cli)
             gradle_out.len()
         );
         assert!(gradle_pct > 85.0);
+    }
+
+    #[test]
+    fn dart_and_flutter_pub_deps_dedup_unicode_ascii_warnings_and_byte_reduction() {
+        // 1. Realistic Flutter SDK 3.x Unicode tree with repeated expanded transitive subtrees,
+        //    native `...` references, ANSI color codes, and version override/conflict warnings.
+        let mut flutter_lines: Vec<String> = vec![
+            "\x1b[1mDart SDK 3.5.4\x1b[0m".to_owned(),
+            "\x1b[1mFlutter SDK 3.24.5\x1b[0m".to_owned(),
+            "shop_mobile 2.4.0+18".to_owned(),
+            "Warning: You are using these overridden dependencies:".to_owned(),
+            "! intl 0.19.0 (overridden from ^0.18.1)".to_owned(),
+        ];
+        let direct_pkgs = [
+            ("cupertino_icons", "1.0.8", false),
+            ("dio", "5.7.0", true),
+            ("flutter", "0.0.0", true),
+            ("go_router", "14.3.0", true),
+            ("http", "1.2.2", true),
+            ("intl", "0.19.0 (overridden)", false),
+            ("riverpod", "2.6.1", true),
+            ("sentry_flutter", "8.9.0", true),
+        ];
+        for (idx, &(pkg, ver, has_sub)) in direct_pkgs.iter().enumerate() {
+            let last_root = idx + 1 == direct_pkgs.len();
+            let conn = if last_root { "└──" } else { "├──" };
+            let bar = if last_root { " " } else { "│" };
+            flutter_lines.push(format!("{conn} \x1b[32m{pkg}\x1b[0m {ver}"));
+            if has_sub {
+                flutter_lines.push(format!("{bar}   ├── http_parser 4.0.2"));
+                flutter_lines.push(format!("{bar}   │   ├── collection 1.18.0"));
+                flutter_lines.push(format!("{bar}   │   ├── source_span 1.10.0"));
+                flutter_lines.push(format!("{bar}   │   │   ├── collection..."));
+                flutter_lines.push(format!("{bar}   │   │   ├── path 1.9.0"));
+                flutter_lines.push(format!("{bar}   │   │   └── term_glyph 1.2.1"));
+                flutter_lines.push(format!("{bar}   │   ├── string_scanner 1.2.0"));
+                flutter_lines.push(format!("{bar}   │   │   └── source_span..."));
+                flutter_lines.push(format!("{bar}   │   └── typed_data 1.3.2"));
+                flutter_lines.push(format!("{bar}   │       └── collection..."));
+                flutter_lines.push(format!("{bar}   ├── meta 1.15.0"));
+                flutter_lines.push(format!("{bar}   └── async 2.11.0"));
+                flutter_lines.push(format!("{bar}       └── collection..."));
+            }
+        }
+        let flutter_raw = flutter_lines.join("\n") + "\n";
+
+        assert!(is_supported(&["flutter", "pub", "deps"]));
+        assert!(is_supported(&["dart", "pub", "deps", "--no-dev"]));
+        assert!(is_supported(&["dart", "pub", "deps", "--style=tree"]));
+        assert!(!is_supported(&["dart", "pub", "deps", "--json"]));
+        assert!(!is_supported(&[
+            "flutter",
+            "pub",
+            "deps",
+            "--style=compact"
+        ]));
+        assert!(!is_supported(&["flutter", "pub", "deps", "-s", "list"]));
+        assert!(!is_supported(&["dart", "pub", "deps", "--executables"]));
+        assert!(!is_supported(&["dart", "pub", "get"]));
+
+        let out = format_words(&["flutter", "pub", "deps"], &flutter_raw, 4000)
+            .expect("flutter pub deps should compact");
+        let reduction_pct = 100.0 * (1.0 - out.len() as f64 / flutter_raw.len() as f64);
+        println!(
+            "MEASURED flutter pub deps ({}L): {} -> {} B ({reduction_pct:.1}%)",
+            flutter_lines.len(),
+            flutter_raw.len(),
+            out.len()
+        );
+        assert!(
+            reduction_pct > 65.0,
+            "expected >65% byte reduction (raw={}, out={}):\n{out}",
+            flutter_raw.len(),
+            out.len()
+        );
+        assert!(
+            out.starts_with(
+                "flutter pub deps: shop_mobile 2.4.0+18 (Dart SDK 3.5.4, Flutter SDK 3.24.5)"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("deduped)"), "{out}");
+        // Override warnings preserved verbatim at the top with exact [stdout:L] pointers.
+        assert!(
+            out.contains("Warning: You are using these overridden dependencies: [stdout:4]"),
+            "{out}"
+        );
+        assert!(
+            out.contains("! intl 0.19.0 (overridden from ^0.18.1) [stdout:5]"),
+            "{out}"
+        );
+        assert!(out.contains("intl 0.19.0 (overridden) [stdout:"), "{out}");
+        // Direct dependencies preserved with exact [stdout:A-B] line ranges.
+        assert!(out.contains("cupertino_icons 1.0.8 [stdout:6]"), "{out}");
+        assert!(
+            out.contains("dio 5.7.0 (+9 transitive) [stdout:7-20]"),
+            "{out}"
+        );
+        assert!(out.contains("intl 0.19.0 [overridden] [stdout:"), "{out}");
+        assert!(
+            out.contains("repeated subtrees:")
+                && out.contains("http_parser 4.0.2 (×6) [stdout:8-17]"),
+            "{out}"
+        );
+        // Zero-alloc ANSI fast path check on plain vs colored lines.
+        assert!(matches!(strip_ansi("├── dio 5.7.0"), Cow::Borrowed(_)));
+        assert!(matches!(
+            strip_ansi("├── \x1b[32mdio\x1b[0m 5.7.0"),
+            Cow::Owned(_)
+        ));
+
+        // 2. Dart SDK 3.x ASCII `|-- ` / `'-- ` tree with repeated subtrees.
+        let ascii_raw = "\
+Dart SDK 3.5.4
+cli_tool 0.4.2
+|-- args 2.5.0
+|-- shelf 1.4.2
+|   |-- async 2.11.0
+|   |   '-- collection 1.18.0
+|   |-- http_parser 4.0.2
+|   |   |-- collection 1.18.0
+|   |   |-- source_span 1.10.0
+|   |   |   |-- path 1.9.0
+|   |   |   '-- term_glyph 1.2.1
+|   |   '-- typed_data 1.3.2
+|   '-- stream_channel 2.1.2
+|       '-- async 2.11.0
+|           '-- collection 1.18.0
+'-- shelf_router 1.1.4
+    |-- http_methods 1.1.1
+    |-- meta 1.15.0
+    '-- shelf 1.4.2
+        |-- async 2.11.0
+        |   '-- collection 1.18.0
+        |-- http_parser 4.0.2
+        |   |-- collection 1.18.0
+        |   |-- source_span 1.10.0
+        |   |   |-- path 1.9.0
+        |   |   '-- term_glyph 1.2.1
+        |   '-- typed_data 1.3.2
+        '-- stream_channel 2.1.2
+            '-- async 2.11.0
+                '-- collection 1.18.0
+";
+        let ascii_out = format_words(&["dart", "pub", "deps"], ascii_raw, 4000)
+            .expect("ASCII dart pub deps should compact");
+        assert!(ascii_out.len() < ascii_raw.len(), "{ascii_out}");
+        assert!(
+            ascii_out.starts_with("dart pub deps: cli_tool 0.4.2 (Dart SDK 3.5.4)"),
+            "{ascii_out}"
+        );
+        assert!(ascii_out.contains("args 2.5.0 [stdout:3]"), "{ascii_out}");
+        assert!(
+            ascii_out.contains("shelf 1.4.2 (+8 transitive) [stdout:4-15]"),
+            "{ascii_out}"
+        );
+        assert!(
+            ascii_out.contains("shelf_router 1.1.4 (+11 transitive) [stdout:16-30]"),
+            "{ascii_out}"
+        );
+        assert!(
+            ascii_out.contains("http_parser 4.0.2 (×2) [stdout:7-12]"),
+            "{ascii_out}"
+        );
     }
 }

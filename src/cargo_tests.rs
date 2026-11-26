@@ -10,6 +10,7 @@
 //! blocks, each block with one result whose counts add up to its `running N
 //! tests`. Captured test output can hold lines that look like these, so any
 //! mismatch leaves the ordinary test report.
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::LazyLock;
 
@@ -111,6 +112,11 @@ static HEX_ADDR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b0x[0-9a-f]{8,}\b").expect("hex address pattern"));
 static THREAD_PANIC_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^thread '[^']*'(?: \(\d+\))? panicked at ").expect("thread panic prefix")
+});
+/// Rust source location (`path/to/file.rs:line` or `path/to/file.rs:line:col`).
+static RUST_LOC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[\s,'(\x22])(?:\./)?([^\s,'()\x22]+?\.rs:\d+(?::\d+)?)")
+        .expect("rust location pattern")
 });
 
 /// Lines of other stream text kept in a report: the first ones and the
@@ -224,20 +230,25 @@ impl Other {
     fn observe(&mut self, line: &str, n: usize) {
         let ordinal = self.range.count;
         self.range.add(n);
-        let text = short(line.trim_end(), 200);
+        let trimmed_end = line.trim_end();
         // A warning or error and the `-->` line that locates it, not the `= note:`
         // and source lines that quote a lint's name.
-        let trimmed = line.trim_start();
+        let trimmed = trimmed_end.trim_start();
         let diagnostic = trimmed.starts_with("--> ")
             || crate::filters::diagnostic(line) && !trimmed.starts_with(['=', '|']);
+        let clipped = short_slice(trimmed_end, 200);
         if self.kept.len() < KEPT_LINES && self.diagnostics == 0
             || diagnostic && self.diagnostics < KEPT_DIAGNOSTICS
         {
             self.diagnostics += usize::from(diagnostic);
-            self.kept.push((ordinal, text));
+            self.kept.push((ordinal, clipped.to_owned()));
             self.last = None;
+        } else if let Some((slot_ord, slot_buf)) = self.last.as_mut() {
+            *slot_ord = ordinal;
+            slot_buf.clear();
+            slot_buf.push_str(clipped);
         } else {
-            self.last = Some((ordinal, text));
+            self.last = Some((ordinal, clipped.to_owned()));
         }
     }
 
@@ -482,12 +493,27 @@ struct CargoFailure {
     first: usize,
     last: usize,
     detail_lines: Vec<String>,
+    panic_loc: Option<String>,
+    has_workspace_loc: bool,
+    in_backtrace: bool,
     saw_panic: bool,
 }
 
 impl CargoFailure {
     fn detail(&self) -> String {
-        short(&self.detail_lines.join(" "), 440)
+        let mut joined = self.detail_lines.join(" ");
+        if let Some(loc) = &self.panic_loc
+            && !joined.contains(loc.as_str())
+        {
+            if !joined.is_empty() {
+                joined.push_str(" (at ");
+                joined.push_str(loc);
+                joined.push(')');
+            } else {
+                joined.push_str(loc);
+            }
+        }
+        short_preserving_loc(&joined, 440, self.panic_loc.as_deref())
     }
 
     fn normalized_key(&self) -> String {
@@ -507,6 +533,9 @@ struct NextestFailure {
     first: usize,
     last: usize,
     excerpt: Vec<String>,
+    panic_loc: Option<String>,
+    has_workspace_loc: bool,
+    in_backtrace: bool,
     saw_panic: bool,
     stopped: bool,
 }
@@ -515,18 +544,30 @@ impl NextestFailure {
     fn render_single(&self) -> String {
         let range = format_range(self.stream.name(), self.first, self.last);
         let mut block = format!("{} {} [{range}]", self.kind, self.name);
+        let mut has_loc = false;
         for line in &self.excerpt {
+            if let Some(loc) = &self.panic_loc
+                && line.contains(loc.as_str())
+            {
+                has_loc = true;
+            }
             block.push_str("\n  ");
             block.push_str(line);
+        }
+        if let Some(loc) = &self.panic_loc
+            && !has_loc
+        {
+            block.push_str("\n  at ");
+            block.push_str(loc);
         }
         block
     }
 
     fn normalized_key(&self) -> String {
-        if self.excerpt.is_empty() {
+        if self.excerpt.is_empty() && self.panic_loc.is_none() {
             return String::new();
         }
-        let joined = self
+        let mut joined = self
             .excerpt
             .iter()
             .enumerate()
@@ -541,6 +582,15 @@ impl NextestFailure {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        if let Some(loc) = &self.panic_loc
+            && !joined.contains(loc.as_str())
+        {
+            if !joined.is_empty() {
+                joined.push('\n');
+            }
+            joined.push_str("at ");
+            joined.push_str(loc);
+        }
         format!("{}\n{}", self.kind, normalize_root_cause(&joined))
     }
 }
@@ -618,7 +668,11 @@ impl Scan {
             let pos = self
                 .cargo_failures
                 .iter()
-                .rposition(|f| f.block == block && f.name == name_short)
+                .rposition(|f| {
+                    f.block == block
+                        && (f.name == name_short
+                            || f.name.strip_suffix(" - compile") == Some(name_short.as_str()))
+                })
                 .unwrap_or_else(|| {
                     self.cargo_failures.push(CargoFailure {
                         block,
@@ -627,6 +681,9 @@ impl Scan {
                         first: n,
                         last: n,
                         detail_lines: Vec::new(),
+                        panic_loc: None,
+                        has_workspace_loc: false,
+                        in_backtrace: false,
                         saw_panic: false,
                     });
                     self.cargo_failures.len() - 1
@@ -641,10 +698,19 @@ impl Scan {
         let failure = &mut self.cargo_failures[pos];
         let mut captured_msg = false;
         if self.panic_lines > 0 {
-            if trimmed.starts_with("note:") || trimmed.starts_with("stack backtrace:") {
+            if trimmed.starts_with("stack backtrace:") {
+                self.panic_lines = 0;
+                failure.in_backtrace = true;
+            } else if trimmed.starts_with("note:") {
                 self.panic_lines = 0;
             } else {
-                failure.detail_lines.push(short(trimmed, 200));
+                let loc = extract_rust_location(trimmed);
+                if let Some(l) = loc {
+                    record_rust_loc(&mut failure.panic_loc, &mut failure.has_workspace_loc, l);
+                }
+                failure
+                    .detail_lines
+                    .push(short_preserving_loc(trimmed, 200, loc));
                 failure.last = n;
                 self.panic_lines -= 1;
                 captured_msg = true;
@@ -654,8 +720,15 @@ impl Scan {
             failure.first = n;
             failure.last = n;
             failure.saw_panic = true;
+            failure.in_backtrace = false;
             failure.detail_lines.clear();
-            failure.detail_lines.push(short(location, 200));
+            let loc = extract_rust_location(location);
+            if let Some(l) = loc {
+                record_rust_loc(&mut failure.panic_loc, &mut failure.has_workspace_loc, l);
+            }
+            failure
+                .detail_lines
+                .push(short_preserving_loc(location, 200, loc));
             self.panic_lines = if location.ends_with(':')
                 || (location.starts_with('\'') && !location.contains("', "))
             {
@@ -663,6 +736,19 @@ impl Scan {
             } else {
                 0
             };
+        } else if trimmed.starts_with("stack backtrace:") {
+            self.panic_lines = 0;
+            failure.in_backtrace = true;
+        } else if failure.in_backtrace {
+            // Scan `RUST_BACKTRACE=1` frames only to recover the first workspace `src/...:line:col`
+            // location when the panic itself occurred in std/core/alloc.
+            if !failure.has_workspace_loc
+                && trimmed.starts_with("at ")
+                && let Some(loc) = extract_rust_location(trimmed)
+                && is_workspace_rust_loc(loc)
+            {
+                record_rust_loc(&mut failure.panic_loc, &mut failure.has_workspace_loc, loc);
+            }
         } else if !captured_msg
             && failure.saw_panic
             && (trimmed.starts_with("assertion ")
@@ -672,18 +758,38 @@ impl Scan {
         {
             failure.detail_lines.push(short(trimmed, 200));
             failure.last = n;
-        } else if !failure.saw_panic
-            && failure.detail_lines.is_empty()
-            && trimmed.starts_with("Error: ")
-        {
-            failure.first = n;
-            failure.last = n;
-            failure.detail_lines.push(short(trimmed, 200));
+        } else if !failure.saw_panic && failure.detail_lines.len() < 3 {
+            if trimmed.starts_with("Error: ")
+                || (RUST_DIAG_HEADER.is_match(trimmed) && trimmed.starts_with("error"))
+            {
+                if failure.detail_lines.is_empty() {
+                    failure.first = n;
+                }
+                failure.last = n;
+                let loc = extract_rust_location(trimmed);
+                if let Some(l) = loc {
+                    record_rust_loc(&mut failure.panic_loc, &mut failure.has_workspace_loc, l);
+                }
+                failure
+                    .detail_lines
+                    .push(short_preserving_loc(trimmed, 200, loc));
+            } else if !failure.detail_lines.is_empty()
+                && let Some(cap) = RUST_ARROW.captures(trimmed)
+            {
+                let loc = match cap.get(3) {
+                    Some(col) => format!("{}:{}:{}", &cap[1], &cap[2], col.as_str()),
+                    None => format!("{}:{}", &cap[1], &cap[2]),
+                };
+                record_rust_loc(&mut failure.panic_loc, &mut failure.has_workspace_loc, &loc);
+                failure.last = n;
+            }
         }
     }
 
     /// Read one line, without its line break, of `stream`.
     pub fn observe(&mut self, line: &str, n: usize, stream: Stream) {
+        let clean = strip_ansi(line.trim_end_matches(['\n', '\r']));
+        let line = clean.as_ref();
         if self.nextest.enabled {
             self.observe_nextest(line, n, stream);
             return;
@@ -691,7 +797,6 @@ impl Scan {
         if self.broken {
             return;
         }
-        let line = line.trim_end_matches(['\n', '\r']);
         let index = stream as usize;
         if line.trim().is_empty() {
             self.diag[index].observe_blank();
@@ -806,6 +911,9 @@ impl Scan {
                         first: n,
                         last: n,
                         detail_lines: Vec::new(),
+                        panic_loc: None,
+                        has_workspace_loc: false,
+                        in_backtrace: false,
                         saw_panic: false,
                     });
                 }
@@ -837,7 +945,6 @@ impl Scan {
     }
 
     fn observe_nextest(&mut self, line: &str, n: usize, stream: Stream) {
-        let line = line.trim_end_matches(['\n', '\r']);
         let trimmed = line.trim();
         let index = stream as usize;
         if trimmed.is_empty() {
@@ -881,11 +988,19 @@ impl Scan {
                         first: n,
                         last: n,
                         excerpt: Vec::new(),
+                        panic_loc: None,
+                        has_workspace_loc: false,
+                        in_backtrace: false,
                         saw_panic: false,
                         stopped: false,
                     });
                     self.nextest.failures.len() - 1
                 });
+            // A `note:` inside STDOUT must never block capturing the actual panic in STDERR.
+            if !self.nextest.failures[pos].saw_panic {
+                self.nextest.failures[pos].stopped = false;
+                self.nextest.failures[pos].in_backtrace = false;
+            }
             self.nextest.in_output = true;
             self.nextest.current = Some((pos, stream));
             return;
@@ -902,6 +1017,9 @@ impl Scan {
                     first: n,
                     last: n,
                     excerpt: Vec::new(),
+                    panic_loc: None,
+                    has_workspace_loc: false,
+                    in_backtrace: false,
                     saw_panic: false,
                     stopped: false,
                 });
@@ -928,20 +1046,47 @@ impl Scan {
             && cur_stream == stream
         {
             let failure = &mut self.nextest.failures[pos];
-            if !failure.stopped {
-                if trimmed.starts_with("note:") || trimmed.starts_with("stack backtrace:") {
+            if let Some((_, location)) = trimmed.split_once(" panicked at ") {
+                failure.saw_panic = true;
+                failure.stopped = false;
+                failure.in_backtrace = false;
+                failure.first = n;
+                failure.last = n;
+                failure.excerpt.clear();
+                let loc = extract_rust_location(location);
+                if let Some(l) = loc {
+                    record_rust_loc(&mut failure.panic_loc, &mut failure.has_workspace_loc, l);
+                }
+                failure
+                    .excerpt
+                    .push(short_preserving_loc(trimmed, 200, loc));
+            } else if failure.in_backtrace {
+                // Recover first workspace `src/...:line:col` frame from `RUST_BACKTRACE=1`
+                // without dumping backtrace noise into the excerpt.
+                if !failure.has_workspace_loc
+                    && trimmed.starts_with("at ")
+                    && let Some(loc) = extract_rust_location(trimmed)
+                    && is_workspace_rust_loc(loc)
+                {
+                    record_rust_loc(&mut failure.panic_loc, &mut failure.has_workspace_loc, loc);
+                }
+            } else if !failure.stopped {
+                if trimmed.starts_with("stack backtrace:") {
                     failure.stopped = true;
-                } else if trimmed.contains(" panicked at ") {
-                    failure.saw_panic = true;
-                    failure.first = n;
-                    failure.last = n;
-                    failure.excerpt.clear();
-                    failure.excerpt.push(short(trimmed, 200));
+                    failure.in_backtrace = true;
+                } else if trimmed.starts_with("note:") {
+                    failure.stopped = true;
                 } else if failure.excerpt.len() < 6
                     && (failure.saw_panic || failure.excerpt.len() < 3)
                 {
+                    let loc = extract_rust_location(trimmed);
+                    if let Some(l) = loc {
+                        record_rust_loc(&mut failure.panic_loc, &mut failure.has_workspace_loc, l);
+                    }
                     failure.last = n;
-                    failure.excerpt.push(short(trimmed, 200));
+                    failure
+                        .excerpt
+                        .push(short_preserving_loc(trimmed, 200, loc));
                 }
             }
             return;
@@ -1070,6 +1215,73 @@ impl Scan {
             failure_count,
         })
     }
+}
+
+/// Strip ANSI escape sequences only when an ESC byte is present (zero-alloc fast path).
+fn strip_ansi(line: &str) -> Cow<'_, str> {
+    if !line.contains('\x1b') {
+        return Cow::Borrowed(line);
+    }
+    crate::capture::ANSI.replace_all(line, "")
+}
+
+fn short_slice(s: &str, len: usize) -> &str {
+    &s[..s.floor_char_boundary(s.len().min(len))]
+}
+
+fn extract_rust_location(text: &str) -> Option<&str> {
+    RUST_LOC
+        .captures(text)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str())
+}
+
+fn is_workspace_rust_loc(loc: &str) -> bool {
+    !(loc.starts_with("/rustc/")
+        || loc.contains("/.cargo/registry/")
+        || loc.contains("\\.cargo\\registry\\")
+        || loc.contains("/.rustup/")
+        || loc.starts_with("library/core/")
+        || loc.starts_with("library/std/")
+        || loc.starts_with("library/alloc/")
+        || loc.contains("/library/core/src/")
+        || loc.contains("/library/std/src/")
+        || loc.contains("/library/alloc/src/"))
+}
+
+fn record_rust_loc(slot: &mut Option<String>, has_workspace: &mut bool, loc: &str) {
+    let ws = is_workspace_rust_loc(loc);
+    if !*has_workspace && (ws || slot.is_none()) {
+        *slot = Some(loc.to_owned());
+        if ws {
+            *has_workspace = true;
+        }
+    }
+}
+
+/// Truncate `text` to at most `limit` UTF-8 bytes while pinning `loc` (`src/...:line:col`)
+/// so panic locations are never lost even under tight per-line or per-failure budgets.
+fn short_preserving_loc(text: &str, limit: usize, loc: Option<&str>) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let Some(loc) = loc.filter(|l| !l.is_empty()) else {
+        return short(text, limit);
+    };
+    let truncated = short(text, limit);
+    if truncated.contains(loc) {
+        return truncated;
+    }
+    if loc.len() >= limit {
+        return short(loc, limit);
+    }
+    let sep = " … ";
+    let head_budget = limit.saturating_sub(loc.len() + sep.len());
+    if head_budget < 8 {
+        return loc.to_owned();
+    }
+    let head = short_slice(text, head_budget).trim_end();
+    format!("{head}{sep}{loc}")
 }
 
 fn format_range(stream: &str, first: usize, last: usize) -> String {
@@ -1212,9 +1424,21 @@ fn group_nextest_failures(failures: &[NextestFailure]) -> Vec<String> {
             rep.kind,
             rep.name
         );
+        let mut has_loc = false;
         for line in &rep.excerpt {
+            if let Some(loc) = &rep.panic_loc
+                && line.contains(loc.as_str())
+            {
+                has_loc = true;
+            }
             block.push_str("\n  ");
             block.push_str(line);
+        }
+        if let Some(loc) = &rep.panic_loc
+            && !has_loc
+        {
+            block.push_str("\n  at ");
+            block.push_str(loc);
         }
         for item in &items[1..] {
             let range = format_range(item.stream.name(), item.first, item.last);
@@ -1378,14 +1602,16 @@ impl Totals {
     }
 }
 
-/// The number before `word` in `passed; 2 failed; 1 ignored`.
+/// The number before `word` in `passed; 2 failed; 1 ignored` (zero-alloc scan).
 fn count_before(line: &str, word: &str) -> Option<usize> {
-    let words: Vec<&str> = line.split_whitespace().collect();
-    words.windows(2).find_map(|pair| {
-        (pair[1].trim_end_matches([',', ';']) == word)
-            .then(|| pair[0].parse().ok())
-            .flatten()
-    })
+    let mut prev: Option<&str> = None;
+    for tok in line.split_whitespace() {
+        if tok.trim_end_matches([',', ';']) == word {
+            return prev.and_then(|p| p.parse().ok());
+        }
+        prev = Some(tok);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2007,6 +2233,143 @@ mod tests {
         assert_ne!(
             normalize_root_cause("failed at /tmp/fixed_a/out.txt"),
             normalize_root_cause("failed at /tmp/fixed_b/out.txt")
+        );
+    }
+
+    #[test]
+    fn nextest_doctest_and_backtrace_panics_pin_source_location_with_ansi_parity() {
+        // Zero-alloc ANSI fast path check.
+        assert!(matches!(strip_ansi("running 3 tests"), Cow::Borrowed(_)));
+        assert!(matches!(
+            strip_ansi("\x1b[31mFAILED\x1b[0m"),
+            Cow::Owned(ref s) if s == "FAILED"
+        ));
+
+        // Tight-budget location pinning never truncates away `src/...:line:col`.
+        let long_single_line = format!(
+            "'{}', src/config/loader.rs:88:17",
+            "expected valid schema field ".repeat(12)
+        );
+        let pinned = short_preserving_loc(
+            &long_single_line,
+            120,
+            extract_rust_location(&long_single_line),
+        );
+        assert!(pinned.len() <= 120, "len={}: {pinned}", pinned.len());
+        assert!(
+            pinned.contains("src/config/loader.rs:88:17"),
+            "panic location must survive tight cap: {pinned}"
+        );
+
+        // 1. `cargo nextest run` with ANSI colors, `note:` in STDOUT before STDERR panic,
+        //    `RUST_BACKTRACE=1` where panic site is in `library/core` and workspace site is in backtrace,
+        //    plus a second failure with an oversized single-line panic message.
+        let build_nx = |colored: bool| -> String {
+            let (red, bold, reset) = if colored {
+                ("\x1b[31m", "\x1b[1m", "\x1b[0m")
+            } else {
+                ("", "", "")
+            };
+            format!(
+                "    Starting 4 tests across 1 binary\n\
+                 {red}        FAIL{reset} [   0.025s] billing::engine calculates_tax\n\
+                 --- STDOUT:              billing::engine calculates_tax ---\n\
+                 note: using synthetic fixture catalog\n\
+                 --- STDERR:              billing::engine calculates_tax ---\n\
+                 {bold}thread 'engine::calculates_tax' panicked at /rustc/abcdef/library/core/src/panicking.rs:220:5:{reset}\n\
+                 index out of bounds: the len is 2 but the index is 5\n\
+                 stack backtrace:\n\
+                    0: rust_begin_unwind\n\
+                              at /rustc/abcdef/library/std/src/panicking.rs:665:5\n\
+                    1: core::panicking::panic_bounds_check\n\
+                              at /rustc/abcdef/library/core/src/panicking.rs:280:5\n\
+                    2: billing::engine::tax_bracket\n\
+                              at ./src/engine/billing.rs:142:9\n\
+                    3: billing::engine::tests::calculates_tax\n\
+                              at ./src/engine/billing.rs:310:14\n\
+                 {red}        FAIL{reset} [   0.019s] billing::config loads_schema\n\
+                 --- STDERR:              billing::config loads_schema ---\n\
+                 thread 'workspace::deeply::nested::billing_service::config_loader::loads_schema' panicked at {long_single_line}\n\
+                 stack backtrace:\n\
+                    0: rust_begin_unwind\n\
+                              at /rustc/abcdef/library/std/src/panicking.rs:665:5\n\
+                 ------------\n\
+                      Summary [   0.090s] 4 tests run: 2 passed, 2 failed, 0 skipped\n"
+            )
+        };
+
+        let nx_plain = nextest_totals(&[(&build_nx(false), Stream::Stderr)])
+            .expect("plain nextest totals")
+            .render();
+        let nx_ansi = nextest_totals(&[(&build_nx(true), Stream::Stderr)])
+            .expect("ansi nextest totals")
+            .render();
+        assert_eq!(nx_plain, nx_ansi);
+        assert!(
+            nx_plain.contains("src/engine/billing.rs:142:9"),
+            "workspace frame from RUST_BACKTRACE=1 must be pinned:\n{nx_plain}"
+        );
+        assert!(
+            nx_plain.contains("src/config/loader.rs:88:17"),
+            "long single-line panic location must stay pinned:\n{nx_plain}"
+        );
+        assert!(
+            !nx_plain.contains("rust_begin_unwind"),
+            "backtrace noise must not bloat report:\n{nx_plain}"
+        );
+
+        // 2. Workspace doc-test failures with `RUST_BACKTRACE=1` (two failing doc-tests sharing
+        //    the same root cause with tempdir variance -> grouped with pinned `crates/core/src/lib.rs:30:9`).
+        let doc_out = "\
+\nrunning 2 tests\n\
+test crates/core/src/lib.rs - parse_a (line 20) ... FAILED\n\
+test crates/core/src/lib.rs - parse_b (line 45) ... FAILED\n\
+\nfailures:\n\n\
+---- crates/core/src/lib.rs - parse_a (line 20) stdout ----\n\
+Test executable failed (exit status: 101).\n\n\
+stderr:\n\
+thread 'main' panicked at crates/core/src/lib.rs:30:9:\n\
+failed to load /tmp/.tmpAa11Bb/cfg.toml: invalid header\n\
+stack backtrace:\n\
+   0: rust_begin_unwind\n\
+             at /rustc/abcdef/library/std/src/panicking.rs:665:5\n\
+   1: rust_out::main\n\
+             at ./crates/core/src/lib.rs:30:9\n\n\
+---- crates/core/src/lib.rs - parse_b (line 45) stdout ----\n\
+Test executable failed (exit status: 101).\n\n\
+stderr:\n\
+thread 'main' panicked at crates/core/src/lib.rs:30:9:\n\
+failed to load /tmp/.tmpCc22Dd/cfg.toml: invalid header\n\
+stack backtrace:\n\
+   0: rust_begin_unwind\n\
+             at /rustc/abcdef/library/std/src/panicking.rs:665:5\n\
+   1: rust_out::main\n\
+             at ./crates/core/src/lib.rs:30:9\n\n\
+failures:\n\
+    crates/core/src/lib.rs - parse_a (line 20)\n\
+    crates/core/src/lib.rs - parse_b (line 45)\n\n\
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s\n";
+        let doc_err = "\x1b[1m\x1b[32m   Doc-tests\x1b[0m core\n\
+            \x1b[1m\x1b[31merror\x1b[0m: doctest failed, to rerun pass `-p core --doc`\n";
+
+        let doc_totals = totals(&[(doc_out, Stream::Stdout), (doc_err, Stream::Stderr)])
+            .expect("workspace doc-test totals");
+        let doc_rendered = doc_totals.render();
+        assert!(
+            doc_rendered.contains("2 test(s): crates/core/src/lib.rs - parse_a (line 20)"),
+            "{doc_rendered}"
+        );
+        assert!(
+            doc_rendered.contains("crates/core/src/lib.rs:30:9"),
+            "{doc_rendered}"
+        );
+        assert!(
+            doc_rendered.contains("0 passed, 2 failed  doc-tests core [stdout:"),
+            "{doc_rendered}"
+        );
+        assert!(
+            !doc_rendered.contains("rust_begin_unwind"),
+            "{doc_rendered}"
         );
     }
 }

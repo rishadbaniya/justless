@@ -15,6 +15,7 @@
 //!   error echo, prioritize the failing step's error anchors and actionable tail
 //!   first within `budget`, and collapse prior steps to a single summary line.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -31,14 +32,6 @@ const MAX_WARNING_LINE_BYTES: usize = 220;
 const MAX_WARNINGS_SHOWN: usize = 8;
 const MAX_FAILING_TAIL_LINES: usize = 12;
 const MAX_ANCHOR_AFTER_LINES: usize = 8;
-
-/// BuildKit step line: `#<id> <rest>` (or `#<id>` alone).
-static BK_STEP_LINE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^#(\d+)(?:[ \t](.*))?$").expect("buildkit step line"));
-
-/// BuildKit elapsed-time prefix on step output: `0.423 <text>` or `12.5`.
-static BK_OUTPUT_TS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d+\.\d+)(?: (.*))?$").expect("buildkit output ts"));
 
 /// BuildKit summary banner: `[+] Building 14.3s (16/16) FINISHED ...`.
 static BK_BANNER: LazyLock<Regex> = LazyLock::new(|| {
@@ -615,10 +608,10 @@ enum StepStatus {
 }
 
 #[derive(Clone, Debug)]
-struct StepOutputLine {
+struct StepOutputLine<'a> {
     stream: StreamKind,
     line_no: usize,
-    text: String,
+    text: Cow<'a, str>,
 }
 
 #[derive(Clone, Debug)]
@@ -630,7 +623,7 @@ struct DockerfileSnippet {
 }
 
 #[derive(Clone, Debug)]
-struct Step {
+struct Step<'a> {
     id: u32,
     classic_label: Option<String>,
     header: String,
@@ -638,12 +631,12 @@ struct Step {
     kind: StepKind,
     status: StepStatus,
     range: MultiRange,
-    output: Vec<StepOutputLine>,
+    output: Vec<StepOutputLine<'a>>,
     dockerfile: Option<DockerfileSnippet>,
     order: usize,
 }
 
-impl Step {
+impl Step<'_> {
     fn display_id(&self) -> String {
         if let Some(label) = &self.classic_label {
             label.clone()
@@ -698,10 +691,10 @@ enum BuildFormat {
     Classic,
 }
 
-struct ParsedBuild {
+struct ParsedBuild<'a> {
     format: BuildFormat,
     tool_label: &'static str,
-    steps: Vec<Step>,
+    steps: Vec<Step<'a>>,
     images: Vec<ExportedImage>,
     warnings: Vec<BuildWarning>,
     services: Vec<String>,
@@ -710,7 +703,7 @@ struct ParsedBuild {
     unmatched_dockerfile: Option<DockerfileSnippet>,
 }
 
-impl ParsedBuild {
+impl ParsedBuild<'_> {
     fn has_failure(&self, exit_code: Option<i32>) -> bool {
         exit_code.is_some_and(|c| c != 0)
             || self.steps.iter().any(Step::is_failed)
@@ -718,24 +711,39 @@ impl ParsedBuild {
     }
 }
 
-/// Strip ANSI escape codes and collapse bare `\r` progress overwrites to their
-/// final non-empty frame, without trimming leading spaces from the payload.
-fn clean_line(raw: &str) -> String {
+/// Strip ANSI escape codes (guarded by a zero-alloc fast path when no ESC byte is present)
+/// and collapse bare `\r` progress overwrites to their final non-empty frame without
+/// trimming leading spaces from the payload.
+fn clean_line(raw: &str) -> Cow<'_, str> {
+    if !raw.contains('\x1b') {
+        let trimmed = raw.trim_end_matches('\n');
+        let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
+        if !trimmed.contains('\r') {
+            return Cow::Borrowed(trimmed);
+        }
+        let last = trimmed
+            .rsplit('\r')
+            .find(|f| !f.trim().is_empty())
+            .unwrap_or_else(|| trimmed.rsplit('\r').next().unwrap_or(trimmed));
+        return Cow::Borrowed(last);
+    }
     let no_ansi = crate::capture::ANSI.replace_all(raw, "");
     let trimmed = no_ansi.trim_end_matches('\n');
     let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
     if !trimmed.contains('\r') {
-        return trimmed.to_owned();
+        return Cow::Owned(trimmed.to_owned());
     }
-    let frames: Vec<&str> = trimmed.split('\r').collect();
-    let last = frames
-        .iter()
-        .rposition(|f| !f.trim().is_empty())
-        .unwrap_or(frames.len() - 1);
-    frames[last].to_owned()
+    let last = trimmed
+        .rsplit('\r')
+        .find(|f| !f.trim().is_empty())
+        .unwrap_or_else(|| trimmed.rsplit('\r').next().unwrap_or(trimmed));
+    Cow::Owned(last.to_owned())
 }
 
-fn split_stream_lines(stream: StreamKind, text: &str) -> Option<Vec<(StreamKind, usize, String)>> {
+fn split_stream_lines<'a>(
+    stream: StreamKind,
+    text: &'a str,
+) -> Option<Vec<(StreamKind, usize, Cow<'a, str>)>> {
     if text.contains('\0') {
         return None;
     }
@@ -749,7 +757,11 @@ fn split_stream_lines(stream: StreamKind, text: &str) -> Option<Vec<(StreamKind,
     Some(lines)
 }
 
-fn detect_build(stdout: &str, stderr: &str, cmd_is_build: bool) -> Option<ParsedBuild> {
+fn detect_build<'a>(
+    stdout: &'a str,
+    stderr: &'a str,
+    cmd_is_build: bool,
+) -> Option<ParsedBuild<'a>> {
     let stdout_lines = split_stream_lines(StreamKind::Stdout, stdout)?;
     let stderr_lines = split_stream_lines(StreamKind::Stderr, stderr)?;
 
@@ -770,16 +782,16 @@ fn detect_build(stdout: &str, stderr: &str, cmd_is_build: bool) -> Option<Parsed
 // BuildKit Parser
 // ============================================================================
 
-struct RepeatBlock {
+struct RepeatBlock<'a> {
     header: String,
-    lines: Vec<StepOutputLine>,
+    lines: Vec<StepOutputLine<'a>>,
 }
 
-fn parse_buildkit(
-    stdout_lines: &[(StreamKind, usize, String)],
-    stderr_lines: &[(StreamKind, usize, String)],
+fn parse_buildkit<'a>(
+    stdout_lines: &[(StreamKind, usize, Cow<'a, str>)],
+    stderr_lines: &[(StreamKind, usize, Cow<'a, str>)],
     cmd_is_build: bool,
-) -> Option<ParsedBuild> {
+) -> Option<ParsedBuild<'a>> {
     // Determine which stream(s) carry BuildKit `#N` step lines.
     let stdout_bk = count_buildkit_signals(stdout_lines);
     let stderr_bk = count_buildkit_signals(stderr_lines);
@@ -797,7 +809,7 @@ fn parse_buildkit(
     }
 
     // Order streams: primary BuildKit stream first (usually stderr), then the other stream.
-    let ordered_streams: [&[(StreamKind, usize, String)]; 2] =
+    let ordered_streams: [&[(StreamKind, usize, Cow<'a, str>)]; 2] =
         if stderr_bk.step_lines >= stdout_bk.step_lines {
             [stderr_lines, stdout_lines]
         } else {
@@ -945,12 +957,9 @@ fn parse_buildkit(
                 continue;
             }
 
-            // 6. BuildKit `#N ...` step line
-            if let Some(caps) = BK_STEP_LINE.captures(trimmed)
-                && let Ok(id) = caps[1].parse::<u32>()
-            {
-                let rest = caps.get(2).map_or("", |m| m.as_str());
-                let raw_after_id = raw_after_step_id(line, id);
+            // 6. BuildKit `#N ...` step line (zero-alloc byte parser).
+            if let Some((id, raw_after_id)) = parse_bk_step_line(line) {
+                let rest = raw_after_id.trim_end();
 
                 if id == 0 {
                     // `#0 building with ...` preamble; capture WARN/ERROR if any.
@@ -990,7 +999,7 @@ fn parse_buildkit(
 
                 steps[idx].range.record(stream, line_no);
 
-                // Classify step line payload.
+                // Classify step line payload without allocating when skipping CACHED/DONE/progress lines.
                 if rest == "CACHED" {
                     steps[idx].status = StepStatus::Cached;
                 } else if rest == "CANCELED" {
@@ -1013,16 +1022,16 @@ fn parse_buildkit(
                     };
                 } else if let Some(warn_msg) = strip_warning_prefix(rest) {
                     record_warning(&mut warnings, &mut warning_seen, warn_msg, stream, line_no);
-                } else if let Some(out_text) = parse_bk_output_payload(raw_after_id) {
+                } else if let Some(out_cow) = extract_bk_output_cow(line) {
                     // Explicit `WARN:` inside step output is also surfaced if uppercase.
-                    let out_trim = out_text.trim();
+                    let out_trim = out_cow.trim();
                     if let Some(warn_msg) = strip_explicit_uppercase_warn(out_trim) {
                         record_warning(&mut warnings, &mut warning_seen, warn_msg, stream, line_no);
                     }
                     steps[idx].output.push(StepOutputLine {
                         stream,
                         line_no,
-                        text: out_text.to_owned(),
+                        text: out_cow,
                     });
                 } else if steps[idx].header.is_empty() && !is_bk_metadata_subline(rest) {
                     let header = rest.trim().to_owned();
@@ -1294,19 +1303,18 @@ struct BkSignalCounts {
     lifecycle_markers: usize,
 }
 
-fn count_buildkit_signals(lines: &[(StreamKind, usize, String)]) -> BkSignalCounts {
+fn count_buildkit_signals(lines: &[(StreamKind, usize, Cow<'_, str>)]) -> BkSignalCounts {
     let mut counts = BkSignalCounts {
         step_lines: 0,
         strong_markers: 0,
         lifecycle_markers: 0,
     };
     for (_, _, line) in lines {
-        let trimmed = line.trim();
-        let Some(caps) = BK_STEP_LINE.captures(trimmed) else {
+        let Some((_, raw_after_id)) = parse_bk_step_line(line) else {
             continue;
         };
         counts.step_lines += 1;
-        let rest = caps.get(2).map_or("", |m| m.as_str());
+        let rest = raw_after_id.trim_end();
         if rest == "CACHED"
             || rest == "CANCELED"
             || rest == "DONE"
@@ -1376,21 +1384,60 @@ fn starts_with_dockerfile_instruction(text: &str) -> bool {
         .any(|kw| first.eq_ignore_ascii_case(kw))
 }
 
-fn raw_after_step_id(line: &str, id: u32) -> &str {
-    let prefix = format!("#{id}");
-    let trimmed_start = line.trim_start();
-    if let Some(rest) = trimmed_start.strip_prefix(&prefix) {
-        rest.strip_prefix(' ')
-            .or_else(|| rest.strip_prefix('\t'))
-            .unwrap_or(rest)
+/// Zero-alloc parser for BuildKit `#<id>[ <rest>]` lines.
+fn parse_bk_step_line(line: &str) -> Option<(u32, &str)> {
+    let s = line.trim_start();
+    let after_hash = s.strip_prefix('#')?;
+    let digits = after_hash.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let id: u32 = after_hash[..digits].parse().ok()?;
+    let tail = &after_hash[digits..];
+    if tail.is_empty() {
+        return Some((id, ""));
+    }
+    let after_sep = tail.strip_prefix(' ').or_else(|| tail.strip_prefix('\t'))?;
+    Some((id, after_sep))
+}
+
+/// Zero-alloc parser for BuildKit elapsed-time step output `<secs>.<frac>[ <text>]`.
+fn parse_bk_output_payload(raw_after_id: &str) -> Option<&str> {
+    let bytes = raw_after_id.as_bytes();
+    let d1 = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+    if d1 == 0 || bytes.get(d1) != Some(&b'.') {
+        return None;
+    }
+    let d2 = bytes[d1 + 1..]
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if d2 == 0 {
+        return None;
+    }
+    let tail = &raw_after_id[d1 + 1 + d2..];
+    if tail.is_empty() {
+        Some("")
     } else {
-        ""
+        tail.strip_prefix(' ')
     }
 }
 
-fn parse_bk_output_payload(raw_after_id: &str) -> Option<&str> {
-    let caps = BK_OUTPUT_TS.captures(raw_after_id)?;
-    Some(caps.get(2).map_or("", |m| m.as_str()))
+/// Extract a BuildKit step output payload as a zero-alloc `Cow::Borrowed` slice
+/// whenever `line` itself is borrowed from the input stream.
+fn extract_bk_output_cow<'a>(line: &Cow<'a, str>) -> Option<Cow<'a, str>> {
+    match line {
+        Cow::Borrowed(s) => {
+            let (_, after_id) = parse_bk_step_line(s)?;
+            let payload = parse_bk_output_payload(after_id)?;
+            Some(Cow::Borrowed(payload))
+        }
+        Cow::Owned(s) => {
+            let (_, after_id) = parse_bk_step_line(s)?;
+            let payload = parse_bk_output_payload(after_id)?;
+            Some(Cow::Owned(payload.to_owned()))
+        }
+    }
 }
 
 fn is_bk_metadata_subline(rest: &str) -> bool {
@@ -1572,24 +1619,25 @@ fn strip_done_timing_suffix(text: &str) -> &str {
     s
 }
 
-fn strip_repeat_echo_prefix(line: &str) -> String {
+fn strip_repeat_echo_prefix<'a>(line: &Cow<'a, str>) -> Cow<'a, str> {
     // Strip optional `#N ` and optional `<float> ` prefix inside `------` echo block.
-    let trimmed_start = line.trim_start();
-    let after_hash = if let Some(caps) = BK_STEP_LINE.captures(trimmed_start)
-        && let Ok(id) = caps[1].parse::<u32>()
-    {
-        raw_after_step_id(trimmed_start, id)
-    } else {
-        line
-    };
-    if let Some(payload) = parse_bk_output_payload(after_hash) {
-        payload.to_owned()
-    } else {
-        after_hash.to_owned()
+    match line {
+        Cow::Borrowed(s) => {
+            let after_hash = parse_bk_step_line(s).map_or(*s, |(_, rest)| rest);
+            Cow::Borrowed(parse_bk_output_payload(after_hash).unwrap_or(after_hash))
+        }
+        Cow::Owned(s) => {
+            let after_hash = parse_bk_step_line(s).map_or(s.as_str(), |(_, rest)| rest);
+            Cow::Owned(
+                parse_bk_output_payload(after_hash)
+                    .unwrap_or(after_hash)
+                    .to_owned(),
+            )
+        }
     }
 }
 
-fn find_step_by_header(steps: &[Step], header: &str) -> Option<usize> {
+fn find_step_by_header(steps: &[Step<'_>], header: &str) -> Option<usize> {
     let needle = header.trim();
     if needle.is_empty() {
         return None;
@@ -1615,7 +1663,7 @@ fn is_dashed_rule(trimmed: &str, min_len: usize) -> bool {
     trimmed.len() >= min_len && trimmed.bytes().all(|b| b == b'-')
 }
 
-fn next_non_empty(lines: &[(StreamKind, usize, String)], mut idx: usize) -> Option<usize> {
+fn next_non_empty(lines: &[(StreamKind, usize, Cow<'_, str>)], mut idx: usize) -> Option<usize> {
     while idx < lines.len() {
         if !lines[idx].2.trim().is_empty() {
             return Some(idx);
@@ -1680,11 +1728,11 @@ fn record_warning(
         .strip_prefix("WARN:")
         .or_else(|| text.strip_prefix("WARNING:"))
         .unwrap_or(text)
-        .trim()
-        .to_owned();
-    if normalized.is_empty() || !seen.insert(normalized) {
+        .trim();
+    if normalized.is_empty() || seen.contains(normalized) {
         return;
     }
+    seen.insert(normalized.to_owned());
     warnings.push(BuildWarning {
         text: text.trim().to_owned(),
         stream,
@@ -1696,11 +1744,11 @@ fn record_warning(
 // Classic Docker / Podman Build Parser
 // ============================================================================
 
-fn parse_classic(
-    stdout_lines: &[(StreamKind, usize, String)],
-    stderr_lines: &[(StreamKind, usize, String)],
+fn parse_classic<'a>(
+    stdout_lines: &[(StreamKind, usize, Cow<'a, str>)],
+    stderr_lines: &[(StreamKind, usize, Cow<'a, str>)],
     cmd_is_build: bool,
-) -> Option<ParsedBuild> {
+) -> Option<ParsedBuild<'a>> {
     let stdout_sig = count_classic_signals(stdout_lines);
     let stderr_sig = count_classic_signals(stderr_lines);
     let total_steps = stdout_sig.step_headers + stderr_sig.step_headers;
@@ -1714,7 +1762,7 @@ fn parse_classic(
         return None;
     }
 
-    let ordered_streams: [&[(StreamKind, usize, String)]; 2] =
+    let ordered_streams: [&[(StreamKind, usize, Cow<'a, str>)]; 2] =
         if stdout_sig.step_headers >= stderr_sig.step_headers {
             [stdout_lines, stderr_lines]
         } else {
@@ -1956,7 +2004,7 @@ struct ClassicSignalCounts {
     markers: usize,
 }
 
-fn count_classic_signals(lines: &[(StreamKind, usize, String)]) -> ClassicSignalCounts {
+fn count_classic_signals(lines: &[(StreamKind, usize, Cow<'_, str>)]) -> ClassicSignalCounts {
     let mut counts = ClassicSignalCounts {
         step_headers: 0,
         markers: 0,
@@ -1988,7 +2036,7 @@ fn count_classic_signals(lines: &[(StreamKind, usize, String)]) -> ClassicSignal
 // Renderer
 // ============================================================================
 
-fn render_build(parsed: &ParsedBuild, exit_code: Option<i32>, budget: usize) -> Option<String> {
+fn render_build(parsed: &ParsedBuild<'_>, exit_code: Option<i32>, budget: usize) -> Option<String> {
     if parsed.has_failure(exit_code) {
         render_failed(parsed, exit_code, budget)
     } else {
@@ -1996,7 +2044,7 @@ fn render_build(parsed: &ParsedBuild, exit_code: Option<i32>, budget: usize) -> 
     }
 }
 
-fn render_clean(parsed: &ParsedBuild, budget: usize) -> Option<String> {
+fn render_clean(parsed: &ParsedBuild<'_>, budget: usize) -> Option<String> {
     let counts = StepCounts::from_steps(&parsed.steps);
     let dur = total_duration_label(parsed);
     let mut header = build_header_prefix(parsed);
@@ -2027,7 +2075,7 @@ fn render_clean(parsed: &ParsedBuild, budget: usize) -> Option<String> {
     let collapsed_reserve = collapsed_line.as_ref().map_or(0, String::len);
 
     // 4. Non-trivial RUN / output-producing step summaries.
-    let notable: Vec<&Step> = parsed
+    let notable: Vec<&Step<'_>> = parsed
         .steps
         .iter()
         .filter(|s| is_notable_clean_step(s))
@@ -2070,7 +2118,11 @@ fn render_clean(parsed: &ParsedBuild, budget: usize) -> Option<String> {
     Some(out)
 }
 
-fn render_failed(parsed: &ParsedBuild, exit_code: Option<i32>, budget: usize) -> Option<String> {
+fn render_failed(
+    parsed: &ParsedBuild<'_>,
+    exit_code: Option<i32>,
+    budget: usize,
+) -> Option<String> {
     let counts = StepCounts::from_steps(&parsed.steps);
     let dur = total_duration_label(parsed);
     let mut header = build_header_prefix(parsed);
@@ -2093,7 +2145,7 @@ fn render_failed(parsed: &ParsedBuild, exit_code: Option<i32>, budget: usize) ->
     let mut out = header;
 
     // Identify failing steps (or fall back to the last non-internal step if exit != 0 without explicit ERROR).
-    let mut failing: Vec<&Step> = parsed.steps.iter().filter(|s| s.is_failed()).collect();
+    let mut failing: Vec<&Step<'_>> = parsed.steps.iter().filter(|s| s.is_failed()).collect();
     if failing.is_empty()
         && let Some(last) = parsed
             .steps
@@ -2180,7 +2232,7 @@ fn render_failed(parsed: &ParsedBuild, exit_code: Option<i32>, budget: usize) ->
     Some(out)
 }
 
-fn build_header_prefix(parsed: &ParsedBuild) -> String {
+fn build_header_prefix(parsed: &ParsedBuild<'_>) -> String {
     let mut prefix = parsed.tool_label.to_owned();
     if !parsed.services.is_empty() {
         let n = parsed.services.len();
@@ -2205,7 +2257,7 @@ struct StepCounts {
 }
 
 impl StepCounts {
-    fn from_steps(steps: &[Step]) -> Self {
+    fn from_steps(steps: &[Step<'_>]) -> Self {
         let mut c = Self {
             total: 0,
             cached: 0,
@@ -2276,7 +2328,7 @@ impl StepCounts {
     }
 }
 
-fn total_duration_label(parsed: &ParsedBuild) -> Option<String> {
+fn total_duration_label(parsed: &ParsedBuild<'_>) -> Option<String> {
     if let Some(wall) = parsed.wall_duration_secs {
         return Some(format_duration_secs(wall));
     }
@@ -2294,14 +2346,14 @@ fn total_duration_label(parsed: &ParsedBuild) -> Option<String> {
     (any && sum > 0.0).then(|| format_duration_secs(sum))
 }
 
-fn is_notable_clean_step(step: &Step) -> bool {
+fn is_notable_clean_step(step: &Step<'_>) -> bool {
     if step.kind == StepKind::Internal || step.kind == StepKind::Export || step.is_cached() {
         return false;
     }
     step.kind == StepKind::Run || !step.output.is_empty()
 }
 
-fn format_clean_step_line(step: &Step) -> String {
+fn format_clean_step_line(step: &Step<'_>) -> String {
     let mut line = format!(
         "  {} {}",
         step.display_id(),
@@ -2383,7 +2435,7 @@ fn append_warnings(out: &mut String, warnings: &[BuildWarning], budget: usize) {
     out.push_str(&section);
 }
 
-fn build_clean_collapsed_line(steps: &[Step]) -> Option<String> {
+fn build_clean_collapsed_line(steps: &[Step<'_>]) -> Option<String> {
     let mut internal = 0usize;
     let mut cached = 0usize;
     let mut other = 0usize;
@@ -2422,7 +2474,7 @@ fn build_clean_collapsed_line(steps: &[Step]) -> Option<String> {
     Some(line)
 }
 
-fn build_prior_steps_line(steps: &[Step], failed_orders: &HashSet<usize>) -> Option<String> {
+fn build_prior_steps_line(steps: &[Step<'_>], failed_orders: &HashSet<usize>) -> Option<String> {
     let mut cached = 0usize;
     let mut ran = 0usize;
     let mut internal = 0usize;
@@ -2480,7 +2532,7 @@ fn format_dockerfile_snippet(snippet: &DockerfileSnippet) -> String {
     }
 }
 
-fn is_redundant_fatal(fatal: &str, failing: &[&Step]) -> bool {
+fn is_redundant_fatal(fatal: &str, failing: &[&Step<'_>]) -> bool {
     let norm = fatal
         .strip_prefix("ERROR:")
         .unwrap_or(fatal)
@@ -2500,7 +2552,7 @@ fn is_redundant_fatal(fatal: &str, failing: &[&Step]) -> bool {
     })
 }
 
-fn format_failing_step(step: &Step, budget: usize) -> String {
+fn format_failing_step(step: &Step<'_>, budget: usize) -> String {
     let mut out = String::new();
 
     // Header: `Failed: #9 [builder 4/6] RUN cargo build --release [stderr:45-218]`
@@ -2577,7 +2629,7 @@ fn format_failing_step(step: &Step, budget: usize) -> String {
 /// 2. Actionable final tail lines.
 ///
 /// Emits contiguous spans with exact `[stream:A-B]` pointers and `… N lines omitted [stream:X-Y]`.
-fn select_failing_output(lines: &[StepOutputLine], budget: usize) -> String {
+fn select_failing_output(lines: &[StepOutputLine<'_>], budget: usize) -> String {
     let n = lines.len();
     if n == 0 {
         return String::new();
@@ -2780,7 +2832,11 @@ fn build_selection_mask(
     keep
 }
 
-fn render_selected_lines(lines: &[StepOutputLine], mask: &[bool], budget: usize) -> Option<String> {
+fn render_selected_lines(
+    lines: &[StepOutputLine<'_>],
+    mask: &[bool],
+    budget: usize,
+) -> Option<String> {
     let n = lines.len();
     let mut out = String::new();
     let mut i = 0usize;
@@ -2900,19 +2956,20 @@ fn format_duration_secs(secs: f64) -> String {
     }
 }
 
-fn truncate_utf8(text: &str, limit: usize) -> String {
+fn truncate_utf8(text: &str, limit: usize) -> Cow<'_, str> {
     if text.len() <= limit {
-        return text.to_owned();
+        return Cow::Borrowed(text);
     }
     let ellipsis = "…";
     if limit <= ellipsis.len() {
         let cut = text.floor_char_boundary(limit);
-        return text[..cut].to_owned();
+        return Cow::Borrowed(&text[..cut]);
     }
     let cut = text.floor_char_boundary(limit - ellipsis.len());
-    let mut out = text[..cut].to_owned();
+    let mut out = String::with_capacity(cut + ellipsis.len());
+    out.push_str(&text[..cut]);
     out.push_str(ellipsis);
-    out
+    Cow::Owned(out)
 }
 
 #[cfg(test)]
@@ -3680,5 +3737,84 @@ mod tests {
             format_for_command(&["podman", "build", "-q", "."], "", &stderr, Some(0), 4096)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn ansi_fast_path_and_plain_parity_with_cached_and_failing_steps() {
+        // Zero-alloc Cow::Borrowed fast path on plain lines (even with bare `\r` progress).
+        assert!(matches!(
+            clean_line("#2 CACHED\n"),
+            Cow::Borrowed("#2 CACHED")
+        ));
+        assert!(matches!(
+            clean_line("#3 0.200 step 1\r#3 0.210 step 2\n"),
+            Cow::Borrowed("#3 0.210 step 2")
+        ));
+        assert!(matches!(
+            clean_line("\x1b[36m#2 CACHED\x1b[0m\n"),
+            Cow::Owned(ref s) if s == "#2 CACHED"
+        ));
+
+        let build_log = |colored: bool| -> String {
+            let (cyan, red, reset) = if colored {
+                ("\x1b[36m", "\x1b[31m", "\x1b[0m")
+            } else {
+                ("", "", "")
+            };
+            let mut s = String::new();
+            let _ = writeln!(
+                s,
+                "{cyan}#1 [internal] load build definition from Dockerfile{reset}"
+            );
+            s.push_str("#1 DONE 0.0s\n");
+            s.push_str("#2 [builder 1/4] FROM rust:1.91-slim\n");
+            s.push_str("#2 CACHED\n");
+            s.push_str("#3 [builder 2/4] COPY Cargo.toml Cargo.lock ./\n");
+            s.push_str("#3 CACHED\n");
+            let _ = writeln!(s, "{cyan}#4 [builder 3/4] RUN cargo build --release{reset}");
+            for i in 0..35 {
+                let _ = writeln!(
+                    s,
+                    "#4 {:.3} Downloading crate-{i:02}\r#4 {:.3}    Compiling crate-{i:02} v0.1.0",
+                    0.1 + i as f64 * 0.03,
+                    0.11 + i as f64 * 0.03,
+                );
+            }
+            let _ = writeln!(s, "#4 2.400 {red}error[E0308]{reset}: mismatched types");
+            s.push_str("#4 2.400   --> src/billing.rs:88:17\n");
+            s.push_str("#4 2.400    |\n");
+            s.push_str("#4 2.400 88 |     let total: u64 = \"bad\";\n");
+            s.push_str("#4 2.400    |                ---   ^^^^^ expected `u64`, found `&str`\n");
+            let _ = writeln!(
+                s,
+                "#4 {red}ERROR: process \"/bin/sh -c cargo build --release\" did not complete successfully: exit code: 101{reset}"
+            );
+            s.push_str("------\n");
+            s.push_str(" > [builder 3/4] RUN cargo build --release:\n");
+            let _ = writeln!(s, "2.400 {red}error[E0308]{reset}: mismatched types");
+            s.push_str("2.400   --> src/billing.rs:88:17\n");
+            s.push_str("------\n");
+            s.push_str("ERROR: failed to solve: process \"/bin/sh -c cargo build --release\" did not complete successfully: exit code: 101\n");
+            s
+        };
+
+        let plain = build_log(false);
+        let colored = build_log(true);
+        let plain_out = format("", &plain, Some(1), 4096).expect("plain buildkit compacts");
+        let color_out = format("", &colored, Some(1), 4096).expect("colored buildkit compacts");
+        assert_eq!(
+            plain_out, color_out,
+            "ANSI fast path must match plain output identically"
+        );
+        assert_all_pointers_valid(&plain_out, "", &plain);
+        assert!(
+            plain_out.contains("error[E0308]: mismatched types"),
+            "{plain_out}"
+        );
+        assert!(
+            plain_out.contains("--> src/billing.rs:88:17"),
+            "{plain_out}"
+        );
+        assert_eq!(plain_out.matches("error[E0308]").count(), 1, "{plain_out}");
     }
 }

@@ -10,6 +10,7 @@
 //! Reports are fail-closed: if output lacks recognized totals or omits failure
 //! blocks for a failing total, `finish` returns `None` so the ordinary preview
 //! or `LineFilter` handles the run unchanged.
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
@@ -348,7 +349,7 @@ impl Report {
 
 /// Group failures by `root_cause` while preserving first-appearance order.
 fn group_failures(failures: &[Failure]) -> Vec<Vec<&Failure>> {
-    let mut groups: Vec<(String, Vec<&Failure>)> = Vec::new();
+    let mut groups: Vec<(&str, Vec<&Failure>)> = Vec::new();
     for failure in failures {
         if !failure.root_cause.is_empty()
             && let Some((_, existing)) = groups
@@ -358,7 +359,7 @@ fn group_failures(failures: &[Failure]) -> Vec<Vec<&Failure>> {
             existing.push(failure);
             continue;
         }
-        groups.push((failure.root_cause.clone(), vec![failure]));
+        groups.push((failure.root_cause.as_str(), vec![failure]));
     }
     groups.into_iter().map(|(_, items)| items).collect()
 }
@@ -403,8 +404,8 @@ impl Other {
     fn observe(&mut self, line: &str, n: usize) {
         let ordinal = self.range.count;
         self.range.add(n);
-        let text = short(line.trim_end(), 200);
-        let trimmed = line.trim();
+        let trimmed_end = line.trim_end();
+        let trimmed = trimmed_end.trim();
         let is_console_header = trimmed == "console.error"
             || trimmed == "console.warn"
             || trimmed.starts_with("console.error ")
@@ -417,14 +418,19 @@ impl Other {
         if is_console_header {
             self.keep_next = 2;
         }
+        let clipped = short_slice(trimmed_end, 200);
         if self.kept.len() < KEPT_LINES && self.diagnostics == 0
             || (diag || follow) && self.diagnostics < KEPT_DIAGNOSTICS
         {
             self.diagnostics += usize::from(diag || follow);
-            self.kept.push((ordinal, text));
+            self.kept.push((ordinal, clipped.to_owned()));
             self.last = None;
+        } else if let Some((slot_ord, slot_buf)) = self.last.as_mut() {
+            *slot_ord = ordinal;
+            slot_buf.clear();
+            slot_buf.push_str(clipped);
         } else {
-            self.last = Some((ordinal, text));
+            self.last = Some((ordinal, clipped.to_owned()));
         }
     }
 
@@ -472,7 +478,8 @@ impl Scan {
         if self.broken {
             return;
         }
-        let line = line.trim_end_matches(['\n', '\r']);
+        let clean = strip_ansi(line.trim_end_matches(['\n', '\r']));
+        let line = clean.as_ref();
         self.jest.observe(line, n, stream);
         self.vitest.observe(line, n, stream);
         self.bun.observe(line, n, stream);
@@ -506,12 +513,54 @@ impl Scan {
 // Shared parsing & normalization helpers
 // ---------------------------------------------------------------------------
 
+/// Strip ANSI escape sequences only when an ESC byte is present (zero-alloc fast path).
+fn strip_ansi(line: &str) -> Cow<'_, str> {
+    if !line.contains('\x1b') {
+        return Cow::Borrowed(line);
+    }
+    crate::capture::ANSI.replace_all(line, "")
+}
+
+fn short_slice(s: &str, len: usize) -> &str {
+    &s[..s.floor_char_boundary(s.len().min(len))]
+}
+
+/// Push an excerpt line while keeping `Expected`/`Received`/`-`/`+`/`Locator`/`Timeout`
+/// diff lines crisp even when unchanged multi-line diff context would fill `MAX_EXCERPT`.
+fn push_excerpt_line(excerpt: &mut Vec<String>, trimmed: &str) {
+    let line = short(trimmed, 200);
+    if excerpt.len() < MAX_EXCERPT {
+        excerpt.push(line);
+        return;
+    }
+    if is_key_assertion_line(trimmed)
+        && let Some(pos) = excerpt.iter().rposition(|l| !is_key_assertion_line(l))
+    {
+        excerpt.remove(pos);
+        excerpt.push(line);
+    }
+}
+
+/// Extract the line number from a code-frame gutter line such as `> 14 | expect(...)` or `14 | ...`.
+fn code_frame_line_number(line: &str) -> Option<usize> {
+    let s = line.trim_start();
+    let s = s.strip_prefix('>').unwrap_or(s).trim_start();
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let after = s[digits..].trim_start();
+    if !after.starts_with('|') {
+        return None;
+    }
+    s[..digits].parse().ok()
+}
+
 fn is_code_frame_line(line: &str) -> bool {
     CODE_FRAME_GUTTER.is_match(line) || CODE_FRAME_CARET.is_match(line) || CARET_ONLY.is_match(line)
 }
 
-fn is_key_assertion_line(line: &str) -> bool {
-    let trimmed = line.trim();
+fn is_explicit_diff_header_or_value(trimmed: &str) -> bool {
     trimmed.starts_with("Expected:")
         || trimmed.starts_with("Received:")
         || trimmed.starts_with("Expected ")
@@ -520,10 +569,29 @@ fn is_key_assertion_line(line: &str) -> bool {
         || trimmed.starts_with("Timeout:")
         || trimmed.starts_with("- Expected")
         || trimmed.starts_with("+ Received")
+}
+
+fn is_key_assertion_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    is_explicit_diff_header_or_value(trimmed)
         || trimmed.starts_with("- ")
         || trimmed.starts_with("+ ")
         || trimmed.starts_with("Cause:")
         || trimmed.starts_with("Caused by:")
+}
+
+fn is_js_error_header(trimmed: &str) -> bool {
+    if trimmed.starts_with("error:") {
+        return true;
+    }
+    let Some((head, _)) = trimmed.split_once(':') else {
+        return false;
+    };
+    let word = head.split_whitespace().next().unwrap_or("");
+    !word.is_empty()
+        && word.as_bytes()[0].is_ascii_uppercase()
+        && word.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && (word.ends_with("Error") || word.ends_with("Exception"))
 }
 
 fn is_js_diagnostic(trimmed: &str) -> bool {
@@ -802,7 +870,7 @@ impl JestScan {
                 self.has_test_stderr = true;
             }
             let key = (self.current_fail_file.clone(), test_name.to_owned());
-            if self.seen_keys.contains(&key) {
+            if !self.seen_keys.insert(key) {
                 self.skip_duplicate_block = true;
                 self.status[idx].add(n);
                 return;
@@ -811,7 +879,6 @@ impl JestScan {
             if self.failures.len() >= FAILURE_LIMIT {
                 return;
             }
-            self.seen_keys.insert(key);
             let display_name =
                 if test_name == "Test suite failed to run" && !self.current_fail_file.is_empty() {
                     format!("{} › {test_name}", self.current_fail_file)
@@ -860,8 +927,8 @@ impl JestScan {
             if !open.saw_stack {
                 if failure.error.is_empty() {
                     failure.error = short(trimmed, 220);
-                } else if failure.excerpt.len() < MAX_EXCERPT {
-                    failure.excerpt.push(short(trimmed, 200));
+                } else {
+                    push_excerpt_line(&mut failure.excerpt, trimmed);
                 }
             }
             return;
@@ -940,6 +1007,7 @@ struct VitestScan {
     fallback_failures: Vec<Failure>,
     open: Option<OpenFailure>,
     open_fallback: Option<(usize, Stream)>,
+    in_failed_section: bool,
     in_unhandled: bool,
     saw_marker: bool,
     saw_totals: bool,
@@ -973,12 +1041,19 @@ impl VitestScan {
             return;
         }
 
-        // Section dividers (`⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯`, `⎯⎯⎯⎯⎯[1/2]⎯`).
-        if trimmed.starts_with("⎯⎯⎯") {
+        // Section dividers (`⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯`, `⎯⎯⎯⎯⎯[1/2]⎯`, or box `───`).
+        if trimmed.starts_with("⎯⎯⎯")
+            || (trimmed.starts_with("───")
+                && (trimmed.contains("Failed Tests")
+                    || trimmed.contains("Failed Suites")
+                    || trimmed.contains("Unhandled Error")))
+        {
             self.open = None;
             self.open_fallback = None;
             self.saw_marker = true;
             self.in_unhandled = trimmed.contains("Unhandled Error");
+            self.in_failed_section =
+                trimmed.contains("Failed Tests") || trimmed.contains("Failed Suites");
             if stream == Stream::Stderr {
                 self.has_test_stderr = true;
             }
@@ -990,6 +1065,7 @@ impl VitestScan {
         if VITEST_FILES_TOTAL.is_match(trimmed) || VITEST_TESTS_TOTAL.is_match(trimmed) {
             self.open = None;
             self.open_fallback = None;
+            self.in_failed_section = false;
             self.in_unhandled = false;
             self.saw_totals = true;
             if FAILED_COUNT.is_match(trimmed) {
@@ -1001,6 +1077,7 @@ impl VitestScan {
         if let Some(cap) = VITEST_ERRORS_TOTAL.captures(trimmed) {
             self.open = None;
             self.open_fallback = None;
+            self.in_failed_section = false;
             self.in_unhandled = false;
             if cap[1].parse::<usize>().unwrap_or(0) > 0 {
                 self.reported_failed = true;
@@ -1011,6 +1088,7 @@ impl VitestScan {
         if trimmed.starts_with("Duration  ") {
             self.open = None;
             self.open_fallback = None;
+            self.in_failed_section = false;
             self.totals.push(short(trimmed, 220));
             return;
         }
@@ -1019,9 +1097,12 @@ impl VitestScan {
             return;
         }
 
-        // Detailed failure header: `FAIL  src/a.test.ts > Suite > test` or `FAIL  src/a.test.ts [ src/a.test.ts ]`.
+        // Detailed failure header: `FAIL  src/a.test.ts > Suite > test`,
+        // `FAIL  src/a.test.ts [ src/a.test.ts ]`, or standalone `FAIL  src/a.test.ts`
+        // inside Vitest v2/v3's Failed Tests / Failed Suites section.
         if let Some(rest) = trimmed.strip_prefix("FAIL ")
-            && (rest.contains(" > ") || rest.contains(" [ "))
+            && (rest.contains(" > ") || rest.contains(" [ ") || self.in_failed_section)
+            && !rest.trim().is_empty()
         {
             self.open = None;
             self.open_fallback = None;
@@ -1033,11 +1114,12 @@ impl VitestScan {
             if self.failures.len() >= FAILURE_LIMIT {
                 return;
             }
-            let name = rest.trim();
+            let name = strip_trailing_timing(rest.trim());
+            let header_loc = extract_location(name).map(|(loc, _)| loc);
             let failure_idx = self.failures.len();
             self.failures.push(Failure {
                 name: short(name, 260),
-                location: None,
+                location: header_loc,
                 error: String::new(),
                 excerpt: Vec::new(),
                 root_cause: String::new(),
@@ -1095,8 +1177,20 @@ impl VitestScan {
             if !open.saw_stack {
                 if failure.error.is_empty() {
                     failure.error = short(trimmed, 220);
-                } else if failure.excerpt.len() < MAX_EXCERPT {
-                    failure.excerpt.push(short(trimmed, 200));
+                } else {
+                    push_excerpt_line(&mut failure.excerpt, trimmed);
+                }
+            } else {
+                // Vitest v3 can emit `- Expected` / `+ Received` / `Expected:` / `Received:`
+                // diffs after a `❯ file:line:col` pointer; keep those crisp diff lines too.
+                let saw_diff_hdr = failure
+                    .excerpt
+                    .iter()
+                    .any(|l| is_explicit_diff_header_or_value(l));
+                if is_explicit_diff_header_or_value(trimmed)
+                    || (saw_diff_hdr && (trimmed.starts_with("- ") || trimmed.starts_with("+ ")))
+                {
+                    push_excerpt_line(&mut failure.excerpt, trimmed);
                 }
             }
             return;
@@ -1219,6 +1313,7 @@ struct PendingBunError {
     error: String,
     excerpt: Vec<String>,
     location: Option<String>,
+    code_frame_line: Option<usize>,
     has_in_repo_loc: bool,
     saw_stack: bool,
 }
@@ -1336,11 +1431,19 @@ impl BunScan {
                 raw_name.to_owned()
             };
             if let Some(pending) = self.pending.take()
-                && (!pending.error.is_empty() || pending.location.is_some())
+                && (!pending.error.is_empty()
+                    || pending.location.is_some()
+                    || pending.code_frame_line.is_some())
             {
+                let location = pending.location.or_else(|| {
+                    pending
+                        .code_frame_line
+                        .filter(|_| !self.current_file.is_empty())
+                        .map(|ln| format!("{}:{ln}", self.current_file))
+                });
                 self.failures.push(Failure {
                     name: short(&name, 260),
-                    location: pending.location,
+                    location,
                     error: pending.error,
                     excerpt: pending.excerpt,
                     root_cause: String::new(),
@@ -1384,6 +1487,7 @@ impl BunScan {
 
         // Code frame lines preceding `error:` in Bun.
         if is_code_frame_line(line) {
+            let frame_line = code_frame_line_number(line);
             if self.pending.is_none() && self.open_after.is_none() {
                 self.pending = Some(PendingBunError {
                     stream,
@@ -1392,11 +1496,15 @@ impl BunScan {
                     error: String::new(),
                     excerpt: Vec::new(),
                     location: None,
+                    code_frame_line: frame_line,
                     has_in_repo_loc: false,
                     saw_stack: false,
                 });
             } else if let Some(pending) = self.pending.as_mut() {
                 pending.last = n;
+                if frame_line.is_some() {
+                    pending.code_frame_line = frame_line;
+                }
             } else if let Some(open) = self.open_after.as_mut() {
                 self.failures[open.index].last = n;
             }
@@ -1404,13 +1512,7 @@ impl BunScan {
         }
 
         // Error / assertion / stack lines (either before `(fail)` or right after `(fail)`).
-        let starts_error = trimmed.starts_with("error:")
-            || trimmed.starts_with("Error:")
-            || trimmed.starts_with("TypeError:")
-            || trimmed.starts_with("ReferenceError:")
-            || trimmed.starts_with("SyntaxError:")
-            || trimmed.starts_with("RangeError:")
-            || trimmed.starts_with("AssertionError:");
+        let starts_error = is_js_error_header(trimmed);
 
         if let Some(open) = self.open_after.as_mut() {
             let failure = &mut self.failures[open.index];
@@ -1426,8 +1528,8 @@ impl BunScan {
                 failure.last = n;
                 if failure.error.is_empty() {
                     failure.error = short(trimmed, 220);
-                } else if failure.excerpt.len() < MAX_EXCERPT {
-                    failure.excerpt.push(short(trimmed, 200));
+                } else {
+                    push_excerpt_line(&mut failure.excerpt, trimmed);
                 }
                 return;
             }
@@ -1441,14 +1543,15 @@ impl BunScan {
                 error: String::new(),
                 excerpt: Vec::new(),
                 location: None,
+                code_frame_line: None,
                 has_in_repo_loc: false,
                 saw_stack: false,
             });
             pending.last = n;
             if pending.error.is_empty() {
                 pending.error = short(trimmed, 220);
-            } else if pending.excerpt.len() < MAX_EXCERPT {
-                pending.excerpt.push(short(trimmed, 200));
+            } else {
+                push_excerpt_line(&mut pending.excerpt, trimmed);
             }
             return;
         }
@@ -1470,9 +1573,16 @@ impl BunScan {
             }
             if !pending.saw_stack && is_key_assertion_line(trimmed) {
                 pending.last = n;
-                if pending.excerpt.len() < MAX_EXCERPT {
-                    pending.excerpt.push(short(trimmed, 200));
-                }
+                push_excerpt_line(&mut pending.excerpt, trimmed);
+                return;
+            }
+            // Absorb unchanged structural lines inside Bun's `toEqual` object/array diff
+            // (`  {`, `  "status": "ok",`, `  }`) so they don't pollute `other` notes.
+            if !pending.saw_stack
+                && !pending.error.is_empty()
+                && (line.starts_with("  ") || matches!(trimmed, "{" | "}" | "[" | "]"))
+            {
+                pending.last = n;
                 return;
             }
         }
@@ -1501,9 +1611,15 @@ impl BunScan {
             } else {
                 "Test file error".into()
             };
+            let location = pending.location.or_else(|| {
+                pending
+                    .code_frame_line
+                    .filter(|_| !self.current_file.is_empty())
+                    .map(|ln| format!("{}:{ln}", self.current_file))
+            });
             self.failures.push(Failure {
                 name: short(&name, 260),
-                location: pending.location,
+                location,
                 error: pending.error,
                 excerpt: pending.excerpt,
                 root_cause: String::new(),
@@ -2234,8 +2350,10 @@ impl PlaywrightScan {
             let failure = &mut self.failures[open.index];
             failure.last = n;
             if trimmed.starts_with("Retry #") {
-                // Keep the latest retry's details if it replaces an earlier attempt, or skip.
+                // Keep Attempt 1 details cleanly without duplicating them on subsequent retries;
+                // if Attempt 1 lacked an error line, allow the retry to populate it.
                 self.in_call_log = false;
+                open.saw_stack = !failure.error.is_empty();
                 return;
             }
             if trimmed == "Call log:" {
@@ -2243,10 +2361,17 @@ impl PlaywrightScan {
                 return;
             }
             if self.in_call_log {
-                if trimmed.starts_with("- ") {
+                if trimmed.starts_with("at ")
+                    || is_code_frame_line(line)
+                    || trimmed.starts_with("Error Context:")
+                    || trimmed.starts_with("attachment #")
+                    || trimmed.starts_with("──")
+                    || trimmed.starts_with("⎯⎯")
+                {
+                    self.in_call_log = false;
+                } else {
                     return;
                 }
-                self.in_call_log = false;
             }
             if is_code_frame_line(line)
                 || trimmed.starts_with("Error Context:")
@@ -2266,8 +2391,8 @@ impl PlaywrightScan {
             if !open.saw_stack {
                 if failure.error.is_empty() {
                     failure.error = short(trimmed, 220);
-                } else if failure.excerpt.len() < MAX_EXCERPT {
-                    failure.excerpt.push(short(trimmed, 200));
+                } else {
+                    push_excerpt_line(&mut failure.excerpt, trimmed);
                 }
             }
             return;
@@ -2907,6 +3032,190 @@ Time:        0.51 s
         assert_eq!(
             crate::summary::family(&args("playwright test --list")),
             "other"
+        );
+    }
+
+    #[test]
+    fn vitest_v3_playwright_and_bun_preserve_locations_expected_received_diffs_and_ansi_parity() {
+        // Zero-alloc ANSI fast path check.
+        assert!(matches!(strip_ansi("PASS src/a.test.ts"), Cow::Borrowed(_)));
+        assert!(matches!(
+            strip_ansi("\x1b[32mPASS\x1b[0m src/a.test.ts"),
+            Cow::Owned(ref s) if s == "PASS src/a.test.ts"
+        ));
+
+        // 1. Vitest v3 with large object diff (many unchanged fields before -/+ diff) + ANSI colors.
+        let vitest_out = "\
+ RUN  v3.0.5 /repo/web
+
+ ✓ src/ok.test.ts (8 tests) 4ms
+ Test Files  1 failed | 1 passed (2)
+      Tests  1 failed | 8 passed (9)
+   Duration  310ms
+";
+        let vitest_err_plain = "\
+⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/invoice.test.ts > Invoice > computes grand total 8ms
+AssertionError: expected { total: 110, ... } to deeply equal { total: 120, ... }
+ ❯ src/invoice.test.ts:42:19
+     40|   const res = computeInvoice(cart);
+     41|   expect(res).toEqual(expected);
+       |               ^
+- Expected
++ Received
+
+  Object {
+    \"currency\": \"USD\",
+    \"customerId\": \"cus_123\",
+    \"discount\": 0,
+    \"region\": \"us-east-1\",
+    \"subtotal\": 100,
+-   \"total\": 120,
++   \"total\": 110,
+  }
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+";
+        let vitest_err_ansi = vitest_err_plain
+            .replace(" FAIL ", "\x1b[31m FAIL \x1b[39m")
+            .replace("- Expected", "\x1b[32m- Expected\x1b[39m")
+            .replace("+ Received", "\x1b[31m+ Received\x1b[39m");
+
+        let v_plain = scan(&[
+            (vitest_out, Stream::Stdout),
+            (vitest_err_plain, Stream::Stderr),
+        ])
+        .expect("vitest v3 plain")
+        .render();
+        let v_ansi = scan(&[
+            (vitest_out, Stream::Stdout),
+            (&vitest_err_ansi, Stream::Stderr),
+        ])
+        .expect("vitest v3 ansi")
+        .render();
+        assert_eq!(v_plain, v_ansi);
+        assert!(v_plain.contains("src/invoice.test.ts:42:19"), "{v_plain}");
+        assert!(v_plain.contains("- Expected"), "{v_plain}");
+        assert!(v_plain.contains("+ Received"), "{v_plain}");
+        assert!(v_plain.contains("-   \"total\": 120,"), "{v_plain}");
+        assert!(v_plain.contains("+   \"total\": 110,"), "{v_plain}");
+
+        // 2. Playwright with modern Call log (`8 × locator resolved...`) + Retry #1 + Expected/Received.
+        let pw_out = "\
+Running 12 tests using 4 workers
+
+  1) [chromium] › tests/nav.spec.ts:18:5 › Nav › opens dashboard ──────────────────────
+
+    Error: expect(locator).toHaveText(expected) failed
+
+    Locator:  getByRole('heading')
+    Expected string: \"Dashboard\"
+    Received string: \"Login\"
+    Timeout:  5000ms
+
+    Call log:
+      - expect.toHaveText with timeout 5000ms
+      - waiting for getByRole('heading')
+        8 × locator resolved to <h1>Login</h1>
+          - unexpected value \"Login\"
+
+      23 |   await page.goto('/dashboard');
+    > 25 |   await expect(page.getByRole('heading')).toHaveText('Dashboard');
+         |                                           ^
+
+        at /repo/tests/nav.spec.ts:25:43
+
+    Retry #1 ──────────────────────────────────────────────────────────────────────────
+
+    Error: expect(locator).toHaveText(expected) failed
+
+    Locator:  getByRole('heading')
+    Expected string: \"Dashboard\"
+    Received string: \"Login\"
+
+  1 failed
+    [chromium] › tests/nav.spec.ts:18:5 › Nav › opens dashboard ───────────────────────
+  11 passed (6.1s)
+";
+        let pw_report = scan(&[(pw_out, Stream::Stdout)]).expect("playwright report");
+        let pw_rendered = pw_report.render();
+        assert!(
+            pw_rendered.contains("/repo/tests/nav.spec.ts:25:43"),
+            "{pw_rendered}"
+        );
+        assert!(
+            pw_rendered.contains("Expected string: \"Dashboard\""),
+            "{pw_rendered}"
+        );
+        assert!(
+            pw_rendered.contains("Received string: \"Login\""),
+            "{pw_rendered}"
+        );
+        assert!(
+            !pw_rendered.contains("locator resolved"),
+            "Call log retry chatter must not leak into excerpt:\n{pw_rendered}"
+        );
+        assert_eq!(
+            pw_rendered
+                .matches("Expected string: \"Dashboard\"")
+                .count(),
+            1,
+            "Retry #1 must not duplicate Expected/Received lines:\n{pw_rendered}"
+        );
+
+        // 3. Bun `toEqual` object diff without `at` frame falls back to code-frame `file:line`
+        //    and keeps diff lines crisp without polluting `other` notes.
+        let bun_err = "\
+bun test v1.2.4 (abcdef12)
+
+src/cart.test.ts:
+(pass) Cart > empty cart [0.10ms]
+14 |     expect(res).toEqual({ total: 120, status: \"ok\" });
+                     ^
+\x1b[31merror\x1b[0m: expect(received).toEqual(expected)
+
+  {
+-   \"total\": 120,
++   \"total\": 110,
+    \"status\": \"ok\",
+  }
+
+- Expected  - 1
++ Received  + 1
+
+(fail) Cart > applies tax [1.20ms]
+
+ 1 pass
+ 1 fail
+Ran 2 tests across 1 file. [14.2ms]
+";
+        let bun_report =
+            scan(&[("", Stream::Stdout), (bun_err, Stream::Stderr)]).expect("bun report");
+        assert_eq!(
+            bun_report.failures[0].location.as_deref(),
+            Some("src/cart.test.ts:14")
+        );
+        assert!(
+            bun_report
+                .notes
+                .iter()
+                .all(|n| !n.contains("other line(s)")),
+            "unchanged object diff braces must not pollute other notes: {:?}",
+            bun_report.notes
+        );
+        let bun_rendered = bun_report.render();
+        assert!(
+            bun_rendered.contains("src/cart.test.ts:14"),
+            "{bun_rendered}"
+        );
+        assert!(
+            bun_rendered.contains("-   \"total\": 120,"),
+            "{bun_rendered}"
+        );
+        assert!(
+            bun_rendered.contains("+   \"total\": 110,"),
+            "{bun_rendered}"
         );
     }
 }
