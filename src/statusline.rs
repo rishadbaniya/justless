@@ -27,6 +27,8 @@
 //! Hooks, from <https://code.claude.com/docs/en/hooks>, run in the session's
 //! current directory with `CLAUDE_PROJECT_DIR` set to the project root where the
 //! session started.
+use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -115,6 +117,22 @@ struct Tally {
     recalled: u64,
 }
 
+#[inline]
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    let Some((&first, rest)) = needle.split_first() else {
+        return true;
+    };
+    let mut pos = 0;
+    while let Some(offset) = haystack[pos..].iter().position(|&b| b == first) {
+        let start = pos + offset + 1;
+        if haystack.get(start..start + rest.len()) == Some(rest) {
+            return true;
+        }
+        pos = start;
+    }
+    false
+}
+
 fn line(root: Option<&Path>, input: &Value, now: u64, width: Option<usize>) -> Option<String> {
     let digest = input["session_id"]
         .as_str()
@@ -124,72 +142,113 @@ fn line(root: Option<&Path>, input: &Value, now: u64, width: Option<usize>) -> O
     if workspaces.is_empty() {
         return None;
     }
-    let mut tally = Tally::default();
-    if let Some(start) = session_start(input, now) {
-        for workspace in &workspaces {
-            tally.add_runs(workspace, start);
-            let recalls = crate::history::archive_recalls(&workspace.state, start);
-            tally.recalled += recalls.bytes - recalls.proxy_bytes;
-        }
+    // Short-circuit cleanly when no discovered project has a `.justless/` state
+    // directory: nothing can be tallied, so avoid reading transcripts or state.
+    if !workspaces.iter().any(|(_, has_state)| *has_state) {
+        return Some(render(&Tally::default(), width));
     }
-    if let Some(digest) = &digest {
-        for workspace in &workspaces {
-            tally.add_tools(workspace, digest);
+    let start = session_start(input, now);
+    let ledger_name = digest.as_deref().map(|d| format!("{d}.jsonl"));
+    let mut tally = Tally::default();
+    let mut path_buf = PathBuf::new();
+    let mut read_buf = Vec::new();
+    for (workspace, has_state) in &workspaces {
+        if !has_state {
+            continue;
+        }
+        if let Some(start) = start {
+            tally.add_runs(workspace, start, &mut path_buf, &mut read_buf);
+            let recalls = crate::history::archive_recalls(&workspace.state, start);
+            tally.recalled = tally
+                .recalled
+                .saturating_add(recalls.bytes.saturating_sub(recalls.proxy_bytes));
+        }
+        if let Some(ledger_name) = &ledger_name {
+            tally.add_tools(workspace, ledger_name, &mut path_buf, &mut read_buf);
         }
     }
     Some(render(&tally, width))
 }
 
-/// The projects whose runs this session may have recorded. Hooks and routed
-/// commands store runs in the project around their working directory, which can
-/// be a nested repository the session moved into. So the session's current and
-/// launch directories are read, and so is every nested project that this
-/// session's runs and hooks listed in them, after the session has left it.
-fn workspaces(root: Option<&Path>, input: &Value, digest: Option<&str>) -> Vec<Workspace> {
-    let starts: Vec<PathBuf> = [
+/// The projects whose runs this session may have recorded, paired with whether
+/// their `.justless/` state directory exists. Hooks and routed commands store
+/// runs in the project around their working directory, which can be a nested
+/// repository the session moved into. So the session's current and launch
+/// directories are read, and so is every nested project that this session's
+/// runs and hooks listed in them, after the session has left it.
+fn workspaces(root: Option<&Path>, input: &Value, digest: Option<&str>) -> Vec<(Workspace, bool)> {
+    let mut starts: [&Path; 3] = [Path::new(""); 3];
+    let mut start_count = 0;
+    for raw in [
         &input["workspace"]["current_dir"],
         &input["cwd"],
         &input["workspace"]["project_dir"],
-    ]
-    .into_iter()
-    .filter_map(Value::as_str)
-    .map(PathBuf::from)
-    .filter(|dir| dir.is_absolute())
-    .collect();
-    let mut found: Vec<Workspace> = Vec::new();
-    if root.is_some() || starts.is_empty() {
-        found.extend(Workspace::discover(root));
+    ] {
+        if let Some(dir) = raw.as_str().map(Path::new).filter(|dir| dir.is_absolute())
+            && !starts[..start_count].contains(&dir)
+        {
+            starts[start_count] = dir;
+            start_count += 1;
+        }
     }
-    if root.is_none() {
-        for start in starts {
-            if let Ok(workspace) = Workspace::discover_from(&start)
-                && !found.iter().any(|known| known.root == workspace.root)
+    let mut found: Vec<(Workspace, bool)> = Vec::new();
+    if root.is_some() || start_count == 0 {
+        if let Ok(workspace) = Workspace::discover(root) {
+            let has_state = workspace.state.is_dir();
+            found.push((workspace, has_state));
+        }
+    } else {
+        for &start in &starts[..start_count] {
+            if let Ok(workspace) = Workspace::discover_from(start)
+                && !found.iter().any(|(known, _)| known.root == workspace.root)
             {
-                found.push(workspace);
+                let has_state = workspace.state.is_dir();
+                found.push((workspace, has_state));
             }
         }
     }
     let Some(digest) = digest else {
         return found;
     };
-    for index in 0..found.len() {
-        let Ok(file) = File::open(roots_file(&found[index].state, digest)) else {
+    let initial = found.len();
+    if !found[..initial].iter().any(|(_, has_state)| *has_state) {
+        return found;
+    }
+    let roots_name = format!("{digest}.roots");
+    let mut path_buf = PathBuf::new();
+    let mut listed = String::new();
+    for index in 0..initial {
+        if !found[index].1 {
+            continue;
+        }
+        path_buf.clear();
+        path_buf.push(&found[index].0.state);
+        path_buf.push("sessions");
+        path_buf.push(&roots_name);
+        let Ok(file) = File::open(&path_buf) else {
             continue;
         };
-        let mut listed = String::new();
+        listed.clear();
         if file.take(ROOTS_SCAN).read_to_string(&mut listed).is_err() {
             continue;
         }
         for line in listed.lines() {
+            if line.is_empty() {
+                continue;
+            }
             let nested = Path::new(line);
             // A list names only projects inside the one that holds it.
-            if nested == found[index].root || !nested.starts_with(&found[index].root) {
+            if nested == found[index].0.root
+                || !nested.starts_with(&found[index].0.root)
+                || found.iter().any(|(known, _)| known.root == nested)
+            {
                 continue;
             }
             if let Ok(workspace) = Workspace::discover(Some(nested))
-                && !found.iter().any(|known| known.root == workspace.root)
+                && !found.iter().any(|(known, _)| known.root == workspace.root)
             {
-                found.push(workspace);
+                let has_state = workspace.state.is_dir();
+                found.push((workspace, has_state));
             }
         }
     }
@@ -204,40 +263,58 @@ fn session_start(input: &Value, now: u64) -> Option<u64> {
         .as_str()
         .filter(|path| !path.is_empty())
         .map(Path::new);
-    transcript
-        .and_then(first_timestamp)
-        .or_else(|| {
-            let created = fs::metadata(transcript?).ok()?.created().ok()?;
-            Some(millis(created))
-        })
-        .or_else(|| {
-            let running = input["cost"]["total_duration_ms"].as_f64()?;
-            (running.is_finite() && running >= 0.0).then(|| now.saturating_sub(running as u64))
-        })
+    transcript.and_then(transcript_start).or_else(|| {
+        let duration = &input["cost"]["total_duration_ms"];
+        let running = duration.as_u64().or_else(|| {
+            let ms = duration.as_f64()?;
+            (ms.is_finite() && ms >= 0.0).then_some(ms as u64)
+        })?;
+        Some(now.saturating_sub(running))
+    })
 }
 
-/// The first top-level `timestamp` in a Claude Code JSONL transcript. Its first
-/// few records, such as the permission mode, carry none.
-fn first_timestamp(path: &Path) -> Option<u64> {
+/// The first top-level `timestamp` in a Claude Code JSONL transcript, falling
+/// back to the transcript file's creation time. Its first few records, such as
+/// the permission mode, carry none.
+fn transcript_start(path: &Path) -> Option<u64> {
     #[derive(Deserialize)]
-    struct Stamp {
-        timestamp: Option<String>,
+    struct Stamp<'a> {
+        #[serde(borrow)]
+        timestamp: Option<Cow<'a, str>>,
     }
-    let mut reader = BufReader::new(File::open(path).ok()?.take(TRANSCRIPT_SCAN));
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(_) => return fs::metadata(path).ok()?.created().ok().map(millis),
+    };
+    let mut reader = BufReader::new(file.take(TRANSCRIPT_SCAN));
     let mut line = Vec::new();
     loop {
         line.clear();
-        if reader.read_until(b'\n', &mut line).ok()? == 0 {
-            return None;
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+        if !contains_bytes(&line, b"timestamp") {
+            continue;
         }
         if let Ok(Stamp {
             timestamp: Some(text),
-        }) = serde_json::from_slice::<Stamp>(&line)
+        }) = serde_json::from_slice::<Stamp<'_>>(&line)
             && let Some(ms) = parse_timestamp(&text)
         {
             return Some(ms);
         }
     }
+    reader
+        .into_inner()
+        .into_inner()
+        .metadata()
+        .ok()?
+        .created()
+        .ok()
+        .map(millis)
 }
 
 /// Parses an RFC 3339 timestamp such as `2026-11-17T15:42:21.427Z` into Unix
@@ -290,11 +367,21 @@ fn parse_timestamp(text: &str) -> Option<u64> {
                 _ => return None,
             };
             let zone = rest.get(1..)?;
-            if zone.len() != 5 || zone.as_bytes()[2] != b':' {
+            let zb = zone.as_bytes();
+            if zb.len() != 5
+                || zb[2] != b':'
+                || !zb[0].is_ascii_digit()
+                || !zb[1].is_ascii_digit()
+                || !zb[3].is_ascii_digit()
+                || !zb[4].is_ascii_digit()
+            {
                 return None;
             }
-            let hours: i64 = zone.get(..2)?.parse().ok()?;
-            let minutes: i64 = zone.get(3..)?.parse().ok()?;
+            let hours = i64::from((zb[0] - b'0') * 10 + (zb[1] - b'0'));
+            let minutes = i64::from((zb[3] - b'0') * 10 + (zb[4] - b'0'));
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
             sign * (hours * 3600 + minutes * 60)
         }
     };
@@ -318,7 +405,13 @@ impl Tally {
     /// Adds hook-routed runs that finished after `start`. Run records do not
     /// name their session, so a concurrent session in the same project counts
     /// here too.
-    fn add_runs(&mut self, workspace: &Workspace, start: u64) {
+    fn add_runs(
+        &mut self,
+        workspace: &Workspace,
+        start: u64,
+        path: &mut PathBuf,
+        buf: &mut Vec<u8>,
+    ) {
         /// The fields a savings total needs, read without decoding the whole record.
         #[derive(Deserialize)]
         struct Cost {
@@ -333,59 +426,86 @@ impl Tally {
             #[serde(default)]
             hook: bool,
         }
-        let Ok(entries) = fs::read_dir(workspace.state.join("runs")) else {
+        path.clear();
+        path.push(&workspace.state);
+        path.push("runs");
+        let Ok(entries) = fs::read_dir(&*path) else {
             return;
         };
         for entry in entries.flatten() {
-            let record = entry.path().join("record.json");
-            let Ok(metadata) = fs::metadata(&record) else {
-                continue;
-            };
-            let modified = metadata.modified().map_or(0, millis);
-            if modified.saturating_add(RECORD_SLACK_MS) < start {
+            if entry.file_type().is_ok_and(|ft| ft.is_file()) {
                 continue;
             }
-            let Some(cost) = fs::read(&record)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Cost>(&bytes).ok())
-            else {
-                continue;
-            };
-            // Records written before completion times existed use their modification time.
-            let completed = if cost.completed_ms > 0 {
-                cost.completed_ms
-            } else {
-                modified
-            };
-            if cost.hook && completed >= start {
-                self.runs += 1;
-                self.run_raw += cost.raw_bytes;
-                self.run_shown += cost.preview_bytes + cost.footer_bytes;
-                self.run_replayed += crate::history::replayed(&entry.path(), true).bytes();
+            path.push(entry.file_name());
+            path.push("record.json");
+            let matched = (|| {
+                let metadata = fs::metadata(&*path).ok()?;
+                let modified = metadata.modified().map_or(0, millis);
+                if modified.saturating_add(RECORD_SLACK_MS) < start {
+                    return None;
+                }
+                buf.clear();
+                File::open(&*path).ok()?.read_to_end(buf).ok()?;
+                let cost: Cost = serde_json::from_slice(buf).ok()?;
+                // Records written before completion times existed use their modification time.
+                let completed = if cost.completed_ms > 0 {
+                    cost.completed_ms
+                } else {
+                    modified
+                };
+                (cost.hook && completed >= start).then_some(cost)
+            })();
+            path.pop();
+            if let Some(cost) = matched {
+                self.runs = self.runs.saturating_add(1);
+                self.run_raw = self.run_raw.saturating_add(cost.raw_bytes);
+                self.run_shown = self
+                    .run_shown
+                    .saturating_add(cost.preview_bytes.saturating_add(cost.footer_bytes));
+                self.run_replayed = self
+                    .run_replayed
+                    .saturating_add(crate::history::replayed(path, true).bytes());
             }
+            path.pop();
         }
     }
 
     /// Adds the Read, Grep and Glob results this session's hooks replaced.
-    fn add_tools(&mut self, workspace: &Workspace, digest: &str) {
-        let Ok(file) = File::open(ledger(&workspace.state, digest)) else {
+    fn add_tools(
+        &mut self,
+        workspace: &Workspace,
+        ledger_name: &str,
+        path: &mut PathBuf,
+        buf: &mut Vec<u8>,
+    ) {
+        path.clear();
+        path.push(&workspace.state);
+        path.push("sessions");
+        path.push(ledger_name);
+        let Ok(file) = File::open(&*path) else {
             return;
         };
-        for line in BufReader::new(file.take(8 << 20))
-            .split(b'\n')
-            .map_while(Result::ok)
-        {
-            let Ok(entry) = serde_json::from_slice::<Replacement>(&line) else {
+        let mut reader = BufReader::new(file.take(8 << 20));
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if buf.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let Ok(entry) = serde_json::from_slice::<Replacement<'_>>(buf) else {
                 continue;
             };
             if entry.tool == "Read" {
-                self.reads += 1;
-                self.read_raw += entry.raw;
-                self.read_shown += entry.shown;
+                self.reads = self.reads.saturating_add(1);
+                self.read_raw = self.read_raw.saturating_add(entry.raw);
+                self.read_shown = self.read_shown.saturating_add(entry.shown);
             } else {
-                self.searches += 1;
-                self.search_raw += entry.raw;
-                self.search_shown += entry.shown;
+                self.searches = self.searches.saturating_add(1);
+                self.search_raw = self.search_raw.saturating_add(entry.raw);
+                self.search_shown = self.search_shown.saturating_add(entry.shown);
             }
         }
     }
@@ -432,10 +552,15 @@ impl Tally {
     }
 
     /// Rounded whole-percent net byte reduction when the session saved bytes.
+    #[cfg(test)]
     fn net_saved_percent(&self) -> Option<u64> {
+        self.net_saved_percent_with(self.net_tokens())
+    }
+
+    fn net_saved_percent_with(&self, net_tokens: i64) -> Option<u64> {
         let raw = self.total_raw();
         let net = self.net_bytes();
-        if raw == 0 || net <= 0 || self.net_tokens() < 0 {
+        if raw == 0 || net <= 0 || net_tokens < 0 {
             return None;
         }
         let pct = (net as f64 * 100.0 / raw as f64).round();
@@ -443,83 +568,145 @@ impl Tally {
     }
 }
 
-/// Counts with the noun in the singular or plural.
-fn count(n: u64, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
+/// Writes `n` with the noun in the singular or plural into `out`.
+fn write_count(out: &mut String, n: u64, one: &str, many: &str) {
+    let _ = write!(out, "{n} {}", if n == 1 { one } else { many });
+}
+
+/// Writes `850`, `41.2k` or `1.3M` into `out` without extra allocations.
+fn write_short_number(out: &mut String, n: u64) {
+    let write_scaled = |out: &mut String, value: f64, unit: char| {
+        let start = out.len();
+        let _ = write!(out, "{value:.1}");
+        if out[start..].ends_with(".0") {
+            out.truncate(out.len() - 2);
+        }
+        out.push(unit);
+    };
+    match n {
+        0..1000 => {
+            let _ = write!(out, "{n}");
+        }
+        1000..999_950 => write_scaled(out, n as f64 / 1e3, 'k'),
+        _ => write_scaled(out, n as f64 / 1e6, 'M'),
+    }
 }
 
 /// `850`, `41.2k` or `1.3M`.
+#[cfg(test)]
 fn short_number(n: u64) -> String {
-    let scaled = |value: f64, unit: &str| {
-        let text = format!("{value:.1}");
-        format!("{}{unit}", text.strip_suffix(".0").unwrap_or(&text))
-    };
-    match n {
-        0..1000 => n.to_string(),
-        1000..999_950 => scaled(n as f64 / 1e3, "k"),
-        _ => scaled(n as f64 / 1e6, "M"),
-    }
+    let mut out = String::new();
+    write_short_number(&mut out, n);
+    out
 }
 
 /// The status line, shortened from the end to fit `width` columns.
 fn render(tally: &Tally, width: Option<usize>) -> String {
-    if tally.runs + tally.reads + tally.searches == 0 {
+    if tally.runs == 0 && tally.reads == 0 && tally.searches == 0 {
         return "justless · ready".into();
     }
     let net = tally.net_tokens();
-    let tokens = short_number(net.unsigned_abs());
-    let saved_plain = if net < 0 {
-        format!("net ≈{tokens} extra tokens")
+    let mut saved_plain = String::with_capacity(32);
+    saved_plain.push_str("net ≈");
+    write_short_number(&mut saved_plain, net.unsigned_abs());
+    saved_plain.push_str(if net < 0 {
+        " extra tokens"
     } else {
-        format!("net ≈{tokens} tokens saved")
-    };
+        " tokens saved"
+    });
     let saved_pct = tally
-        .net_saved_percent()
+        .net_saved_percent_with(net)
         .map(|pct| format!("{saved_plain} ({pct}%)"));
     let saved = saved_pct.as_deref().unwrap_or(&saved_plain);
-    let mut counts = Vec::new();
+
+    let mut counts: [(u64, &str, &str); 3] = [(0, "", ""); 3];
+    let mut count_len = 0;
     if tally.runs > 0 {
-        counts.push(count(tally.runs, "run", "runs"));
+        counts[count_len] = (tally.runs, "run", "runs");
+        count_len += 1;
     }
     if tally.reads > 0 {
-        counts.push(count(tally.reads, "read", "reads"));
+        counts[count_len] = (tally.reads, "read", "reads");
+        count_len += 1;
     }
     if tally.searches > 0 {
-        counts.push(count(tally.searches, "search", "searches"));
+        counts[count_len] = (tally.searches, "search", "searches");
+        count_len += 1;
     }
-    let mut variants = Vec::new();
+
+    let fits = |text: &str| width.is_none_or(|limit| text.chars().count() <= limit);
+    let mut candidate = String::with_capacity(128);
+
     if tally.run_replayed > 0 || tally.recalled > 0 {
         let initial = tally.initial_tokens();
-        let tokens = short_number(initial.unsigned_abs());
-        let direction = if initial < 0 { "extra" } else { "saved" };
-        let initial_part = format!("justless · initially ≈{tokens} tokens {direction}");
-        let both = format!("{initial_part} · {saved}");
-        let mut full = vec![format!("{both} this session")];
-        full.extend(counts.iter().cloned());
-        variants.push(full.join(" · "));
-        variants.push(both);
+        let mut initial_part = String::with_capacity(48);
+        initial_part.push_str("justless · initially ≈");
+        write_short_number(&mut initial_part, initial.unsigned_abs());
+        initial_part.push_str(if initial < 0 {
+            " tokens extra"
+        } else {
+            " tokens saved"
+        });
+
+        candidate.push_str(&initial_part);
+        candidate.push_str(" · ");
+        candidate.push_str(saved);
+        let both_len = candidate.len();
+        candidate.push_str(" this session");
+        for &(n, one, many) in &counts[..count_len] {
+            candidate.push_str(" · ");
+            write_count(&mut candidate, n, one, many);
+        }
+        if fits(&candidate) {
+            return candidate;
+        }
+        candidate.truncate(both_len);
+        if fits(&candidate) {
+            return candidate;
+        }
         if saved_pct.is_some() {
-            variants.push(format!("{initial_part} · {saved_plain}"));
+            candidate.clear();
+            candidate.push_str(&initial_part);
+            candidate.push_str(" · ");
+            candidate.push_str(&saved_plain);
+            if fits(&candidate) {
+                return candidate;
+            }
         }
     }
-    for kept in (0..=counts.len()).rev() {
-        let mut parts = vec!["justless".to_owned(), format!("{saved} this session")];
-        parts.extend(counts[..kept].iter().cloned());
-        variants.push(parts.join(" · "));
+
+    for kept in (0..=count_len).rev() {
+        candidate.clear();
+        candidate.push_str("justless · ");
+        candidate.push_str(saved);
+        candidate.push_str(" this session");
+        for &(n, one, many) in &counts[..kept] {
+            candidate.push_str(" · ");
+            write_count(&mut candidate, n, one, many);
+        }
+        if fits(&candidate) {
+            return candidate;
+        }
     }
     if let Some(with_pct) = &saved_pct {
-        variants.push(format!("justless · {with_pct}"));
+        candidate.clear();
+        candidate.push_str("justless · ");
+        candidate.push_str(with_pct);
+        if fits(&candidate) {
+            return candidate;
+        }
     }
-    variants.push(format!("justless · {saved_plain}"));
-    let fits = |text: &String| width.is_none_or(|width| text.chars().count() <= width);
-    let last = variants.pop().unwrap_or_default();
-    variants.into_iter().find(fits).unwrap_or(last)
+    candidate.clear();
+    candidate.push_str("justless · ");
+    candidate.push_str(&saved_plain);
+    candidate
 }
 
 /// One Read, Grep or Glob result a hook replaced, as stored in a session ledger.
 #[derive(Deserialize)]
-struct Replacement {
-    tool: String,
+struct Replacement<'a> {
+    #[serde(borrow)]
+    tool: Cow<'a, str>,
     raw: u64,
     shown: u64,
 }
@@ -652,20 +839,33 @@ pub fn register(root: &Path, digest: &str) {
     if digest.len() != 24 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return;
     }
-    let Some(text) = root.to_str().filter(|text| !text.contains('\n')) else {
+    let Some(text) = root.to_str().filter(|text| !text.contains(['\n', '\r'])) else {
         return;
     };
+    let roots_name = format!("{digest}.roots");
+    let mut path = PathBuf::new();
+    let mut listed = String::new();
+    let mut entry_line = String::new();
     for ancestor in root.ancestors().skip(1) {
-        let path = roots_file(&ancestor.join(".justless"), digest);
+        path.clear();
+        path.push(ancestor);
+        path.push(".justless");
+        path.push("sessions");
+        path.push(&roots_name);
         if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
             continue;
         }
-        let mut listed = String::new();
+        listed.clear();
         let read = File::open(&path)
             .and_then(|file| file.take(ROOTS_SCAN).read_to_string(&mut listed))
             .is_ok();
         if read && !listed.lines().any(|line| line == text) {
-            let _ = append(&path, format!("{text}\n").as_bytes());
+            if entry_line.is_empty() {
+                entry_line.reserve(text.len() + 1);
+                entry_line.push_str(text);
+                entry_line.push('\n');
+            }
+            let _ = append(&path, entry_line.as_bytes());
         }
     }
 }
@@ -1325,5 +1525,120 @@ mod tests {
             Audit::Unreadable { label, .. } if label == LOCAL
         ));
         assert!(!root.join(".justless").exists());
+    }
+
+    #[test]
+    fn single_pass_tally_short_circuits_without_state_and_aggregates_nested_projects() {
+        let temp = tempfile::tempdir().unwrap();
+        let launch = temp.path().canonicalize().unwrap();
+        fs::write(launch.join("Cargo.toml"), "[package]\nname = \"a\"\n").unwrap();
+
+        // 1. Without `.justless/`, `line()` short-circuits cleanly to ready
+        //    without opening the transcript or creating any state files.
+        let missing_transcript = launch.join("does-not-exist.jsonl");
+        let input = json!({
+            "session_id": "sess-1",
+            "transcript_path": missing_transcript,
+            "cwd": launch,
+            "workspace": {"current_dir": launch, "project_dir": launch},
+        });
+        assert_eq!(
+            line(None, &input, 2_000_000, None).as_deref(),
+            Some("justless · ready")
+        );
+        assert!(!launch.join(".justless").exists());
+
+        // 2. With launch + nested projects (one with state, one without) plus
+        //    corrupt/empty lines in `.roots`, `.jsonl` ledgers, and `record.json`,
+        //    single-pass aggregation totals every valid run and tool replacement.
+        let nested_active = launch.join("pkg-active");
+        let nested_empty = launch.join("pkg-empty");
+        fs::create_dir_all(nested_active.join(".git")).unwrap();
+        fs::create_dir_all(nested_empty.join(".git")).unwrap();
+
+        let digest = session_digest("sess-1");
+        let start = 1_767_323_045_678u64;
+        let transcript = launch.join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            "{\"type\":\"permission-mode\"}\n\
+             not json\n\
+             {\"type\":\"user\",\"timestamp\":\"2026-01-02T03:04:05.678Z\"}\n",
+        )
+        .unwrap();
+
+        // Launch project: one hook run + one corrupt run + one Read replacement.
+        let launch_runs = launch.join(".justless/runs");
+        fs::create_dir_all(launch_runs.join("run-1")).unwrap();
+        fs::write(
+            launch_runs.join("run-1/record.json"),
+            json!({"completed_ms": start + 500, "raw_bytes": 20_000, "preview_bytes": 1_952, "footer_bytes": 48, "hook": true}).to_string(),
+        )
+        .unwrap();
+        fs::create_dir_all(launch_runs.join("run-corrupt")).unwrap();
+        fs::write(launch_runs.join("run-corrupt/record.json"), "{broken").unwrap();
+        fs::write(launch_runs.join("stray-file"), "ignore").unwrap();
+
+        let launch_sessions = launch.join(".justless/sessions");
+        fs::create_dir_all(&launch_sessions).unwrap();
+        fs::write(
+            launch_sessions.join(format!("{digest}.jsonl")),
+            "\nnot-json\n{\"tool\":\"Read\",\"raw\":50000,\"shown\":5000}\n   \n",
+        )
+        .unwrap();
+        fs::write(
+            launch_sessions.join(format!("{digest}.roots")),
+            format!(
+                "\n{}\n{}\n{}\n/outside/path\n",
+                nested_active.display(),
+                nested_active.display(),
+                nested_empty.display()
+            ),
+        )
+        .unwrap();
+
+        // Active nested project: one hook run + one Grep replacement.
+        let nested_runs = nested_active.join(".justless/runs/run-2");
+        fs::create_dir_all(&nested_runs).unwrap();
+        fs::write(
+            nested_runs.join("record.json"),
+            json!({"completed_ms": start + 900, "raw_bytes": 10_000, "preview_bytes": 952, "footer_bytes": 48, "hook": true}).to_string(),
+        )
+        .unwrap();
+        let nested_sessions = nested_active.join(".justless/sessions");
+        fs::create_dir_all(&nested_sessions).unwrap();
+        fs::write(
+            nested_sessions.join(format!("{digest}.jsonl")),
+            "{\"tool\":\"Grep\",\"raw\":12000,\"shown\":2000}\n",
+        )
+        .unwrap();
+
+        let active_input = json!({
+            "session_id": "sess-1",
+            "transcript_path": transcript,
+            "cwd": launch,
+            "workspace": {"current_dir": launch, "project_dir": launch},
+        });
+        let expected_tally = Tally {
+            runs: 2,
+            run_raw: 30_000,
+            run_shown: 3_000,
+            reads: 1,
+            read_raw: 50_000,
+            read_shown: 5_000,
+            searches: 1,
+            search_raw: 12_000,
+            search_shown: 2_000,
+            ..Tally::default()
+        };
+        assert_eq!(
+            line(None, &active_input, start + 5_000, None).as_deref(),
+            Some(render(&expected_tally, None).as_str())
+        );
+        // Never creates state in nested projects that had none.
+        assert!(!nested_empty.join(".justless").exists());
+        // Invalid timezone offsets are rejected cleanly.
+        assert_eq!(parse_timestamp("2026-11-17T15:42:21+25:00"), None);
+        assert_eq!(parse_timestamp("2026-11-17T15:42:21+-1:00"), None);
     }
 }

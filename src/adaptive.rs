@@ -9,11 +9,13 @@
 //! the budget moves one step at a time. `.justless/budget-runs.json` caches the
 //! few facts it needs from each finished run, so a `run` reads only records it
 //! has not seen.
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
-use std::fs;
-use std::io;
+use std::fmt::Write as _;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -136,10 +138,13 @@ impl Brief {
             Replaced::Nothing => [self.stdout > at, self.stderr > at],
             Replaced::Stdout => {
                 let report = self.shown.saturating_sub(self.stderr.min(budget));
-                [self.stdout > at && report * 3 >= budget, self.stderr > at]
+                [
+                    self.stdout > at && report.saturating_mul(3) >= budget,
+                    self.stderr > at,
+                ]
             }
             Replaced::Both => {
-                let filled = self.shown * 3 >= budget;
+                let filled = self.shown.saturating_mul(3) >= budget;
                 [self.stdout > at && filled, self.stderr > at && filled]
             }
         }
@@ -161,13 +166,19 @@ impl Brief {
         let clipped = |size: u64| u64::from(size > budget);
         let (most, clipped) = match self.replaced {
             Replaced::Nothing => (
-                fits(self.stdout) + fits(self.stderr),
+                fits(self.stdout).saturating_add(fits(self.stderr)),
                 clipped(self.stdout) + clipped(self.stderr),
             ),
-            Replaced::Stdout => (budget + fits(self.stderr), clipped(self.stderr)),
-            Replaced::Both => (budget.max(fits(self.stdout) + fits(self.stderr)), 0),
+            Replaced::Stdout => (
+                budget.saturating_add(fits(self.stderr)),
+                clipped(self.stderr),
+            ),
+            Replaced::Both => (
+                budget.max(fits(self.stdout).saturating_add(fits(self.stderr))),
+                0,
+            ),
         };
-        (clipped * budget / 4..=most).contains(&self.shown)
+        (clipped.saturating_mul(budget) / 4..=most).contains(&self.shown)
     }
 }
 
@@ -179,23 +190,36 @@ struct Replays {
     stderr: u64,
 }
 
-/// Which streams of the run in `directory` the agent replayed in full. A run
-/// replayed before streams were recorded counts both when `recalls.json` has a
-/// full replay.
-fn replayed(directory: &Path) -> [bool; 2] {
-    if let Ok(bytes) = fs::read(directory.join(REPLAYS)) {
-        let replays: Replays = serde_json::from_slice(&bytes).unwrap_or_default();
+#[derive(Deserialize)]
+struct Recalls {
+    #[serde(default)]
+    full: u64,
+}
+
+fn read_into(path: &Path, buf: &mut Vec<u8>) -> bool {
+    buf.clear();
+    File::open(path)
+        .and_then(|mut file| file.read_to_end(buf))
+        .is_ok()
+}
+
+/// Which streams of run `id` under `runs_dir` the agent replayed in full,
+/// reusing `path` and `buf` to avoid per-run allocations. A run replayed before
+/// streams were recorded counts both when `recalls.json` has a full replay.
+fn replayed_in(path: &mut PathBuf, buf: &mut Vec<u8>, id: &str) -> [bool; 2] {
+    path.push(id);
+    path.push(REPLAYS);
+    if read_into(path, buf) {
+        path.pop();
+        path.pop();
+        let replays: Replays = serde_json::from_slice(buf).unwrap_or_default();
         return [replays.stdout > 0, replays.stderr > 0];
     }
-    #[derive(Deserialize)]
-    struct Recalls {
-        #[serde(default)]
-        full: u64,
-    }
-    let full = fs::read(directory.join("recalls.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Recalls>(&bytes).ok())
-        .is_some_and(|recalls| recalls.full > 0);
+    path.set_file_name("recalls.json");
+    let full = read_into(path, buf)
+        && serde_json::from_slice::<Recalls>(buf).is_ok_and(|recalls| recalls.full > 0);
+    path.pop();
+    path.pop();
     [full, full]
 }
 
@@ -212,10 +236,10 @@ pub fn note_replay(directory: &Path, stream: &str) {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
     if stream != "stderr" {
-        replays.stdout += 1;
+        replays.stdout = replays.stdout.saturating_add(1);
     }
     if stream != "stdout" {
-        replays.stderr += 1;
+        replays.stderr = replays.stderr.saturating_add(1);
     }
     let _ = write_json(&path, &replays);
 }
@@ -254,7 +278,7 @@ struct Decision {
 fn lowering_threshold(limits: Limits, level: i32) -> u64 {
     let budget = limits.budget(level);
     if budget > limits.default {
-        limits.budget(level - 1) as u64
+        limits.budget(level.saturating_sub(1)) as u64
     } else {
         budget as u64
     }
@@ -267,16 +291,28 @@ fn lowering_threshold(limits: Limits, level: i32) -> u64 {
 /// neither: they mean the preview's line markers led to what was needed. Runs
 /// reported as unchanged, and runs whose preview did not come from this budget,
 /// are left out.
+#[cfg(test)]
 fn decide(
     limits: Limits,
     level: i32,
     window: usize,
     runs: &[Brief],
-    replayed: impl Fn(&Brief) -> [bool; 2],
+    replayed: impl FnMut(&Brief) -> [bool; 2],
+) -> Decision {
+    decide_inner(limits, level, window, runs, replayed, true)
+}
+
+fn decide_inner(
+    limits: Limits,
+    level: i32,
+    window: usize,
+    runs: &[Brief],
+    mut replayed: impl FnMut(&Brief) -> [bool; 2],
+    need_details: bool,
 ) -> Decision {
     let budget = limits.budget(level) as u64;
     let threshold = lowering_threshold(limits, level);
-    let can_lower = limits.budget(level - 1) < budget as usize;
+    let can_lower = limits.budget(level.saturating_sub(1)) < budget as usize;
     let mut decision = Decision {
         window,
         ..Decision::default()
@@ -286,16 +322,17 @@ fn decide(
         let here = run.limited(budget, budget);
         let below = run.limited(threshold, budget);
         let count_here = here.contains(&true) && decision.clipped < WINDOW;
-        let count_below = can_lower && below.contains(&true) && decision.over < window;
-        let recent = index < WINDOW;
+        let check_below = can_lower && (need_details || decision.over_reopened == 0);
+        let count_below = check_below && below.contains(&true) && decision.over < window;
+        let recent = need_details && index < WINDOW;
         if !(count_here || count_below || recent) {
-            if decision.clipped == WINDOW && (!can_lower || decision.over == window) {
+            if decision.clipped == WINDOW && (!check_below || decision.over == window) {
                 break;
             }
             continue;
         }
         let replay = replayed(run);
-        let hit = |limited: [bool; 2]| limited.iter().zip(replay).any(|(l, r)| *l && r);
+        let hit = |limited: [bool; 2]| (limited[0] && replay[0]) || (limited[1] && replay[1]);
         if count_here {
             decision.clipped += 1;
             decision.reopened += usize::from(hit(here));
@@ -309,7 +346,7 @@ fn decide(
         }
     }
     decision.step = if wants_raise(decision.clipped, decision.reopened)
-        && limits.budget(level + 1) > budget as usize
+        && limits.budget(level.saturating_add(1)) > budget as usize
     {
         Step::Raise
     } else if can_lower && decision.over >= window && decision.over_reopened == 0 {
@@ -321,7 +358,7 @@ fn decide(
 }
 
 fn wants_raise(clipped: usize, reopened: usize) -> bool {
-    clipped >= MIN_SAMPLE && reopened * 4 >= clipped
+    clipped >= MIN_SAMPLE && reopened.saturating_mul(4) >= clipped
 }
 
 /// The family `capture` will record for `args`, and the command label beside it.
@@ -340,17 +377,22 @@ fn family(args: &[OsString]) -> String {
     }
 }
 
-/// The budget key for a run: its family, or its command label when that names
-/// the command more precisely, as `git log` does within `git` and `make test`
-/// within `other`. Runs that only the catch-all `other` or `legacy` describe mix
-/// unrelated commands, as runners do, so they keep the default.
-fn key(family: &str, label: &str) -> Option<String> {
+/// The budget key for a run as a borrowed slice: its family, or its command
+/// label when that names the command more precisely, as `git log` does within
+/// `git` and `make test` within `other`. Runs that only the catch-all `other`
+/// or `legacy` describe mix unrelated commands, as runners do, so they keep
+/// the default.
+fn key_str<'a>(family: &'a str, label: &'a str) -> Option<&'a str> {
     let specific = family == "other"
         || label
             .strip_prefix(family)
             .is_some_and(|rest| rest.starts_with(' '));
-    let key = if specific { label } else { family };
-    (!matches!(key, "" | "other" | "legacy") && !runner(key)).then(|| key.to_owned())
+    let candidate = if specific { label } else { family };
+    (!matches!(candidate, "" | "other" | "legacy") && !runner(candidate)).then_some(candidate)
+}
+
+fn key(family: &str, label: &str) -> Option<String> {
+    key_str(family, label).map(str::to_owned)
 }
 
 /// Whether a key names a runner rather than the work it runs: a shell or
@@ -360,18 +402,10 @@ fn key(family: &str, label: &str) -> Option<String> {
 /// unrelated scripts and targets. A key that selects a command profile, such as
 /// the linter `golangci-lint run`, names the work.
 fn runner(key: &str) -> bool {
-    let words: Vec<OsString> = key.split(' ').map(OsString::from).collect();
-    let profile = crate::filters::Selection::for_run(&words, &[])
-        .ok()
-        .and_then(|selection| selection.profile);
-    if profile.is_some() {
-        return false;
-    }
-    match key.split_once(' ') {
+    let looks_like_runner = match key.split_once(' ') {
         Some((_, subcommand)) => matches!(subcommand, "run" | "exec" | "dlx" | "x"),
         None => {
-            crate::history::label(&[key, "build"]) != key
-                || key.starts_with("python")
+            key.starts_with("python")
                 || key.starts_with("pypy")
                 || matches!(
                     key,
@@ -406,8 +440,17 @@ fn runner(key: &str) -> bool {
                         | "just"
                         | "task"
                 )
+                || crate::history::label(&[key, "build"]) != key
         }
+    };
+    if !looks_like_runner {
+        return false;
     }
+    let words: Vec<OsString> = key.split(' ').map(OsString::from).collect();
+    crate::filters::Selection::for_run(&words, &[])
+        .ok()
+        .and_then(|selection| selection.profile)
+        .is_none()
 }
 
 fn command_key(args: &[OsString]) -> Option<String> {
@@ -415,23 +458,49 @@ fn command_key(args: &[OsString]) -> Option<String> {
     key(&family(args), &crate::history::label(&words))
 }
 
+#[derive(Default)]
+struct HasElements(bool);
+
+impl<'de> Deserialize<'de> for HasElements {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = HasElements;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a sequence")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut any = false;
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    any = true;
+                }
+                Ok(HasElements(any))
+            }
+        }
+        deserializer.deserialize_seq(Visitor)
+    }
+}
+
 #[derive(Default, Deserialize)]
-struct RecordSummary {
+struct RecordSummary<'a> {
+    #[serde(default, borrow)]
+    kind: Cow<'a, str>,
     #[serde(default)]
-    kind: String,
+    items: HasElements,
     #[serde(default)]
-    items: Vec<serde::de::IgnoredAny>,
-    #[serde(default)]
-    outcomes: Vec<serde::de::IgnoredAny>,
+    outcomes: HasElements,
 }
 
 /// The fields of a run record the advisor reads.
 #[derive(Deserialize)]
-struct Record {
-    #[serde(default)]
-    family: String,
-    #[serde(default)]
-    label: String,
+struct Record<'a> {
+    #[serde(default, borrow)]
+    family: Cow<'a, str>,
+    #[serde(default, borrow)]
+    label: Cow<'a, str>,
     #[serde(default)]
     status: i32,
     #[serde(default)]
@@ -442,17 +511,17 @@ struct Record {
     completed_ms: u64,
     #[serde(default)]
     unchanged: bool,
-    #[serde(default)]
-    summary: RecordSummary,
-    #[serde(default)]
-    replaced: Option<String>,
+    #[serde(default, borrow)]
+    summary: RecordSummary<'a>,
+    #[serde(default, borrow)]
+    replaced: Option<Cow<'a, str>>,
     #[serde(default)]
     budget_bytes: Option<u64>,
     #[serde(default)]
     explicit_budget: bool,
 }
 
-impl Record {
+impl Record<'_> {
     /// What replaced the plain preview: persisted directly by `capture` when
     /// available, falling back to the legacy summary heuristic for older
     /// records written before `replaced` and `budget_bytes` existed.
@@ -468,11 +537,10 @@ impl Record {
         }
         let summary = &self.summary;
         let renders = !summary.kind.is_empty()
-            && (!summary.items.is_empty() || !summary.outcomes.is_empty())
+            && (summary.items.0 || summary.outcomes.0)
             && !(self.status != 0
-                && (summary.kind == "inventory"
-                    || summary.kind == "tests" && summary.items.is_empty()));
-        match summary.kind.as_str() {
+                && (summary.kind == "inventory" || summary.kind == "tests" && !summary.items.0));
+        match summary.kind.as_ref() {
             _ if !renders => Replaced::Nothing,
             "lint" => Replaced::Both,
             _ => Replaced::Stdout,
@@ -483,14 +551,24 @@ impl Record {
 /// A finished run's budget key and brief. `None` marks a run outside every
 /// budget, one reported as unchanged, one too small for any budget to limit, or
 /// a damaged record.
+#[cfg(test)]
 fn brief(id: &str, directory: &Path, record: &[u8]) -> Option<(String, Brief)> {
-    let run: Record = serde_json::from_slice(record).ok()?;
-    let key = key(&run.family, &run.label)?;
+    let mut path = directory.to_path_buf();
+    brief_in(id, &mut path, record)
+}
+
+fn brief_in(id: &str, directory: &mut PathBuf, record: &[u8]) -> Option<(String, Brief)> {
+    let run: Record<'_> = serde_json::from_slice(record).ok()?;
     if run.unchanged {
         return None;
     }
-    let size = |name: &str| fs::metadata(directory.join(name)).ok().map(|m| m.len());
-    let (stdout, stderr) = match (size("stdout"), size("stderr")) {
+    let key = key_str(&run.family, &run.label)?;
+    directory.push("stdout");
+    let stdout = fs::metadata(&*directory).ok().map(|m| m.len());
+    directory.set_file_name("stderr");
+    let stderr = fs::metadata(&*directory).ok().map(|m| m.len());
+    directory.pop();
+    let (stdout, stderr) = match (stdout, stderr) {
         (Some(stdout), Some(stderr)) => (stdout, stderr),
         _ => (run.raw_bytes, 0),
     };
@@ -499,7 +577,7 @@ fn brief(id: &str, directory: &Path, record: &[u8]) -> Option<(String, Brief)> {
     }
     let replaced = run.replaced();
     Some((
-        key,
+        key.to_owned(),
         Brief {
             id: id.to_owned(),
             completed_ms: run.completed_ms,
@@ -521,18 +599,19 @@ fn brief(id: &str, directory: &Path, record: &[u8]) -> Option<(String, Brief)> {
 #[derive(Default, Serialize, Deserialize)]
 struct Index {
     version: u32,
+    #[serde(default)]
     seen: String,
+    #[serde(default)]
     runs: BTreeMap<String, Vec<Brief>>,
 }
 
 const INDEX: &str = "budget-runs.json";
 const INDEX_VERSION: u32 = 3;
 
-/// Briefs by budget key, newest first. An unfinished run is skipped until its
-/// record exists, and a damaged record silently: this runs before every command,
-/// and a warning there would reach the agent with the command's output. `save`
-/// refreshes the cached index.
-fn recorded(workspace: &Workspace, only: Option<&str>, save: bool) -> BTreeMap<String, Vec<Brief>> {
+/// Loads and refreshes the cached run index. An unfinished run is skipped until
+/// its record exists, and a damaged record silently: this runs before every
+/// command, and a warning there would reach the agent with the command's output.
+fn load_index(workspace: &Workspace, save: bool) -> Option<Index> {
     let directory = workspace.state.join("runs");
     let path = workspace.state.join(INDEX);
     let cached = fs::read(&path)
@@ -544,27 +623,51 @@ fn recorded(workspace: &Workspace, only: Option<&str>, save: bool) -> BTreeMap<S
         // A run was deleted, or there was no usable cache.
         _ => match refresh(&directory, Index::default()) {
             Some((index, _)) => (index, true),
-            None => return BTreeMap::new(),
+            None => return None,
         },
     };
     index.version = INDEX_VERSION;
     if save && changed {
         let _ = write_json(&path, &index);
     }
-    match only {
-        Some(key) => index.runs.remove_entry(key).into_iter().collect(),
-        None => index.runs,
-    }
+    Some(index)
+}
+
+fn recorded_for(workspace: &Workspace, key: &str, save: bool) -> Vec<Brief> {
+    load_index(workspace, save)
+        .and_then(|mut index| index.runs.remove(key))
+        .unwrap_or_default()
+}
+
+fn recorded_all(workspace: &Workspace, save: bool) -> BTreeMap<String, Vec<Brief>> {
+    load_index(workspace, save)
+        .map(|index| index.runs)
+        .unwrap_or_default()
 }
 
 /// Adds the runs in `directory` that `index` has not seen, and whether any were
-/// added. `None` when the directory cannot be listed or a seen run is gone.
+/// added or cleaned up. `None` when the directory cannot be listed or a seen
+/// run is gone. Corrupt or empty lines in `index.seen` are skipped cleanly.
 fn refresh(directory: &Path, mut index: Index) -> Option<(Index, bool)> {
     let entries = fs::read_dir(directory).ok()?;
+    index.runs.retain(|key, _| !key.trim().is_empty());
     let seen_text = std::mem::take(&mut index.seen);
-    let seen: HashSet<&str> = seen_text.lines().collect();
-    let mut found = 0;
+    let mut seen = HashSet::new();
+    let mut seen_dirty = !seen_text.is_empty() && !seen_text.ends_with('\n');
+    for line in seen_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("run-") && trimmed.len() > "run-".len() {
+            if trimmed.len() != line.len() || !seen.insert(trimmed) {
+                seen_dirty = true;
+            }
+        } else {
+            seen_dirty = true;
+        }
+    }
+    let mut found = 0usize;
     let mut added = Vec::new();
+    let mut path = directory.to_path_buf();
+    let mut record_buf = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(id) = name.to_str() else {
@@ -573,33 +676,52 @@ fn refresh(directory: &Path, mut index: Index) -> Option<(Index, bool)> {
         if !id.starts_with("run-") {
             continue;
         }
-        if seen.contains(id) {
+        if !seen.is_empty() && seen.contains(id) {
             found += 1;
             continue;
         }
-        let path = entry.path();
-        let Ok(record) = fs::read(path.join("record.json")) else {
-            continue;
-        };
-        let brief = brief(id, &path, &record);
-        added.push((id.to_owned(), brief));
+        path.push(id);
+        path.push("record.json");
+        let has_record = read_into(&path, &mut record_buf);
+        path.pop();
+        if has_record {
+            let brief = brief_in(id, &mut path, &record_buf);
+            added.push((id.to_owned(), brief));
+        }
+        path.pop();
     }
     if found < seen.len() {
         return None;
     }
-    drop(seen);
-    let mut seen_text = seen_text;
-    let changed = !added.is_empty();
+    let mut seen_text = if seen_dirty {
+        let mut rebuilt = String::with_capacity(seen_text.len());
+        for id in &seen {
+            rebuilt.push_str(id);
+            rebuilt.push('\n');
+        }
+        drop(seen);
+        rebuilt
+    } else {
+        drop(seen);
+        seen_text
+    };
+    let changed = seen_dirty || !added.is_empty();
     let mut keys = HashSet::new();
     for (id, brief) in added {
         seen_text.push_str(&id);
         seen_text.push('\n');
         if let Some((key, brief)) = brief {
-            let list = index.runs.entry(key.clone()).or_default();
-            if !list.iter().any(|known| known.id == brief.id) {
-                list.push(brief);
+            if let Some(list) = index.runs.get_mut(&key) {
+                if !list.iter().any(|known| known.id == brief.id) {
+                    list.push(brief);
+                    if !keys.contains(&key) {
+                        keys.insert(key);
+                    }
+                }
+            } else {
+                index.runs.insert(key.clone(), vec![brief]);
+                keys.insert(key);
             }
-            keys.insert(key);
         }
     }
     for key in keys {
@@ -669,11 +791,33 @@ impl Entry {
 
 type State = BTreeMap<String, Entry>;
 
+fn parse_state(bytes: &[u8]) -> State {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return State::new();
+    }
+    if let Ok(mut state) = serde_json::from_slice::<State>(bytes) {
+        state.retain(|key, _| !key.trim().is_empty());
+        return state;
+    }
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(bytes) else {
+        return State::new();
+    };
+    let mut state = State::new();
+    for (key, value) in map {
+        if key.trim().is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_value::<Entry>(value) {
+            state.insert(key, entry);
+        }
+    }
+    state
+}
+
 fn read_state(workspace: &Workspace) -> State {
     fs::read(workspace.state.join(STATE))
         .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+        .map_or_else(State::new, |bytes| parse_state(&bytes))
 }
 
 /// The budget the next run of a family gets, and why.
@@ -692,8 +836,19 @@ fn advise(
     limits: Limits,
     entry: Option<&Entry>,
     runs: &[Brief],
-    replayed: impl Fn(&Brief) -> [bool; 2],
+    replayed: impl FnMut(&Brief) -> [bool; 2],
     now: u64,
+) -> Advice {
+    advise_inner(limits, entry, runs, replayed, now, true)
+}
+
+fn advise_inner(
+    limits: Limits,
+    entry: Option<&Entry>,
+    runs: &[Brief],
+    replayed: impl FnMut(&Brief) -> [bool; 2],
+    now: u64,
+    need_details: bool,
 ) -> Advice {
     let saved = entry.map_or(0, |entry| limits.normalize(entry.level));
     let since = entry.map_or(0, |entry| entry.since_ms);
@@ -702,14 +857,21 @@ fn advise(
         .take_while(|run| run.completed_ms > since)
         .count();
     let window = Entry::window(entry, limits, saved);
-    let decision = decide(limits, saved, window, &runs[..recent], replayed);
-    let budget = human_bytes(limits.budget(saved) as u64);
+    let decision = decide_inner(
+        limits,
+        saved,
+        window,
+        &runs[..recent],
+        replayed,
+        need_details,
+    );
     let level = match decision.step {
         Step::Raise => saved + 1,
         Step::Lower => saved - 1,
         Step::Hold => saved,
     };
     let change = (level != saved).then(|| {
+        let budget = human_bytes(limits.budget(saved) as u64);
         let mut next = Entry::step(entry, limits, saved, level, now);
         next.reason = match decision.step {
             Step::Raise => {
@@ -718,11 +880,12 @@ fn advise(
                     reopened_text(decision.clipped, decision.reopened)
                 );
                 if next.relapses > 0 {
-                    reason.push_str(&format!(
+                    let _ = write!(
+                        reason,
                         " · raised back here {}, so lowering it again waits for {} runs",
                         times(next.relapses),
                         Entry::window(Some(&next), limits, level)
-                    ));
+                    );
                 }
                 reason
             }
@@ -738,9 +901,13 @@ fn advise(
         };
         next
     });
-    let reason = match &change {
-        Some(next) => next.reason.clone(),
-        None => hold_reason(limits, saved, entry, &decision),
+    let reason = if !need_details {
+        String::new()
+    } else {
+        match &change {
+            Some(next) => next.reason.clone(),
+            None => hold_reason(limits, saved, entry, &decision),
+        }
     };
     Advice {
         bytes: limits.budget(level),
@@ -751,11 +918,11 @@ fn advise(
     }
 }
 
-fn times(count: u32) -> String {
+fn times(count: u32) -> Cow<'static, str> {
     match count {
-        1 => "once".into(),
-        2 => "twice".into(),
-        count => format!("{count} times"),
+        1 => Cow::Borrowed("once"),
+        2 => Cow::Borrowed("twice"),
+        count => Cow::Owned(format!("{count} times")),
     }
 }
 
@@ -770,13 +937,17 @@ fn reopened_text(clipped: usize, reopened: usize) -> String {
 /// then show, distinguishing evidence still accruing from runs that cannot count.
 fn hold_reason(limits: Limits, level: i32, entry: Option<&Entry>, decision: &Decision) -> String {
     let budget = limits.budget(level);
-    let can_raise = limits.budget(level + 1) > budget;
-    let can_lower = limits.budget(level - 1) < budget;
+    let can_raise = limits.budget(level.saturating_add(1)) > budget;
+    let can_lower = limits.budget(level.saturating_sub(1)) < budget;
     let threshold = lowering_threshold(limits, level);
-    let mut text = match entry.filter(|entry| !entry.reason.is_empty()) {
-        Some(entry) => format!("{} · since then ", entry.reason),
-        None => "default · ".to_owned(),
-    };
+    let mut text = String::with_capacity(96);
+    match entry.filter(|entry| !entry.reason.is_empty()) {
+        Some(entry) => {
+            text.push_str(&entry.reason);
+            text.push_str(" · since then ");
+        }
+        None => text.push_str("default · "),
+    }
     let Decision {
         clipped,
         reopened,
@@ -788,52 +959,62 @@ fn hold_reason(limits: Limits, level: i32, entry: Option<&Entry>, decision: &Dec
     } = *decision;
     if clipped > 0 {
         if clipped < MIN_SAMPLE {
-            text.push_str(&format!(
+            let _ = write!(
+                text,
                 "{reopened} of {clipped} clipped run{} reopened in full",
                 if clipped == 1 { "" } else { "s" }
-            ));
+            );
             if can_raise {
-                text.push_str(&format!(", {MIN_SAMPLE} needed"));
+                let _ = write!(text, ", {MIN_SAMPLE} needed");
             }
         } else {
-            text.push_str(&reopened_text(clipped, reopened));
+            let _ = write!(
+                text,
+                "{reopened} of the last {clipped} clipped runs {} reopened in full",
+                if reopened == 1 { "was" } else { "were" }
+            );
         }
         if !can_raise && wants_raise(clipped, reopened) {
             text.push_str(" · at the cap");
         } else if !can_lower && clipped >= WINDOW && reopened == 0 {
             text.push_str(" · at the floor");
         } else if can_lower && over_reopened == 0 && window > WINDOW {
-            text.push_str(&format!(
+            let _ = write!(
+                text,
                 " · {over} of the {window} runs needed to lower, none reopened in full"
-            ));
+            );
         }
     } else if can_lower && over > 0 {
         let over_text = human_bytes(threshold);
-        text.push_str(&if over_reopened == 0 {
-            format!(
+        if over_reopened == 0 {
+            let _ = write!(
+                text,
                 "no run was clipped · {over} of the {window} runs over {over_text} \
                  needed to lower, none reopened in full"
-            )
+            );
         } else {
-            format!(
+            let _ = write!(
+                text,
                 "no run was clipped · {over_reopened} of {over} runs over {over_text} \
                  reopened in full"
-            )
-        });
+            );
+        }
     } else if threshold < budget as u64 {
-        text.push_str(&format!(
+        let _ = write!(
+            text,
             "no run was over {}, so none counts",
             human_bytes(threshold)
-        ));
+        );
     } else {
         text.push_str("no run was clipped");
     }
     if uncounted > 0 {
-        text.push_str(&format!(
+        let _ = write!(
+            text,
             " · {uncounted} run{} reopened in full where the stream was summarized or \
              shown whole, which a larger budget would not change",
             if uncounted == 1 { " was" } else { "s were" }
-        ));
+        );
     }
     text
 }
@@ -843,31 +1024,49 @@ fn hold_reason(limits: Limits, level: i32, entry: Option<&Entry>, decision: &Dec
 /// each command, in every session, starts fresh instead of being compared with a
 /// run made before the change.
 fn forget_baselines(workspace: &Workspace, key: &str) -> Result<()> {
+    #[derive(Deserialize)]
+    struct RecordKey<'a> {
+        #[serde(default, borrow)]
+        family: Cow<'a, str>,
+        #[serde(default, borrow)]
+        label: Cow<'a, str>,
+    }
     let baselines = workspace.state.join("baselines");
     if !baselines.is_dir() {
         return Ok(());
     }
     let _guard = lock_state(&workspace.state.join("capture.lock"))?;
-    let runs = workspace.state.join("runs");
+    let mut record_path = workspace.state.join("runs");
+    let mut id_buf = String::new();
+    let mut record_buf = Vec::new();
     for entry in fs::read_dir(&baselines)? {
         let path = entry?.path();
-        let Ok(id) = fs::read_to_string(&path) else {
+        id_buf.clear();
+        let Ok(mut file) = File::open(&path) else {
             continue;
         };
-        let id = id.trim();
+        if file.read_to_string(&mut id_buf).is_err() {
+            continue;
+        }
+        let id = id_buf.trim();
         let valid = id.strip_prefix("run-").is_some_and(|rest| {
             !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphanumeric())
         });
         if !valid {
             continue;
         }
-        let Ok(record) = fs::read(runs.join(id).join("record.json")) else {
+        record_path.push(id);
+        record_path.push("record.json");
+        let ok = read_into(&record_path, &mut record_buf);
+        record_path.pop();
+        record_path.pop();
+        if !ok {
+            continue;
+        }
+        let Ok(run) = serde_json::from_slice::<RecordKey<'_>>(&record_buf) else {
             continue;
         };
-        let Ok(run) = serde_json::from_slice::<Record>(&record) else {
-            continue;
-        };
-        if self::key(&run.family, &run.label).as_deref() == Some(key)
+        if key_str(&run.family, &run.label) == Some(key)
             && let Err(error) = fs::remove_file(&path)
             && error.kind() != io::ErrorKind::NotFound
         {
@@ -922,17 +1121,17 @@ fn preview_budget_inner(workspace: &Workspace, args: &[OsString]) -> Result<usiz
     let Some(key) = command_key(args) else {
         return Ok(limits.default);
     };
-    let runs = recorded(workspace, Some(&key), true)
-        .remove(&key)
-        .unwrap_or_default();
+    let runs = recorded_for(workspace, &key, true);
     let mut state = read_state(workspace);
-    let directory = workspace.state.join("runs");
-    let advice = advise(
+    let mut path_buf = workspace.state.join("runs");
+    let mut read_buf = Vec::new();
+    let advice = advise_inner(
         limits,
         state.get(&key),
         &runs,
-        |run| replayed(&directory.join(&run.id)),
+        |run| replayed_in(&mut path_buf, &mut read_buf, &run.id),
         now_ms(),
+        false,
     );
     if let Some(entry) = advice.change {
         if forget_baselines(workspace, &key).is_err() {
@@ -981,18 +1180,21 @@ fn report(workspace: &Workspace) -> Result<Report> {
     let mut families = Vec::new();
     if settings.adaptive_previews {
         let state = read_state(workspace);
-        let mut runs = recorded(workspace, None, false);
+        let mut runs = recorded_all(workspace, false);
         for key in state.keys() {
-            runs.entry(key.clone()).or_default();
+            if !runs.contains_key(key) {
+                runs.insert(key.clone(), Vec::new());
+            }
         }
-        let directory = workspace.state.join("runs");
+        let mut path_buf = workspace.state.join("runs");
+        let mut read_buf = Vec::new();
         let now = now_ms();
         for (key, runs) in runs {
             let advice = advise(
                 limits,
                 state.get(&key),
                 &runs,
-                |run| replayed(&directory.join(&run.id)),
+                |run| replayed_in(&mut path_buf, &mut read_buf, &run.id),
                 now,
             );
             families.push(Row {
@@ -1627,5 +1829,84 @@ mod tests {
             );
         }
         assert_eq!(INDEX_VERSION, 3);
+    }
+
+    #[test]
+    fn corrupt_or_empty_state_and_seen_lines_are_skipped_without_panicking() {
+        // 1. Empty, whitespace, invalid JSON, and partially corrupt `budgets.json`
+        //    skip bad/empty entries cleanly while keeping valid families.
+        assert!(parse_state(b"").is_empty());
+        assert!(parse_state(b"   \n\t  ").is_empty());
+        assert!(parse_state(b"{corrupt").is_empty());
+        assert!(parse_state(b"[1, 2, 3]").is_empty());
+
+        let mixed_state = br#"{
+            "": {"level": 2, "since_ms": 100},
+            "   ": {"level": 1, "since_ms": 200},
+            "broken": "not-an-entry",
+            "null-entry": null,
+            "cargo test": {"level": 1, "since_ms": 500, "reason": "raised"}
+        }"#;
+        let parsed = parse_state(mixed_state);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed["cargo test"].level, 1);
+        assert_eq!(parsed["cargo test"].since_ms, 500);
+
+        // 2. Corrupt, empty, duplicate, and unterminated lines in `Index::seen`
+        //    are skipped and normalized without breaking deleted-run detection.
+        let temporary = tempfile::tempdir().unwrap();
+        let runs = temporary.path();
+        let dir = runs.join("run-ok");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("stdout"), "x".repeat(8_000)).unwrap();
+        fs::write(dir.join("stderr"), "").unwrap();
+        fs::write(
+            dir.join("record.json"),
+            serde_json::json!({
+                "id": "run-ok", "status": 0, "raw_bytes": 8_000, "preview_bytes": 2_000,
+                "completed_ms": 10, "family": "other", "label": "gen.sh"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let dirty = Index {
+            version: INDEX_VERSION,
+            seen: "\n  \ncorrupt-line\nrun-\n  run-ok  \nrun-ok".into(),
+            runs: BTreeMap::from([("".into(), Vec::new())]),
+        };
+        let (cleaned, changed) = refresh(runs, dirty).expect("valid seen run still exists");
+        assert!(changed);
+        assert_eq!(cleaned.seen, "run-ok\n");
+        assert!(!cleaned.runs.contains_key(""));
+
+        // 3. Extreme byte counts and levels do not overflow or panic.
+        let extreme = Brief {
+            id: "run-0".into(),
+            completed_ms: u64::MAX,
+            stdout: u64::MAX,
+            stderr: u64::MAX,
+            shown: u64::MAX,
+            replaced: Replaced::Both,
+            budget: None,
+            explicit: false,
+        };
+        assert_eq!(extreme.limited(4096, 4096), [true, true]);
+        assert!(!extreme.made_at(4096));
+        assert_eq!(
+            decide(
+                LIMITS,
+                i32::MAX,
+                WINDOW,
+                std::slice::from_ref(&extreme),
+                first(1)
+            )
+            .step,
+            Step::Hold
+        );
+        assert_eq!(
+            decide(LIMITS, i32::MIN, WINDOW, &[extreme], first(0)).step,
+            Step::Hold
+        );
     }
 }

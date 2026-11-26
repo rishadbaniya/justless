@@ -10,7 +10,9 @@
 //! Claude Code also records the usage the provider reported for every request in
 //! its session transcripts. [`sessions`] sums it for a workspace. That is total
 //! usage, not savings, and only model labels and numbers leave this module.
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -73,46 +75,74 @@ const CALIBRATION: [Calibration; 4] = [
     },
 ];
 
+const _: () = {
+    let mut i = 0;
+    while i < CALIBRATION.len() {
+        let c = &CALIBRATION[i];
+        assert!(c.bytes > 0 && c.tokens > 0 && c.tokens <= c.bytes);
+        i += 1;
+    }
+};
+
 impl Content {
     const ALL: [Content; 4] = [Content::Code, Content::Json, Content::Prose, Content::Logs];
 
-    fn calibration(self) -> &'static Calibration {
+    #[inline]
+    const fn calibration(self) -> &'static Calibration {
         &CALIBRATION[self as usize]
     }
 
-    pub(crate) fn name(self) -> &'static str {
+    #[inline]
+    pub(crate) const fn name(self) -> &'static str {
         self.calibration().name
     }
 
-    pub(crate) fn bytes_per_token(self) -> f64 {
+    #[inline]
+    pub(crate) const fn bytes_per_token(self) -> f64 {
         let c = self.calibration();
         c.bytes as f64 / c.tokens as f64
     }
 
     /// Estimated tokens in `bytes` of this content, rounded up.
-    pub(crate) fn tokens(self, bytes: u64) -> u64 {
+    /// Exact integer ceiling arithmetic in `u128` avoids overflow and
+    /// floating-point precision loss across all `u64` byte sizes.
+    #[inline]
+    pub(crate) const fn tokens(self, bytes: u64) -> u64 {
+        if bytes == 0 {
+            return 0;
+        }
         let c = self.calibration();
-        let tokens = (u128::from(bytes) * u128::from(c.tokens)).div_ceil(u128::from(c.bytes));
-        u64::try_from(tokens).unwrap_or(u64::MAX)
+        let tokens = (bytes as u128 * c.tokens as u128).div_ceil(c.bytes as u128);
+        if tokens > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            tokens as u64
+        }
     }
 
     /// [`Content::tokens`] for net savings, which can be negative.
-    pub(crate) fn tokens_signed(self, bytes: i64) -> i64 {
-        let tokens = i64::try_from(self.tokens(bytes.unsigned_abs())).unwrap_or(i64::MAX);
+    #[inline]
+    pub(crate) const fn tokens_signed(self, bytes: i64) -> i64 {
+        let raw = self.tokens(bytes.unsigned_abs());
+        let tokens = if raw > i64::MAX as u64 {
+            i64::MAX
+        } else {
+            raw as i64
+        };
         if bytes < 0 { -tokens } else { tokens }
     }
 }
 
 /// How reports describe the estimate.
 pub(crate) fn method() -> String {
-    let ratios: Vec<_> = Content::ALL
-        .iter()
-        .map(|c| format!("{} {:.2}", c.name(), c.bytes_per_token()))
-        .collect();
-    format!(
-        "UTF-8 bytes / bytes per token by content type, measured with {MODEL}: {}",
-        ratios.join(", ")
-    )
+    let mut out = format!("UTF-8 bytes / bytes per token by content type, measured with {MODEL}: ");
+    for (i, c) in Content::ALL.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "{} {:.2}", c.name(), c.bytes_per_token());
+    }
+    out
 }
 
 /// Saved bytes by content type, and the tokens they are estimated to be. A run
@@ -139,18 +169,23 @@ impl Estimate {
     }
 
     pub(crate) fn saved_tokens(&self) -> u64 {
-        let tokens = Content::ALL
-            .iter()
-            .map(|&c| c.tokens_signed(self.saved[c as usize]))
-            .fold(0, i64::saturating_add);
-        tokens.max(0).unsigned_abs()
+        let mut total = 0i128;
+        for c in Content::ALL {
+            total += i128::from(c.tokens_signed(self.saved[c as usize]));
+        }
+        if total <= 0 {
+            0
+        } else {
+            u64::try_from(total).unwrap_or(u64::MAX)
+        }
     }
 
     pub(crate) fn net_tokens(&self) -> i64 {
-        Content::ALL
-            .iter()
-            .map(|&c| c.tokens_signed(self.net[c as usize]))
-            .fold(0, i64::saturating_add)
+        let mut total = 0i128;
+        for c in Content::ALL {
+            total += i128::from(c.tokens_signed(self.net[c as usize]));
+        }
+        total.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
     }
 
     /// Each type's bytes and calibration, so a reader can redo the arithmetic.
@@ -177,22 +212,28 @@ impl Estimate {
     /// The ratios applied, most saved bytes first, such as
     /// `2.21 bytes per token for logs, 2.57 for code`.
     pub(crate) fn basis(&self) -> String {
-        let mut used: Vec<_> = Content::ALL
-            .into_iter()
-            .filter(|&c| self.saved[c as usize] > 0 || self.net[c as usize] != 0)
-            .collect();
-        if used.is_empty() {
-            used.push(Content::Logs);
+        let mut used = [Content::Logs; 4];
+        let mut count = 0usize;
+        for c in Content::ALL {
+            if self.saved[c as usize] > 0 || self.net[c as usize] != 0 {
+                used[count] = c;
+                count += 1;
+            }
         }
-        used.sort_by_key(|&c| std::cmp::Reverse(self.saved[c as usize]));
-        used.iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let unit = if i == 0 { " bytes per token" } else { "" };
-                format!("{:.2}{unit} for {}", c.bytes_per_token(), c.name())
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
+        if count == 0 {
+            count = 1;
+        }
+        let slice = &mut used[..count];
+        slice.sort_by_key(|&c| std::cmp::Reverse(self.saved[c as usize]));
+        let mut out = String::with_capacity(count * 24);
+        for (i, c) in slice.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let unit = if i == 0 { " bytes per token" } else { "" };
+            let _ = write!(out, "{:.2}{unit} for {}", c.bytes_per_token(), c.name());
+        }
+        out
     }
 }
 
@@ -202,17 +243,25 @@ const SNIFF: u64 = 8192;
 /// The content type of a run's output, from the start of its archived stdout and
 /// then stderr. Without an archive, command output counts as logs.
 pub(crate) fn run_content(directory: &Path) -> Content {
-    let mut sample = Vec::new();
+    let mut sample = [0u8; SNIFF as usize];
+    let mut len = 0usize;
     for stream in ["stdout", "stderr"] {
-        let left = SNIFF.saturating_sub(sample.len() as u64);
-        if left == 0 {
+        if len >= sample.len() {
             break;
         }
-        if let Ok(file) = File::open(directory.join(stream)) {
-            let _ = file.take(left).read_to_end(&mut sample);
+        let Ok(mut file) = File::open(directory.join(stream)) else {
+            continue;
+        };
+        while len < sample.len() {
+            match file.read(&mut sample[len..]) {
+                Ok(0) => break,
+                Ok(n) => len += n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
         }
     }
-    classify(&sample)
+    classify(&sample[..len])
 }
 
 /// JSON when the text opens a JSON value; code when two lines in five look like
@@ -220,6 +269,9 @@ pub(crate) fn run_content(directory: &Path) -> Content {
 /// A line that starts with a location or a level, as compilers and linters
 /// print them, counts as neither code nor prose.
 pub(crate) fn classify(sample: &[u8]) -> Content {
+    if sample.is_empty() {
+        return Content::Logs;
+    }
     let text = String::from_utf8_lossy(sample);
     let trimmed = text.trim_start();
     if trimmed.starts_with(['{', '[']) {
@@ -266,22 +318,25 @@ fn log_line(line: &str) -> bool {
     ];
     let mut words = line.split_whitespace();
     let first = words.next().unwrap_or("");
-    let level = first
-        .trim_start_matches('[')
-        .split([':', '[', ']'])
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let is_level = (first.ends_with([':', ']']) || first.starts_with('[')) && {
+        let level = first
+            .trim_start_matches('[')
+            .split([':', '[', ']'])
+            .next()
+            .unwrap_or("");
+        LEVELS.iter().any(|l| level.eq_ignore_ascii_case(l))
+    };
     first
         .split(':')
         .nth(1)
         .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
-        || (LEVELS.contains(&level.as_str())
-            && (first.ends_with([':', ']']) || first.starts_with('[')))
+        || is_level
         || ["-->", "=", "^"].contains(&first)
         // A diagnostic's gutter, not a Markdown table row.
         || (first == "|" && !line.ends_with('|'))
-        || (first.bytes().all(|b| b.is_ascii_digit()) && words.next() == Some("|"))
+        || (!first.is_empty()
+            && first.bytes().all(|b| b.is_ascii_digit())
+            && words.next() == Some("|"))
 }
 
 fn code_line(line: &str) -> bool {
@@ -354,9 +409,23 @@ fn markdown_line(line: &str) -> bool {
 
 /// A line of at least six words whose other characters are mostly letters.
 fn prose_line(line: &str) -> bool {
-    let visible = line.chars().filter(|c| !c.is_whitespace()).count();
-    let letters = line.chars().filter(|c| c.is_alphabetic()).count();
-    line.split_whitespace().count() >= 6 && letters * 10 >= visible * 7
+    let (mut words, mut visible, mut letters) = (0usize, 0usize, 0usize);
+    let mut in_word = false;
+    for c in line.chars() {
+        if c.is_whitespace() {
+            in_word = false;
+        } else {
+            if !in_word {
+                words += 1;
+                in_word = true;
+            }
+            visible += 1;
+            if c.is_alphabetic() {
+                letters += 1;
+            }
+        }
+    }
+    words >= 6 && letters.saturating_mul(10) >= visible.saturating_mul(7)
 }
 
 /// Provider-reported token counts.
@@ -433,32 +502,65 @@ pub(crate) struct Sessions {
 /// The fields read from a transcript line. The rest, content included, is
 /// skipped without being kept.
 #[derive(Deserialize)]
-struct Line {
-    timestamp: Option<String>,
-    #[serde(rename = "requestId")]
-    request_id: Option<String>,
+struct Line<'a> {
+    #[serde(borrow)]
+    timestamp: Option<Cow<'a, str>>,
+    #[serde(rename = "requestId", borrow)]
+    request_id: Option<Cow<'a, str>>,
     #[serde(rename = "isSidechain", default)]
     sidechain: bool,
-    message: Option<Message>,
+    #[serde(borrow)]
+    message: Option<Message<'a>>,
 }
 
 #[derive(Deserialize)]
-struct Message {
-    id: Option<String>,
-    model: Option<String>,
-    usage: Option<Counts>,
+struct Message<'a> {
+    #[serde(borrow)]
+    id: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    model: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    usage: Option<Counts<'a>>,
 }
 
 #[derive(Deserialize)]
-struct Counts {
-    #[serde(rename = "type")]
-    kind: Option<String>,
-    model: Option<String>,
+struct Counts<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    model: Option<Cow<'a, str>>,
     input_tokens: Option<u64>,
     cache_creation_input_tokens: Option<u64>,
     cache_read_input_tokens: Option<u64>,
     output_tokens: Option<u64>,
-    iterations: Option<Vec<Counts>>,
+    #[serde(borrow)]
+    iterations: Option<Vec<Counts<'a>>>,
+}
+
+#[inline]
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    let Some((&first, rest)) = needle.split_first() else {
+        return true;
+    };
+    let mut pos = 0;
+    while let Some(offset) = haystack[pos..].iter().position(|&b| b == first) {
+        let start = pos + offset + 1;
+        if haystack.get(start..start + rest.len()) == Some(rest) {
+            return true;
+        }
+        pos = start;
+    }
+    false
+}
+
+fn with_model(models: &mut BTreeMap<String, Usage>, model: &str, update: impl FnOnce(&mut Usage)) {
+    if let Some(usage) = models.get_mut(model) {
+        update(usage);
+    } else {
+        let mut usage = Usage::default();
+        update(&mut usage);
+        models.insert(model.to_owned(), usage);
+    }
 }
 
 /// An RFC 3339 UTC timestamp with milliseconds, as Claude Code writes them, so
@@ -495,29 +597,30 @@ fn sessions_in(directory: PathBuf, since_ms: u64) -> Sessions {
     crate::discover::transcripts(&directory, since, 6, &mut files);
     files.sort();
     let since_iso = iso(since_ms);
-    let mut seen = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut models: BTreeMap<String, Usage> = BTreeMap::new();
     let mut sessions = BTreeSet::new();
-    let mut subagent_requests = 0;
+    let mut subagent_requests = 0u64;
+    let mut bytes = Vec::new();
     for file in &files {
         let Ok(handle) = File::open(file) else {
             continue;
         };
         let mut reader = BufReader::new(handle);
-        let mut bytes = Vec::new();
+        let mut file_counted = false;
         loop {
             bytes.clear();
             // The end of the file or a read error; `read_until` retries interruptions.
             if !matches!(reader.read_until(b'\n', &mut bytes), Ok(1..)) {
                 break;
             }
+            if !contains_bytes(&bytes, b"\"usage\"") {
+                continue;
+            }
             // A tool result may hold bytes that are not UTF-8; they affect only
             // their own line.
             let line = String::from_utf8_lossy(&bytes);
-            if !line.contains("\"usage\"") {
-                continue;
-            }
-            let Ok(entry) = serde_json::from_str::<Line>(&line) else {
+            let Ok(entry) = serde_json::from_str::<Line<'_>>(&line) else {
                 continue;
             };
             let Some(Message {
@@ -528,7 +631,7 @@ fn sessions_in(directory: PathBuf, since_ms: u64) -> Sessions {
             else {
                 continue;
             };
-            let model = model.unwrap_or_else(|| "unknown".to_owned());
+            let model = model.as_deref().unwrap_or("unknown");
             if model == "<synthetic>"
                 || entry
                     .timestamp
@@ -537,38 +640,51 @@ fn sessions_in(directory: PathBuf, since_ms: u64) -> Sessions {
             {
                 continue;
             }
-            if let Some(key) = id.or(entry.request_id)
-                && !seen.insert(key)
-            {
-                continue;
+            if let Some(key) = id.or(entry.request_id) {
+                if seen.contains(key.as_ref()) {
+                    continue;
+                }
+                seen.insert(key.into_owned());
             }
             // <session>.jsonl and everything under <session>/ belong to one session.
-            if let Some(first) = file
-                .strip_prefix(&directory)
-                .ok()
-                .and_then(|relative| relative.components().next())
-            {
-                let name = first.as_os_str().to_string_lossy();
-                sessions.insert(name.strip_suffix(".jsonl").unwrap_or(&name).to_owned());
-            }
-            let mut calls = 1;
-            models.entry(model.clone()).or_default().requests += 1;
-            match usage.iterations.as_deref() {
-                Some(parts) if !parts.is_empty() => {
-                    for part in parts {
-                        let owner = part.model.clone().unwrap_or_else(|| model.clone());
-                        let usage = models.entry(owner).or_default();
-                        usage.add(part);
-                        if part.kind.as_deref() == Some("advisor_message") {
-                            usage.requests += 1;
-                            calls += 1;
-                        }
+            if !file_counted {
+                file_counted = true;
+                if let Some(first) = file
+                    .strip_prefix(&directory)
+                    .ok()
+                    .and_then(|relative| relative.components().next())
+                {
+                    let name = first.as_os_str().to_string_lossy();
+                    let session = name.strip_suffix(".jsonl").unwrap_or(&name);
+                    if !sessions.contains(session) {
+                        sessions.insert(session.to_owned());
                     }
                 }
-                _ => models.entry(model).or_default().add(&usage),
+            }
+            let mut calls = 1u64;
+            match usage.iterations.as_deref() {
+                Some(parts) if !parts.is_empty() => {
+                    with_model(&mut models, model, |u| {
+                        u.requests = u.requests.saturating_add(1);
+                    });
+                    for part in parts {
+                        let owner = part.model.as_deref().unwrap_or(model);
+                        with_model(&mut models, owner, |u| {
+                            u.add(part);
+                            if part.kind.as_deref() == Some("advisor_message") {
+                                u.requests = u.requests.saturating_add(1);
+                                calls = calls.saturating_add(1);
+                            }
+                        });
+                    }
+                }
+                _ => with_model(&mut models, model, |u| {
+                    u.requests = u.requests.saturating_add(1);
+                    u.add(&usage);
+                }),
             }
             if entry.sidechain {
-                subagent_requests += calls;
+                subagent_requests = subagent_requests.saturating_add(calls);
             }
         }
     }
@@ -861,5 +977,70 @@ mod tests {
         assert_eq!(found.total.output_tokens, 3);
         assert_eq!(found.total.tokens(), u64::MAX);
         assert_eq!(found.models[0].usage.tokens(), u64::MAX);
+    }
+
+    #[test]
+    fn byte_token_conversions_handle_zero_one_multi_gb_and_extremes_without_overflow() {
+        const GIB: u64 = 1 << 30;
+        let samples = [
+            0u64,
+            1,
+            2,
+            3,
+            4096,
+            GIB,
+            4 * GIB,
+            64 * GIB,
+            1u64 << 53,
+            i64::MAX as u64,
+            u64::MAX,
+        ];
+        for content in Content::ALL {
+            let cal = content.calibration();
+            assert!(content.bytes_per_token().is_finite() && content.bytes_per_token() > 1.0);
+            assert_eq!(content.tokens(0), 0);
+            assert_eq!(content.tokens(1), 1);
+            assert_eq!(content.tokens_signed(0), 0);
+            assert_eq!(content.tokens_signed(1), 1);
+            assert_eq!(content.tokens_signed(-1), -1);
+
+            let mut prev = 0u64;
+            for bytes in samples {
+                let expected = u64::try_from(
+                    (u128::from(bytes) * u128::from(cal.tokens)).div_ceil(u128::from(cal.bytes)),
+                )
+                .unwrap();
+                let got = content.tokens(bytes);
+                assert_eq!(got, expected, "{:?} at {bytes} bytes", content);
+                assert!(got >= prev, "{:?} must be monotonic at {bytes}", content);
+                prev = got;
+            }
+
+            for signed in [0i64, 1, 4 * GIB as i64, 64 * GIB as i64, i64::MAX] {
+                let pos = content.tokens_signed(signed);
+                let neg = content.tokens_signed(-signed);
+                assert_eq!(pos, -neg, "{:?} symmetry at {signed}", content);
+            }
+            let min_tokens = content.tokens_signed(i64::MIN);
+            assert!(min_tokens < 0);
+            assert_eq!(
+                min_tokens.unsigned_abs(),
+                content.tokens(i64::MIN.unsigned_abs())
+            );
+        }
+
+        // Huge opposing estimates across content types cancel cleanly in i128
+        // without premature i64 saturation.
+        let mut estimate = Estimate::default();
+        estimate.add(Content::Code, i64::MAX, i64::MAX);
+        estimate.add(Content::Logs, i64::MAX, i64::MAX);
+        estimate.add(Content::Json, i64::MAX, i64::MAX);
+        estimate.add(Content::Prose, -i64::MAX, -i64::MAX);
+        let expected_net = i128::from(Content::Code.tokens_signed(i64::MAX))
+            + i128::from(Content::Logs.tokens_signed(i64::MAX))
+            + i128::from(Content::Json.tokens_signed(i64::MAX))
+            + i128::from(Content::Prose.tokens_signed(-i64::MAX));
+        assert_eq!(estimate.net_tokens(), expected_net as i64);
+        assert_eq!(estimate.saved_tokens(), expected_net as u64);
     }
 }
