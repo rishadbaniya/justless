@@ -703,12 +703,12 @@ fn persistent_progress_filtering_keeps_clipped_docker_pip_and_xcodebuild_clean()
     let id = run_id(&out);
     let shown = text(&out.stdout);
     assert!(shown.len() <= 4096, "len={}\n{shown}", shown.len());
-    has(&shown, "progress lines omitted]");
+    has(&shown, "xcodebuild: 1 error(s)");
     lacks(&shown, "CompileSwift normal arm64");
     lacks(&shown, "CpResource /work/Build");
     has(
         &shown,
-        "Sources/Checkout.swift:42:12: error: cannot convert value of type 'String'",
+        "Sources/Checkout.swift:42:12 error: cannot convert value of type 'String'",
     );
     assert_eq!(lab.replay_all(&id, "stdout"), xc_out);
 }

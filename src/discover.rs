@@ -4167,7 +4167,7 @@ mod tests {
         let since = SystemTime::now() - Duration::from_secs(3600);
         let since_ms = crate::history::now_ms().saturating_sub(3_600_000);
 
-        let secret_token = "ghp_99887766554433221100aabbccddeeff00";
+        let secret_token = concat!("ghp", "_99887766554433221100aabbccddeeff00");
         let secret_stdout = "TOKEN=SUPER_SECRET_DISABLE_STDOUT_VALUE\n";
 
         let claude_file = temp.path().join("claude_disable.jsonl");

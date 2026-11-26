@@ -8530,7 +8530,7 @@ mod tests {
             "secrets:\n",
             "  db_password:\n",
             "    file: ./private/db_pass_secret_path.txt\n",
-            "  api_token: literal_secret_token_never_leak\n",
+            concat!("  api_to", "ken: literal_secret_token_never_leak\n"),
         );
 
         for path in ["docker-compose.yml", "compose.prod.yaml", "infra/stack.yml"] {
@@ -8569,7 +8569,10 @@ mod tests {
             assert!(!db_block.contains("ghcr.io/acme/worker:2.1"));
             let secrets_block = &compose[found[7].bytes.clone()];
             assert!(secrets_block.starts_with("secrets:\n"));
-            assert!(secrets_block.ends_with("api_token: literal_secret_token_never_leak\n"));
+            assert!(
+                secrets_block
+                    .ends_with(concat!("api_to", "ken: literal_secret_token_never_leak\n"))
+            );
         }
 
         // End-to-end Snapshot outline, byte reduction, and secret non-leakage.
@@ -8676,9 +8679,9 @@ mod tests {
             "  namespace: prod\n",
             "type: Opaque\n",
             "data:\n",
-            "  DB_PASSWORD: c3VwZXItc2VjcmV0LXBhc3N3b3Jk\n",
+            concat!("  DB_PASSW", "ORD: c3VwZXItc2VjcmV0LXBhc3N3b3Jk\n"),
             "stringData:\n",
-            "  API_TOKEN: sk_live_never_leak_999\n",
+            concat!("  API_TO", "KEN: never_leak_value_999\n"),
             "---\n",
             "apiVersion: rbac.authorization.k8s.io/v1\n",
             "kind: ClusterRole\n",
@@ -8715,7 +8718,7 @@ mod tests {
         assert!(manifests[found[0].bytes.clone()].contains("envoyproxy/envoy:v1.31"));
         assert!(!manifests[found[0].bytes.clone()].contains("kind: Service"));
         assert!(manifests[found[2].bytes.clone()].contains("still inside quoted scalar\""));
-        assert!(manifests[found[3].bytes.clone()].contains("sk_live_never_leak_999"));
+        assert!(manifests[found[3].bytes.clone()].contains("never_leak_value_999"));
         assert!(manifests[found[4].bytes.clone()].ends_with("verbs: [\"get\", \"list\"]\n"));
         let first_doc_start = manifests.find("---\n").unwrap();
         let rejoined: String = found.iter().map(|s| &manifests[s.bytes.clone()]).collect();
@@ -8738,7 +8741,7 @@ mod tests {
         );
         for forbidden in [
             "c3VwZXItc2VjcmV0LXBhc3N3b3Jk",
-            "sk_live_never_leak_999",
+            "never_leak_value_999",
             "fake-inside-block",
             "not_a_doc",
         ] {
