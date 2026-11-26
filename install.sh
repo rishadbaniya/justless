@@ -4,7 +4,7 @@ set -eu
 repo=rishadbaniya/justless
 
 usage() {
-    echo "Usage: sh install.sh [codex|claude|agy|opencode|cursor|gemini|copilot|windsurf|cline|roo ... | --cli-only]"
+    echo "Usage: sh install.sh [codex|claude|agy|opencode|cursor|gemini|copilot|windsurf|cline|roo|kiro|kilo ... | --cli-only]"
     echo "By default, configure project hooks for supported agents found on PATH."
     echo "Builds Justless from source with Cargo. JUSTLESS_VERSION=X.Y.Z builds tag vX.Y.Z instead of main."
 }
@@ -55,13 +55,19 @@ main() {
         if command -v opencode >/dev/null 2>&1; then
             case "$(opencode --version 2>/dev/null)" in 1.*) set -- "$@" opencode ;; esac
         fi
+        if command -v kiro >/dev/null 2>&1 || command -v kiro-cli >/dev/null 2>&1 || [ -d .kiro ]; then
+            set -- "$@" kiro
+        fi
+        if command -v kilo >/dev/null 2>&1 || [ -d .kilocode ] || [ -d .kilo ]; then
+            set -- "$@" kilo
+        fi
     elif [ "$#" -eq 1 ] && [ "$1" = "--cli-only" ]; then
         shift
     fi
     agents=
     for agent do
         case "$agent" in
-            codex|claude|agy|opencode|cursor|gemini|copilot|windsurf|cline|roo) agents="$agents $agent" ;;
+            codex|claude|agy|opencode|cursor|gemini|copilot|windsurf|cline|roo|kiro|kilo) agents="$agents $agent" ;;
             *) usage >&2; return 2 ;;
         esac
     done

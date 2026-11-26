@@ -6036,7 +6036,7 @@ fn doctor_reports_an_unset_project_and_changes_nothing() {
 fn doctor_accepts_every_agent_that_init_sets_up() {
     let agents = [
         "claude", "codex", "cursor", "gemini", "copilot", "opencode", "agy", "windsurf", "cline",
-        "roo",
+        "roo", "kiro", "kilo",
     ];
     let (tools, repo) = doctor_repository(&["claude"], &agents);
     let root = repo.path();
@@ -6057,6 +6057,8 @@ fn doctor_accepts_every_agent_that_init_sets_up() {
         "✓ Instructions: .windsurf/rules/justless.md has the current Justless block",
         "✓ Instructions: .clinerules/justless.md has the current Justless block",
         "✓ Instructions: .roo/rules/justless.md has the current Justless block",
+        "✓ Instructions: .kiro/steering/justless.md has the current Justless block",
+        "✓ Instructions: .kilocode/rules/justless.md has the current Justless block",
         // Configured clients that never routed a command say so, recognizably. Claude
         // Code starts in default mode, where the hook routes only allowed commands.
         "! Claude Code has not routed a command through Justless here yet. Your settings start sessions in `default` permission mode, where the command hook routes only commands that allow rules cover",
@@ -6097,7 +6099,7 @@ fn doctor_accepts_every_agent_that_init_sets_up() {
         serde_json::json!({"acceptEdits": 1, "dontAsk": 2})
     );
     let agents = report["agents"].as_array().unwrap();
-    assert_eq!(agents.len(), 10);
+    assert_eq!(agents.len(), 12);
     assert!(agents.iter().all(|agent| agent["set_up"] == true));
     let text = serde_json::to_string(&report["sections"]).unwrap();
     assert!(!text.contains("has not routed"), "{text}");
@@ -18025,4 +18027,196 @@ fn windsurf_cline_and_roo_init_mcp_doctor_and_remove_round_trip() {
     run("justless init --remove --purge");
     assert_eq!(removal_tree(&root), original);
     assert!(windsurf_mcp.is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn kiro_init_mcp_doctor_and_remove_round_trip() {
+    let (_project, root) = removal_project(&[
+        ("package.json", "{\"name\":\"kiro-test\"}\n"),
+        (".gitignore", "target/\n"),
+    ]);
+    let original = removal_tree(&root);
+    let tools = doctor_tools(&["kiro"]);
+    let bin = tools.path().join("bin");
+    let path = bin.to_str().unwrap();
+    let run = |line: &str| {
+        let out = doctor_shell(&root, tools.path(), path, line);
+        assert!(
+            out.status.success(),
+            "{line}\nstdout: {}\nstderr: {}",
+            stdout(&out),
+            stderr(&out)
+        );
+        stdout(&out)
+    };
+
+    run("justless init --agent kiro --mcp");
+    assert!(root.join(".kiro/steering/justless.md").is_file());
+    assert!(root.join(".kiro/settings/mcp.json").is_file());
+
+    let mcp_cfg: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join(".kiro/settings/mcp.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        mcp_cfg["mcpServers"]["justless"],
+        serde_json::json!({"command": "justless", "args": ["mcp"]})
+    );
+
+    // User-level Kiro MCP install respects KIRO_HOME without touching project state.
+    let kiro_home = tools.path().join("kiro-home");
+    let global_out = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .current_dir(&root)
+        .env("KIRO_HOME", &kiro_home)
+        .args(["mcp", "--install", "kiro", "--global"])
+        .output()
+        .unwrap();
+    assert!(global_out.status.success(), "{}", stderr(&global_out));
+    assert!(kiro_home.join("settings/mcp.json").is_file());
+
+    // Doctor checks rules and MCP read-only and exits 0.
+    let before = doctor_snapshot(&root);
+    let (status, report) = doctor_text(&root, tools.path());
+    assert_eq!(status, Some(0), "{report}");
+    assert_eq!(doctor_snapshot(&root), before);
+    assert_all_in(
+        &report,
+        &[
+            "✓ Instructions: .kiro/steering/justless.md has the current Justless block",
+            "✓ Kiro: .kiro/settings/mcp.json runs `justless mcp`",
+        ],
+    );
+    assert!(!report.contains('✗'), "{report}");
+
+    // `init --remove` removes all Kiro files/dirs; `--purge` restores the workspace byte-for-byte.
+    run("justless init --remove");
+    assert!(!root.join(".kiro").exists());
+    run("justless init --remove --purge");
+    assert_eq!(removal_tree(&root), original);
+    assert!(kiro_home.join("settings/mcp.json").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn kilo_init_mcp_doctor_and_remove_round_trip() {
+    let (_project, root) = removal_project(&[
+        ("package.json", "{\"name\":\"kilo-test\"}\n"),
+        (".gitignore", "target/\n"),
+    ]);
+    let original = removal_tree(&root);
+    let tools = doctor_tools(&["kilo"]);
+    let bin = tools.path().join("bin");
+    let path = bin.to_str().unwrap();
+    let run = |line: &str| {
+        let out = doctor_shell(&root, tools.path(), path, line);
+        assert!(
+            out.status.success(),
+            "{line}\nstdout: {}\nstderr: {}",
+            stdout(&out),
+            stderr(&out)
+        );
+        stdout(&out)
+    };
+
+    run("justless init --agent kilo --mcp");
+    assert!(root.join(".kilocode/rules/justless.md").is_file());
+    assert!(root.join(".kilocode/mcp.json").is_file());
+
+    let mcp_cfg: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join(".kilocode/mcp.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        mcp_cfg["mcpServers"]["justless"],
+        serde_json::json!({"command": "justless", "args": ["mcp"]})
+    );
+
+    let before = doctor_snapshot(&root);
+    let (status, report) = doctor_text(&root, tools.path());
+    assert_eq!(status, Some(0), "{report}");
+    assert_eq!(doctor_snapshot(&root), before);
+    assert_all_in(
+        &report,
+        &[
+            "✓ Instructions: .kilocode/rules/justless.md has the current Justless block",
+            "✓ Kilo Code: .kilocode/mcp.json runs `justless mcp`",
+        ],
+    );
+    assert!(!report.contains('✗'), "{report}");
+
+    run("justless init --remove");
+    assert!(!root.join(".kilocode").exists());
+    run("justless init --remove --purge");
+    assert_eq!(removal_tree(&root), original);
+}
+
+#[test]
+fn init_dry_run_previews_planned_paths_and_writes_nothing() {
+    let (_project, root) = removal_project(&[("package.json", "{\"name\":\"dry-run\"}\n")]);
+    let original = removal_tree(&root);
+
+    let preview = success(
+        &root,
+        &["init", "--dry-run", "--agent", "claude", "--hooks", "--mcp"],
+    );
+    assert_all_in(
+        &preview,
+        &[
+            "dry-run (no files written):",
+            "[create] .claude/settings.json",
+            "[create] .gitignore",
+            "[create] .mcp.json",
+            "[create] CLAUDE.md",
+        ],
+    );
+    // CRITICAL INVARIANT: zero files or directories created on disk.
+    assert_eq!(removal_tree(&root), original);
+    assert!(!root.join(".justless").exists());
+    assert!(!root.join(".claude").exists());
+    assert!(!root.join("CLAUDE.md").exists());
+    assert!(!root.join(".mcp.json").exists());
+
+    // After real init, a second dry-run marks every planned file unchanged and writes nothing.
+    success(&root, &["init", "--agent", "claude", "--hooks", "--mcp"]);
+    let after_init = removal_tree(&root);
+    let unchanged = success(
+        &root,
+        &["init", "--dry-run", "--agent", "claude", "--hooks", "--mcp"],
+    );
+    assert_all_in(
+        &unchanged,
+        &[
+            "dry-run (no files written):",
+            "[unchanged] .claude/settings.json",
+            "[unchanged] .gitignore",
+            "[unchanged] .mcp.json",
+            "[unchanged] CLAUDE.md",
+        ],
+    );
+    assert_eq!(removal_tree(&root), after_init);
+
+    // `init --global --dry-run` also previews without creating user settings dirs.
+    let claude_dir = tempfile::tempdir().unwrap();
+    let missing_claude = claude_dir.path().join("claude-cfg");
+    let global_out = Command::new(env!("CARGO_BIN_EXE_justless"))
+        .current_dir(&root)
+        .env("CLAUDE_CONFIG_DIR", &missing_claude)
+        .args(["init", "--global", "--dry-run", "--agent", "claude"])
+        .output()
+        .unwrap();
+    assert!(
+        global_out.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&global_out),
+        stderr(&global_out)
+    );
+    let global_text = stdout(&global_out);
+    assert!(
+        global_text.contains("dry-run (no files written):"),
+        "{global_text}"
+    );
+    assert!(
+        global_text.contains("[create]") && global_text.contains("settings.json"),
+        "{global_text}"
+    );
+    assert!(!missing_claude.exists());
 }

@@ -277,6 +277,8 @@ fn label(agent: Agent) -> &'static str {
         Agent::Windsurf => "Windsurf",
         Agent::Cline => "Cline",
         Agent::Roo => "Roo Code",
+        Agent::Kiro => "Kiro",
+        Agent::Kilo => "Kilo Code",
     }
 }
 

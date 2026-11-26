@@ -28,8 +28,9 @@ use crate::mcp::Client;
 use crate::workspace::{Workspace, lock_state, write_json, write_text};
 
 /// Every client `init` sets up, by the name `--agent` takes.
-const AGENTS: [&str; 10] = [
-    "codex", "claude", "agy", "opencode", "cursor", "gemini", "copilot", "windsurf", "cline", "roo",
+const AGENTS: [&str; 12] = [
+    "codex", "claude", "agy", "opencode", "cursor", "gemini", "copilot", "windsurf", "cline",
+    "roo", "kiro", "kilo",
 ];
 const RECORD: &str = "setup.json";
 const IGNORE_LINE: &str = "/.justless/";
@@ -90,7 +91,11 @@ fn user_level(root: &Path) -> Option<String> {
             root.display()
         ));
     }
-    for (name, folder) in [("CLAUDE_CONFIG_DIR", ".claude"), ("CODEX_HOME", ".codex")] {
+    for (name, folder) in [
+        ("CLAUDE_CONFIG_DIR", ".claude"),
+        ("CODEX_HOME", ".codex"),
+        ("KIRO_HOME", ".kiro"),
+    ] {
         if let Some(config) = directory(name)
             && root
                 .join(folder)
@@ -478,6 +483,8 @@ fn mcp_client(agent: Agent) -> Option<Client> {
         Agent::Copilot => Some(Client::VsCode),
         Agent::Cline => Some(Client::Cline),
         Agent::Roo => Some(Client::Roo),
+        Agent::Kiro => Some(Client::Kiro),
+        Agent::Kilo => Some(Client::Kilo),
         Agent::Agy | Agent::OpenCode | Agent::Windsurf => None,
     }
 }

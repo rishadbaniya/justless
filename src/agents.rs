@@ -39,6 +39,8 @@ pub enum Agent {
     Windsurf,
     Cline,
     Roo,
+    Kiro,
+    Kilo,
 }
 
 impl Agent {
@@ -54,13 +56,18 @@ impl Agent {
             "windsurf" => Ok(Self::Windsurf),
             "cline" => Ok(Self::Cline),
             "roo" => Ok(Self::Roo),
+            "kiro" => Ok(Self::Kiro),
+            "kilo" => Ok(Self::Kilo),
             _ => anyhow::bail!("unknown agent {name}"),
         }
     }
 
     /// Whether `init --hooks` writes a project-local hook or plugin file for this agent.
     pub(crate) fn has_hooks(self) -> bool {
-        !matches!(self, Self::Windsurf | Self::Cline | Self::Roo)
+        !matches!(
+            self,
+            Self::Windsurf | Self::Cline | Self::Roo | Self::Kiro | Self::Kilo
+        )
     }
 
     pub(crate) fn config(self) -> (&'static str, &'static str) {
@@ -72,7 +79,7 @@ impl Agent {
             Self::Cursor => (".cursor", "hooks.json"),
             Self::Gemini => (".gemini", "settings.json"),
             Self::Copilot => (".github", "hooks/justless.json"),
-            Self::Windsurf | Self::Cline | Self::Roo => ("", ""),
+            Self::Windsurf | Self::Cline | Self::Roo | Self::Kiro | Self::Kilo => ("", ""),
         }
     }
 
@@ -88,6 +95,8 @@ impl Agent {
             Self::Windsurf => "windsurf",
             Self::Cline => "cline",
             Self::Roo => "roo",
+            Self::Kiro => "kiro",
+            Self::Kilo => "kilo",
         };
         format!("justless hook-{agent} {mode}")
     }
@@ -100,7 +109,8 @@ impl Agent {
     /// <https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-custom-instructions>.
     /// Windsurf loads `.windsurf/rules/*.md`, Cline loads `.clinerules/*.md`
     /// (or a legacy single `.clinerules` file; see [`Self::instructions_for`]),
-    /// and Roo Code loads `.roo/rules/*.md`.
+    /// Roo Code loads `.roo/rules/*.md`, Kiro loads `.kiro/steering/*.md`,
+    /// and Kilo Code loads `.kilocode/rules/*.md`.
     pub(crate) fn instructions(self) -> &'static str {
         match self {
             Self::Claude => "CLAUDE.md",
@@ -108,6 +118,8 @@ impl Agent {
             Self::Windsurf => ".windsurf/rules/justless.md",
             Self::Cline => ".clinerules/justless.md",
             Self::Roo => ".roo/rules/justless.md",
+            Self::Kiro => ".kiro/steering/justless.md",
+            Self::Kilo => ".kilocode/rules/justless.md",
             _ => "AGENTS.md",
         }
     }
@@ -4755,7 +4767,7 @@ fn appended(existing: &str, text: &str) -> String {
 // Read-only views of what `init` writes, for `justless doctor`.
 
 /// Every agent `init` configures, by its `--agent` name.
-pub(crate) const AGENTS: [(&str, Agent); 10] = [
+pub(crate) const AGENTS: [(&str, Agent); 12] = [
     ("claude", Agent::Claude),
     ("codex", Agent::Codex),
     ("cursor", Agent::Cursor),
@@ -4766,6 +4778,8 @@ pub(crate) const AGENTS: [(&str, Agent); 10] = [
     ("windsurf", Agent::Windsurf),
     ("cline", Agent::Cline),
     ("roo", Agent::Roo),
+    ("kiro", Agent::Kiro),
+    ("kilo", Agent::Kilo),
 ];
 
 impl Agent {
@@ -4849,6 +4863,76 @@ pub(crate) fn fresh_hooks(agent: Agent) -> Result<String> {
     prepare_hooks(&workspace, agent)?
         .map(|(_, contents)| contents)
         .context("setup writes no hooks for this agent")
+}
+
+/// What a planned `init --dry-run` write would do to one path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlanAction {
+    Create,
+    Update,
+    Unchanged,
+}
+
+impl PlanAction {
+    pub(crate) fn tag(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Update => "update",
+            Self::Unchanged => "unchanged",
+        }
+    }
+}
+
+/// Read-only preview of what `agents::init` would create, update, leave
+/// unchanged, or skip.
+pub(crate) struct DryRunPlan {
+    pub(crate) entries: BTreeMap<PathBuf, PlanAction>,
+    pub(crate) skipped: Vec<&'static str>,
+}
+
+/// Plans `init` without touching the filesystem or creating `.justless/`.
+pub(crate) fn plan_dry_run(
+    workspace: &Workspace,
+    agents: &[Agent],
+    hooks: bool,
+) -> Result<DryRunPlan> {
+    let (changes, skipped) = planned_changes(workspace, agents, hooks)?;
+    let mut entries = BTreeMap::new();
+    for path in changes.into_keys() {
+        let action = if fs::symlink_metadata(&path).is_ok() {
+            PlanAction::Update
+        } else {
+            PlanAction::Create
+        };
+        entries.insert(path, action);
+    }
+    let root = &workspace.root;
+    let shared = agents
+        .iter()
+        .any(|agent| agent.instructions() == "AGENTS.md");
+    let imported = agents
+        .contains(&Agent::Claude)
+        .then(|| imported_instructions(root, shared))
+        .flatten();
+    for &agent in agents {
+        let target = match &imported {
+            Some((_, target)) if agent == Agent::Claude => Some(target.clone()),
+            _ => instructions_file(root, &root.join(agent.instructions_for(root)))?,
+        };
+        if let Some(path) = target {
+            entries.entry(path).or_insert(PlanAction::Unchanged);
+        }
+        if hooks && agent.has_hooks() {
+            let (directory, file) = agent.config();
+            entries
+                .entry(root.join(directory).join(file))
+                .or_insert(PlanAction::Unchanged);
+        }
+    }
+    entries
+        .entry(root.join(".gitignore"))
+        .or_insert(PlanAction::Unchanged);
+    Ok(DryRunPlan { entries, skipped })
 }
 
 /// Why `init` for `agents` would stop before it writes anything, or `None` when
@@ -5367,5 +5451,64 @@ mod tests {
             "{err}"
         );
         assert!(!bad_root.join(".justless").exists());
+    }
+
+    #[test]
+    fn kiro_and_kilo_init_rules_and_dry_run_writes_nothing() {
+        use super::{
+            Agent, END, PlanAction, START, Workspace, init, plan_dry_run, planned_changes,
+            prepare_hooks,
+        };
+        use std::fs;
+
+        assert_eq!(Agent::parse("kiro").unwrap(), Agent::Kiro);
+        assert_eq!(Agent::parse("kilo").unwrap(), Agent::Kilo);
+        for agent in [Agent::Kiro, Agent::Kilo] {
+            assert!(!agent.has_hooks());
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("package.json"), "{}\n").unwrap();
+        let ws = Workspace::discover_from(&root).unwrap();
+
+        // Dry run previews exact paths without creating any files or directories.
+        let plan = plan_dry_run(&ws, &[Agent::Kiro, Agent::Kilo], true).unwrap();
+        assert_eq!(
+            plan.entries.get(&root.join(".kiro/steering/justless.md")),
+            Some(&PlanAction::Create)
+        );
+        assert_eq!(
+            plan.entries.get(&root.join(".kilocode/rules/justless.md")),
+            Some(&PlanAction::Create)
+        );
+        assert_eq!(
+            plan.entries.get(&root.join(".gitignore")),
+            Some(&PlanAction::Create)
+        );
+        assert!(!root.join(".kiro").exists());
+        assert!(!root.join(".kilocode").exists());
+        assert!(!root.join(".justless").exists());
+
+        for agent in [Agent::Kiro, Agent::Kilo] {
+            assert!(prepare_hooks(&ws, agent).unwrap().is_none());
+        }
+        init(&ws, &[Agent::Kiro, Agent::Kilo], true).unwrap();
+
+        for rel in [".kiro/steering/justless.md", ".kilocode/rules/justless.md"] {
+            let text = fs::read_to_string(root.join(rel)).unwrap();
+            assert!(text.contains(START) && text.contains(END), "{rel}: {text}");
+        }
+        // Idempotent second run and dry-run marks everything unchanged.
+        let (again, skipped) = planned_changes(&ws, &[Agent::Kiro, Agent::Kilo], true).unwrap();
+        assert!(again.is_empty(), "{again:?}");
+        assert!(skipped.is_empty());
+        let dry_again = plan_dry_run(&ws, &[Agent::Kiro, Agent::Kilo], true).unwrap();
+        assert!(
+            dry_again
+                .entries
+                .values()
+                .all(|action| *action == PlanAction::Unchanged)
+        );
     }
 }

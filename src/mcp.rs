@@ -78,12 +78,18 @@ pub fn command() -> Command<'static> {
                 .possible_values(Client::NAMES)
                 .help("Add the server to a client's project config instead of serving"),
         )
+        .arg(
+            Arg::new("global")
+                .long("global")
+                .requires("install")
+                .help("With --install, write to the client's user-level MCP config where supported (e.g. ~/.kiro/settings/mcp.json)"),
+        )
 }
 
 pub fn run(workspace: &Workspace, matches: &ArgMatches) -> Result<()> {
     if let Some(names) = matches.values_of("install") {
         let clients = names.map(Client::parse).collect::<Result<BTreeSet<_>>>()?;
-        return install(workspace, &clients);
+        return install_with_scope(workspace, &clients, matches.is_present("global"));
     }
     serve(workspace)
 }
@@ -1317,6 +1323,8 @@ pub enum Client {
     Windsurf,
     Cline,
     Roo,
+    Kiro,
+    Kilo,
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -1325,9 +1333,16 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn kiro_mcp_path(kiro_home: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    kiro_home
+        .or_else(|| home.map(|home| home.join(".kiro")))
+        .map(|dir| dir.join("settings").join("mcp.json"))
+}
+
 impl Client {
-    pub(crate) const NAMES: [&'static str; 9] = [
-        "claude", "cursor", "gemini", "vscode", "codex", "agy", "windsurf", "cline", "roo",
+    pub(crate) const NAMES: [&'static str; 11] = [
+        "claude", "cursor", "gemini", "vscode", "codex", "agy", "windsurf", "cline", "roo", "kiro",
+        "kilo",
     ];
 
     pub(crate) fn parse(name: &str) -> Result<Self> {
@@ -1341,8 +1356,28 @@ impl Client {
             "windsurf" => Self::Windsurf,
             "cline" => Self::Cline,
             "roo" => Self::Roo,
+            "kiro" => Self::Kiro,
+            "kilo" => Self::Kilo,
             _ => bail!("unknown MCP client: {name}"),
         })
+    }
+
+    pub(crate) fn for_agent(agent: crate::agents::Agent) -> Option<Self> {
+        use crate::agents::Agent;
+        match agent {
+            Agent::Claude => Some(Self::Claude),
+            Agent::Cursor => Some(Self::Cursor),
+            Agent::Gemini => Some(Self::Gemini),
+            Agent::Codex => Some(Self::Codex),
+            Agent::Copilot => Some(Self::VsCode),
+            Agent::Agy => Some(Self::Agy),
+            Agent::Windsurf => Some(Self::Windsurf),
+            Agent::Cline => Some(Self::Cline),
+            Agent::Roo => Some(Self::Roo),
+            Agent::Kiro => Some(Self::Kiro),
+            Agent::Kilo => Some(Self::Kilo),
+            Agent::OpenCode => None,
+        }
     }
 
     pub(crate) fn label(self) -> &'static str {
@@ -1356,10 +1391,12 @@ impl Client {
             Self::Windsurf => "Windsurf",
             Self::Cline => "Cline",
             Self::Roo => "Roo Code",
+            Self::Kiro => "Kiro",
+            Self::Kilo => "Kilo Code",
         }
     }
 
-    /// Whether this client's MCP config is user-level rather than project-local.
+    /// Whether this client's default MCP config is user-level rather than project-local.
     pub(crate) fn is_global(self) -> bool {
         matches!(self, Self::Agy | Self::Windsurf)
     }
@@ -1385,6 +1422,9 @@ impl Client {
     /// - Cline `.cline/mcp.json` `mcpServers` (portable project-local config,
     ///   avoiding OS-dependent VS Code `globalStorage` paths)
     /// - Roo Code `.roo/mcp.json` `mcpServers` (project-local)
+    /// - Kiro `.kiro/settings/mcp.json` `mcpServers` (project-local; user-level
+    ///   `$KIRO_HOME/settings/mcp.json` or `~/.kiro/settings/mcp.json` with `--global`)
+    /// - Kilo Code `.kilocode/mcp.json` `mcpServers` (project-local)
     pub fn file(self) -> &'static str {
         match self {
             Self::Claude => ".mcp.json",
@@ -1396,23 +1436,46 @@ impl Client {
             Self::Windsurf => "~/.codeium/windsurf/mcp_config.json",
             Self::Cline => ".cline/mcp.json",
             Self::Roo => ".roo/mcp.json",
+            Self::Kiro => ".kiro/settings/mcp.json",
+            Self::Kilo => ".kilocode/mcp.json",
+        }
+    }
+
+    /// User-level MCP config path for clients that support `--global` (or are always global).
+    pub(crate) fn user_path(self) -> Option<Result<PathBuf>> {
+        match self {
+            Self::Agy => Some(
+                crate::global::config_dir(crate::agents::Agent::Agy)
+                    .context("no home directory to find Antigravity MCP config in")
+                    .map(|dir| dir.join("mcp_config.json")),
+            ),
+            Self::Windsurf => Some(
+                home_dir()
+                    .context("no home directory to find Windsurf MCP config in")
+                    .map(|home| {
+                        home.join(".codeium")
+                            .join("windsurf")
+                            .join("mcp_config.json")
+                    }),
+            ),
+            Self::Kiro => {
+                let kiro_home = std::env::var_os("KIRO_HOME")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from);
+                Some(
+                    kiro_mcp_path(kiro_home, home_dir())
+                        .context("no home directory to find Kiro MCP config in"),
+                )
+            }
+            _ => None,
         }
     }
 
     pub(crate) fn path(self, workspace: &Workspace) -> Result<PathBuf> {
-        match self {
-            Self::Agy => crate::global::config_dir(crate::agents::Agent::Agy)
-                .context("no home directory to find Antigravity MCP config in")
-                .map(|dir| dir.join("mcp_config.json")),
-            Self::Windsurf => home_dir()
-                .context("no home directory to find Windsurf MCP config in")
-                .map(|home| {
-                    home.join(".codeium")
-                        .join("windsurf")
-                        .join("mcp_config.json")
-                }),
-            _ => Ok(workspace.root.join(self.file())),
+        if self.is_global() {
+            return self.user_path().expect("global MCP client has a user_path");
         }
+        Ok(workspace.root.join(self.file()))
     }
 
     pub(crate) fn servers_key(self) -> &'static str {
@@ -1440,7 +1503,9 @@ impl Client {
             | Self::Agy
             | Self::Windsurf
             | Self::Cline
-            | Self::Roo => {
+            | Self::Roo
+            | Self::Kiro
+            | Self::Kilo => {
                 json!({"command": "justless", "args": ["mcp"]})
             }
         }
@@ -1462,26 +1527,66 @@ pub fn config_entries(
     workspace: &Workspace,
     clients: &BTreeSet<Client>,
 ) -> Result<Vec<ConfigFile>> {
+    config_entries_with_scope(workspace, clients, false)
+}
+
+fn config_entries_with_scope(
+    workspace: &Workspace,
+    clients: &BTreeSet<Client>,
+    global: bool,
+) -> Result<Vec<ConfigFile>> {
     clients
         .iter()
         .map(|&client| {
-            let path = client.path(workspace)?;
-            let display = if client.is_global() {
+            let is_user = global || client.is_global();
+            let path = if global {
+                client.user_path().with_context(|| {
+                    format!(
+                        "{} does not have a user-level MCP config supported by --global; omit --global to configure {}",
+                        client.label(),
+                        client.file()
+                    )
+                })??
+            } else {
+                client.path(workspace)?
+            };
+            let display = if is_user {
                 path.display().to_string()
             } else {
                 client.file().to_owned()
             };
-            if let Some(directory) = path.parent().filter(|dir| *dir != workspace.root) {
-                match fs::symlink_metadata(directory) {
-                    Ok(metadata) => ensure!(
-                        metadata.is_dir(),
-                        "{} must be a directory",
-                        directory.display()
-                    ),
-                    Err(error) if error.kind() == ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(error)
-                            .with_context(|| format!("inspect {}", directory.display()));
+            if is_user {
+                if let Some(directory) = path.parent() {
+                    match fs::symlink_metadata(directory) {
+                        Ok(metadata) => ensure!(
+                            metadata.is_dir(),
+                            "{} must be a directory",
+                            directory.display()
+                        ),
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(error)
+                                .with_context(|| format!("inspect {}", directory.display()));
+                        }
+                    }
+                }
+            } else if let Ok(relative) = path.strip_prefix(&workspace.root)
+                && let Some(parent) = relative.parent()
+            {
+                let mut current = workspace.root.clone();
+                for component in parent.components() {
+                    current.push(component);
+                    match fs::symlink_metadata(&current) {
+                        Ok(metadata) => ensure!(
+                            metadata.is_dir(),
+                            "{} must be a directory",
+                            current.display()
+                        ),
+                        Err(error) if error.kind() == ErrorKind::NotFound => break,
+                        Err(error) => {
+                            return Err(error)
+                                .with_context(|| format!("inspect {}", current.display()));
+                        }
                     }
                 }
             }
@@ -1578,30 +1683,76 @@ fn read_regular(path: &Path) -> Result<String> {
     }
 }
 
+#[cfg(test)]
 fn install(workspace: &Workspace, clients: &BTreeSet<Client>) -> Result<()> {
-    let project_local = clients.iter().any(|client| !client.is_global());
+    install_with_scope(workspace, clients, false)
+}
+
+pub(crate) fn clients_for_agents(agents: &[crate::agents::Agent]) -> BTreeSet<Client> {
+    agents
+        .iter()
+        .filter_map(|&agent| Client::for_agent(agent))
+        .collect()
+}
+
+pub(crate) fn install_for_agents(
+    workspace: &Workspace,
+    agents: &[crate::agents::Agent],
+) -> Result<()> {
+    let clients = clients_for_agents(agents);
+    for &agent in agents {
+        if Client::for_agent(agent).is_none() {
+            println!("OpenCode: no MCP config (uses its plugin instead)");
+        }
+    }
+    if !clients.is_empty() {
+        install_with_scope(workspace, &clients, false)?;
+    }
+    Ok(())
+}
+
+fn install_with_scope(
+    workspace: &Workspace,
+    clients: &BTreeSet<Client>,
+    global: bool,
+) -> Result<()> {
+    // Validate every selected file before creating state or writing anything.
+    config_entries_with_scope(workspace, clients, global)?;
+    let project_local = !global && clients.iter().any(|client| !client.is_global());
     let _guard = if project_local {
         workspace.prepare_state()?;
         Some(lock_state(&workspace.state.join("setup.lock"))?)
     } else {
         None
     };
-    // Validate every selected file before writing any of them.
-    let files = config_entries(workspace, clients)?;
+    let files = config_entries_with_scope(workspace, clients, global)?;
     // Absolute paths show which project or user config was changed.
     for file in files {
         let path = file.path.display();
+        let is_user = global || file.client.is_global();
         match file.contents {
             Some(contents) => {
                 let parent = file.path.parent().context("config directory")?;
-                if file.client.is_global() {
+                if is_user {
                     if fs::symlink_metadata(parent).is_err() {
                         fs::create_dir_all(parent)
                             .with_context(|| format!("create {}", parent.display()))?;
                     }
                 } else {
                     crate::uninstall::remember(workspace, &file.path, &contents);
-                    private_dir(parent)?;
+                    let mut missing = Vec::new();
+                    for ancestor in parent.ancestors() {
+                        if ancestor == workspace.root || ancestor.exists() {
+                            break;
+                        }
+                        missing.push(ancestor);
+                    }
+                    for dir in missing.into_iter().rev() {
+                        private_dir(dir)?;
+                    }
+                    if parent != workspace.root {
+                        private_dir(parent)?;
+                    }
                 }
                 write_text(&file.path, &contents)?;
                 println!("{}: added justless to {path}", file.client.label());
@@ -1987,6 +2138,65 @@ mod tests {
         );
 
         // Second install is idempotent.
+        let entries = config_entries(&ws, &clients).unwrap();
+        assert!(entries.iter().all(|file| file.contents.is_none()));
+    }
+
+    #[test]
+    fn kiro_and_kilo_mcp_clients_project_and_kiro_home_global() {
+        assert_eq!(Client::parse("kiro").unwrap(), Client::Kiro);
+        assert_eq!(Client::parse("kilo").unwrap(), Client::Kilo);
+        assert!(!Client::Kiro.is_global());
+        assert!(!Client::Kilo.is_global());
+        assert_eq!(Client::Kiro.file(), ".kiro/settings/mcp.json");
+        assert_eq!(Client::Kilo.file(), ".kilocode/mcp.json");
+        assert_eq!(Client::Kiro.servers_key(), "mcpServers");
+        assert_eq!(Client::Kilo.servers_key(), "mcpServers");
+        assert_eq!(
+            kiro_mcp_path(
+                Some(PathBuf::from("/custom/kiro")),
+                Some(PathBuf::from("/home/u"))
+            ),
+            Some(PathBuf::from("/custom/kiro/settings/mcp.json"))
+        );
+        assert_eq!(
+            kiro_mcp_path(None, Some(PathBuf::from("/home/u"))),
+            Some(PathBuf::from("/home/u/.kiro/settings/mcp.json"))
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("package.json"), "{}\n").unwrap();
+        fs::create_dir_all(root.join(".kiro/settings")).unwrap();
+        fs::write(
+            root.join(".kiro/settings/mcp.json"),
+            r#"{"otherKey":1,"mcpServers":{"docs":{"command":"docs-mcp"}}}"#,
+        )
+        .unwrap();
+
+        let ws = Workspace::discover_from(&root).unwrap();
+        let clients = BTreeSet::from([Client::Kiro, Client::Kilo]);
+        install(&ws, &clients).unwrap();
+
+        let kiro: Value = serde_json::from_str(
+            &fs::read_to_string(root.join(".kiro/settings/mcp.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(kiro["otherKey"], 1);
+        assert_eq!(kiro["mcpServers"]["docs"]["command"], "docs-mcp");
+        assert_eq!(
+            kiro["mcpServers"]["justless"],
+            json!({"command": "justless", "args": ["mcp"]})
+        );
+
+        let kilo: Value =
+            serde_json::from_str(&fs::read_to_string(root.join(".kilocode/mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            kilo["mcpServers"]["justless"],
+            json!({"command": "justless", "args": ["mcp"]})
+        );
+
         let entries = config_entries(&ws, &clients).unwrap();
         assert!(entries.iter().all(|file| file.contents.is_none()));
     }

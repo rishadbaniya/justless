@@ -92,6 +92,23 @@ check editor-clients '[ "$status" -eq 0 ]'
 check editor-clients 'grep -qx "init --hooks --agent windsurf --agent cline --agent roo" "$work/editor-clients/fake.log"'
 check editor-clients 'grep -qF "Project hooks configured for windsurf cline roo." "$work/editor-clients/out"'
 
+run kiro-kilo-clients "" kiro kilo
+check kiro-kilo-clients '[ "$status" -eq 0 ]'
+check kiro-kilo-clients 'grep -qx "init --hooks --agent kiro --agent kilo" "$work/kiro-kilo-clients/fake.log"'
+check kiro-kilo-clients 'grep -qF "Project hooks configured for kiro kilo." "$work/kiro-kilo-clients/out"'
+
+# Auto-detect Kiro (.kiro/) and Kilo Code (.kilo/ or .kilocode/) project directories
+# without needing their CLIs on PATH.
+mkdir -p "$work/dir-detect-bin" "$work/auto-kiro-kilo/project/.kiro" "$work/auto-kiro-kilo/project/.kilo"
+ln -s "$work/stub/cargo" "$work/dir-detect-bin/cargo"
+ln -s "$(command -v mkdir)" "$work/dir-detect-bin/mkdir"
+ln -s "$(command -v chmod)" "$work/dir-detect-bin/chmod"
+run_path="$work/dir-detect-bin"
+run auto-kiro-kilo ""
+unset run_path
+check auto-kiro-kilo '[ "$status" -eq 0 ]'
+check auto-kiro-kilo 'grep -qx "init --hooks --agent kiro --agent kilo" "$work/auto-kiro-kilo/fake.log"'
+
 # Auto-detect windsurf on PATH when no agent arguments are passed (isolated PATH so
 # host agent CLIs do not affect detection).
 mkdir -p "$work/windsurf-bin"

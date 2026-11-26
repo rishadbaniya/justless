@@ -221,6 +221,8 @@ fn profiles() -> Vec<Profile> {
                 "windsurf" => ("Windsurf", &["windsurf"], ""),
                 "cline" => ("Cline", &[], ""),
                 "roo" => ("Roo Code", &[], ""),
+                "kiro" => ("Kiro", &["kiro", "kiro-cli"], ""),
+                "kilo" => ("Kilo Code", &["kilo"], ""),
                 _ => unreachable!("known agent"),
             };
             Profile {
@@ -353,13 +355,13 @@ impl Doctor<'_> {
         let mut agents_json = Vec::new();
         // The agents the setup command names, without those whose files `init`
         // cannot read: one of them would stop the whole run.
+        let found_in_project = project_detected(root, &profiles, &clis);
         let candidates = if set_up {
             Vec::new()
+        } else if found_in_project.is_empty() {
+            vec!["claude"]
         } else {
-            match detected(&profiles, &clis) {
-                detected if detected.is_empty() => vec!["claude"],
-                detected => detected,
-            }
+            found_in_project.clone()
         };
         let ready: Vec<&'static str> = candidates
             .iter()
@@ -486,9 +488,9 @@ impl Doctor<'_> {
             let mut message = String::from(
                 "Justless is not set up in this project: no agent hooks, instructions or MCP entries",
             );
-            if detected(&profiles, &clis).is_empty() {
+            if found_in_project.is_empty() {
                 message.push_str(
-                    ". Replace claude in the fix with your agent: codex, cursor, gemini, copilot, opencode, agy, windsurf, cline or roo",
+                    ". Replace claude in the fix with your agent: codex, cursor, gemini, copilot, opencode, agy, windsurf, cline, roo, kiro or kilo",
                 );
             }
             let any_hooks = |names: &[&str]| {
@@ -993,6 +995,8 @@ impl Doctor<'_> {
                     | Agent::Windsurf
                     | Agent::Cline
                     | Agent::Roo
+                    | Agent::Kiro
+                    | Agent::Kilo
             );
         let mut checks = hooks.checks;
         if let Some(file) = &global {
@@ -1491,110 +1495,120 @@ impl Doctor<'_> {
             .iter()
             .filter_map(|name| Client::parse(name).ok())
         {
-            let Ok(path) = client.path(self.workspace) else {
-                continue;
-            };
-            let file = if client.is_global() {
-                path.display().to_string()
-            } else {
-                client.file().to_owned()
-            };
-            let text = match fs::read_to_string(&path) {
-                Ok(text) if text.contains("justless") => text,
-                _ => continue,
-            };
-            let label = client.label();
-            let entry = if client == Client::Codex {
-                match text.parse::<toml_edit::DocumentMut>() {
-                    Ok(document) => document
-                        .get("mcp_servers")
-                        .and_then(|servers| servers.get("justless"))
-                        .map(|entry| {
-                            let args = entry
-                                .get("args")
-                                .and_then(|args| args.as_array())
-                                .map(|args| {
-                                    args.iter()
-                                        .filter_map(|arg| arg.as_str().map(str::to_owned))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            let command = entry
-                                .get("command")
-                                .and_then(|command| command.as_str())
-                                .unwrap_or_default();
-                            (command.to_owned(), args)
-                        }),
-                    Err(error) => {
-                        checks.push(Check::new(
-                            Status::Warn,
-                            format!("{label}: {file} is not valid TOML, so doctor cannot check its justless server ({error})"),
-                        ));
-                        continue;
-                    }
-                }
-            } else {
-                match serde_json::from_str::<Value>(&text) {
-                    Ok(config) => config
-                        .get(client.servers_key())
-                        .and_then(|servers| servers.get("justless"))
-                        .map(|entry| {
-                            (
-                                entry["command"].as_str().unwrap_or_default().to_owned(),
-                                strings(&entry["args"]),
-                            )
-                        }),
-                    Err(_) => {
-                        checks.push(Check::new(
-                            Status::Warn,
-                            format!("{label}: {file} is not plain JSON, perhaps because it has comments, so doctor cannot check its justless server"),
-                        ));
-                        continue;
-                    }
-                }
-            };
-            let Some((command, args)) = entry else {
-                continue;
-            };
-            let shown = std::iter::once(command.as_str())
-                .chain(args.iter().map(String::as_str))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let want = strings(&client.server_entry()["args"]);
-            let program = Path::new(&command);
-            // `--root`, the one global option, may come before the subcommand.
-            let mut rest = args.as_slice();
-            loop {
-                match rest {
-                    [flag, _, tail @ ..] if flag == "--root" => rest = tail,
-                    [flag, tail @ ..] if flag.starts_with("--root=") => rest = tail,
-                    _ => break,
-                }
+            let mut targets = Vec::new();
+            if let Ok(path) = client.path(self.workspace) {
+                let file = if client.is_global() {
+                    path.display().to_string()
+                } else {
+                    client.file().to_owned()
+                };
+                targets.push((path, file));
             }
-            let problem = if rest.first().map(String::as_str) != Some("mcp") {
-                Some((
-                    "which does not start the MCP server",
-                    "args",
-                    Value::from(want),
-                ))
-            } else if program.file_stem().is_none_or(|stem| stem != "justless") {
-                Some(("which is not justless", "command", json!("justless")))
-            } else if program.is_absolute() && !program.is_file() {
-                Some(("and that file does not exist", "command", json!("justless")))
-            } else {
-                None
-            };
-            checks.push(if let Some((why, key, value)) = problem {
-                Check::new(
-                    Status::Fail,
-                    format!("{label}: {file} runs `{shown}`, {why}"),
-                )
-                .fix(Fix::Manual(format!(
-                    "In {file}, set the justless server's {key} to {value}"
-                )))
-            } else {
-                Check::new(Status::Ok, format!("{label}: {file} runs `{shown}`"))
-            });
+            if !client.is_global()
+                && let Some(Ok(user_path)) = client.user_path()
+                && !targets.iter().any(|(existing, _)| *existing == user_path)
+            {
+                let file = user_path.display().to_string();
+                targets.push((user_path, file));
+            }
+            for (path, file) in targets {
+                let text = match fs::read_to_string(&path) {
+                    Ok(text) if text.contains("justless") => text,
+                    _ => continue,
+                };
+                let label = client.label();
+                let entry = if client == Client::Codex {
+                    match text.parse::<toml_edit::DocumentMut>() {
+                        Ok(document) => document
+                            .get("mcp_servers")
+                            .and_then(|servers| servers.get("justless"))
+                            .map(|entry| {
+                                let args = entry
+                                    .get("args")
+                                    .and_then(|args| args.as_array())
+                                    .map(|args| {
+                                        args.iter()
+                                            .filter_map(|arg| arg.as_str().map(str::to_owned))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                let command = entry
+                                    .get("command")
+                                    .and_then(|command| command.as_str())
+                                    .unwrap_or_default();
+                                (command.to_owned(), args)
+                            }),
+                        Err(error) => {
+                            checks.push(Check::new(
+                                Status::Warn,
+                                format!("{label}: {file} is not valid TOML, so doctor cannot check its justless server ({error})"),
+                            ));
+                            continue;
+                        }
+                    }
+                } else {
+                    match serde_json::from_str::<Value>(&text) {
+                        Ok(config) => config
+                            .get(client.servers_key())
+                            .and_then(|servers| servers.get("justless"))
+                            .map(|entry| {
+                                (
+                                    entry["command"].as_str().unwrap_or_default().to_owned(),
+                                    strings(&entry["args"]),
+                                )
+                            }),
+                        Err(_) => {
+                            checks.push(Check::new(
+                                Status::Warn,
+                                format!("{label}: {file} is not plain JSON, perhaps because it has comments, so doctor cannot check its justless server"),
+                            ));
+                            continue;
+                        }
+                    }
+                };
+                let Some((command, args)) = entry else {
+                    continue;
+                };
+                let shown = std::iter::once(command.as_str())
+                    .chain(args.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let want = strings(&client.server_entry()["args"]);
+                let program = Path::new(&command);
+                // `--root`, the one global option, may come before the subcommand.
+                let mut rest = args.as_slice();
+                loop {
+                    match rest {
+                        [flag, _, tail @ ..] if flag == "--root" => rest = tail,
+                        [flag, tail @ ..] if flag.starts_with("--root=") => rest = tail,
+                        _ => break,
+                    }
+                }
+                let problem = if rest.first().map(String::as_str) != Some("mcp") {
+                    Some((
+                        "which does not start the MCP server",
+                        "args",
+                        Value::from(want),
+                    ))
+                } else if program.file_stem().is_none_or(|stem| stem != "justless") {
+                    Some(("which is not justless", "command", json!("justless")))
+                } else if program.is_absolute() && !program.is_file() {
+                    Some(("and that file does not exist", "command", json!("justless")))
+                } else {
+                    None
+                };
+                checks.push(if let Some((why, key, value)) = problem {
+                    Check::new(
+                        Status::Fail,
+                        format!("{label}: {file} runs `{shown}`, {why}"),
+                    )
+                    .fix(Fix::Manual(format!(
+                        "In {file}, set the justless server's {key} to {value}"
+                    )))
+                } else {
+                    Check::new(Status::Ok, format!("{label}: {file} runs `{shown}`"))
+                });
+            }
         }
         checks
     }
@@ -2012,6 +2026,24 @@ fn detected(profiles: &[Profile], clis: &[Option<PathBuf>]) -> Vec<&'static str>
         .filter(|(profile, cli)| cli.is_some() && profile.requirement().is_empty())
         .map(|(profile, _)| profile.name)
         .collect()
+}
+
+/// Clients found on PATH plus project-local agent directories present in `root`
+/// (`.kiro/`, `.kilocode/`, `.kilo/`).
+fn project_detected(
+    root: &Path,
+    profiles: &[Profile],
+    clis: &[Option<PathBuf>],
+) -> Vec<&'static str> {
+    let mut found = detected(profiles, clis);
+    if root.join(".kiro").is_dir() && !found.contains(&"kiro") {
+        found.push("kiro");
+    }
+    if (root.join(".kilocode").is_dir() || root.join(".kilo").is_dir()) && !found.contains(&"kilo")
+    {
+        found.push("kilo");
+    }
+    found
 }
 
 // ---------------------------------------------------------------------------
@@ -3383,5 +3415,96 @@ mod tests {
                 && c.message
                     .contains(".clinerules has the current Justless block")
         }));
+    }
+
+    #[test]
+    fn doctor_audits_kiro_and_kilo_read_only_and_detects_project_dirs() {
+        let (_, _, block) = agents::instruction_block();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("package.json"), "{}\n").unwrap();
+        fs::create_dir_all(root.join(".kiro/steering")).unwrap();
+        fs::create_dir_all(root.join(".kiro/settings")).unwrap();
+        fs::write(
+            root.join(".kiro/steering/justless.md"),
+            format!("{block}\n"),
+        )
+        .unwrap();
+        fs::write(
+            root.join(".kiro/settings/mcp.json"),
+            r#"{"mcpServers":{"justless":{"command":"justless","args":["mcp"]}}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join(".kilocode/rules")).unwrap();
+        fs::write(
+            root.join(".kilocode/rules/justless.md"),
+            format!("{block}\n"),
+        )
+        .unwrap();
+        fs::write(
+            root.join(".kilocode/mcp.json"),
+            r#"{"mcpServers":{"justless":{"command":"justless","args":["mcp"]}}}"#,
+        )
+        .unwrap();
+
+        let ws = Workspace::discover_from(&root).unwrap();
+        let doctor = Doctor {
+            workspace: &ws,
+            explicit_root: true,
+            at_root: true,
+        };
+        let report = doctor.report(Some(&root));
+        assert!(!root.join(".justless").exists());
+
+        for (id, rules) in [
+            ("kiro", ".kiro/steering/justless.md"),
+            ("kilo", ".kilocode/rules/justless.md"),
+        ] {
+            let section = report
+                .sections
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("missing section {id}"));
+            assert!(
+                section
+                    .checks
+                    .iter()
+                    .any(|c| c.status == Status::Ok && c.message.contains(rules)),
+                "{id}: {:?}",
+                section
+                    .checks
+                    .iter()
+                    .map(|c| &c.message)
+                    .collect::<Vec<_>>()
+            );
+            assert!(!section.checks.iter().any(|c| c.status == Status::Fail));
+        }
+        let mcp = report
+            .sections
+            .iter()
+            .find(|s| s.id == "mcp")
+            .expect("mcp section");
+        assert!(
+            mcp.checks
+                .iter()
+                .any(|c| c.status == Status::Ok && c.message.contains(".kiro/settings/mcp.json"))
+        );
+        assert!(
+            mcp.checks
+                .iter()
+                .any(|c| c.status == Status::Ok && c.message.contains(".kilocode/mcp.json"))
+        );
+
+        // Auto-detect `.kiro/` and `.kilo/` project directories even when CLIs are absent.
+        let detect_dir = tempfile::tempdir().unwrap();
+        let detect_root = detect_dir.path().canonicalize().unwrap();
+        fs::create_dir_all(detect_root.join(".kiro")).unwrap();
+        fs::create_dir_all(detect_root.join(".kilo")).unwrap();
+        let profs = profiles();
+        let no_clis = vec![None; profs.len()];
+        assert_eq!(
+            project_detected(&detect_root, &profs, &no_clis),
+            vec!["kiro", "kilo"]
+        );
     }
 }

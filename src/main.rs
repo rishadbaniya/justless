@@ -375,7 +375,7 @@ fn cli() -> Command<'static> {
                         .multiple_occurrences(true)
                         .possible_values([
                             "codex", "claude", "agy", "opencode", "cursor", "gemini", "copilot",
-                            "windsurf", "cline", "roo",
+                            "windsurf", "cline", "roo", "kiro", "kilo",
                         ])
                         .default_value("codex")
                         .help("Agent to configure (repeat to select several)"),
@@ -386,6 +386,12 @@ fn cli() -> Command<'static> {
                         .help("Install project-local hooks"),
                 )
                 .arg(
+                    Arg::new("mcp")
+                        .long("mcp")
+                        .conflicts_with_all(&["remove", "global"])
+                        .help("Also add the justless MCP server to each selected agent's config"),
+                )
+                .arg(
                     Arg::new("remove")
                         .long("remove")
                         .conflicts_with("hooks")
@@ -394,8 +400,7 @@ fn cli() -> Command<'static> {
                 .arg(
                     Arg::new("dry-run")
                         .long("dry-run")
-                        .requires("remove")
-                        .help("With --remove, print each change without making it"),
+                        .help("Preview every file that would be created, updated or removed without writing anything"),
                 )
                 .arg(
                     Arg::new("purge")
@@ -412,7 +417,7 @@ fn cli() -> Command<'static> {
                 .arg(
                     Arg::new("global")
                         .long("global")
-                        .conflicts_with_all(&["hooks", "statusline", "purge"])
+                        .conflicts_with_all(&["hooks", "mcp", "statusline", "purge"])
                         .help("Install user-level Claude Code, Codex and Antigravity CLI hooks that work in every project; with --remove, remove them"),
                 ),
         )
@@ -816,8 +821,12 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         ("init", sub) if sub.is_present("global") && sub.is_present("remove") => {
             global::remove(sub)?
         }
+        ("init", sub) if sub.is_present("global") && sub.is_present("dry-run") => {
+            init_global_dry_run(sub)?
+        }
         ("init", sub) if sub.is_present("global") => global::init(sub)?,
         ("init", sub) if sub.is_present("remove") => uninstall::run(&workspace, sub)?,
+        ("init", sub) if sub.is_present("dry-run") => init_dry_run(&workspace, sub)?,
         ("init", sub) => {
             let selected = sub
                 .values_of("agent")
@@ -825,16 +834,27 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
                 .map(agents::Agent::parse)
                 .collect::<Result<Vec<_>>>()?;
             let hooks = sub.is_present("hooks");
+            let mcp = sub.is_present("mcp");
             let statusline = sub.is_present("statusline");
+            let run_agents = !statusline || hooks || mcp || sub.occurrences_of("agent") > 0;
             let before = statusline::project_settings(&workspace);
-            // Check the status line's files too before any agent setup is written.
+            // Check MCP and status line files too before any agent setup is written.
+            if mcp {
+                let clients = mcp::clients_for_agents(&selected);
+                if !clients.is_empty() {
+                    mcp::config_entries(&workspace, &clients)?;
+                }
+            }
             if statusline {
                 statusline::check(&workspace)?;
             }
             // `--statusline` alone changes only Claude Code's settings, not the
             // default agent's instructions.
-            if !statusline || hooks || sub.occurrences_of("agent") > 0 {
+            if run_agents {
                 agents::init(&workspace, &selected, hooks)?;
+            }
+            if mcp {
+                mcp::install_for_agents(&workspace, &selected)?;
             }
             if statusline {
                 statusline::install(&workspace)?;
@@ -852,6 +872,164 @@ fn dispatch(matches: &ArgMatches) -> Result<i32> {
         _ => unreachable!("known subcommand"),
     }
     Ok(0)
+}
+
+fn merge_plan_action(
+    entries: &mut std::collections::BTreeMap<std::path::PathBuf, agents::PlanAction>,
+    path: std::path::PathBuf,
+    action: agents::PlanAction,
+) {
+    entries
+        .entry(path)
+        .and_modify(|existing| {
+            if *existing == agents::PlanAction::Unchanged {
+                *existing = action;
+            }
+        })
+        .or_insert(action);
+}
+
+fn init_dry_run(workspace: &Workspace, sub: &ArgMatches) -> Result<()> {
+    let selected = sub
+        .values_of("agent")
+        .unwrap()
+        .map(agents::Agent::parse)
+        .collect::<Result<Vec<_>>>()?;
+    let hooks = sub.is_present("hooks");
+    let mcp = sub.is_present("mcp");
+    let statusline = sub.is_present("statusline");
+    let run_agents = !statusline || hooks || mcp || sub.occurrences_of("agent") > 0;
+    let mut entries = std::collections::BTreeMap::new();
+    let mut notes = Vec::new();
+    if run_agents {
+        let plan = agents::plan_dry_run(workspace, &selected, hooks)?;
+        for (path, action) in plan.entries {
+            merge_plan_action(&mut entries, path, action);
+        }
+        for filename in plan.skipped {
+            notes.push(format!("  [skip] {filename} (links outside project)"));
+        }
+    }
+    if mcp {
+        let clients = mcp::clients_for_agents(&selected);
+        for &agent in &selected {
+            if mcp::Client::for_agent(agent).is_none() {
+                notes.push("  [skip] OpenCode: no MCP config (uses its plugin instead)".into());
+            }
+        }
+        if !clients.is_empty() {
+            for file in mcp::config_entries(workspace, &clients)? {
+                let action = match file.contents {
+                    Some(_) if std::fs::symlink_metadata(&file.path).is_ok() => {
+                        agents::PlanAction::Update
+                    }
+                    Some(_) => agents::PlanAction::Create,
+                    None => agents::PlanAction::Unchanged,
+                };
+                merge_plan_action(&mut entries, file.path, action);
+            }
+        }
+    }
+    if statusline {
+        statusline::check(workspace)?;
+        match statusline::audit(workspace) {
+            statusline::Audit::Unconfigured => {
+                let local = workspace.root.join(".claude/settings.local.json");
+                let exists = std::fs::symlink_metadata(&local).is_ok();
+                merge_plan_action(
+                    &mut entries,
+                    local,
+                    if exists {
+                        agents::PlanAction::Update
+                    } else {
+                        agents::PlanAction::Create
+                    },
+                );
+                if !exists
+                    && std::process::Command::new("git")
+                        .args(["check-ignore", "-q", "--", ".claude/settings.local.json"])
+                        .current_dir(&workspace.root)
+                        .output()
+                        .is_ok_and(|out| out.status.code() == Some(1))
+                {
+                    let gitignore = workspace.root.join(".gitignore");
+                    let action = if std::fs::symlink_metadata(&gitignore).is_ok() {
+                        agents::PlanAction::Update
+                    } else {
+                        agents::PlanAction::Create
+                    };
+                    merge_plan_action(&mut entries, gitignore, action);
+                }
+            }
+            statusline::Audit::Installed { .. } => {
+                merge_plan_action(
+                    &mut entries,
+                    workspace.root.join(".claude/settings.local.json"),
+                    agents::PlanAction::Unchanged,
+                );
+            }
+            statusline::Audit::Shadowed { label, .. } => {
+                notes.push(format!("  [keep] {label} (existing statusLine kept)"));
+            }
+            statusline::Audit::Unreadable { .. } => {}
+        }
+    }
+    println!("dry-run (no files written):");
+    for (path, action) in entries {
+        let display = path
+            .strip_prefix(&workspace.root)
+            .unwrap_or(&path)
+            .display();
+        println!("  [{}] {display}", action.tag());
+    }
+    for note in notes {
+        println!("{note}");
+    }
+    Ok(())
+}
+
+fn init_global_dry_run(sub: &ArgMatches) -> Result<()> {
+    use anyhow::Context;
+    let chosen = if sub.occurrences_of("agent") > 0 {
+        let mut selected = Vec::new();
+        for value in sub.values_of("agent").into_iter().flatten() {
+            let agent = agents::Agent::parse(value)?;
+            ensure!(
+                global::CLIENTS.contains(&agent),
+                "--global sets up Claude Code, Codex and Antigravity CLI only, not {value}"
+            );
+            if !selected.contains(&agent) {
+                selected.push(agent);
+            }
+        }
+        selected
+    } else {
+        let found: Vec<agents::Agent> = global::CLIENTS
+            .into_iter()
+            .filter(|&agent| global::config_dir(agent).is_some_and(|dir| dir.is_dir()))
+            .collect();
+        ensure!(
+            !found.is_empty(),
+            "found no Claude Code, Codex or Antigravity CLI config directory; name the client with --agent claude, --agent codex or --agent agy"
+        );
+        found
+    };
+    let mut entries = std::collections::BTreeMap::new();
+    for agent in chosen {
+        let path =
+            global::hook_file(agent).context("no home directory to find the user settings in")?;
+        let action = match agents::merge_hooks(&path, agent, " --global")? {
+            Some(_) if std::fs::symlink_metadata(&path).is_ok() => agents::PlanAction::Update,
+            Some(_) => agents::PlanAction::Create,
+            None => agents::PlanAction::Unchanged,
+        };
+        entries.insert(path, action);
+    }
+    println!("dry-run (no files written):");
+    for (path, action) in entries {
+        println!("  [{}] {}", action.tag(), path.display());
+    }
+    Ok(())
 }
 
 /// Parsers recurse once per level of source nesting, so a deep but valid file
