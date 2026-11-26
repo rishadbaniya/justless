@@ -1347,12 +1347,13 @@ fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
     if haystack.len() < len {
         return false;
     }
+    let first_lower = first.to_ascii_lowercase();
     let first_upper = first.to_ascii_uppercase();
     let limit = haystack.len() - len;
     let mut i = 0;
     while i <= limit {
         let byte = haystack[i];
-        if (byte == first || byte == first_upper)
+        if (byte == first_lower || byte == first_upper)
             && haystack[i..i + len].eq_ignore_ascii_case(needle)
         {
             return true;
@@ -1877,5 +1878,16 @@ mod tests {
         assert_eq!(blocks[4].kind, BlockKind::Heading(2));
         assert_eq!(blocks[4].name, "After");
         assert_eq!(slice_of(&blocks[4]), "## After\nTrailing text.\n");
+    }
+
+    #[test]
+    fn contains_ascii_case_insensitive_handles_uppercase_needles() {
+        assert!(contains_ascii_case_insensitive(
+            b"closing </pre> tag",
+            b"</PRE>"
+        ));
+        assert!(contains_ascii_case_insensitive(b"hello world", b"WORLD"));
+        assert!(contains_ascii_case_insensitive(b"HELLO WORLD", b"world"));
+        assert!(!contains_ascii_case_insensitive(b"hello", b"WORLD"));
     }
 }

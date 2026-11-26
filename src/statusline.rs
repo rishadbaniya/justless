@@ -294,7 +294,7 @@ fn transcript_start(path: &Path) -> Option<u64> {
         match reader.read_until(b'\n', &mut line) {
             Ok(0) => break,
             Ok(_) => {}
-            Err(_) => return None,
+            Err(_) => break,
         }
         if !contains_bytes(&line, b"timestamp") {
             continue;
@@ -1640,5 +1640,18 @@ mod tests {
         // Invalid timezone offsets are rejected cleanly.
         assert_eq!(parse_timestamp("2026-11-17T15:42:21+25:00"), None);
         assert_eq!(parse_timestamp("2026-11-17T15:42:21+-1:00"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcript_start_falls_back_to_created_on_read_error() {
+        let temp = tempfile::tempdir().unwrap();
+        // Opening a directory succeeds on Unix and `read_until` fails with EISDIR;
+        // `transcript_start` must break into the file metadata `created()` fallback.
+        let expected = fs::metadata(temp.path())
+            .ok()
+            .and_then(|meta| meta.created().ok())
+            .map(millis);
+        assert_eq!(transcript_start(temp.path()), expected);
     }
 }

@@ -188,7 +188,9 @@ fn walk_postings(
     while position < bytes.len() {
         let delta = get_varint(bytes, &mut position)?;
         check(previous.is_none() || delta > 0, "unordered postings")?;
-        let chunk = u64::from(previous.unwrap_or(0)) + delta;
+        let chunk = u64::from(previous.unwrap_or(0))
+            .checked_add(delta)
+            .ok_or_else(|| corrupt("posting outside the segment"))?;
         check(chunk < u64::from(chunks), "posting outside the segment")?;
         let chunk = chunk as u32;
         previous = Some(chunk);
@@ -217,7 +219,9 @@ fn decode_postings(bytes: &[u8], chunks: u32, out: &mut Vec<Posting>) -> Result<
     while position < bytes.len() {
         let delta = get_varint(bytes, &mut position)?;
         check(previous.is_none() || delta > 0, "unordered postings")?;
-        let chunk = u64::from(previous.unwrap_or(0)) + delta;
+        let chunk = u64::from(previous.unwrap_or(0))
+            .checked_add(delta)
+            .ok_or_else(|| corrupt("posting outside the segment"))?;
         check(chunk < u64::from(chunks), "posting outside the segment")?;
         let chunk = chunk as u32;
         previous = Some(chunk);
@@ -1175,5 +1179,25 @@ mod tests {
                 let _ = (segment.name(&row), segment.kind(&row), row.class());
             }
         }
+    }
+
+    #[test]
+    fn posting_delta_overflow_returns_corrupt_without_wrapping() {
+        let mut bytes = Vec::new();
+        // First posting: chunk 1, field mask 1, frequency 1.
+        put_varint(&mut bytes, 1);
+        bytes.push(1);
+        put_varint(&mut bytes, 1);
+        // Second posting: delta u64::MAX would overflow/wrap `1 + u64::MAX` to 0.
+        put_varint(&mut bytes, u64::MAX);
+        bytes.push(1);
+        put_varint(&mut bytes, 1);
+
+        let walk_err = walk_postings(&bytes, 4, |_, _| {}).unwrap_err();
+        assert!(is_corrupt(&walk_err), "{walk_err:#}");
+
+        let mut decoded = Vec::new();
+        let decode_err = decode_postings(&bytes, 4, &mut decoded).unwrap_err();
+        assert!(is_corrupt(&decode_err), "{decode_err:#}");
     }
 }

@@ -246,6 +246,9 @@ struct Extractor {
     /// Flat stack of local bindings across nested lexical scopes.
     locals: Vec<(String, Option<Vec<String>>)>,
     scope_starts: Vec<usize>,
+    /// Start index in `locals` visible to the current item (nested items cannot
+    /// capture outer function locals).
+    locals_floor: usize,
     /// Reusable buffer for allocation-free `Ident` formatting during lookups.
     scratch: String,
     /// Whether to read the body of any macro call, not only the standard ones.
@@ -358,7 +361,11 @@ impl Extractor {
             resolved
         } else if path.segments.len() == 1 && matches!(kind, Kind::Call | Kind::Reference) {
             let name = ident_str(&first.ident, &mut self.scratch);
-            if self.locals.iter().rev().any(|(local, _)| local == name) {
+            if self.locals[self.locals_floor..]
+                .iter()
+                .rev()
+                .any(|(local, _)| local == name)
+            {
                 return;
             }
             vec![name.to_owned()]
@@ -376,7 +383,7 @@ impl Extractor {
     }
 
     fn local(&self, name: &str) -> Option<&Option<Vec<String>>> {
-        self.locals
+        self.locals[self.locals_floor..]
             .iter()
             .rev()
             .find(|(local, _)| local == name)
@@ -489,6 +496,7 @@ impl Extractor {
 
 impl<'ast> Visit<'ast> for Extractor {
     fn visit_item(&mut self, item: &'ast Item) {
+        let previous_floor = std::mem::replace(&mut self.locals_floor, self.locals.len());
         match item {
             Item::Fn(function) => self.with_symbol(
                 &function.sig.ident,
@@ -589,6 +597,7 @@ impl<'ast> Visit<'ast> for Extractor {
             }
             _ => visit::visit_item(self, item),
         }
+        self.locals_floor = previous_floor;
     }
 
     fn visit_impl_item_fn(&mut self, method: &'ast syn::ImplItemFn) {
@@ -689,7 +698,7 @@ impl<'ast> Visit<'ast> for Extractor {
             Expr::Path(path) => {
                 let resolved = path.path.get_ident().and_then(|ident| {
                     let name = ident_str(ident, &mut self.scratch);
-                    self.locals
+                    self.locals[self.locals_floor..]
                         .iter()
                         .rev()
                         .find(|(local, _)| local == name)
@@ -1005,5 +1014,30 @@ mod tests {
         // `#[cfg(test)] mod tests` byte span begins at the attribute for outline test-module folding.
         let tests_mod = &syntax.symbols[7];
         assert!(src[tests_mod.bytes.clone()].starts_with("#[cfg(test)]\nmod tests"));
+    }
+
+    #[test]
+    fn nested_items_do_not_inherit_enclosing_function_locals() {
+        let src = concat!(
+            "fn helper() {}\n",
+            "fn outer() {\n",
+            "    let helper = 1;\n",
+            "    fn inner() { helper(); }\n",
+            "    let _ = helper;\n",
+            "}\n",
+        );
+        let syntax = parse(src).unwrap();
+        let inner_idx = syntax
+            .symbols
+            .iter()
+            .position(|s| s.name == "inner")
+            .unwrap();
+        let calls: Vec<_> = syntax
+            .references
+            .iter()
+            .filter(|r| r.path == ["helper"])
+            .map(|r| (r.from, r.kind))
+            .collect();
+        assert_eq!(calls, [(Some(inner_idx), Kind::Call)]);
     }
 }

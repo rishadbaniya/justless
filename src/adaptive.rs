@@ -207,6 +207,12 @@ fn read_into(path: &Path, buf: &mut Vec<u8>) -> bool {
 /// reusing `path` and `buf` to avoid per-run allocations. A run replayed before
 /// streams were recorded counts both when `recalls.json` has a full replay.
 fn replayed_in(path: &mut PathBuf, buf: &mut Vec<u8>, id: &str) -> [bool; 2] {
+    let mut components = Path::new(id).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return [false, false];
+    }
     path.push(id);
     path.push(REPLAYS);
     if read_into(path, buf) {
@@ -650,7 +656,9 @@ fn recorded_all(workspace: &Workspace, save: bool) -> BTreeMap<String, Vec<Brief
 /// run is gone. Corrupt or empty lines in `index.seen` are skipped cleanly.
 fn refresh(directory: &Path, mut index: Index) -> Option<(Index, bool)> {
     let entries = fs::read_dir(directory).ok()?;
+    let before_runs = index.runs.len();
     index.runs.retain(|key, _| !key.trim().is_empty());
+    let mut changed = index.runs.len() != before_runs;
     let seen_text = std::mem::take(&mut index.seen);
     let mut seen = HashSet::new();
     let mut seen_dirty = !seen_text.is_empty() && !seen_text.ends_with('\n');
@@ -673,7 +681,7 @@ fn refresh(directory: &Path, mut index: Index) -> Option<(Index, bool)> {
         let Some(id) = name.to_str() else {
             continue;
         };
-        if !id.starts_with("run-") {
+        if !(id.starts_with("run-") && id.len() > "run-".len()) {
             continue;
         }
         if !seen.is_empty() && seen.contains(id) {
@@ -693,6 +701,13 @@ fn refresh(directory: &Path, mut index: Index) -> Option<(Index, bool)> {
     if found < seen.len() {
         return None;
     }
+    if index
+        .runs
+        .values()
+        .any(|list| list.iter().any(|brief| !seen.contains(brief.id.as_str())))
+    {
+        return None;
+    }
     let mut seen_text = if seen_dirty {
         let mut rebuilt = String::with_capacity(seen_text.len());
         for id in &seen {
@@ -705,7 +720,7 @@ fn refresh(directory: &Path, mut index: Index) -> Option<(Index, bool)> {
         drop(seen);
         seen_text
     };
-    let changed = seen_dirty || !added.is_empty();
+    changed |= seen_dirty || !added.is_empty();
     let mut keys = HashSet::new();
     for (id, brief) in added {
         seen_text.push_str(&id);
@@ -1908,5 +1923,121 @@ mod tests {
             decide(LIMITS, i32::MIN, WINDOW, &[extreme], first(0)).step,
             Step::Hold
         );
+    }
+
+    #[test]
+    fn malformed_run_ids_never_poison_replayed_in_path_buffer() {
+        let temp = tempfile::tempdir().unwrap();
+        let runs = temp.path().join("runs");
+        let valid = runs.join("run-good");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&valid).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(valid.join(REPLAYS), r#"{"stdout": 1, "stderr": 0}"#).unwrap();
+        fs::write(outside.join(REPLAYS), r#"{"stdout": 1, "stderr": 1}"#).unwrap();
+
+        let mut path = runs.clone();
+        let mut buf = Vec::new();
+        for bad in ["", "/abs", "../outside", ".", "..", "a/b"] {
+            assert_eq!(
+                replayed_in(&mut path, &mut buf, bad),
+                [false, false],
+                "malformed id {bad:?} must be ignored"
+            );
+            assert_eq!(
+                path, runs,
+                "malformed id {bad:?} must leave shared PathBuf intact"
+            );
+        }
+        assert_eq!(replayed_in(&mut path, &mut buf, "run-good"), [true, false]);
+        assert_eq!(path, runs);
+    }
+
+    #[test]
+    fn corrupt_seen_with_ghost_briefs_forces_rebuild_and_cleans_blank_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join(".justless");
+        let runs = state.join("runs");
+        let live = runs.join("run-live");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("stdout"), "x".repeat(8_000)).unwrap();
+        fs::write(live.join("stderr"), "").unwrap();
+        fs::write(
+            live.join("record.json"),
+            serde_json::json!({
+                "id": "run-live", "status": 0, "raw_bytes": 8_000, "preview_bytes": 2_000,
+                "completed_ms": 10, "family": "other", "label": "gen.sh"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // A bare `"run-"` directory must be skipped so it never pollutes `seen`.
+        fs::create_dir_all(runs.join("run-")).unwrap();
+
+        let ghost = Brief {
+            id: "run-deleted".into(),
+            completed_ms: 9,
+            stdout: 8_000,
+            stderr: 0,
+            shown: 2_000,
+            replaced: Replaced::Nothing,
+            budget: Some(4096),
+            explicit: false,
+        };
+        let corrupt_cache = Index {
+            version: INDEX_VERSION,
+            seen: "run-live\n".into(),
+            runs: BTreeMap::from([("gen.sh".into(), vec![ghost])]),
+        };
+        assert!(
+            refresh(&runs, corrupt_cache).is_none(),
+            "cached ghost brief absent from verified `seen` must trigger rebuild"
+        );
+
+        // End-to-end through `load_index`: rebuilds cleanly without retaining the ghost.
+        let workspace = Workspace {
+            root: temp.path().to_path_buf(),
+            cwd: temp.path().to_path_buf(),
+            state: state.clone(),
+            origin: temp.path().to_path_buf(),
+        };
+        write_json(
+            &state.join(INDEX),
+            &Index {
+                version: INDEX_VERSION,
+                seen: "corrupt-line\nrun-live\n".into(),
+                runs: BTreeMap::from([(
+                    "gen.sh".into(),
+                    vec![Brief {
+                        id: "run-deleted".into(),
+                        completed_ms: 9,
+                        stdout: 8_000,
+                        stderr: 0,
+                        shown: 2_000,
+                        replaced: Replaced::Nothing,
+                        budget: Some(4096),
+                        explicit: false,
+                    }],
+                )]),
+            },
+        )
+        .unwrap();
+        let rebuilt = load_index(&workspace, true).expect("rebuild succeeds");
+        assert_eq!(rebuilt.seen, "run-live\n");
+        let ids: Vec<&str> = rebuilt.runs["gen.sh"]
+            .iter()
+            .map(|b| b.id.as_str())
+            .collect();
+        assert_eq!(ids, ["run-live"]);
+
+        // Removing a blank-key bucket alone marks the refreshed index as changed.
+        let blank_only = Index {
+            version: INDEX_VERSION,
+            seen: "run-live\n".into(),
+            runs: BTreeMap::from([("   ".into(), Vec::new())]),
+        };
+        let (cleaned, changed) = refresh(&runs, blank_only).expect("valid seen run exists");
+        assert!(changed);
+        assert!(cleaned.runs.is_empty());
     }
 }

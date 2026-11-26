@@ -181,12 +181,13 @@ fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
     if haystack.len() < len {
         return false;
     }
+    let first_lower = first.to_ascii_lowercase();
     let first_upper = first.to_ascii_uppercase();
     let limit = haystack.len() - len;
     let mut i = 0;
     while i <= limit {
         let byte = haystack[i];
-        if (byte == first || byte == first_upper)
+        if (byte == first_lower || byte == first_upper)
             && haystack[i..i + len].eq_ignore_ascii_case(needle)
         {
             return true;
@@ -1177,5 +1178,18 @@ mod tests {
         assert!(reverse[0].steps[0].reverse);
         assert_eq!(reverse[0].steps[0].to.name, "dispatch_order");
         assert!(!reverse[0].steps[1].reverse);
+    }
+
+    #[test]
+    fn contains_ascii_case_insensitive_handles_uppercase_needles() {
+        assert!(contains_ascii_case_insensitive(
+            b"how does a connect to b",
+            b"CONNECT"
+        ));
+        assert!(contains_ascii_case_insensitive(b"TRACE flow", b"trace"));
+        assert!(!contains_ascii_case_insensitive(
+            b"ordinary query",
+            b"CONNECT"
+        ));
     }
 }
