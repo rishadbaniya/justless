@@ -33,14 +33,16 @@
 //! lines. A stream that produced no finding is summarized by its line range, so other
 //! output such as a crash is never silently hidden. Findings are only reported when
 //! at least one was recognized, so other output keeps the ordinary preview.
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::LazyLock;
 
 use regex::Regex;
 use sha2::{Digest, Sha256};
 
-use crate::capture::Stream;
+use crate::capture::{ANSI, Stream};
 use crate::summary::{Item, Summary, short};
 
 /// Named ecosystem linters supported by [`Lint`].
@@ -425,6 +427,19 @@ static BUILD_OUTCOME: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+fn strip_ansi_cow(line: &str) -> Cow<'_, str> {
+    if line.contains('\x1b') {
+        ANSI.replace_all(line, "")
+    } else {
+        Cow::Borrowed(line)
+    }
+}
+
+fn starts_with_ignore_ascii_case(text: &str, prefix: &str) -> bool {
+    text.len() >= prefix.len()
+        && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StatusKind {
     Cargo,
@@ -432,45 +447,54 @@ enum StatusKind {
     Lint,
 }
 
+#[derive(Clone, Copy)]
+enum Classify {
+    Matched,
+    Status((StatusKind, bool, bool)),
+    Other,
+}
+
 /// Recognize a clean build or linter status line, whether it carries the final
 /// completion notice for the one-line clean summary, and whether it requires a
 /// completion notice before [`Lint::clean`] may succeed.
 fn build_status(line: &str) -> Option<(StatusKind, bool, bool)> {
-    if CARGO_STATUS.is_match(line) {
+    let first = *line.as_bytes().first()?;
+    if first == b' ' && CARGO_STATUS.is_match(line) {
         return Some((
             StatusKind::Cargo,
             line.trim_start().starts_with("Finished "),
             false,
         ));
     }
-    if CMAKE_PROGRESS.is_match(line) {
+    if first == b'[' && CMAKE_PROGRESS.is_match(line) {
         return Some((StatusKind::Build, CMAKE_BUILT_FINAL.is_match(line), false));
     }
-    if CMAKE_DONE.is_match(line) {
+    if line.starts_with("-- ") && CMAKE_DONE.is_match(line) {
         return Some((
             StatusKind::Build,
             line.starts_with("-- Build files have been written to:"),
             false,
         ));
     }
-    if STEP_PROGRESS.is_match(line)
+    if first == b'['
+        && STEP_PROGRESS.is_match(line)
         && !line.contains("FAILED")
         && !line.contains("error:")
         && !line.contains("warning:")
     {
         return Some((StatusKind::Build, false, false));
     }
-    if NINJA_STATUS.is_match(line) {
+    if line.starts_with("ninja: ") && NINJA_STATUS.is_match(line) {
         return Some((StatusKind::Build, line == "ninja: no work to do.", false));
     }
-    if MAKE_STATUS.is_match(line) {
+    if (line.starts_with("make") || line.starts_with("gmake")) && MAKE_STATUS.is_match(line) {
         return Some((
             StatusKind::Build,
             line.contains("Nothing to be done for ") || line.ends_with(" is up to date."),
             false,
         ));
     }
-    if GRADLE_STATUS.is_match(line) {
+    if (matches!(first, b'>' | b'B') || first.is_ascii_digit()) && GRADLE_STATUS.is_match(line) {
         return Some((
             StatusKind::Build,
             line.starts_with("BUILD SUCCESSFUL"),
@@ -487,60 +511,87 @@ fn build_status(line: &str) -> Option<(StatusKind, bool, bool)> {
             false,
         ));
     }
-    if DOTNET_STATUS.is_match(line) {
+    if (matches!(first, b'M' | b'B' | b'T') || line.starts_with(char::is_whitespace))
+        && DOTNET_STATUS.is_match(line)
+    {
         return Some((
             StatusKind::Build,
             line.starts_with("Build succeeded"),
             false,
         ));
     }
-    if SWIFT_STATUS.is_match(line) {
+    if matches!(first, b'B' | b'P') && SWIFT_STATUS.is_match(line) {
         return Some((
             StatusKind::Build,
             line.starts_with("Build ") && line.contains("complete!"),
             false,
         ));
     }
-    if GO_STATUS.is_match(line) {
+    if line.starts_with("go: downloading ") && GO_STATUS.is_match(line) {
         return Some((StatusKind::Build, false, false));
     }
-    if PHPSTAN_STATUS.is_match(line) {
+    if (matches!(first, b'N' | b'[')
+        || first.is_ascii_digit()
+        || line.starts_with(char::is_whitespace))
+        && PHPSTAN_STATUS.is_match(line)
+    {
         let finished = line.trim() == "[OK] No errors";
         return Some((StatusKind::Lint, finished, !finished));
     }
-    if let Some(c) = CLANG_TIDY_GENERATED.captures(line) {
+    if first.is_ascii_digit()
+        && let Some(c) = CLANG_TIDY_GENERATED.captures(line)
+    {
         let count: usize = c[1].parse().unwrap_or(1);
         return Some((StatusKind::Lint, count == 0, count > 0));
     }
-    if CLANG_TIDY_SUPPRESSED.is_match(line) {
+    if line.starts_with("Suppressed ") && CLANG_TIDY_SUPPRESSED.is_match(line) {
         return Some((StatusKind::Lint, true, false));
     }
-    if CLANG_TIDY_HEADER_FILTER.is_match(line) {
+    if line.starts_with("Use -header-filter=") && CLANG_TIDY_HEADER_FILTER.is_match(line) {
         return Some((StatusKind::Lint, false, true));
     }
-    if CPPCHECK_STATUS.is_match(line) {
+    if (line.starts_with("Checking ") || line.starts_with("nofile:0:0: ") || first.is_ascii_digit())
+        && CPPCHECK_STATUS.is_match(line)
+    {
         return Some((StatusKind::Lint, line.ends_with("100% done"), false));
     }
-    if MARKDOWNLINT_STATUS.is_match(line) {
+    if (line.starts_with("markdownlint-cli2 v")
+        || line.starts_with("Finding: ")
+        || line.starts_with("Linting: ")
+        || line == "Summary: 0 error(s)")
+        && MARKDOWNLINT_STATUS.is_match(line)
+    {
         let finished = line == "Summary: 0 error(s)";
         return Some((StatusKind::Lint, finished, !finished));
     }
-    if SQLFLUFF_CLEAN.is_match(line) {
+    if (line.starts_with("== [") || line.starts_with("All Finished"))
+        && SQLFLUFF_CLEAN.is_match(line)
+    {
         let finished = line.starts_with("All Finished");
         return Some((StatusKind::Lint, finished, false));
     }
-    if DENO_STATUS.is_match(line) {
+    if (line.starts_with("Check") || line.starts_with("Download ")) && DENO_STATUS.is_match(line) {
         return Some((StatusKind::Lint, line.starts_with("Checked "), false));
     }
-    if ANSIBLE_CLEAN.is_match(line) {
+    if (line.starts_with("Passed") || line.starts_with("WARNING")) && ANSIBLE_CLEAN.is_match(line) {
         let finished = line.starts_with("Passed");
         return Some((StatusKind::Lint, finished, !finished));
     }
-    if CREDO_CLEAN.is_match(line) {
+    if (line.starts_with("Checking ")
+        || line.starts_with("Please report ")
+        || line.starts_with("Analysis took ")
+        || line.starts_with("Use ")
+        || first.is_ascii_digit())
+        && CREDO_CLEAN.is_match(line)
+    {
         let finished = line.ends_with("found no issues.");
         return Some((StatusKind::Lint, finished, !finished));
     }
-    if DART_ANALYZE_STATUS.is_match(line) {
+    if (line.starts_with("Analyzing ")
+        || line.starts_with("No issues found!")
+        || line.starts_with("Running \"flutter pub get\" in "))
+        && DART_ANALYZE_STATUS.is_match(line)
+    {
         let finished = line.starts_with("No issues found!");
         return Some((StatusKind::Lint, finished, !finished));
     }
@@ -557,7 +608,10 @@ fn is_build_outcome(text: &str) -> bool {
             && !rest.starts_with("Re-run Maven")
             && !rest.starts_with("For more information");
     }
-    BUILD_OUTCOME.is_match(text)
+    matches!(
+        text.as_bytes().first(),
+        Some(b'g' | b'm' | b'n' | b'F' | b'B')
+    ) && BUILD_OUTCOME.is_match(text)
 }
 // rustc names a lint only on its first diagnostic, and the wording of later ones
 // varies with the item kind and plural forms. `--message-format=short` names none.
@@ -668,8 +722,13 @@ enum Severity {
 
 impl Severity {
     fn parse(text: &str) -> Self {
-        let text = text.to_ascii_lowercase();
-        if text.contains("error") || matches!(text.as_str(), "e" | "f") {
+        if text.eq_ignore_ascii_case("e")
+            || text.eq_ignore_ascii_case("f")
+            || text
+                .as_bytes()
+                .windows(5)
+                .any(|w| w.eq_ignore_ascii_case(b"error"))
+        {
             Self::Error
         } else {
             Self::Warning
@@ -830,31 +889,45 @@ impl Lint {
             self.overflow = true;
             return;
         }
-        let line = text.trim_end_matches(['\n', '\r']);
-        if !line.trim().is_empty() {
+        let cleaned = strip_ansi_cow(text.trim_end_matches(['\n', '\r']));
+        let line = cleaned.as_ref();
+        let non_blank = !line.trim().is_empty();
+        if non_blank {
             self.lines[stream as usize] += 1;
         }
-        if !self.classify(line, n, stream) && !line.trim().is_empty() {
-            self.other[stream as usize].note(n, line);
-            if let Some((kind, finished, requires_completion)) = build_status(line) {
-                let status = &mut self.status[stream as usize];
-                *status = (status.0 + 1, if status.0 == 0 { n } else { status.1 }, n);
-                if kind != StatusKind::Cargo {
-                    self.cargo_status_only = false;
+        match self.classify(line, n, stream) {
+            Classify::Matched => {}
+            Classify::Status((kind, finished, requires_completion)) => {
+                if non_blank {
+                    self.other[stream as usize].note(n, line);
+                    let status = &mut self.status[stream as usize];
+                    *status = (status.0 + 1, if status.0 == 0 { n } else { status.1 }, n);
+                    if kind != StatusKind::Cargo {
+                        self.cargo_status_only = false;
+                    }
+                    if kind != StatusKind::Lint {
+                        self.lint_status_only = false;
+                    }
+                    if requires_completion {
+                        self.needs_completion = true;
+                    }
+                    if line.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                        && let Some(c) = CLANG_TIDY_GENERATED.captures(line)
+                    {
+                        self.clang_generated += c[1].parse::<usize>().unwrap_or(0);
+                    } else if line.starts_with("Suppressed ")
+                        && let Some(c) = CLANG_TIDY_SUPPRESSED.captures(line)
+                    {
+                        self.clang_suppressed += c[1].parse::<usize>().unwrap_or(0);
+                    }
+                    if finished {
+                        self.finished = short(line.trim(), 200);
+                    }
                 }
-                if kind != StatusKind::Lint {
-                    self.lint_status_only = false;
-                }
-                if requires_completion {
-                    self.needs_completion = true;
-                }
-                if let Some(c) = CLANG_TIDY_GENERATED.captures(line) {
-                    self.clang_generated += c[1].parse::<usize>().unwrap_or(0);
-                } else if let Some(c) = CLANG_TIDY_SUPPRESSED.captures(line) {
-                    self.clang_suppressed += c[1].parse::<usize>().unwrap_or(0);
-                }
-                if finished {
-                    self.finished = short(line.trim(), 200);
+            }
+            Classify::Other => {
+                if non_blank {
+                    self.other[stream as usize].note(n, line);
                 }
             }
         }
@@ -891,29 +964,32 @@ impl Lint {
         } else {
             "build"
         };
-        let mut line = format!("{label}: 0 findings");
+        let mut line = String::with_capacity(label.len() + self.finished.len() + 96);
+        let _ = write!(line, "{label}: 0 findings");
         for stream in [Stream::Stdout, Stream::Stderr] {
             let (count, first, last) = self.status[stream as usize];
             if count > 0 {
                 let name = stream.name();
-                line.push_str(&format!(
+                let _ = write!(
+                    line,
                     " · {count} {kind} status line(s) [{name}:{first}-{last}]"
-                ));
+                );
             }
         }
         if !self.finished.is_empty() {
-            line.push_str(&format!(" · {}", self.finished));
+            let _ = write!(line, " · {}", self.finished);
         }
         line.push('\n');
         Some(line)
     }
 
     /// Record a line and return whether it belonged to a recognized shape.
-    fn classify(&mut self, line: &str, n: usize, stream: Stream) -> bool {
+    fn classify(&mut self, line: &str, n: usize, stream: Stream) -> Classify {
         // Two-line Ansible-lint block: a pending `rule[sub]: message` header promotes to
         // a finding only when the immediately following line on the same stream is `path:line`.
         if let Some(pending) = self.ansible_pending.take()
             && pending.stream == stream
+            && line.contains(':')
             && let Some(c) = ANSIBLE_LOC.captures(line)
         {
             let mut finding = Finding::new(
@@ -927,7 +1003,7 @@ impl Lint {
             finding.last = n;
             finding.excerpt.push(short(line.trim(), 240));
             self.push(finding, false);
-            return true;
+            return Classify::Matched;
         }
         // Active Credo multi-line issue block (`[W] ↗ msg` + `┃   path:line:col`).
         if let Some(credo) = self.credo_block.as_mut().filter(|b| b.stream == stream) {
@@ -939,6 +1015,7 @@ impl Lint {
                 || (!credo.file.is_empty() && !line.starts_with('┃') && !line.starts_with('|'));
             if !ends {
                 if credo.file.is_empty()
+                    && line.contains(':')
                     && let Some(c) = CREDO_LOC.captures(line)
                 {
                     (credo.file, credo.line, credo.column) =
@@ -947,7 +1024,7 @@ impl Lint {
                     if credo.excerpt.len() < EXCERPT_LINES {
                         credo.excerpt.push(short(line.trim(), 240));
                     }
-                    return true;
+                    return Classify::Matched;
                 }
                 if credo.file.is_empty() && (line.starts_with('┃') || line.starts_with('|')) {
                     let body = line.trim_start_matches(['┃', '|']).trim();
@@ -958,7 +1035,7 @@ impl Lint {
                         if credo.excerpt.len() < EXCERPT_LINES {
                             credo.excerpt.push(short(line.trim(), 240));
                         }
-                        return true;
+                        return Classify::Matched;
                     }
                 }
                 if !credo.file.is_empty() && (line.starts_with('┃') || line.starts_with('|')) {
@@ -966,7 +1043,7 @@ impl Lint {
                     if credo.excerpt.len() < EXCERPT_LINES {
                         credo.excerpt.push(short(line.trim(), 240));
                     }
-                    return true;
+                    return Classify::Matched;
                 }
             }
             self.close_credo();
@@ -983,7 +1060,7 @@ impl Lint {
                 || TOTAL.is_match(line.trim())
                 || build_status(line).is_some();
             if line.is_empty() && !ends {
-                return true;
+                return Classify::Matched;
             }
             if !ends {
                 block.last = n;
@@ -995,7 +1072,9 @@ impl Lint {
                         };
                         (block.file, block.line, block.column) =
                             position(&self.root, file, row, col);
-                    } else if let Some(c) = AT_LOC.captures(line) {
+                    } else if line.contains(':')
+                        && let Some(c) = AT_LOC.captures(line)
+                    {
                         (block.file, block.line, block.column) =
                             position(&self.root, &c[1], &c[2], c.get(3));
                     }
@@ -1019,7 +1098,7 @@ impl Lint {
                 if block.excerpt.len() < EXCERPT_LINES {
                     block.excerpt.push(short(line, 240));
                 }
-                return true;
+                return Classify::Matched;
             }
         }
         if let Some(index) = self.note_open.take()
@@ -1044,7 +1123,7 @@ impl Lint {
         {
             self.findings[index].last = n;
             self.note_open = Some(index);
-            return true;
+            return Classify::Matched;
         }
         if let Some(index) = self.open.take()
             && self.findings[index].stream == stream
@@ -1089,6 +1168,7 @@ impl Lint {
                 }
             } else {
                 if finding.rule.is_none()
+                    && line.contains("(report")
                     && let Some(c) = PYRIGHT_RULE.captures(line)
                 {
                     finding.rule = Some(c[2].to_owned());
@@ -1098,16 +1178,19 @@ impl Lint {
                 }
             }
             self.open = Some(index);
-            return true;
+            return Classify::Matched;
         }
         self.close();
-        if build_status(line).is_some() {
+        if let Some(status) = build_status(line) {
             self.file_header = None;
             self.sqlfluff_file = None;
             self.last_located = None;
-            return false;
+            return Classify::Status(status);
         }
-        if PHPSTAN_BORDER.is_match(line) {
+        let trimmed = line.trim();
+        let starts_ws = line.starts_with(char::is_whitespace);
+        let first_byte = line.as_bytes().first().copied();
+        if trimmed.starts_with("---") && PHPSTAN_BORDER.is_match(line) {
             self.last_located = None;
             if let Some((_, seen_sep)) = &mut self.phpstan_file {
                 if *seen_sep {
@@ -1115,7 +1198,7 @@ impl Lint {
                 } else {
                     *seen_sep = true;
                 }
-                return true;
+                return Classify::Matched;
             }
             match self.phpstan_general {
                 0 => {
@@ -1123,44 +1206,48 @@ impl Lint {
                 }
                 2 => {
                     self.phpstan_general = 3;
-                    return true;
+                    return Classify::Matched;
                 }
                 3 => {
                     self.phpstan_general = 0;
-                    return true;
+                    return Classify::Matched;
                 }
                 _ => {
                     self.phpstan_general = 1;
                 }
             }
-            return false;
+            return Classify::Other;
         }
-        if let Some(c) = PHPSTAN_HEADER.captures(line) {
+        if starts_ws
+            && trimmed.starts_with("Line")
+            && let Some(c) = PHPSTAN_HEADER.captures(line)
+        {
             let raw = c[1].trim();
             let file = raw.split(" (in context of ").next().unwrap_or(raw).trim();
             self.phpstan_file = Some((file.to_owned(), false));
             self.phpstan_general = 0;
             self.file_header = None;
             self.last_located = None;
-            return true;
+            return Classify::Matched;
         }
-        if self.phpstan_general == 1 && PHPSTAN_GENERAL_HEADER.is_match(line) {
+        if self.phpstan_general == 1 && trimmed == "Error" && PHPSTAN_GENERAL_HEADER.is_match(line)
+        {
             self.phpstan_general = 2;
             self.last_located = None;
-            return true;
+            return Classify::Matched;
         }
         if self.phpstan_general == 3 {
-            let trimmed = line.trim();
             if !trimmed.is_empty() {
                 self.unlocated_errors += 1;
                 self.outcome(trimmed, &[], stream, n);
-                return true;
+                return Classify::Matched;
             }
             self.phpstan_general = 0;
         } else if self.phpstan_general > 0 {
             self.phpstan_general = 0;
         }
         if let Some((file, _)) = &self.phpstan_file
+            && starts_ws
             && let Some(c) = PHPSTAN_ROW.captures(line)
         {
             let row = if &c[1] == "-" { "0" } else { &c[1] };
@@ -1170,25 +1257,28 @@ impl Lint {
             };
             let finding = Finding::new(Severity::Error, rule, &message, stream)
                 .at(&self.root, file, row, None)
-                .lines(n, line.trim());
+                .lines(n, trimmed);
             self.push(finding, true);
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = SQLFLUFF_HEADER.captures(line) {
+        if line.starts_with("== [")
+            && let Some(c) = SQLFLUFF_HEADER.captures(line)
+        {
             self.file_header = None;
             self.last_located = None;
             return match &c[2] {
                 "FAIL" | "WARNING" => {
                     self.sqlfluff_file = Some(c[1].to_owned());
-                    true
+                    Classify::Matched
                 }
                 _ => {
                     self.sqlfluff_file = None;
-                    false
+                    Classify::Other
                 }
             };
         }
         if let Some(file) = &self.sqlfluff_file
+            && line.starts_with("L:")
             && let Some(c) = SQLFLUFF_ROW.captures(line)
         {
             let code = &c[3];
@@ -1199,70 +1289,87 @@ impl Lint {
             };
             let finding = Finding::new(severity, Some(code.to_owned()), &c[4], stream)
                 .at(&self.root, file, &c[1], c.get(2))
-                .lines(n, line.trim());
+                .lines(n, trimmed);
             self.push(finding, true);
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = CREDO_ONELINE.captures(line) {
+        if (matches!(first_byte, Some(b'[' | b'|')) || line.starts_with('┃'))
+            && let Some(c) = CREDO_ONELINE.captures(line)
+        {
             let finding = Finding::new(Severity::Warning, None, &c[5], stream)
                 .at(&self.root, &c[2], &c[3], c.get(4))
-                .lines(n, line.trim());
+                .lines(n, trimmed);
             self.push(finding, false);
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = CREDO_HEADER.captures(line) {
+        if (matches!(first_byte, Some(b'[' | b'|')) || line.starts_with('┃'))
+            && let Some(c) = CREDO_HEADER.captures(line)
+        {
             self.last_located = None;
             self.credo_block =
-                Some(Finding::new(Severity::Warning, None, &c[2], stream).lines(n, line.trim()));
-            return true;
+                Some(Finding::new(Severity::Warning, None, &c[2], stream).lines(n, trimmed));
+            return Classify::Matched;
         }
-        if GO_PACKAGE.is_match(line) {
+        if line.starts_with("# ") && GO_PACKAGE.is_match(line) {
             self.go_package = true;
             self.file_header = None;
             self.last_located = None;
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = RUST_HEADER.captures(line) {
+        if (line.starts_with("error") || line.starts_with("warning"))
+            && let Some(c) = RUST_HEADER.captures(line)
+        {
             self.last_located = None;
             let rule = c.get(2).map(|m| m.as_str().to_owned());
             self.block =
                 Some(Finding::new(Severity::parse(&c[1]), rule, &c[3], stream).lines(n, line));
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = DENO_CHECK_HEADER.captures(line) {
+        if line.starts_with("TS")
+            && let Some(c) = DENO_CHECK_HEADER.captures(line)
+        {
             self.last_located = None;
             self.block = Some(
                 Finding::new(Severity::parse(&c[2]), Some(c[1].to_owned()), &c[3], stream)
                     .lines(n, line),
             );
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = CODE_HEADER.captures(line) {
+        if first_byte.is_some_and(|b| b.is_ascii_uppercase())
+            && let Some(c) = CODE_HEADER.captures(line)
+        {
             self.last_located = None;
             let rule = Some(c[1].to_owned());
             self.block = Some(Finding::new(Severity::Warning, rule, &c[2], stream).lines(n, line));
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = OXLINT_HEADER.captures(line) {
+        if trimmed.starts_with(['×', '✖', '!', '⚠'])
+            && let Some(c) = OXLINT_HEADER.captures(line)
+        {
             self.last_located = None;
             let severity = match &c[1] {
                 "×" | "✖" => Severity::Error,
                 _ => Severity::Warning,
             };
             self.block = Some(
-                Finding::new(severity, Some(c[2].to_owned()), &c[3], stream).lines(n, line.trim()),
+                Finding::new(severity, Some(c[2].to_owned()), &c[3], stream).lines(n, trimmed),
             );
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = BIOME_HEADER.captures(line) {
+        if !starts_ws
+            && line.contains('━')
+            && let Some(c) = BIOME_HEADER.captures(line)
+        {
             self.last_located = None;
             let finding = Finding::new(Severity::Error, Some(c[4].to_owned()), "", stream)
                 .at(&self.root, &c[1], &c[2], c.get(3))
                 .lines(n, line);
             self.block = Some(finding);
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = MAVEN.captures(line) {
+        if (line.starts_with("[ERROR] ") || line.starts_with("[WARNING] "))
+            && let Some(c) = MAVEN.captures(line)
+        {
             let (rule, message) = match JAVAC_LINT.captures(c[5].trim()) {
                 Some(j) => (Some(j[1].to_owned()), j.get(2).unwrap().as_str()),
                 None => (None, c[5].trim()),
@@ -1271,32 +1378,41 @@ impl Lint {
                 .at(&self.root, &c[2], &c[3], c.get(4))
                 .lines(n, line);
             self.push(finding, true);
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = KOTLIN.captures(line) {
+        if (line.starts_with("e: ") || line.starts_with("w: "))
+            && let Some(c) = KOTLIN.captures(line)
+        {
             let finding = Finding::new(Severity::parse(&c[1]), None, &c[5], stream)
                 .at(&self.root, &c[2], &c[3], c.get(4))
                 .lines(n, line);
             self.push(finding, true);
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = TSC.captures(line) {
+        if !starts_ws
+            && line.contains("): ")
+            && let Some(c) = TSC.captures(line)
+        {
             let finding =
                 Finding::new(Severity::parse(&c[4]), Some(c[5].to_owned()), &c[6], stream)
                     .at(&self.root, &c[1], &c[2], c.get(3))
                     .lines(n, line);
             self.push(finding, true);
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = MSBUILD.captures(line) {
+        if line.contains("): ")
+            && let Some(c) = MSBUILD.captures(line)
+        {
             let finding =
                 Finding::new(Severity::parse(&c[4]), Some(c[5].to_owned()), &c[6], stream)
                     .at(&self.root, &c[1], &c[2], c.get(3))
-                    .lines(n, line.trim());
+                    .lines(n, trimmed);
             self.push(finding, false);
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = CPPCHECK_BRACKET.captures(line) {
+        if first_byte == Some(b'[')
+            && let Some(c) = CPPCHECK_BRACKET.captures(line)
+        {
             let (message, rule) = match TRAILING_BRACKET.captures(c[5].trim()) {
                 Some(t) => (t[1].trim().to_owned(), Some(t[2].to_owned())),
                 None => (c[5].trim().to_owned(), None),
@@ -1305,9 +1421,12 @@ impl Lint {
                 .at(&self.root, &c[1], &c[2], c.get(3))
                 .lines(n, line);
             self.push(finding, true);
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = MARKDOWNLINT.captures(line) {
+        if !starts_ws
+            && line.contains(" MD")
+            && let Some(c) = MARKDOWNLINT.captures(line)
+        {
             let severity = c
                 .get(4)
                 .map_or(Severity::Error, |m| Severity::parse(m.as_str()));
@@ -1315,21 +1434,30 @@ impl Lint {
                 .at(&self.root, &c[1], &c[2], c.get(3))
                 .lines(n, line);
             self.push(finding, false);
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = STYLELINT_COMPACT.captures(line) {
+        if !starts_ws
+            && line.contains(": ")
+            && line.contains("line ")
+            && let Some(c) = STYLELINT_COMPACT.captures(line)
+        {
             let rule = c.get(6).map(|m| m.as_str().to_owned());
             let finding = Finding::new(Severity::parse(&c[4]), rule, &c[5], stream)
                 .at(&self.root, &c[1], &c[2], c.get(3))
                 .lines(n, line);
             self.push(finding, false);
-            return true;
+            return Classify::Matched;
         }
-        if let Some(finding) = parse_dart_analyze(line, &self.root, n, stream) {
+        if (line.contains(" • ") || line.contains(" - "))
+            && let Some(finding) = parse_dart_analyze(line, &self.root, n, stream)
+        {
             self.push(finding, false);
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = LOCATED.captures(line) {
+        if !starts_ws
+            && line.contains(':')
+            && let Some(c) = LOCATED.captures(line)
+        {
             if let Some(mut finding) = located(&c[1], &c[4], stream, self.tool) {
                 if self.go_package
                     && c[1].ends_with(".go")
@@ -1351,9 +1479,13 @@ impl Lint {
                 self.findings[idx].last = n;
                 self.note_open = Some(idx);
             }
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = PHPSTAN_RAW.captures(line) {
+        if !starts_ws
+            && line.contains(':')
+            && line.contains('.')
+            && let Some(c) = PHPSTAN_RAW.captures(line)
+        {
             let rest = c[3].trim();
             let looks_like_col = rest.chars().all(|ch| ch.is_ascii_digit())
                 || rest.split_once(':').is_some_and(|(head, _)| {
@@ -1373,51 +1505,63 @@ impl Lint {
                     .at(&self.root, &c[1], &c[2], None)
                     .lines(n, line);
                 self.push(finding, false);
-                return true;
+                return Classify::Matched;
             }
         }
-        if let Some(c) = PYRIGHT.captures(line) {
+        if starts_ws
+            && line.contains(" - ")
+            && let Some(c) = PYRIGHT.captures(line)
+        {
             let (message, rule) = match PYRIGHT_RULE.captures(&c[5]) {
                 Some(r) => (r[1].to_owned(), Some(r[2].to_owned())),
                 None => (c[5].to_owned(), None),
             };
             let finding = Finding::new(Severity::parse(&c[4]), rule, &message, stream)
                 .at(&self.root, &c[1], &c[2], c.get(3))
-                .lines(n, line.trim());
+                .lines(n, trimmed);
             self.push(finding, true);
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = HADOLINT.captures(line) {
+        if !starts_ws
+            && (line.contains(" DL") || line.contains(" SC"))
+            && let Some(c) = HADOLINT.captures(line)
+        {
             let finding =
                 Finding::new(Severity::parse(&c[5]), Some(c[4].to_owned()), &c[6], stream)
                     .at(&self.root, &c[1], &c[2], c.get(3))
                     .lines(n, line);
             self.push(finding, false);
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = SHELLCHECK_FILE.captures(line) {
+        if line.starts_with("In ")
+            && line.ends_with(':')
+            && let Some(c) = SHELLCHECK_FILE.captures(line)
+        {
             self.last_located = None;
             self.shellcheck_line = Some((c[1].to_owned(), c[2].to_owned()));
-            return true;
+            return Classify::Matched;
         }
-        if let Some(c) = SHELLCHECK_ROW.captures(line)
-            && let Some((file, row)) = &self.shellcheck_line
+        if let Some((file, row)) = &self.shellcheck_line
+            && trimmed.starts_with('^')
+            && let Some(c) = SHELLCHECK_ROW.captures(line)
         {
             let finding =
                 Finding::new(Severity::parse(&c[2]), Some(c[1].to_owned()), &c[3], stream)
                     .at(&self.root, file, row, None)
-                    .lines(n, line.trim());
+                    .lines(n, trimmed);
             self.push(finding, false);
-            return true;
+            return Classify::Matched;
         }
-        if let Some(file) = &self.file_header {
+        if let Some(file) = &self.file_header
+            && starts_ws
+        {
             if let Some(c) = YAMLLINT_ROW.captures(line) {
                 let finding =
                     Finding::new(Severity::parse(&c[3]), Some(c[5].to_owned()), &c[4], stream)
                         .at(&self.root, file, &c[1], c.get(2))
-                        .lines(n, line.trim());
+                        .lines(n, trimmed);
                 self.push(finding, false);
-                return true;
+                return Classify::Matched;
             }
             if let Some(c) = STYLELINT_ROW.captures(line) {
                 let severity = match &c[3] {
@@ -1427,54 +1571,62 @@ impl Lint {
                 let rule = c.get(5).map(|m| m.as_str().to_owned());
                 let finding = Finding::new(severity, rule, &c[4], stream)
                     .at(&self.root, file, &c[1], c.get(2))
-                    .lines(n, line.trim());
+                    .lines(n, trimmed);
                 self.push(finding, false);
-                return true;
+                return Classify::Matched;
             }
             if let Some(c) = ESLINT_ROW.captures(line) {
                 let rule = c.get(5).map(|m| m.as_str().to_owned());
                 let finding = Finding::new(Severity::parse(&c[3]), rule, &c[4], stream)
                     .at(&self.root, file, &c[1], c.get(2))
-                    .lines(n, line.trim());
+                    .lines(n, trimmed);
                 self.push(finding, false);
-                return true;
+                return Classify::Matched;
             }
         }
         // ESLint, stylelint and yamllint rows belong to the file named since the last blank or other line.
-        if line.trim().is_empty() {
+        if trimmed.is_empty() {
             self.file_header = None;
             self.sqlfluff_file = None;
             self.last_located = None;
-            return false;
+            return Classify::Other;
         }
         self.last_located = None;
-        if !line.starts_with(char::is_whitespace) {
+        if !starts_ws {
             let trimmed_end = line.trim_end();
-            if ESLINT_FILE.is_match(trimmed_end) {
+            if trimmed_end.contains('.') && ESLINT_FILE.is_match(trimmed_end) {
                 self.file_header = Some(trimmed_end.to_owned());
-                return true;
+                return Classify::Matched;
             }
             self.file_header = None;
         }
-        let text = line.trim();
-        let lower = text.to_ascii_lowercase();
-        if UNLOCATED_ERROR.is_match(text) {
+        let text = trimmed;
+        if (text.contains(':')
+            || text
+                .as_bytes()
+                .first()
+                .is_some_and(|b| b.eq_ignore_ascii_case(&b'u')))
+            && UNLOCATED_ERROR.is_match(text)
+        {
             self.unlocated_errors += 1;
             self.outcome(text, &[], stream, n);
-            return true;
+            return Classify::Matched;
         }
-        if lower.starts_with("error")
-            || lower.starts_with("fatal")
+        if starts_with_ignore_ascii_case(text, "error")
+            || starts_with_ignore_ascii_case(text, "fatal")
             || text.starts_with('✖')
             || TOTAL.is_match(text)
             || is_build_outcome(text)
         {
             self.outcome(text, &[], stream, n);
-            return true;
+            return Classify::Matched;
         }
         // Hold a candidate Ansible-lint `rule[sub]: message` line until the next line
-        // confirms it with `path:line`; return `false` so unrecognized lines stay in `other`.
-        if let Some(c) = ANSIBLE_BLOCK_HEADER.captures(line) {
+        // confirms it with `path:line`; return `Classify::Other` so unrecognized lines stay in `other`.
+        if first_byte.is_some_and(|b| b.is_ascii_lowercase())
+            && line.contains(':')
+            && let Some(c) = ANSIBLE_BLOCK_HEADER.captures(line)
+        {
             let rule = &c[1];
             let is_severity_word = matches!(
                 rule,
@@ -1508,7 +1660,7 @@ impl Lint {
                 });
             }
         }
-        false
+        Classify::Other
     }
 
     fn push(&mut self, finding: Finding, extends: bool) {
@@ -1813,7 +1965,10 @@ impl Lint {
                 .sum();
             (shown, room - used)
         };
-        let mut report = header + &lead;
+        let mut report =
+            String::with_capacity(header.len() + lead.len() + tail.len() + compact + 64);
+        report.push_str(&header);
+        report.push_str(&lead);
         for (head, detail, places, _) in &sections[..shown] {
             report.push_str(head);
             if detail.len() <= spare {
@@ -1824,11 +1979,12 @@ impl Lint {
         }
         if shown < sections.len() {
             let hidden = &sections[shown..];
-            report.push_str(&format!(
-                "+{} more rule(s) with {} finding(s) in full log\n",
+            let _ = writeln!(
+                report,
+                "+{} more rule(s) with {} finding(s) in full log",
                 hidden.len(),
                 hidden.iter().map(|s| s.3).sum::<usize>()
-            ));
+            );
         }
         report.push_str(&tail);
         Some((report, summary))
@@ -2118,7 +2274,11 @@ fn position(
 }
 
 fn normalize(message: &str) -> String {
-    QUOTED.replace_all(message, "…").into_owned()
+    if message.contains(['`', '\'', '"']) {
+        QUOTED.replace_all(message, "…").into_owned()
+    } else {
+        message.to_owned()
+    }
 }
 
 fn locations(findings: &[Finding]) -> String {
@@ -2127,29 +2287,44 @@ fn locations(findings: &[Finding]) -> String {
     places.sort_by(|a, b| (&a.file, a.line, a.column).cmp(&(&b.file, b.line, b.column)));
     places.dedup_by(|a, b| (&a.file, a.line, a.column) == (&b.file, b.line, b.column));
     let distinct = places.len();
-    let mut out = String::new();
+    let mut out = String::with_capacity(96);
     let mut previous_file = None;
     for finding in places.into_iter().take(SHOWN_LOCATIONS) {
         if !out.is_empty() {
             out.push_str(", ");
         }
         if previous_file == Some(finding.file.as_str()) {
-            out.push_str(&finding.position());
+            match finding.column {
+                Some(column) => {
+                    let _ = write!(out, "{}:{column}", finding.line);
+                }
+                None => {
+                    let _ = write!(out, "{}", finding.line);
+                }
+            }
         } else {
-            out.push_str(&finding.place());
+            match finding.column {
+                Some(column) => {
+                    let _ = write!(out, "{}:{}:{column}", finding.file, finding.line);
+                }
+                None => {
+                    let _ = write!(out, "{}:{}", finding.file, finding.line);
+                }
+            }
         }
         previous_file = Some(finding.file.as_str());
     }
     if distinct > SHOWN_LOCATIONS {
-        out.push_str(&format!(" +{} more", distinct - SHOWN_LOCATIONS));
+        let _ = write!(out, " +{} more", distinct - SHOWN_LOCATIONS);
     }
     let first = &findings[0];
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         " [{}:{}-{}]",
         first.stream.name(),
         first.first,
         first.last
-    ));
+    );
     out
 }
 
@@ -4030,5 +4205,42 @@ lib/parser.ex:102:7: F: Function is too complex (cyclomatic complexity is 12, ma
             feed("Analyzing my_app...\n", "").clean("dart analyze"),
             None
         );
+    }
+
+    #[test]
+    fn ansi_fast_path_produces_identical_grouped_lint_reports() {
+        assert!(matches!(
+            strip_ansi_cow("src/lib.rs:10:5: warning: unused"),
+            Cow::Borrowed(_)
+        ));
+        let plain = concat!(
+            "   Compiling app v0.1.0 (/repo)\n",
+            "warning: unused variable: `x`\n",
+            " --> src/lib.rs:10:9\n",
+            "  |\n",
+            "10 |     let x = 1;\n",
+            "   |         ^ help: if this is intentional, prefix it with an underscore: `_x`\n",
+            "  |\n",
+            "  = note: `#[warn(unused_variables)]` on by default\n",
+            "error[E0308]: mismatched types\n",
+            " --> src/lib.rs:12:5\n",
+            "error: could not compile `app` (lib) due to 1 previous error; 1 warning emitted\n",
+        );
+        let colored = concat!(
+            "   \x1b[1;32mCompiling\x1b[0m app v0.1.0 (/repo)\n",
+            "\x1b[1;33mwarning\x1b[0m: unused variable: `x`\n",
+            " \x1b[1;34m-->\x1b[0m src/lib.rs:10:9\n",
+            "  |\n",
+            "10 |     let x = 1;\n",
+            "   |         ^ help: if this is intentional, prefix it with an underscore: `_x`\n",
+            "  |\n",
+            "  = note: `#[warn(unused_variables)]` on by default\n",
+            "\x1b[1;31merror[E0308]\x1b[0m: mismatched types\n",
+            " \x1b[1;34m-->\x1b[0m src/lib.rs:12:5\n",
+            "\x1b[1;31merror\x1b[0m: could not compile `app` (lib) due to 1 previous error; 1 warning emitted\n",
+        );
+        let (r_plain, _) = feed("", plain).finish("cargo check", 4096, None).unwrap();
+        let (r_colored, _) = feed("", colored).finish("cargo check", 4096, None).unwrap();
+        assert_eq!(r_plain, r_colored);
     }
 }

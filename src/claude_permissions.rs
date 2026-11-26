@@ -290,17 +290,17 @@ fn list(settings: &Value, name: &str) -> Result<Vec<String>, String> {
     match permissions.get(name) {
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::Array(items)) => {
-            let rules: Vec<String> = items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_owned))
-                .collect();
-            if name == "allow" || rules.len() == items.len() {
-                Ok(rules)
-            } else {
-                Err(format!(
-                    "`permissions.{name}` holds a rule that is not a string"
-                ))
+            let mut rules = Vec::with_capacity(items.len());
+            for item in items {
+                if let Some(s) = item.as_str() {
+                    rules.push(s.to_owned());
+                } else if name != "allow" {
+                    return Err(format!(
+                        "`permissions.{name}` holds a rule that is not a string"
+                    ));
+                }
             }
+            Ok(rules)
         }
         Some(_) => Err(format!("`permissions.{name}` is not a list")),
     }
@@ -335,8 +335,12 @@ enum Scope {
 
 /// Read every settings file the sources name.
 pub fn load(sources: &Sources) -> Rules {
+    load_inner(sources, true)
+}
+
+fn load_inner(sources: &Sources, record_found: bool) -> Rules {
     let mut rules = Rules::default();
-    let mut files: Vec<(PathBuf, Scope)> = Vec::new();
+    let mut files: Vec<(PathBuf, Scope)> = Vec::with_capacity(8 + sources.nearby.len() * 2);
     match managed_files(&sources.managed) {
         Ok(managed) => files.extend(managed.into_iter().map(|file| (file, Scope::Managed))),
         Err(broken) => rules.broken.push(broken),
@@ -360,15 +364,15 @@ pub fn load(sources: &Sources) -> Rules {
         files.push((dir.join(".claude").join("settings.local.json"), scope));
     }
     for dir in &sources.nearby {
-        for name in ["settings.json", "settings.local.json"] {
-            files.push((dir.join(".claude").join(name), Scope::Nearby));
-        }
+        let nearby_claude = dir.join(".claude");
+        files.push((nearby_claude.join("settings.json"), Scope::Nearby));
+        files.push((nearby_claude.join("settings.local.json"), Scope::Nearby));
     }
     let mut managed_allow = Vec::new();
     let mut only_managed = false;
     // A file listed twice, such as the repository's local file as a nearby one,
     // counts once, in the scope listed first.
-    let mut seen = Vec::new();
+    let mut seen = Vec::with_capacity(files.len());
     for (file, scope) in files {
         let key = file.canonicalize().unwrap_or_else(|_| file.clone());
         if seen.contains(&key) {
@@ -425,12 +429,16 @@ pub fn load(sources: &Sources) -> Rules {
                 .get(key)
                 .is_some_and(|value| !matches!(value, Value::Null | Value::Bool(false)))
         });
-        if scope != Scope::Nearby {
-            rules.allow.extend(allow.iter().cloned());
+        if record_found {
+            if scope != Scope::Nearby {
+                rules.allow.extend(allow.iter().cloned());
+            }
+            rules
+                .found
+                .extend(allow.into_iter().map(|rule| (file.clone(), rule)));
+        } else if scope != Scope::Nearby && !only_managed {
+            rules.allow.extend(allow);
         }
-        rules
-            .found
-            .extend(allow.into_iter().map(|rule| (file.clone(), rule)));
         rules.ask.extend(ask);
         rules.deny.extend(deny);
     }
@@ -458,12 +466,6 @@ impl Rules {
         if !self.broken.is_empty() {
             return Verdict::Deny;
         }
-        let candidates: Vec<String> = segments.iter().flat_map(|s| candidates(s)).collect();
-        let any = |rules: &[String]| {
-            rules
-                .iter()
-                .any(|rule| candidates.iter().any(|text| loosely(rule, text)))
-        };
         // Claude Code also checks the paths that file commands in Bash name against
         // Read and Edit rules and the working directories, which this check does
         // not model, so such a command is never taken as allowed while any apply.
@@ -471,13 +473,37 @@ impl Rules {
         // file rule might deny or ask, a line that runs such a command is judged
         // as that rule would be, and stays as written in every mode.
         let file_rule = |rules: &[String]| rules.iter().any(|rule| names_file_tool(rule));
-        let reads = segments.iter().any(|segment| reads_files(segment));
-        let guarded = self.blocks_paths || file_rule(&self.deny) || file_rule(&self.ask);
-        if any(&self.deny) || reads && file_rule(&self.deny) {
-            Verdict::Deny
-        } else if any(&self.ask) || reads && file_rule(&self.ask) {
-            Verdict::Ask
-        } else if !segments.is_empty()
+        let deny_file = file_rule(&self.deny);
+        let ask_file = file_rule(&self.ask);
+        let guarded = self.blocks_paths || deny_file || ask_file;
+        let need_candidates = !self.deny.is_empty() || !self.ask.is_empty();
+        if need_candidates {
+            let mut texts: Vec<String> = Vec::with_capacity(segments.len() * 2);
+            let mut reads = false;
+            let check_reads = deny_file || ask_file;
+            for &segment in segments {
+                let (words, indices) = starts(segment);
+                if check_reads && !reads {
+                    reads = indices
+                        .iter()
+                        .filter_map(|&start| words.get(start))
+                        .any(|word| FILE_READERS.contains(&basename(word)));
+                }
+                push_candidates(segment, &words, &indices, &mut texts);
+            }
+            let any = |rules: &[String]| {
+                rules
+                    .iter()
+                    .any(|rule| texts.iter().any(|text| loosely(rule, text)))
+            };
+            if any(&self.deny) || (reads && deny_file) {
+                return Verdict::Deny;
+            }
+            if any(&self.ask) || (reads && ask_file) {
+                return Verdict::Ask;
+            }
+        }
+        if !segments.is_empty()
             && segments.iter().all(|segment| {
                 approvable(segment, guarded) && self.allow.iter().any(|rule| allows(rule, segment))
             })
@@ -532,29 +558,42 @@ fn names_file_tool(rule: &str) -> bool {
         .any(|name| tool.eq_ignore_ascii_case(name) || tool.contains('*') && glob(tool, name))
 }
 
-/// The texts an ask or deny rule is matched against: the command as written, and
-/// its words without quotes, a final `2>&1`, leading assignments or wrappers.
-fn candidates(segment: &str) -> Vec<String> {
-    let (words, starts) = starts(segment);
-    let mut texts = vec![segment.trim().to_owned()];
-    texts.extend(
-        starts
-            .into_iter()
-            .filter(|&start| start < words.len())
-            .map(|start| words[start..].join(" ")),
-    );
-    texts
+/// Append the texts an ask or deny rule is matched against: the command as written,
+/// and its words without quotes, a final `2>&1`, leading assignments or wrappers.
+fn push_candidates(
+    segment: &str,
+    words: &[String],
+    starts: &BTreeSet<usize>,
+    texts: &mut Vec<String>,
+) {
+    let trimmed = segment.trim();
+    texts.push(trimmed.to_owned());
+    for &start in starts {
+        if start < words.len() {
+            let slice = &words[start..];
+            if !words_eq_joined(slice, trimmed) {
+                texts.push(slice.join(" "));
+            }
+        }
+    }
 }
 
-/// Whether any word that may start the command, after leading assignments and
-/// wrappers, names a program that reads the files it names, such as `rg`, `cat`
-/// or `git`.
-fn reads_files(segment: &str) -> bool {
-    let (words, starts) = starts(segment);
-    starts
-        .into_iter()
-        .filter_map(|start| words.get(start))
-        .any(|word| FILE_READERS.contains(&basename(word)))
+/// Whether `words.join(" ") == text` without allocating.
+fn words_eq_joined(words: &[String], text: &str) -> bool {
+    let mut rest = text;
+    for (i, word) in words.iter().enumerate() {
+        if i > 0 {
+            let Some(after_space) = rest.strip_prefix(' ') else {
+                return false;
+            };
+            rest = after_space;
+        }
+        let Some(after_word) = rest.strip_prefix(word.as_str()) else {
+            return false;
+        };
+        rest = after_word;
+    }
+    rest.is_empty()
 }
 
 /// A command's words without quotes or a final `2>&1`, and each index at which
@@ -568,17 +607,18 @@ fn starts(segment: &str) -> (Vec<String>, BTreeSet<usize>) {
         words.pop();
     }
     let mut starts = BTreeSet::from([0]);
-    let mut pending = vec![0];
+    let mut pending = Vec::with_capacity(8);
+    pending.push(0);
     while let Some(at) = pending.pop() {
         let Some(word) = words.get(at) else { continue };
-        let next: Vec<usize> = if assignment(word) {
-            vec![at + 1]
+        let range = if assignment(word) {
+            at + 1..at + 2
         } else if WRAPPERS.contains(&basename(word)) {
-            (at + 1..words.len().min(at + 6)).collect()
+            at + 1..words.len().min(at + 6)
         } else {
-            Vec::new()
+            0..0
         };
-        for start in next {
+        for start in range {
             if starts.insert(start) {
                 pending.push(start);
             }
@@ -617,21 +657,46 @@ fn loosely(rule: &str, text: &str) -> bool {
         Some(spec) => spec,
     };
     if let Some(prefix) = spec.strip_suffix(":*") {
-        return glob(&format!("{prefix}*"), text);
+        return glob_bytes(prefix.as_bytes(), Some(b'*'), text.as_bytes(), None);
     }
-    glob(spec, text) || glob(spec, &format!("{text} "))
+    glob_bytes(spec.as_bytes(), None, text.as_bytes(), None)
+        || glob_bytes(spec.as_bytes(), None, text.as_bytes(), Some(b' '))
 }
 
 /// Whether `text` matches `pattern`, where `*` stands for any text.
 fn glob(pattern: &str, text: &str) -> bool {
-    let (pattern, text) = (pattern.as_bytes(), text.as_bytes());
+    glob_bytes(pattern.as_bytes(), None, text.as_bytes(), None)
+}
+
+/// Zero-allocation byte glob matcher with optional virtual trailing byte on
+/// `pattern` (for `{prefix}*`) or `text` (for `{text} `).
+fn glob_bytes(pattern: &[u8], extra_p: Option<u8>, text: &[u8], extra_t: Option<u8>) -> bool {
+    let p_len = pattern.len() + usize::from(extra_p.is_some());
+    let t_len = text.len() + usize::from(extra_t.is_some());
+    let p_at = |i: usize| -> Option<u8> {
+        if i < pattern.len() {
+            Some(pattern[i])
+        } else if i == pattern.len() {
+            extra_p
+        } else {
+            None
+        }
+    };
+    let t_at = |i: usize| -> u8 {
+        if i < text.len() {
+            text[i]
+        } else {
+            extra_t.expect("bounded by t_len")
+        }
+    };
     let (mut p, mut t) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
-    while t < text.len() {
-        if pattern.get(p) == Some(&b'*') {
+    while t < t_len {
+        let pb = p_at(p);
+        if pb == Some(b'*') {
             star = Some((p, t));
             p += 1;
-        } else if pattern.get(p) == Some(&text[t]) {
+        } else if pb == Some(t_at(t)) {
             p += 1;
             t += 1;
         } else if let Some((at, from)) = star {
@@ -642,7 +707,13 @@ fn glob(pattern: &str, text: &str) -> bool {
             return false;
         }
     }
-    pattern[p..].iter().all(|&byte| byte == b'*')
+    while p < p_len {
+        if p_at(p) != Some(b'*') {
+            return false;
+        }
+        p += 1;
+    }
+    true
 }
 
 /// Whether an allow rule may approve this command at all: a literal command, other
@@ -742,7 +813,7 @@ pub fn decide(root: &Path, mode: &str, segments: &[&str]) -> Answer {
     ) {
         return Answer::Leave;
     }
-    load(&Sources::for_hook(root)).answer(mode, segments)
+    load_inner(&Sources::for_hook(root), false).answer(mode, segments)
 }
 
 impl Rules {
@@ -1160,5 +1231,79 @@ mod tests {
         );
         assert!(found[0].0.ends_with("user/settings.json"));
         assert!(found[2].0.ends_with("settings.local.json"));
+    }
+
+    #[test]
+    fn zero_alloc_glob_and_hook_loader_preserve_exact_permission_semantics() {
+        // Verify zero-alloc `glob_bytes` matches `loosely` on `:*` (with and without
+        // internal `*`), trailing-space forms, multi-star backtracking, and Unicode.
+        for (rule, text, expected) in [
+            ("Bash(git push:*)", "git push", true),
+            ("Bash(git push:*)", "git push origin main", true),
+            ("Bash(git * push:*)", "git -C repo push --force", true),
+            ("Bash(git * push:*)", "git status", false),
+            ("Bash(rm *)", "rm", true),
+            ("Bash(rm *)", "rm -rf /tmp/x", true),
+            ("Bash(rm *)", "rmdir x", false),
+            ("Bash(é*)", "éè", true),
+            ("Bash(cargo test)", "cargo test --lib", false),
+        ] {
+            assert_eq!(loosely(rule, text), expected, "{rule} vs {text}");
+        }
+
+        // Verify `load_inner(..., false)` (hook hot path) agrees 100% with `load(...)`
+        // across allow, ask, deny, file-tool guards, managed-only, and broken nearby files.
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
+        write(
+            &dir.join("user/settings.json"),
+            r#"{"permissions":{"allow":["Bash(cargo test:*)","Bash(git status:*)"],"ask":["Read(./.env)"],"deny":["Bash(git push:*)"]}}"#,
+        );
+        write(
+            &dir.join("project/.claude/settings.local.json"),
+            r#"{"permissions":{"allow":["Bash(npm test)"]}}"#,
+        );
+        let src = sources(dir);
+        let full = load(&src);
+        let fast = load_inner(&src, false);
+        assert!(fast.found.is_empty());
+        assert!(!full.found.is_empty());
+        for segs in [
+            &["cargo test --lib"][..],
+            &["git status"][..],
+            &["LC_ALL=C git status"][..],
+            &["timeout 10 git push origin main"][..],
+            &["npm test"][..],
+            &["echo hi"][..],
+        ] {
+            assert_eq!(
+                fast.verdict(segs),
+                full.verdict(segs),
+                "verdict mismatch for {segs:?}"
+            );
+            for m in [
+                "default",
+                "acceptEdits",
+                "dontAsk",
+                "bypassPermissions",
+                "auto",
+                "plan",
+            ] {
+                assert_eq!(
+                    fast.answer(m, segs),
+                    full.answer(m, segs),
+                    "answer mismatch for {m} {segs:?}"
+                );
+            }
+        }
+        // Broken allow list in a nearby settings file MUST still fail closed to Deny.
+        write(
+            &dir.join("root/.claude/settings.json"),
+            r#"{"permissions":{"allow":"Bash"}}"#,
+        );
+        assert_eq!(
+            load_inner(&src, false).verdict(&["cargo test"]),
+            Verdict::Deny
+        );
     }
 }

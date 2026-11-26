@@ -17,6 +17,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -392,6 +393,10 @@ pub fn runner_for_words(words: &[&str]) -> Option<Runner> {
     }
 }
 
+fn is_dart_display_reporter(val: &str) -> bool {
+    val.eq_ignore_ascii_case("compact") || val.eq_ignore_ascii_case("expanded")
+}
+
 fn dart_test_excluded(tail: &[&str]) -> bool {
     let mut iter = tail.iter().copied();
     while let Some(arg) = iter.next() {
@@ -405,21 +410,21 @@ fn dart_test_excluded(tail: &[&str]) -> bool {
             .strip_prefix("--reporter=")
             .or_else(|| arg.strip_prefix("-r="))
         {
-            if !matches!(val.to_ascii_lowercase().as_str(), "compact" | "expanded") {
+            if !is_dart_display_reporter(val) {
                 return true;
             }
             continue;
         }
         if matches!(arg, "-r" | "--reporter") {
             let val = iter.next().unwrap_or("");
-            if !matches!(val.to_ascii_lowercase().as_str(), "compact" | "expanded") {
+            if !is_dart_display_reporter(val) {
                 return true;
             }
             continue;
         }
         if let Some(val) = arg.strip_prefix("-r")
             && !val.is_empty()
-            && !matches!(val.to_ascii_lowercase().as_str(), "compact" | "expanded")
+            && !is_dart_display_reporter(val)
         {
             return true;
         }
@@ -770,16 +775,6 @@ struct PassedSummary {
     last: usize,
 }
 
-impl PassedSummary {
-    fn render(&self) -> String {
-        format!(
-            "{} {}",
-            self.label,
-            format_range(self.stream.name(), self.first, self.last)
-        )
-    }
-}
-
 struct ParsedReport {
     failures: Vec<RawFailure>,
     passed: Vec<PassedSummary>,
@@ -874,19 +869,20 @@ fn finalize_report(
 }
 
 fn render_report(parsed: &ParsedReport, level: RenderLevel) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(
+        parsed.failures.len() * 96 + parsed.totals.len() * 64 + parsed.notes.len() * 64 + 64,
+    );
     if !parsed.failures.is_empty() {
-        out.push_str(&format!(
-            "{} reported failing test(s)\n",
-            parsed.failures.len()
-        ));
+        let _ = writeln!(out, "{} reported failing test(s)", parsed.failures.len());
         let groups = group_raw_failures(&parsed.failures);
         for group in groups {
             render_group(&mut out, &group, level);
         }
     }
     for passed in &parsed.passed {
-        out.push_str(&passed.render());
+        out.push_str(&passed.label);
+        out.push(' ');
+        write_range(&mut out, passed.stream.name(), passed.first, passed.last);
         out.push('\n');
     }
     for total in &parsed.totals {
@@ -905,35 +901,40 @@ fn render_report(parsed: &ParsedReport, level: RenderLevel) -> String {
 }
 
 fn group_raw_failures(failures: &[RawFailure]) -> Vec<Vec<&RawFailure>> {
-    let mut groups: Vec<(&str, Vec<&RawFailure>)> = Vec::new();
+    let mut groups: Vec<Vec<&RawFailure>> = Vec::with_capacity(failures.len().min(64));
+    let mut by_key: HashMap<&str, usize> = HashMap::with_capacity(failures.len().min(64));
     for f in failures {
-        if !f.key.is_empty()
-            && !f.key.starts_with("test:")
-            && let Some((_, existing)) = groups.iter_mut().find(|(k, _)| *k == f.key.as_str())
-        {
-            existing.push(f);
-            continue;
+        if !f.key.is_empty() && !f.key.starts_with("test:") {
+            if let Some(&idx) = by_key.get(f.key.as_str()) {
+                groups[idx].push(f);
+                continue;
+            }
+            let idx = groups.len();
+            by_key.insert(f.key.as_str(), idx);
+            groups.push(vec![f]);
+        } else {
+            groups.push(vec![f]);
         }
-        groups.push((f.key.as_str(), vec![f]));
     }
-    groups.into_iter().map(|(_, items)| items).collect()
+    groups
 }
 
 fn render_group(out: &mut String, group: &[&RawFailure], level: RenderLevel) {
     if group.len() == 1 {
         let f = group[0];
         let cause = f.cause_text();
-        let range = format_range(f.stream.name(), f.start, f.end);
         if cause.is_empty() {
-            out.push_str(&format!("1 test(s): {} {range}\n", f.test));
+            let _ = write!(out, "1 test(s): {} ", f.test);
         } else {
             let shown_cause = if level == RenderLevel::Headlines {
                 short(&cause, 140)
             } else {
                 cause
             };
-            out.push_str(&format!("1 test(s): {} · {shown_cause} {range}\n", f.test));
+            let _ = write!(out, "1 test(s): {} · {shown_cause} ", f.test);
         }
+        write_range(out, f.stream.name(), f.start, f.end);
+        out.push('\n');
         if level == RenderLevel::Full {
             for ex in f.excerpt.iter().take(3) {
                 if !f.error.contains(ex.as_str()) {
@@ -951,7 +952,7 @@ fn render_group(out: &mut String, group: &[&RawFailure], level: RenderLevel) {
     let shown_cause = if level == RenderLevel::Headlines {
         short(&cause, 140)
     } else {
-        cause.clone()
+        cause
     };
 
     // Check if all tests in this group belong to a single parametrized family.
@@ -961,19 +962,18 @@ fn render_group(out: &mut String, group: &[&RawFailure], level: RenderLevel) {
     let max_end = group.iter().map(|f| f.end).max().unwrap_or(head.end);
 
     if let Some(stem) = shared_stem {
-        let span = if same_stream {
-            format_range(head.stream.name(), min_start, max_end)
+        let (span_start, span_end) = if same_stream {
+            (min_start, max_end)
         } else {
-            format_range(head.stream.name(), head.start, head.end)
+            (head.start, head.end)
         };
         if shown_cause.is_empty() {
-            out.push_str(&format!("{} test(s): {stem} {span}\n", group.len()));
+            let _ = write!(out, "{} test(s): {stem} ", group.len());
         } else {
-            out.push_str(&format!(
-                "{} test(s): {stem} {shown_cause} {span}\n",
-                group.len()
-            ));
+            let _ = write!(out, "{} test(s): {stem} {shown_cause} ", group.len());
         }
+        write_range(out, head.stream.name(), span_start, span_end);
+        out.push('\n');
         if level == RenderLevel::Full {
             for ex in head.excerpt.iter().take(2) {
                 if !head.error.contains(ex.as_str()) {
@@ -984,20 +984,18 @@ fn render_group(out: &mut String, group: &[&RawFailure], level: RenderLevel) {
             }
             if group.len() <= 4 {
                 for f in group {
-                    let r = format_range(f.stream.name(), f.start, f.end);
-                    out.push_str(&format!("  {} {r}\n", f.test));
+                    let _ = write!(out, "  {} ", f.test);
+                    write_range(out, f.stream.name(), f.start, f.end);
+                    out.push('\n');
                 }
             } else {
                 let first = group[0];
                 let last = group[group.len() - 1];
-                out.push_str(&format!(
-                    "  {} {} … {} {} (+{} more)\n",
-                    first.test,
-                    format_range(first.stream.name(), first.start, first.end),
-                    last.test,
-                    format_range(last.stream.name(), last.start, last.end),
-                    group.len() - 2
-                ));
+                let _ = write!(out, "  {} ", first.test);
+                write_range(out, first.stream.name(), first.start, first.end);
+                let _ = write!(out, " … {} ", last.test);
+                write_range(out, last.stream.name(), last.start, last.end);
+                let _ = writeln!(out, " (+{} more)", group.len() - 2);
             }
         }
         return;
@@ -1005,20 +1003,22 @@ fn render_group(out: &mut String, group: &[&RawFailure], level: RenderLevel) {
 
     // Non-parametrized root-cause group.
     if level == RenderLevel::Headlines {
-        let span = format_range(head.stream.name(), min_start, max_end);
-        out.push_str(&format!(
-            "{} test(s): {} (+{} more) · {shown_cause} {span}\n",
+        let _ = write!(
+            out,
+            "{} test(s): {} (+{} more) · {shown_cause} ",
             group.len(),
             head.test,
             group.len() - 1
-        ));
+        );
+        write_range(out, head.stream.name(), min_start, max_end);
+        out.push('\n');
         return;
     }
 
     if shown_cause.is_empty() {
-        out.push_str(&format!("{} test(s): {}\n", group.len(), head.test));
+        let _ = writeln!(out, "{} test(s): {}", group.len(), head.test);
     } else {
-        out.push_str(&format!("{} test(s): {shown_cause}\n", group.len()));
+        let _ = writeln!(out, "{} test(s): {shown_cause}", group.len());
     }
     if level == RenderLevel::Full {
         for ex in head.excerpt.iter().take(2) {
@@ -1033,22 +1033,22 @@ fn render_group(out: &mut String, group: &[&RawFailure], level: RenderLevel) {
     let max_members = if level == RenderLevel::Full { 8 } else { 2 };
     if group.len() <= max_members {
         for f in group {
-            let r = format_range(f.stream.name(), f.start, f.end);
-            out.push_str(&format!("  {} {r}\n", f.test));
+            let _ = write!(out, "  {} ", f.test);
+            write_range(out, f.stream.name(), f.start, f.end);
+            out.push('\n');
         }
     } else {
         let show_front = max_members.saturating_sub(1).max(1);
         for f in &group[..show_front] {
-            let r = format_range(f.stream.name(), f.start, f.end);
-            out.push_str(&format!("  {} {r}\n", f.test));
+            let _ = write!(out, "  {} ", f.test);
+            write_range(out, f.stream.name(), f.start, f.end);
+            out.push('\n');
         }
         let omitted = group.len() - show_front - 1;
         let last = group[group.len() - 1];
-        let last_r = format_range(last.stream.name(), last.start, last.end);
-        out.push_str(&format!(
-            "  … +{omitted} more, last: {} {last_r}\n",
-            last.test
-        ));
+        let _ = write!(out, "  … +{omitted} more, last: {} ", last.test);
+        write_range(out, last.stream.name(), last.start, last.end);
+        out.push('\n');
     }
 }
 
@@ -1094,14 +1094,55 @@ fn normalize_root_cause(text: &str) -> String {
     if text.trim().is_empty() {
         return String::new();
     }
-    let s = VOLATILE_TS.replace_all(text, "<ts>");
-    let s = EPHEMERAL_PATH.replace_all(&s, "<tmp>");
-    let s = VOLATILE_UUID.replace_all(&s, "<uuid>");
-    let s = VOLATILE_OFFSET.replace_all(&s, "+<off>");
-    let s = VOLATILE_HEX.replace_all(&s, "0x<addr>");
-    let s = VOLATILE_GOROUTINE.replace_all(&s, "goroutine <id>");
-    let s = VOLATILE_TIME.replace_all(&s, "<time>");
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut s = Cow::Borrowed(text);
+    let has_digit = text.bytes().any(|b| b.is_ascii_digit());
+    if has_digit
+        && s.contains('-')
+        && s.contains(':')
+        && let Cow::Owned(replaced) = VOLATILE_TS.replace_all(&s, "<ts>")
+    {
+        s = Cow::Owned(replaced);
+    }
+    if (s.contains("/tmp/")
+        || s.contains("/var/folders/")
+        || s.contains("\\AppData\\Local\\Temp\\"))
+        && let Cow::Owned(replaced) = EPHEMERAL_PATH.replace_all(&s, "<tmp>")
+    {
+        s = Cow::Owned(replaced);
+    }
+    if s.len() >= 36
+        && s.contains('-')
+        && let Cow::Owned(replaced) = VOLATILE_UUID.replace_all(&s, "<uuid>")
+    {
+        s = Cow::Owned(replaced);
+    }
+    if (s.contains("+0x") || s.contains("+0X"))
+        && let Cow::Owned(replaced) = VOLATILE_OFFSET.replace_all(&s, "+<off>")
+    {
+        s = Cow::Owned(replaced);
+    }
+    if (s.contains("0x") || s.contains("0X"))
+        && let Cow::Owned(replaced) = VOLATILE_HEX.replace_all(&s, "0x<addr>")
+    {
+        s = Cow::Owned(replaced);
+    }
+    if has_digit
+        && s.contains("goroutine ")
+        && let Cow::Owned(replaced) = VOLATILE_GOROUTINE.replace_all(&s, "goroutine <id>")
+    {
+        s = Cow::Owned(replaced);
+    }
+    if has_digit && let Cow::Owned(replaced) = VOLATILE_TIME.replace_all(&s, "<time>") {
+        s = Cow::Owned(replaced);
+    }
+    let mut out = String::with_capacity(s.len());
+    for (i, word) in s.split_whitespace().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
 }
 
 fn strip_ansi(line: &str) -> Cow<'_, str> {
@@ -1112,12 +1153,18 @@ fn strip_ansi(line: &str) -> Cow<'_, str> {
     }
 }
 
-fn format_range(stream: &str, start: usize, end: usize) -> String {
+fn write_range(out: &mut String, stream: &str, start: usize, end: usize) {
     if start == end {
-        format!("[{stream}:{start}]")
+        let _ = write!(out, "[{stream}:{start}]");
     } else {
-        format!("[{stream}:{start}-{end}]")
+        let _ = write!(out, "[{stream}:{start}-{end}]");
     }
+}
+
+fn format_range(stream: &str, start: usize, end: usize) -> String {
+    let mut out = String::with_capacity(stream.len() + 16);
+    write_range(&mut out, stream, start, end);
+    out
 }
 
 fn is_assertion_excerpt(line: &str) -> bool {
@@ -1451,7 +1498,9 @@ impl PytestScan {
                 return;
             }
             // Pytest bottom location line: `tests/test_a.py:42: AssertionError` or `in fn`
-            if let Some(cap) = PYTEST_LOC_ERR.captures(trimmed) {
+            if trimmed.contains(".py:")
+                && let Some(cap) = PYTEST_LOC_ERR.captures(trimmed)
+            {
                 let path = &cap[1];
                 let loc = format!("{path}:{}", &cap[2]);
                 let detail = cap[3].trim();
@@ -1472,7 +1521,9 @@ impl PytestScan {
                 return;
             }
             // Standard Python `File "path", line N, in fn` frame (`--tb=native`).
-            if let Some(cap) = PYTEST_FILE_LINE.captures(line) {
+            if trimmed.starts_with("File \"")
+                && let Some(cap) = PYTEST_FILE_LINE.captures(line)
+            {
                 let path = &cap[1];
                 let loc = format!("{path}:{}", &cap[2]);
                 let in_repo = !is_python_stdlib_or_venv(path);
@@ -1575,7 +1626,7 @@ fn strip_pytest_banner(trimmed: &str, ch: char) -> Option<&str> {
 }
 
 fn is_pytest_final_summary(text: &str) -> bool {
-    if !PYTEST_SUMMARY_TIME.is_match(text) {
+    if !text.contains(" in ") || !PYTEST_SUMMARY_TIME.is_match(text) {
         return false;
     }
     text.starts_with("no tests ran in ") || PYTEST_SUMMARY_COUNT.is_match(text)
@@ -1738,7 +1789,7 @@ impl UnittestScan {
         }
 
         // `Ran 42 tests in 0.123s`
-        if UNITTEST_RAN.is_match(trimmed) {
+        if trimmed.starts_with("Ran ") && UNITTEST_RAN.is_match(trimmed) {
             self.open = None;
             self.saw_ran = true;
             if stream == Stream::Stderr {
@@ -1777,7 +1828,9 @@ impl UnittestScan {
         if let Some(open) = self.open.as_mut() {
             let f = &mut self.failures[open.index];
             f.end = n;
-            if let Some(cap) = PYTEST_FILE_LINE.captures(line) {
+            if trimmed.starts_with("File \"")
+                && let Some(cap) = PYTEST_FILE_LINE.captures(line)
+            {
                 let path = &cap[1];
                 let loc = format!("{path}:{}", &cap[2]);
                 let in_repo = !is_python_stdlib_or_venv(path);
@@ -2144,10 +2197,12 @@ impl GoTestScan {
         if let Some(GoBlock::Panic { index, .. }) = &self.open {
             let f = &mut self.failures[*index];
             f.end = n;
-            if let Some(cap) = GO_FILE_LINE.captures(trimmed) {
+            if f.location.is_none()
+                && trimmed.contains(".go:")
+                && let Some(cap) = GO_FILE_LINE.captures(trimmed)
+            {
                 let loc = cap[1].to_owned();
-                if !loc.contains("/runtime/") && !loc.contains("/testing/") && f.location.is_none()
-                {
+                if !loc.contains("/runtime/") && !loc.contains("/testing/") {
                     f.location = Some(loc);
                 }
             }
@@ -2345,7 +2400,9 @@ impl DotnetScan {
         }
 
         // Assembly summary: `Failed!  - Failed: 2, Passed: 40, Skipped: 1, Total: 43, ...`
-        if let Some(cap) = DOTNET_SUMMARY.captures(trimmed) {
+        if (trimmed.starts_with("Passed!") || trimmed.starts_with("Failed!"))
+            && let Some(cap) = DOTNET_SUMMARY.captures(trimmed)
+        {
             self.open = None;
             self.saw_summary = true;
             let failed = cap[2].parse::<usize>().unwrap_or(0);
@@ -2608,7 +2665,9 @@ impl MavenScan {
         }
 
         // `Tests run: N, Failures: F, Errors: E, Skipped: S`
-        if let Some(cap) = MAVEN_TOTALS.captures(body) {
+        if body.contains("Tests run:")
+            && let Some(cap) = MAVEN_TOTALS.captures(body)
+        {
             self.open = None;
             let fails = cap[2].parse::<usize>().unwrap_or(0);
             let errs = cap[3].parse::<usize>().unwrap_or(0);
@@ -2910,7 +2969,10 @@ impl GradleScan {
         }
 
         // `42 tests completed, 3 failed`
-        if let Some(cap) = GRADLE_COMPLETED.captures(trimmed) {
+        if trimmed.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            && trimmed.contains(" completed,")
+            && let Some(cap) = GRADLE_COMPLETED.captures(trimmed)
+        {
             self.open = None;
             self.saw_completed = true;
             self.reported_failed += cap[2].parse::<usize>().unwrap_or(0);
@@ -3088,7 +3150,9 @@ impl SwiftScan {
         }
 
         // XCTest summary: `Executed 42 tests, with 2 failures (0 unexpected) in ...`
-        if let Some(cap) = SWIFT_XCTEST_EXECUTED.captures(trimmed) {
+        if trimmed.starts_with("Executed ")
+            && let Some(cap) = SWIFT_XCTEST_EXECUTED.captures(trimmed)
+        {
             if stream == Stream::Stderr {
                 self.has_test_stderr = true;
             }
@@ -3106,7 +3170,9 @@ impl SwiftScan {
 
         // XCTest diagnostic line BEFORE `Test Case '...' failed`:
         // `/repo/Tests/A.swift:42: error: -[Pkg.Suite testFoo] : XCTAssertEqual failed: ...`
-        if let Some(cap) = SWIFT_XCTEST_DIAG.captures(trimmed) {
+        if trimmed.contains(".swift:")
+            && let Some(cap) = SWIFT_XCTEST_DIAG.captures(trimmed)
+        {
             if stream == Stream::Stderr {
                 self.has_test_stderr = true;
             }
@@ -3125,7 +3191,9 @@ impl SwiftScan {
         }
 
         // XCTest case lifecycle: `Test Case '...' started/passed/failed`.
-        if let Some(cap) = SWIFT_XCTEST_CASE.captures(trimmed) {
+        if trimmed.starts_with("Test Case '")
+            && let Some(cap) = SWIFT_XCTEST_CASE.captures(trimmed)
+        {
             if stream == Stream::Stderr {
                 self.has_test_stderr = true;
             }
@@ -3165,7 +3233,9 @@ impl SwiftScan {
         }
 
         // Swift Testing: `✘ Test "..." recorded an issue at File.swift:42:5: ...`
-        if let Some(cap) = SWIFT_TESTING_ISSUE.captures(trimmed) {
+        if trimmed.starts_with('✘')
+            && let Some(cap) = SWIFT_TESTING_ISSUE.captures(trimmed)
+        {
             if stream == Stream::Stderr {
                 self.has_test_stderr = true;
             }
@@ -3188,7 +3258,9 @@ impl SwiftScan {
         }
 
         // Swift Testing: `✘ Test "..." failed after ...`
-        if let Some(cap) = SWIFT_TESTING_FAIL.captures(trimmed) {
+        if trimmed.starts_with('✘')
+            && let Some(cap) = SWIFT_TESTING_FAIL.captures(trimmed)
+        {
             if stream == Stream::Stderr {
                 self.has_test_stderr = true;
             }
@@ -3218,7 +3290,7 @@ impl SwiftScan {
         }
 
         // Swift Testing: `✔ Test "..." passed after ...`
-        if SWIFT_TESTING_PASS.is_match(trimmed) {
+        if trimmed.starts_with('✔') && SWIFT_TESTING_PASS.is_match(trimmed) {
             if stream == Stream::Stderr {
                 self.has_test_stderr = true;
             }
@@ -3227,7 +3299,9 @@ impl SwiftScan {
         }
 
         // Swift Testing run summary: `✘ Test run with N tests failed after ... with M issues.`
-        if let Some(cap) = SWIFT_TESTING_RUN.captures(trimmed) {
+        if (trimmed.starts_with('✔') || trimmed.starts_with('✘'))
+            && let Some(cap) = SWIFT_TESTING_RUN.captures(trimmed)
+        {
             if stream == Stream::Stderr {
                 self.has_test_stderr = true;
             }
@@ -3378,7 +3452,9 @@ impl CtestScan {
         }
 
         // `85% tests passed, 3 tests failed out of 20`
-        if let Some(cap) = CTEST_TOTAL.captures(trimmed) {
+        if trimmed.contains("% tests passed,")
+            && let Some(cap) = CTEST_TOTAL.captures(trimmed)
+        {
             self.open = None;
             self.in_failed_list = false;
             self.saw_total = true;
@@ -3395,7 +3471,9 @@ impl CtestScan {
 
         // ` 1/20 Test  #1: test_math .......   Passed   0.01 sec`
         // ` 3/20 Test  #3: test_parse ......***Failed   0.15 sec`
-        if let Some(cap) = CTEST_RESULT.captures(line) {
+        if line.contains(" Test ")
+            && let Some(cap) = CTEST_RESULT.captures(line)
+        {
             self.open = None;
             self.in_failed_list = false;
             let num = cap[1].to_owned();
@@ -3550,6 +3628,7 @@ impl MixScan {
 
         // Totals: `42 tests, 2 failures` or `3 doctests, 42 tests, 2 failures, 1 skipped`
         if !line.starts_with(' ')
+            && trimmed.contains(" test")
             && let Some(cap) = MIX_TOTAL.captures(trimmed)
         {
             self.open = None;
@@ -3561,6 +3640,8 @@ impl MixScan {
 
         // Failure block header: `  1) test creates order (MyApp.OrderTest)`
         if !line.starts_with("     ")
+            && trimmed.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            && trimmed.contains(") ")
             && let Some(cap) = MIX_FAILURE_HEADER.captures(line)
             && (cap[2].starts_with("test ")
                 || cap[2].starts_with("doctest ")
@@ -3715,7 +3796,9 @@ impl DenoScan {
         }
 
         // Final totals line: `ok | 42 passed | 0 failed (125ms)` or `FAILED | ...`
-        if let Some(cap) = DENO_TOTAL.captures(trimmed) {
+        if (trimmed.starts_with("ok") || trimmed.starts_with("FAILED"))
+            && let Some(cap) = DENO_TOTAL.captures(trimmed)
+        {
             self.open = None;
             self.section = DenoSection::Progress;
             self.saw_total = true;
@@ -4009,7 +4092,10 @@ impl DartTestScan {
         }
 
         // Timestamped `package:test` / `flutter test` progress, failure, and summary lines.
-        if let Some(cap) = DART_TEST_LINE.captures(trimmed) {
+        if trimmed.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            && trimmed.contains(" +")
+            && let Some(cap) = DART_TEST_LINE.captures(trimmed)
+        {
             let failed_count = cap
                 .get(4)
                 .and_then(|m| m.as_str().parse::<usize>().ok())
@@ -4193,7 +4279,9 @@ fn observe_dart_detail(
     {
         return;
     }
-    if let Some(cap) = DART_VM_FRAME.captures(trimmed) {
+    if trimmed.starts_with('#')
+        && let Some(cap) = DART_VM_FRAME.captures(trimmed)
+    {
         let raw_loc = &cap[1];
         if location.is_none() && !is_dart_framework_frame(raw_loc) {
             *location = Some(strip_file_uri(raw_loc).to_owned());
@@ -4206,14 +4294,18 @@ fn observe_dart_detail(
     {
         return;
     }
-    if let Some(cap) = DART_TERSE_FRAME_LOC.captures(trimmed) {
+    if trimmed.contains(".dart ")
+        && let Some(cap) = DART_TERSE_FRAME_LOC.captures(trimmed)
+    {
         let path = &cap[1];
         if location.is_none() && !is_dart_framework_frame(path) {
             *location = Some(format!("{}:{}", strip_file_uri(path), &cap[2]));
         }
         return;
     }
-    if DART_TERSE_FRAME_PKG.is_match(trimmed) {
+    if (trimmed.starts_with("package:") || trimmed.starts_with("dart:"))
+        && DART_TERSE_FRAME_PKG.is_match(trimmed)
+    {
         return;
     }
     if trimmed == "Test failed. See exception logs above." {
@@ -4248,6 +4340,7 @@ fn observe_dart_detail(
         return;
     }
     if location.is_none()
+        && trimmed.contains(".dart:")
         && let Some(cap) = DART_INLINE_LOC.captures(trimmed)
         && !is_dart_framework_frame(&cap[1])
     {
@@ -5960,6 +6053,54 @@ mod tests {
             &["flutter", "analyze"][..],
         ] {
             assert_eq!(runner_for_words(words), None, "expected None for {words:?}");
+        }
+    }
+
+    #[test]
+    fn ansi_fast_path_and_volatile_normalizer_parity() {
+        // Zero-alloc Cow::Borrowed when clean; owned stripping when ESC is present.
+        assert!(matches!(
+            strip_ansi("plain test line"),
+            Cow::Borrowed("plain test line")
+        ));
+        assert_eq!(
+            strip_ansi("\x1b[31mFAILED\x1b[0m tests/a_test.py").as_ref(),
+            "FAILED tests/a_test.py"
+        );
+
+        // Volatile normalizer preserves exact replacements across all token families
+        // while taking the zero-regex path on plain digit-free diagnostics.
+        assert_eq!(
+            normalize_root_cause("  AssertionError:   expected   true  "),
+            "AssertionError: expected true"
+        );
+        for (input, expected) in [
+            (
+                "2026-11-26T12:34:56.789Z goroutine 42 at 0x7fffaabbccdd+0x1a in /var/tmp/pytest-of-ci/tmp_xyz/a.py uuid aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee took 12.5 ms",
+                "<ts> goroutine <id> at 0x<addr>+<off> in <tmp>/a.py uuid <uuid> took <time>",
+            ),
+            (
+                "panic at /private/var/folders/ab/cd/T/TestRun123/x.go (0.42s)",
+                "panic at <tmp>/x.go (<time>)",
+            ),
+            (
+                r"open C:\Users\alice\AppData\Local\Temp\t1\f.txt failed",
+                r"open <tmp>\f.txt failed",
+            ),
+        ] {
+            let reference = {
+                let s = VOLATILE_TS.replace_all(input, "<ts>");
+                let s = EPHEMERAL_PATH.replace_all(&s, "<tmp>");
+                let s = VOLATILE_UUID.replace_all(&s, "<uuid>");
+                let s = VOLATILE_OFFSET.replace_all(&s, "+<off>");
+                let s = VOLATILE_HEX.replace_all(&s, "0x<addr>");
+                let s = VOLATILE_GOROUTINE.replace_all(&s, "goroutine <id>");
+                let s = VOLATILE_TIME.replace_all(&s, "<time>");
+                s.split_whitespace().collect::<Vec<_>>().join(" ")
+            };
+            let actual = normalize_root_cause(input);
+            assert_eq!(actual, reference, "fast-path drift for {input}");
+            assert_eq!(actual, expected, "unexpected normalization for {input}");
         }
     }
 }
