@@ -1,7 +1,7 @@
 # Benchmarks
 
 - [Agent benchmark (four arms)](#agent-benchmark-four-arms) — paid Messages API campaign and large-output family
-- [Compactor suite (18 reproducible offline workloads)](#compactor-suite-18-reproducible-offline-workloads) — offline release suite (`5e96988`)
+- [Compactor suite (26 reproducible offline workloads)](#compactor-suite-26-reproducible-offline-workloads) — deterministic offline suite (`962bdc4` / `314c512`)
 - [Earlier single-task illustrations](#earlier-single-task-illustrations) — paid single-task replays, local replay, scripted repair, progressive reads and tool history
 - [Script runner](#script-runner) — `justless exec` on multi-megabyte files
 - [Secret redaction](#secret-redaction) — 200 MiB CPU overhead
@@ -9,7 +9,7 @@
 - [Assignments and a final `2>&1`](#assignments-and-a-final-21) — transcript routing audit
 - [Ranged Read outlines](#ranged-read-outlines) — transcript replay and follow-up reads
 - [Code questions](#code-questions) — `justless query` vs grep + Read
-- [Tree-sitter, archive latency and live-zone proxy compaction](#tree-sitter-archive-latency-and-live-zone-proxy-compaction) — query caching, archive speed and `--compact-live`
+- [Index latency, Tree-sitter caching and live-zone proxy compaction](#index-latency-tree-sitter-caching-and-live-zone-proxy-compaction) — binary `index.bin` + CSR graph speedups, `map --html` sizes, query caching and multi-provider `--compact-live`
 - [Token estimates](#token-estimates) — calibrated byte-to-token ratios
 - [Where the prompt tokens go](#where-the-prompt-tokens-go) — session spend breakdown
 
@@ -225,15 +225,15 @@ Run on 2026-11-20: 96 runs over the 8 frozen tasks × 3 repetitions × 4 arms, $
 
 **What it shows.** The model did not take the scripted path. Where the scripted plain path saw 59 to 192 KB of tool output, a plain Sonnet run saw a median of 9.1 KB (10.9 KB with Justless): it filtered its own commands, searched 24 times and never used Read. So this family did not put large output in front of Justless either. In the 48 runs with Justless, the hooks changed 34 of 343 Bash and Read results: 6 commands rewritten before they ran, 27 Bash results and 1 Read compacted after. The agent typed `justless` itself 28 times in arm b, and that arm resent more of the conversation from cache, 2.40M tokens in all against 1.51M. On these tasks, with this model, Justless again neither saved nor clearly cost, and the campaign is too small to tell an 11% difference from none. It ran before reads of at most 600 lines kept their text (see "What the agent read next"), so it measured the earlier thresholds.
 
-## Compactor suite (18 reproducible offline workloads)
+## Compactor suite (26 reproducible offline workloads)
 
-`scripts/suite_benchmark.py` exercises 18 real Justless compactors, source outlines, code-graph queries and tool-history retirement in a single offline pass. It requires zero network or model API calls, runs every workload inside an isolated temporary workspace (never touching the checkout's `.justless/`), produces deterministic UTF-8 byte counts, and verifies each contract under `--check`: preserved child exit codes (`0`, `1`, `101`), exact `[stdout/stderr:A-B]` byte-for-byte replay from the local archive, lossless JSON / table / blame round-trips, and lossless `mask --restore`.
+`scripts/suite_benchmark.py` exercises 26 real Justless compactors, source and notebook outlines, code-graph queries and tool-history retirement in a single offline pass. It requires zero network or model API calls, runs every workload inside an isolated temporary workspace (never touching the checkout's `.justless/`), produces deterministic UTF-8 byte counts, and verifies each contract under `--check`: preserved child exit codes (`0`, `1`, `101`), exact `[stdout/stderr:A-B]` byte-for-byte replay from the local archive, Secret-value safety on `helm template`, lossless JSON / table / CSV / blame round-trips, and lossless `mask --restore`.
 
 ```sh
 cargo build --release --locked && python3 scripts/suite_benchmark.py --binary ./target/release/justless --check --markdown
 ```
 
-Measured on 2026-11-26 at commit `5e96988` on Linux x86_64 with a release build (`1,185,309 → 50,560` UTF-8 bytes, or `1,157.5 KB → 49.4 KB`, `95.7%` cut, `23.4×` overall; `1.64 s` total elapsed across all 18 workloads). Figures below are measured UTF-8 bytes (`1 KB = 1,024 bytes`), not provider token counts (see [Token estimates](#token-estimates) for calibrated byte-to-token ratios).
+Measured on 2026-11-26 on Linux x86_64: at commit `962bdc4` (when the 26-workload suite landed), total output dropped **`1,544.5 KB → 59.6 KB` (`96.1%` saved, `25.9×` compression)**; at commit `314c512` (shown per row below, reflecting `src/` growth from proxy prefix-drift detection), total output dropped **`1,587,107 → 60,967` UTF-8 bytes (`1,549.9 KB → 59.5 KB`, `96.2%` cut, `26.0×` overall)**. Figures below are measured UTF-8 bytes (`1 KB = 1,024 bytes`), not provider token counts (see [Token estimates](#token-estimates) for calibrated byte-to-token ratios).
 
 | # | Workload | Category | Raw | Justless | Cut | Ratio |
 | ---: | --- | --- | ---: | ---: | ---: | ---: |
@@ -252,12 +252,20 @@ Measured on 2026-11-26 at commit `5e96988` on Linux x86_64 with a release build 
 | 13 | `gh api JSON` (80 nested objects) | json | 30.2 KB | 3.6 KB | 87.9% | 8.3× |
 | 14 | `git diff` (semantic + lockfile) | git | 12.2 KB | 490 B | 96.1% | 25.5× |
 | 15 | `git status + blame` (60 files + 60L blame) | git | 8.7 KB | 2.8 KB | 68.2% | 3.1× |
-| 16 | `rg -n "fn " src` (live repo search) | search | 349.0 KB | 4.0 KB | 98.9% | 88.2× |
-| 17 | `read --outline` (reference.md + expand) | source | 267.2 KB | 2.3 KB | 99.1% | 114.4× |
-| 18 | `query + map + mask` (graph + NL + retire) | code_graph | 264.9 KB | 22.6 KB | 91.5% | 11.7× |
-| | **Total (18 workloads)** | | **1,157.5 KB** | **49.4 KB** | **95.7%** | **23.4×** |
+| 16 | `rg -n "fn " src` (live repo search) | search | 438.0 KB | 4.0 KB | 99.1% | 110.8× |
+| 17 | `read --outline` (reference.md + expand) | source | 278.3 KB | 2.4 KB | 99.1% | 117.5× |
+| 18 | `query + map + mask` (graph + NL + retire) | code_graph | 282.2 KB | 22.6 KB | 92.0% | 12.5× |
+| 19 | `csvview (exec)` (1,000-row RFC 4180 CSV) | tables | 115.4 KB | 1.7 KB | 98.5% | 68.9× |
+| 20 | `kubectl diff + helm` (managedFields + Secret-safe) | infra | 23.2 KB | 3.1 KB | 86.6% | 7.5× |
+| 21 | `aws s3 ls` (251 objects · prefix groups) | infra | 16.0 KB | 373 B | 97.7% | 44.0× |
+| 22 | `flutter test` (pass + multi-failure) | tests | 10.3 KB | 798 B | 92.5% | 13.3× |
+| 23 | `flutter pub deps` (ANSI tree · subtree dedup) | deps | 5.4 KB | 1.2 KB | 78.8% | 4.7× |
+| 24 | `read --outline (.ipynb)` (50 KB PNG + error cell) | source | 52.3 KB | 745 B | 98.6% | 71.8× |
+| 25 | `JSON + klog logs` (Zap/Pino/K8s · pinned errs) | logs | 38.6 KB | 1.4 KB | 96.3% | 27.3× |
+| 26 | `git diff (Pipfile.lock)` (20-pkg lock + logic edit) | git | 13.6 KB | 918 B | 93.4% | 15.2× |
+| | **Total (26 workloads, `314c512`)** | | **1,549.9 KB** | **59.5 KB** | **96.2%** | **26.0×** |
 
-Every grouped or folded case verifies exact archive replay of a `[stdout/stderr:A-B]` span against the raw stream. Row 12 (`psql table`) verifies both Tier 1 lossless table compaction (`28,123 → 13,589` bytes, all 500 rows with constant/default column hoisting) and Tier 2 bounded output (`4,134` bytes, shown in the table). Row 13 (`gh api JSON`) verifies lossless deep-schema `jsonview` round-trip decoding back to the exact original JSON. Row 18 combines `query would_route` (`207,789 → 1,560` B), `map --explain` (`2,325` B), `lookup` across TypeScript → Python → SQL (`1,079` B), and `mask` + `--restore` (`62,798 → 18,176` B).
+Every grouped or folded case verifies exact archive replay of a `[stdout/stderr:A-B]` span against the raw stream. Rows 16–18 read the checkout's own `src/` and `docs/reference.md`, so their raw bytes track repository growth (earlier 18-workload baseline at `5e96988`: `1,157.5 KB → 49.4 KB`, `95.7%`, `23.4×`; 26-workload baseline at `962bdc4`: `1,544.5 KB → 59.6 KB`, `96.1%`, `25.9×`). Row 12 (`psql table`) verifies both Tier 1 lossless table compaction (`28,123 → 13,589` bytes, all 500 rows with constant/default column hoisting) and Tier 2 bounded output (`4,134` bytes, shown in the table). Row 13 (`gh api JSON`) verifies lossless deep-schema `jsonview` round-trip decoding back to the exact original JSON. Row 19 (`csvview`) compacts a 1,000-row RFC 4180 CSV (`115.4 KB → 1.7 KB`, `98.5%`) with schema/type/range summaries and exact middle-row replay pointers. Row 20 (`kubectl diff + helm`) folds Kubernetes `managedFields` metadata while verifying that Kubernetes `Secret` data payloads are never leaked in `helm template` inventories. Row 24 (`read --outline (.ipynb)`) strips embedded 50 KB base64 PNG cell outputs (`52.3 KB → 745 B`, `98.6%`) while surfacing headings, signatures and execution errors with exact cell byte spans. Row 26 folds a 20-package `Pipfile.lock` diff (`96.8%` cut on the lockfile section alone; companion `pubspec.lock` folding cuts `91.8%`) while keeping `src/billing.py` logic edits verbatim.
 
 ## Earlier single-task illustrations
 
@@ -504,7 +512,26 @@ An agent without an index answers "where is `X` defined and what calls it" by se
 
 The total ratio is **73.4×** and the median ratio is **71.3×** — up from `59.8×` total (`1,141,318 → 19,086`) and `57×` median on 2026-11-19 at commit `6ee090d` (macOS arm64), after grouped edge formatting and same-file `(from :LINE)` deduplication shrank dense `query` results. Against reading the full defining file with `cat` instead of Claude Code's 2,000-line Read cap, `would_route` reaches **133×** (`207,789 → 1,560` bytes). The ratio grows with the size of the defining file, and this repository's files are large: the median defining file here is about 95 KB. In a project of small files the search and the read are smaller, and so is the ratio. Names that several definitions share are left out, because `query` then lists the candidates with their locations instead of answering.
 
-## Tree-sitter, archive latency and live-zone proxy compaction
+## Index latency, Tree-sitter caching and live-zone proxy compaction
+
+### Binary index cache, CSR graph latency and footprint
+
+Replacing legacy JSON index serialization (`index.json`) with a string-interned binary format (`.justless/index.bin`, commit `9d9d362`), rewriting `map` / `review` graph algorithms over dense CSR `usize` adjacency lists (commit `5d77b85`), and stripping release binary symbols (`Cargo.lock` frozen at `144` crates — `0` new dependencies) delivered these measured improvements on this repository (release build, Linux x86_64, 2026-11-26):
+
+| Metric | Before (`index.json`) | After (`index.bin` + CSR) | Improvement |
+| --- | ---: | ---: | ---: |
+| Warm `justless query` | 251.0 ms | 17.7 ms | **14.2× faster** |
+| Warm `justless map` (PageRank + LPA + bridges) | 425.0 ms | 34.3 ms | **12.4× faster** |
+| Warm `justless map --explain` | 403.0 ms | 30.9 ms | **13.0× faster** |
+| On-disk index cache size | 20.6 MB | 1.96 MiB | **10.5× smaller** |
+| Release binary size (`Cargo.lock`: 144 crates, 0 added) | 89.0 MB | 84.4 MB (80.5 MiB stripped) | −4.6 MB |
+
+Offline single-file HTML5 Canvas graph explorer (`justless map --html`, zero CDN, XSS-safe, commit `8abec8b`):
+
+| Repository | Rendered HTML size | Graph summary |
+| --- | ---: | --- |
+| `fixtures/mixed` (TypeScript + Python + SQL) | 31.7 KB | Cross-language routes & SQL tables |
+| Justless repository | 138.5 KB | 250 top hubs · 98 communities · 40 bridges |
 
 ### Tree-sitter query caching and archive read latency
 
@@ -516,9 +543,9 @@ Caching compiled Tree-sitter queries in per-grammar `LazyLock` statics (`src/pol
 | `read --outline` across 10 TypeScript files | 3.31 s | 102 ms | 32× |
 | `stats --json` across 500 archived runs | 202 ms | 21.6 ms | 9.3× |
 
-### Live-zone proxy compaction (`--compact-live`)
+### Multi-provider live-zone proxy compaction (`--compact-live`) and prefix-drift detection
 
-`justless proxy --compact-live` (and `justless wrap --compact-live`, commit `d02390c`) compacts only the newest uncached tool results at the request boundary, leaving every earlier message untouched so prompt-cache prefixes stay intact while archiving originals locally for exact recovery via `justless recall`. Measured UTF-8 byte reductions across four representative tool-result payloads (release build, Linux x86_64, 2026-11-26):
+`justless proxy --compact-live` (and `justless wrap --compact-live`, commits `d02390c`, `58968d7`, `1624c21`, `314c512`) compacts only the newest uncached tool results at the request boundary across **Anthropic `/v1/messages`**, **OpenAI `/v1/chat/completions`**, **OpenAI `/v1/responses`**, and **Google Gemini `:generateContent` / `:streamGenerateContent`**, leaving every earlier message untouched so prompt-cache prefixes stay intact while archiving originals locally for exact recovery via `justless recall` (with an anti-recursion guard skipping already-recalled `[justless ` blocks). Across providers, live-zone compaction cuts oversized newest payloads by **82.7%–96.6%** with **0%** prefix-cache invalidation, while read-only SHA-256 prefix-drift detection tracks `system`, `tools`, and prior `message[i]` fingerprints per `(endpoint, model)` without mutating bytes or storing prompt text. Measured UTF-8 byte reductions across four representative Anthropic tool-result payloads (release build, Linux x86_64, 2026-11-26):
 
 | Payload kind | Measured byte reduction | Prefix-cache invalidation | Recovery |
 | --- | ---: | ---: | --- |

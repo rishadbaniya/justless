@@ -1878,95 +1878,110 @@ def render_statusline_svg(theme_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 8. how-it-works-dark.svg & how-it-works-light.svg (1140x550)
+# 8. how-it-works-dark.svg & how-it-works-light.svg (1200x550)
 # ---------------------------------------------------------------------------
 def render_how_it_works_svg(theme_name: str) -> str:
     t = THEMES[theme_name]
-    agents = [
+    agents_col1 = [
         "Claude Code",
         "Codex",
+        "Antigravity",
         "Cursor",
         "Gemini CLI",
-        "OpenCode",
         "Copilot CLI",
-        "Antigravity",
+    ]
+    agents_col2 = [
+        "OpenCode",
+        "Windsurf",
+        "Cline",
+        "Roo Code",
+        "Kiro CLI",
+        "Kilo Code",
     ]
     agent_els = [
-        f'<text x="40" y="{120 + i * 34}" font-family="{SANS_FONT}" font-size="13" fill="{t["muted"]}" text-anchor="start">{name}</text>'
-        for i, name in enumerate(agents)
+        f'<text x="38" y="{126 + i * 39}" font-family="{SANS_FONT}" font-size="12.5" fill="{t["muted"]}" text-anchor="start">{name}</text>'
+        for i, name in enumerate(agents_col1)
+    ] + [
+        f'<text x="142" y="{126 + i * 39}" font-family="{SANS_FONT}" font-size="12.5" fill="{t["muted"]}" text-anchor="start">{name}</text>'
+        for i, name in enumerate(agents_col2)
     ]
     desc = (
-        "How Justless works: Claude Code, Codex, Cursor, Gemini CLI, OpenCode, Copilot CLI, "
-        "and Antigravity connect via hooks, MCP, or CLI to the local offline justless binary, "
-        "which compacts commands (tests, lint, BuildKit, diffs, logs, tables, JSON), code "
-        "(26 graph langs, 43 outline formats, map --explain, lookup --graph), and history "
-        "(duplicates, semantic cues, compaction). Full output is archived locally in .justless/ "
-        "and replayable byte-for-byte on demand via log, expand, and recall."
+        "How Justless works: 12 supported coding agents (Claude Code, Codex, Antigravity, "
+        "Cursor, Gemini CLI, Copilot CLI, OpenCode, Windsurf, Cline, Roo Code, Kiro CLI, "
+        "and Kilo Code) connect via hooks, MCP, or CLI to the local offline justless binary, "
+        "which compacts commands (tests, lint, BuildKit, K8s/Cloud, CSV, diffs, JSON), code "
+        "(26 graph langs, 48+ outline formats, map --html/--explain, lookup --graph, AST rename), "
+        "and history (duplicates, semantic cues, multi-provider cache-safe --compact-live proxy "
+        "with prefix-drift detection). Full output is archived locally in .justless/ (runs/, "
+        "index.bin, observations/) and replayable byte-for-byte on demand via log, expand, and recall."
     )
     return "\n".join([
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1140 550" width="1140" height="550" role="img" aria-labelledby="t d">',
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 550" width="1200" height="550" role="img" aria-labelledby="t d">',
         '<title id="t">How Justless works</title>',
         f'<desc id="d">{esc(desc)}</desc>',
         "<defs>",
         f'  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="{t["raw_bar"]}"/></marker>',
         f'  <marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="{t["accent"]}"/></marker>',
         "</defs>",
-        # Left card: Your agent (7 supported agents)
-        f'<rect x="20" y="40" width="168" height="340" rx="14" fill="{t["card_bg"]}" stroke="{t["border"]}"/>',
-        f'<text x="40" y="78" font-family="{SANS_FONT}" font-size="16" font-weight="600" fill="{t["fg"]}" text-anchor="start">Your agent</text>',
+        # Left card: Your agent (12 supported agents in a clean 2x6 grid)
+        f'<rect x="20" y="40" width="224" height="340" rx="14" fill="{t["card_bg"]}" stroke="{t["border"]}"/>',
+        f'<text x="38" y="77" font-family="{SANS_FONT}" font-size="16" font-weight="600" fill="{t["fg"]}" text-anchor="start">Your agent</text>',
+        f'<rect x="164" y="61" width="64" height="22" rx="11" fill="{t["pill_bg"]}"/>',
+        f'<text x="196" y="76" font-family="{SANS_FONT}" font-size="11" font-weight="600" fill="{t["accent"]}" text-anchor="middle">12 agents</text>',
+        f'<line x1="36" y1="96" x2="228" y2="96" stroke="{t["border"]}"/>',
         *agent_els,
-        # Middle card: justless (widened so all Wave 1-6 rows sit comfortably inside borders)
-        f'<rect x="282" y="40" width="570" height="340" rx="16" fill="{t["card_bg"]}" stroke="{t["accent"]}" stroke-width="1.5"/>',
-        f'<text x="306" y="78" font-family="{MONO_FONT}" font-size="20" font-weight="700" fill="{t["fg"]}" text-anchor="start">justless</text>',
-        f'<text x="828" y="77" font-family="{SANS_FONT}" font-size="12" fill="{t["muted"]}" text-anchor="end">local · offline · one binary</text>',
+        # Middle card: justless
+        f'<rect x="338" y="40" width="570" height="340" rx="16" fill="{t["card_bg"]}" stroke="{t["accent"]}" stroke-width="1.5"/>',
+        f'<text x="362" y="78" font-family="{MONO_FONT}" font-size="20" font-weight="700" fill="{t["fg"]}" text-anchor="start">justless</text>',
+        f'<text x="884" y="77" font-family="{SANS_FONT}" font-size="12" fill="{t["muted"]}" text-anchor="end">local · offline · one binary</text>',
         # Commands row
-        f'<rect x="306" y="128" width="96" height="28" rx="14" fill="{t["pill_bg"]}"/>',
-        f'<text x="354" y="147" font-family="{SANS_FONT}" font-size="13" font-weight="600" fill="{t["accent"]}" text-anchor="middle">Commands</text>',
-        f'<text x="418" y="140" font-family="{SANS_FONT}" font-size="13.5" font-weight="500" fill="{t["fg"]}" text-anchor="start">tests · lint · BuildKit · diffs · logs · tables · JSON</text>',
-        f'<text x="418" y="162" font-family="{SANS_FONT}" font-size="12.5" fill="{t["muted"]}" text-anchor="start">grouped by failure, rule, hunk and log template</text>',
-        f'<line x1="302" y1="194" x2="832" y2="194" stroke="{t["border"]}"/>',
+        f'<rect x="362" y="128" width="96" height="28" rx="14" fill="{t["pill_bg"]}"/>',
+        f'<text x="410" y="147" font-family="{SANS_FONT}" font-size="13" font-weight="600" fill="{t["accent"]}" text-anchor="middle">Commands</text>',
+        f'<text x="474" y="140" font-family="{SANS_FONT}" font-size="13.5" font-weight="500" fill="{t["fg"]}" text-anchor="start">tests · lint · BuildKit · K8s/Cloud · CSV · diffs · JSON</text>',
+        f'<text x="474" y="162" font-family="{SANS_FONT}" font-size="12.5" fill="{t["muted"]}" text-anchor="start">grouped by failure, rule, hunk, schema and log template</text>',
+        f'<line x1="358" y1="194" x2="888" y2="194" stroke="{t["border"]}"/>',
         # Code row
-        f'<rect x="306" y="218" width="96" height="28" rx="14" fill="{t["pill_bg"]}"/>',
-        f'<text x="354" y="237" font-family="{SANS_FONT}" font-size="13" font-weight="600" fill="{t["accent"]}" text-anchor="middle">Code</text>',
-        f'<text x="418" y="230" font-family="{SANS_FONT}" font-size="13.5" font-weight="500" fill="{t["fg"]}" text-anchor="start">26 graph langs · 43 outline formats</text>',
-        f'<text x="418" y="252" font-family="{SANS_FONT}" font-size="12.5" fill="{t["muted"]}" text-anchor="start">map --explain · lookup --graph · query · expand</text>',
-        f'<line x1="302" y1="284" x2="832" y2="284" stroke="{t["border"]}"/>',
+        f'<rect x="362" y="218" width="96" height="28" rx="14" fill="{t["pill_bg"]}"/>',
+        f'<text x="410" y="237" font-family="{SANS_FONT}" font-size="13" font-weight="600" fill="{t["accent"]}" text-anchor="middle">Code</text>',
+        f'<text x="474" y="230" font-family="{SANS_FONT}" font-size="13.5" font-weight="500" fill="{t["fg"]}" text-anchor="start">26 graph langs · 48+ outline formats · AST rename</text>',
+        f'<text x="474" y="252" font-family="{SANS_FONT}" font-size="12.5" fill="{t["muted"]}" text-anchor="start">map --html/--explain · lookup --graph · query · expand</text>',
+        f'<line x1="358" y1="284" x2="888" y2="284" stroke="{t["border"]}"/>',
         # History row
-        f'<rect x="306" y="308" width="96" height="28" rx="14" fill="{t["pill_bg"]}"/>',
-        f'<text x="354" y="327" font-family="{SANS_FONT}" font-size="13" font-weight="600" fill="{t["accent"]}" text-anchor="middle">History</text>',
-        f'<text x="418" y="320" font-family="{SANS_FONT}" font-size="13.5" font-weight="500" fill="{t["fg"]}" text-anchor="start">duplicates · semantic cues · compaction</text>',
-        f'<text x="418" y="342" font-family="{SANS_FONT}" font-size="12.5" fill="{t["muted"]}" text-anchor="start">old tool results retired by ID across sessions</text>',
+        f'<rect x="362" y="308" width="96" height="28" rx="14" fill="{t["pill_bg"]}"/>',
+        f'<text x="410" y="327" font-family="{SANS_FONT}" font-size="13" font-weight="600" fill="{t["accent"]}" text-anchor="middle">History</text>',
+        f'<text x="474" y="320" font-family="{SANS_FONT}" font-size="13.5" font-weight="500" fill="{t["fg"]}" text-anchor="start">duplicates · semantic cues · multi-provider proxy</text>',
+        f'<text x="474" y="342" font-family="{SANS_FONT}" font-size="12.5" fill="{t["muted"]}" text-anchor="start">cache-safe --compact-live · prefix-drift · recall by ID</text>',
         # Right card: Context window
-        f'<rect x="948" y="40" width="172" height="340" rx="14" fill="{t["card_bg"]}" stroke="{t["border"]}"/>',
-        f'<text x="968" y="78" font-family="{SANS_FONT}" font-size="16" font-weight="600" fill="{t["fg"]}" text-anchor="start">Context window</text>',
-        f'<rect x="964" y="124" width="140" height="50" rx="8" fill="{t["recessed_bg"]}" stroke="{t["border"]}"/>',
-        f'<text x="976" y="145" font-family="{MONO_FONT}" font-size="12" fill="{t["fg"]}" text-anchor="start">3 failing tests</text>',
-        f'<text x="976" y="162" font-family="{MONO_FONT}" font-size="11" fill="{t["muted"]}" text-anchor="start">run-7Gq2 · exit 1</text>',
-        f'<path d="M858 149 L940 149" stroke="{t["accent"]}" stroke-width="1.8" fill="none" marker-end="url(#arrow-accent)"/>',
-        f'<rect x="964" y="214" width="140" height="50" rx="8" fill="{t["recessed_bg"]}" stroke="{t["border"]}"/>',
-        f'<text x="976" y="235" font-family="{MONO_FONT}" font-size="12" fill="{t["fg"]}" text-anchor="start">outline</text>',
-        f'<text x="976" y="252" font-family="{MONO_FONT}" font-size="11" fill="{t["muted"]}" text-anchor="start">40 rows · rev#12</text>',
-        f'<path d="M858 239 L940 239" stroke="{t["accent"]}" stroke-width="1.8" fill="none" marker-end="url(#arrow-accent)"/>',
-        f'<rect x="964" y="304" width="140" height="50" rx="8" fill="{t["recessed_bg"]}" stroke="{t["border"]}"/>',
-        f'<text x="976" y="325" font-family="{MONO_FONT}" font-size="12" fill="{t["fg"]}" text-anchor="start">recall 9f3c…</text>',
-        f'<text x="976" y="342" font-family="{MONO_FONT}" font-size="11" fill="{t["muted"]}" text-anchor="start">archived result</text>',
-        f'<path d="M858 329 L940 329" stroke="{t["accent"]}" stroke-width="1.8" fill="none" marker-end="url(#arrow-accent)"/>',
+        f'<rect x="1004" y="40" width="176" height="340" rx="14" fill="{t["card_bg"]}" stroke="{t["border"]}"/>',
+        f'<text x="1024" y="78" font-family="{SANS_FONT}" font-size="16" font-weight="600" fill="{t["fg"]}" text-anchor="start">Context window</text>',
+        f'<rect x="1020" y="124" width="144" height="50" rx="8" fill="{t["recessed_bg"]}" stroke="{t["border"]}"/>',
+        f'<text x="1032" y="145" font-family="{MONO_FONT}" font-size="12" fill="{t["fg"]}" text-anchor="start">3 failing tests</text>',
+        f'<text x="1032" y="162" font-family="{MONO_FONT}" font-size="11" fill="{t["muted"]}" text-anchor="start">run-7Gq2 · exit 1</text>',
+        f'<path d="M914 149 L996 149" stroke="{t["accent"]}" stroke-width="1.8" fill="none" marker-end="url(#arrow-accent)"/>',
+        f'<rect x="1020" y="214" width="144" height="50" rx="8" fill="{t["recessed_bg"]}" stroke="{t["border"]}"/>',
+        f'<text x="1032" y="235" font-family="{MONO_FONT}" font-size="12" fill="{t["fg"]}" text-anchor="start">outline</text>',
+        f'<text x="1032" y="252" font-family="{MONO_FONT}" font-size="11" fill="{t["muted"]}" text-anchor="start">40 rows · rev#12</text>',
+        f'<path d="M914 239 L996 239" stroke="{t["accent"]}" stroke-width="1.8" fill="none" marker-end="url(#arrow-accent)"/>',
+        f'<rect x="1020" y="304" width="144" height="50" rx="8" fill="{t["recessed_bg"]}" stroke="{t["border"]}"/>',
+        f'<text x="1032" y="325" font-family="{MONO_FONT}" font-size="12" fill="{t["fg"]}" text-anchor="start">recall 9f3c…</text>',
+        f'<text x="1032" y="342" font-family="{MONO_FONT}" font-size="11" fill="{t["muted"]}" text-anchor="start">archived result</text>',
+        f'<path d="M914 329 L996 329" stroke="{t["accent"]}" stroke-width="1.8" fill="none" marker-end="url(#arrow-accent)"/>',
         # Connectors & labels
-        f'<path d="M194 210 L274 210" stroke="{t["raw_bar"]}" stroke-width="1.6" fill="none" marker-end="url(#arrow)"/>',
-        f'<text x="235" y="198" font-family="{SANS_FONT}" font-size="12" fill="{t["muted"]}" text-anchor="middle">hooks · MCP</text>',
-        f'<text x="235" y="232" font-family="{SANS_FONT}" font-size="12" fill="{t["muted"]}" text-anchor="middle">CLI</text>',
-        f'<text x="900" y="119" font-family="{SANS_FONT}" font-size="12" font-weight="600" fill="{t["accent"]}" text-anchor="middle">compact</text>',
-        f'<text x="900" y="135" font-family="{SANS_FONT}" font-size="12" font-weight="600" fill="{t["accent"]}" text-anchor="middle">by default</text>',
-        f'<path d="M567 386 L567 422" stroke="{t["raw_bar"]}" stroke-width="1.6" fill="none" marker-end="url(#arrow)"/>',
-        f'<text x="580" y="410" font-family="{SANS_FONT}" font-size="12" fill="{t["muted"]}" text-anchor="start">full output, archived</text>',
+        f'<path d="M250 210 L330 210" stroke="{t["raw_bar"]}" stroke-width="1.6" fill="none" marker-end="url(#arrow)"/>',
+        f'<text x="291" y="198" font-family="{SANS_FONT}" font-size="12" fill="{t["muted"]}" text-anchor="middle">hooks · MCP</text>',
+        f'<text x="291" y="232" font-family="{SANS_FONT}" font-size="12" fill="{t["muted"]}" text-anchor="middle">CLI</text>',
+        f'<text x="956" y="119" font-family="{SANS_FONT}" font-size="12" font-weight="600" fill="{t["accent"]}" text-anchor="middle">compact</text>',
+        f'<text x="956" y="135" font-family="{SANS_FONT}" font-size="12" font-weight="600" fill="{t["accent"]}" text-anchor="middle">by default</text>',
+        f'<path d="M623 386 L623 422" stroke="{t["raw_bar"]}" stroke-width="1.6" fill="none" marker-end="url(#arrow)"/>',
+        f'<text x="636" y="410" font-family="{SANS_FONT}" font-size="12" fill="{t["muted"]}" text-anchor="start">full output, archived</text>',
         # Bottom archive box: .justless/
-        f'<rect x="282" y="430" width="570" height="90" rx="14" fill="{t["recessed_bg"]}" stroke="{t["border"]}" stroke-dasharray="5 4"/>',
-        f'<text x="306" y="466" font-family="{MONO_FONT}" font-size="15" font-weight="600" fill="{t["fg"]}" text-anchor="start">.justless/</text>',
-        f'<text x="414" y="466" font-family="{MONO_FONT}" font-size="13" fill="{t["muted"]}" text-anchor="start">runs/ · index.json · observations/</text>',
-        f'<text x="306" y="494" font-family="{SANS_FONT}" font-size="13" fill="{t["muted"]}" text-anchor="start">Every byte kept locally, replayable exactly.</text>',
-        f'<path d="M858 475 L1022 475 Q1034 475 1034 463 L1034 388" stroke="{t["accent"]}" stroke-width="1.6" stroke-dasharray="6 5" fill="none" marker-end="url(#arrow-accent)"/>',
-        f'<text x="876" y="465" font-family="{SANS_FONT}" font-size="12" font-weight="600" fill="{t["accent"]}" text-anchor="start">exact on demand</text>',
-        f'<text x="876" y="495" font-family="{MONO_FONT}" font-size="12" fill="{t["muted"]}" text-anchor="start">log · expand · recall</text>',
+        f'<rect x="338" y="430" width="570" height="90" rx="14" fill="{t["recessed_bg"]}" stroke="{t["border"]}" stroke-dasharray="5 4"/>',
+        f'<text x="362" y="466" font-family="{MONO_FONT}" font-size="15" font-weight="600" fill="{t["fg"]}" text-anchor="start">.justless/</text>',
+        f'<text x="470" y="466" font-family="{MONO_FONT}" font-size="13" fill="{t["muted"]}" text-anchor="start">runs/ · index.bin · observations/</text>',
+        f'<text x="362" y="494" font-family="{SANS_FONT}" font-size="13" fill="{t["muted"]}" text-anchor="start">Every byte kept locally, replayable exactly.</text>',
+        f'<path d="M914 475 L1080 475 Q1092 475 1092 463 L1092 388" stroke="{t["accent"]}" stroke-width="1.6" stroke-dasharray="6 5" fill="none" marker-end="url(#arrow-accent)"/>',
+        f'<text x="932" y="465" font-family="{SANS_FONT}" font-size="12" font-weight="600" fill="{t["accent"]}" text-anchor="start">exact on demand</text>',
+        f'<text x="932" y="495" font-family="{MONO_FONT}" font-size="12" fill="{t["muted"]}" text-anchor="start">log · expand · recall</text>',
         "</svg>\n",
     ])
 
