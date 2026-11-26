@@ -80,7 +80,162 @@ function runClaudeHook(directory, mode, payload) {
   });
 }
 
+const RETRIEVAL_SUBCOMMANDS = new Set([
+  "recall", "log", "expand", "search", "read", "code", "run", "exec",
+]);
+
+const RUN_MARKER_RE = /^\[justless run-[A-Za-z0-9]+(?:\]| · )/m;
+const RECALL_MARKER_RE = /^\[justless recall [0-9a-f]{64}(?:\]| · )/m;
+
+function isCompactedOutput(text) {
+  if (typeof text !== "string" || !text) return false;
+  if (text.startsWith("[justless ") || text.startsWith("[justless]")) return true;
+  if (text.includes("[justless run-") && RUN_MARKER_RE.test(text)) return true;
+  if (text.includes("[justless recall ") && RECALL_MARKER_RE.test(text)) return true;
+  return false;
+}
+
+function splitShellSegments(command) {
+  const segments = [];
+  let current = "";
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+  for (let i = 0; i < command.length; i += 1) {
+    const ch = command[i];
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (!inSingle && ch === "\\") {
+      current += ch;
+      escaped = true;
+      continue;
+    }
+    if (!inDouble && ch === "'") {
+      inSingle = !inSingle;
+      current += ch;
+      continue;
+    }
+    if (!inSingle && ch === "\"") {
+      inDouble = !inDouble;
+      current += ch;
+      continue;
+    }
+    if (!inSingle && !inDouble) {
+      const two = command.slice(i, i + 2);
+      if (two === "&&" || two === "||") {
+        if (current.trim()) segments.push(current.trim());
+        current = "";
+        i += 1;
+        continue;
+      }
+      if (ch === ";" || ch === "|" || ch === "\n") {
+        if (current.trim()) segments.push(current.trim());
+        current = "";
+        continue;
+      }
+    }
+    current += ch;
+  }
+  if (current.trim()) segments.push(current.trim());
+  return segments;
+}
+
+function tokenizeSegment(segment) {
+  const tokens = [];
+  let cur = "";
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+  for (let i = 0; i < segment.length; i += 1) {
+    const ch = segment[i];
+    if (escaped) {
+      cur += ch;
+      escaped = false;
+      continue;
+    }
+    if (!inSingle && ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (!inDouble && ch === "'") {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (!inSingle && ch === "\"") {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (!inSingle && !inDouble && /\s/.test(ch)) {
+      if (cur) {
+        tokens.push(cur);
+        cur = "";
+      }
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur) tokens.push(cur);
+  return tokens;
+}
+
+function parseJustlessInvocation(segment) {
+  const tokens = tokenizeSegment(segment);
+  let i = 0;
+  while (i < tokens.length) {
+    const tok = tokens[i];
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) {
+      i += 1;
+      continue;
+    }
+    if (tok === "env" || tok === "command" || tok === "exec" || tok === "nohup" || tok === "time") {
+      i += 1;
+      while (i < tokens.length && (tokens[i].startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i]))) {
+        const flag = tokens[i];
+        i += 1;
+        if (flag === "--") break;
+      }
+      continue;
+    }
+    break;
+  }
+  if (i >= tokens.length) return undefined;
+  const exe = tokens[i];
+  const base = exe.split(/[\\/]/).pop();
+  const configured = binary().split(/[\\/]/).pop();
+  if (base !== "justless" && base !== "justless.exe" && base !== configured) {
+    return undefined;
+  }
+  i += 1;
+  while (i < tokens.length && tokens[i].startsWith("-")) {
+    const flag = tokens[i];
+    i += 1;
+    if ((flag === "--root" || flag === "-C") && i < tokens.length) {
+      i += 1;
+    }
+  }
+  return { subcommand: tokens[i] ?? "" };
+}
+
+function isJustlessCommand(command) {
+  if (typeof command !== "string" || !command.trim()) return false;
+  const segments = splitShellSegments(command);
+  if (segments.length === 0) return false;
+  if (segments.length === 1) {
+    return parseJustlessInvocation(segments[0]) !== undefined;
+  }
+  return segments.some((seg) => {
+    const inv = parseJustlessInvocation(seg);
+    return inv !== undefined && RETRIEVAL_SUBCOMMANDS.has(inv.subcommand);
+  });
+}
+
 async function afterBash(directory, command, stdout, sessionId) {
+  // Never re-compact explicit `justless recall|log|expand|search|...` calls or
+  // outputs already carrying Justless compaction/recall markers.
+  if (isJustlessCommand(command) || isCompactedOutput(stdout)) return undefined;
   const payload = {
     hook_event_name: "PostToolUse",
     tool_name: "Bash",
@@ -91,7 +246,9 @@ async function afterBash(directory, command, stdout, sessionId) {
   if (typeof sessionId === "string" && sessionId) payload.session_id = sessionId;
   const parsed = await runClaudeHook(directory, "after-bash", payload);
   const next = parsed?.hookSpecificOutput?.updatedToolOutput?.stdout;
-  return typeof next === "string" && next !== stdout ? next : undefined;
+  return typeof next === "string" && next !== stdout && next.length < stdout.length
+    ? next
+    : undefined;
 }
 
 function hasToolError(metadata) {
@@ -129,7 +286,7 @@ function extractReadContent(raw) {
     const numbered = inner.length === 0 ? [] : inner.split("\n");
     const unwrapped = [];
     for (const line of numbered) {
-      const m = line.match(/^\d+\| ?(.*)$/);
+      const m = line.match(/^\s*\d+\| ?(.*)$/);
       if (!m) return undefined;
       unwrapped.push(m[1]);
     }
@@ -142,7 +299,7 @@ function extractReadContent(raw) {
 }
 
 async function afterRead(directory, args, rawOutput, metadata, sessionId) {
-  if (rawOutput.length < 512 || rawOutput.startsWith("[justless recall ")) return;
+  if (rawOutput.length < 512 || isCompactedOutput(rawOutput)) return;
   if (hasToolError(metadata)) return;
   if (args?.allow_large === true || args?.allow_large === "true" || args?.pages != null) return;
   const rawPath = args?.filePath ?? args?.file_path ?? args?.path;
@@ -196,7 +353,7 @@ async function afterRead(directory, args, rawOutput, metadata, sessionId) {
 }
 
 async function afterSearch(directory, kind, args, rawOutput, metadata, sessionId) {
-  if (rawOutput.length < 1024 || rawOutput.startsWith("[justless recall ")) return;
+  if (rawOutput.length < 1024 || isCompactedOutput(rawOutput)) return;
   if (hasToolError(metadata)) return;
 
   const toolInput = {};
@@ -272,7 +429,7 @@ function partTargetKey(part) {
   }
   if (tool === "bash" || tool === "run_command" || tool === "exec_command" || tool === "shell") {
     const cmd = input.command ?? input.CommandLine ?? input.cmd;
-    if (typeof cmd !== "string" || !cmd.trim()) return;
+    if (typeof cmd !== "string" || !cmd.trim() || isJustlessCommand(cmd)) return;
     const cwd = normalizePathKey(input.cwd ?? input.workdir) ?? "";
     return { key: `bash:${cwd}:${cmd.trim()}` };
   }
@@ -393,6 +550,7 @@ export const Justless = async ({ directory }) => {
       }
     }
     let hasCandidate = false;
+    const sent = new Array(locations.length).fill(false);
     const parts = locations.map(({ part }, i) => {
       const canRetire = isRetirable(part);
       const out = canRetire ? part.state.output : "";
@@ -410,6 +568,7 @@ export const Justless = async ({ directory }) => {
         hasCandidate = true;
       }
       const send = canRetire && (i < cutoff || dup || targetShared);
+      sent[i] = send;
       const state = {
         status: part.state.status,
         output: send ? out : "",
@@ -420,10 +579,12 @@ export const Justless = async ({ directory }) => {
     if (!hasCandidate) return;
     try {
       const masked = await mask(directory, model, parts);
+      if (!Array.isArray(masked) || masked.length !== locations.length) return;
       // Copy only changed parts into the outbound view. Keep session records intact.
       for (const [k, { i, j, part }] of locations.entries()) {
-        const output = masked[k].state.output;
-        if (output === parts[k].state.output) continue;
+        if (!sent[k]) continue;
+        const output = masked[k]?.state?.output;
+        if (typeof output !== "string" || output === parts[k].state.output) continue;
         const message = messages[i];
         const updated = [...message.parts];
         updated[j] = { ...part, state: { ...part.state, output } };

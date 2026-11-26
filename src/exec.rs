@@ -4,6 +4,7 @@
 //!
 //! This isolates output, not code: scripts run with the caller's permissions.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -982,7 +983,7 @@ fn shape_text_preview_with_mode(
 ) -> ShapedText {
     let text = match redactor {
         Some(redactor) => redactor.text(raw),
-        None => std::borrow::Cow::Borrowed(raw),
+        None => Cow::Borrowed(raw),
     };
     let text = text.as_ref();
     if text.is_empty() || text.contains('\0') {
@@ -1097,24 +1098,41 @@ fn shape_json_view(text: &str, max_bytes: usize, group: bool) -> Option<Vec<u8>>
         .filter(|view| view.len() < text.len() && view.len() <= max_bytes)
 }
 
+fn strip_ansi(text: &str) -> Cow<'_, str> {
+    if !text.contains('\x1b') {
+        return Cow::Borrowed(text);
+    }
+    crate::capture::ANSI.replace_all(text, "")
+}
+
+fn decimal_digits(mut n: usize) -> usize {
+    let mut digits = 1;
+    while n >= 10 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
+}
+
 /// Clips a `jsonview` rendering at whole lines to `max_bytes`, keeping the legend,
 /// header, and whole rows unless too little would fit.
 fn clip_json_view(view: String, max_bytes: usize) -> Option<Vec<u8>> {
     if view.len() <= max_bytes {
         return Some(view.into_bytes());
     }
+    const MARKER_PREFIX: &str = "[";
+    const MARKER_SUFFIX: &str = " more lines of this view in the full log]\n";
     let lines = view.split_inclusive('\n').count();
-    let mut shown = String::new();
+    let mut shown = String::with_capacity(max_bytes);
     for (index, line) in view.split_inclusive('\n').enumerate() {
-        let marker = format!(
-            "[{} more lines of this view in the full log]\n",
-            lines - index
-        );
-        if shown.len() + line.len() + marker.len() > max_bytes {
+        let remaining = lines - index;
+        let marker_len = MARKER_PREFIX.len() + decimal_digits(remaining) + MARKER_SUFFIX.len();
+        if shown.len() + line.len() + marker_len > max_bytes {
             if index < 3 || shown.len() < max_bytes / 2 {
                 return None;
             }
-            shown.push_str(&marker);
+            use std::fmt::Write as _;
+            let _ = write!(shown, "{MARKER_PREFIX}{remaining}{MARKER_SUFFIX}");
             break;
         }
         shown.push_str(line);
@@ -1131,20 +1149,44 @@ fn format_logview(stream: &str, text: &str, max_bytes: usize) -> Option<String> 
     (folded.len() <= max_bytes && folded.len() < text.len()).then_some(folded)
 }
 
-fn has_json_key(line: &str, key: &str) -> bool {
-    let pattern = format!("\"{key}\"");
+fn has_json_key(line: &str, quoted_key: &str) -> bool {
     let mut offset = 0;
-    while let Some(pos) = line[offset..].find(&pattern) {
-        let after = &line[offset + pos + pattern.len()..];
+    while let Some(pos) = line[offset..].find(quoted_key) {
+        let after = &line[offset + pos + quoted_key.len()..];
         if after.trim_start().starts_with(':') {
             return true;
         }
-        offset += pos + pattern.len();
+        offset += pos + quoted_key.len();
     }
     false
 }
 
 fn is_json_log_line(line: &str) -> bool {
+    const LEVEL_KEYS: &[&str] = &[
+        "\"level\"",
+        "\"lvl\"",
+        "\"severity\"",
+        "\"levelname\"",
+        "\"log.level\"",
+        "\"priority\"",
+        "\"PRIORITY\"",
+    ];
+    const TS_KEYS: &[&str] = &[
+        "\"ts\"",
+        "\"timestamp\"",
+        "\"time\"",
+        "\"@timestamp\"",
+        "\"datetime\"",
+        "\"t\"",
+    ];
+    const MSG_KEYS: &[&str] = &[
+        "\"msg\"",
+        "\"message\"",
+        "\"event\"",
+        "\"error\"",
+        "\"err\"",
+    ];
+
     let trimmed = line.trim();
     let candidate = if trimmed.starts_with('{') && trimmed.ends_with('}') {
         trimmed
@@ -1156,29 +1198,26 @@ fn is_json_log_line(line: &str) -> bool {
             return false;
         }
     };
-    let has_level = ["level", "lvl", "severity", "levelname", "log.level"]
-        .iter()
-        .any(|k| has_json_key(candidate, k));
-    if has_level {
+    if LEVEL_KEYS.iter().any(|k| has_json_key(candidate, k)) {
         return true;
     }
-    let has_ts = ["ts", "timestamp", "time", "@timestamp", "datetime"]
-        .iter()
-        .any(|k| has_json_key(candidate, k));
-    let has_msg = ["msg", "message", "event", "error", "err"]
-        .iter()
-        .any(|k| has_json_key(candidate, k));
-    has_ts && has_msg
+    TS_KEYS.iter().any(|k| has_json_key(candidate, k))
+        && MSG_KEYS.iter().any(|k| has_json_key(candidate, k))
 }
 
 /// Whether `text` is NDJSON structured logs (at least 8 non-empty lines, mostly JSON
 /// objects carrying log keys such as `level`/`ts`/`msg`) rather than structured data.
 fn looks_like_json_logs(text: &str) -> bool {
+    let has_ansi = text.contains('\x1b');
     let mut sampled = 0usize;
     let mut json_objects = 0usize;
     let mut json_logs = 0usize;
     for raw in text.lines() {
-        let clean = crate::capture::ANSI.replace_all(raw, "");
+        let clean = if has_ansi {
+            strip_ansi(raw)
+        } else {
+            Cow::Borrowed(raw)
+        };
         let line = clean.trim();
         if line.is_empty() {
             continue;
@@ -1199,40 +1238,29 @@ fn looks_like_json_logs(text: &str) -> bool {
 }
 
 fn is_level_word_upper(word: &str) -> bool {
-    matches!(
-        word.to_ascii_uppercase().as_str(),
-        "TRACE"
-            | "TRC"
-            | "DEBUG"
-            | "DBG"
-            | "INFO"
-            | "INF"
-            | "LOG"
-            | "NOTICE"
-            | "WARN"
-            | "WARNING"
-            | "WRN"
-            | "ERROR"
-            | "ERR"
-            | "ERRO"
-            | "FATAL"
-            | "FATA"
-            | "CRIT"
-            | "CRITICAL"
-            | "PANIC"
-            | "SEVERE"
-    )
+    const LEVEL_WORDS: &[&str] = &[
+        "TRACE", "TRC", "DEBUG", "DBG", "INFO", "INF", "LOG", "NOTICE", "WARN", "WARNING", "WRN",
+        "ERROR", "ERR", "ERRO", "FATAL", "FATA", "CRIT", "CRITICAL", "PANIC", "SEVERE",
+    ];
+    LEVEL_WORDS
+        .iter()
+        .any(|level| word.eq_ignore_ascii_case(level))
 }
 
 /// Whether `text` looks like repetitive timestamped, JSON, level-prefixed, or
 /// container-prefixed structured logs eligible for `logview` folding. Plain numbered
 /// lines, CSV rows, and data exports return `false`.
 fn looks_like_structured_logs(text: &str) -> bool {
+    let has_ansi = text.contains('\x1b');
     let mut non_empty = 0usize;
     let mut sampled = 0usize;
     let mut structured = 0usize;
     for raw in text.lines() {
-        let clean = crate::capture::ANSI.replace_all(raw, "");
+        let clean = if has_ansi {
+            strip_ansi(raw)
+        } else {
+            Cow::Borrowed(raw)
+        };
         let line = clean.trim();
         if line.is_empty() {
             continue;
@@ -1303,7 +1331,13 @@ fn ruby_workspace_roots(workspace_root: Option<&Path>) -> Vec<String> {
 }
 
 fn classify_ruby_frame(raw_path: &str, roots: &[String]) -> (bool, String) {
-    let path = raw_path.trim().replace('\\', "/");
+    let trimmed = raw_path.trim();
+    let path_cow = if trimmed.contains('\\') {
+        Cow::Owned(trimmed.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(trimmed)
+    };
+    let path = path_cow.as_ref();
     if path.starts_with("<internal:") || path.starts_with("(eval") {
         return (false, "ruby:internal".to_owned());
     }
@@ -1369,6 +1403,10 @@ fn collapse_ruby_stacktrace(
     workspace_root: Option<&Path>,
     stream: Option<&str>,
 ) -> Option<String> {
+    if !text.contains(":in ") {
+        return None;
+    }
+    let has_ansi = text.contains('\x1b');
     let roots = ruby_workspace_roots(workspace_root);
     let mut out = String::with_capacity(text.len());
     let mut run: Vec<(usize, &str, String, String)> = Vec::new();
@@ -1421,10 +1459,17 @@ fn collapse_ruby_stacktrace(
     for (idx, raw) in text.split_inclusive('\n').enumerate() {
         let line_no = idx + 1;
         let stripped_nl = raw.strip_suffix('\n').unwrap_or(raw);
-        let plain_cow = crate::capture::ANSI.replace_all(stripped_nl, "");
+        let plain_cow = if has_ansi {
+            strip_ansi(stripped_nl)
+        } else {
+            Cow::Borrowed(stripped_nl)
+        };
         let plain = plain_cow.trim_end_matches('\r');
 
-        if let Some(caps) = RUBY_FRAME.captures(plain) {
+        if plain.starts_with([' ', '\t'])
+            && plain.contains(":in ")
+            && let Some(caps) = RUBY_FRAME.captures(plain)
+        {
             let indent = caps.get(1).map_or("", |m| m.as_str()).to_owned();
             let path = caps.get(2).map_or("", |m| m.as_str());
             let has_redacted = plain.contains("[redacted:");
@@ -1457,7 +1502,7 @@ fn outline_collapsed_text(
         return None;
     }
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    let mut head = String::new();
+    let mut head = String::with_capacity(max_bytes);
     let mut head_count = 0usize;
     for &line in &lines {
         if head.len() + line.len() > body / 2 {
@@ -1543,11 +1588,12 @@ fn intent_terms(intent: &str) -> Vec<IntentTerm> {
             continue;
         }
         intent_tokens(part, |_, token| {
-            let word = token.to_lowercase();
+            let mut word = token.to_lowercase();
             let single = word.chars().count() == 1 && !word.chars().all(|c| c.is_ascii_digit());
             if !single && !INTENT_STOPWORDS.contains(&word.as_str()) {
+                intent_stem_in_place(&mut word);
                 add(IntentTerm {
-                    text: intent_stem(&word),
+                    text: word,
                     phrase: false,
                 });
             }
@@ -1582,10 +1628,9 @@ fn intent_tokens(text: &str, mut emit: impl FnMut(usize, &str)) {
     }
 }
 
-fn intent_stem(word: &str) -> String {
-    let mut word = word.to_owned();
+fn intent_stem_in_place(word: &mut String) {
     if word.bytes().any(|b| b.is_ascii_digit()) {
-        return word;
+        return;
     }
     if word.len() > 4 && word.ends_with("ies") {
         word.truncate(word.len() - 3);
@@ -1611,7 +1656,6 @@ fn intent_stem(word: &str) -> String {
     if word.len() > 3 && word.ends_with('e') {
         word.pop();
     }
-    word
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1627,6 +1671,7 @@ struct IntentAnalysis {
     words: usize,
     shortest: usize,
     longest: usize,
+    scratch: String,
 }
 
 impl IntentAnalysis {
@@ -1638,6 +1683,7 @@ impl IntentAnalysis {
             words: 0,
             shortest: words.clone().map(|term| term.text.len()).min().unwrap_or(0),
             longest: words.map(|term| term.text.len() + 5).max().unwrap_or(0),
+            scratch: String::with_capacity(64),
         }
     }
 
@@ -1652,9 +1698,20 @@ impl IntentAnalysis {
             if !has_words || token.is_ascii() && !(shortest..=longest).contains(&token.len()) {
                 return;
             }
-            let word = intent_stem(&token.to_lowercase());
+            self.scratch.clear();
+            if token.is_ascii() {
+                self.scratch.push_str(token);
+                self.scratch.make_ascii_lowercase();
+            } else {
+                for ch in token.chars() {
+                    for lower in ch.to_lowercase() {
+                        self.scratch.push(lower);
+                    }
+                }
+            }
+            intent_stem_in_place(&mut self.scratch);
             for (index, term) in terms.iter().enumerate() {
-                if !term.phrase && term.text == word {
+                if !term.phrase && term.text == self.scratch {
                     self.counts[index] += 1;
                     if self.spans.len() < INTENT_SPAN_LIMIT {
                         self.spans.push(IntentSpan {
@@ -1725,7 +1782,7 @@ impl IntentExcerpt {
                 .min(text.len().saturating_sub(room)),
         );
         let end = text.floor_char_boundary((start + room).min(text.len()));
-        let mut excerpt = String::new();
+        let mut excerpt = String::with_capacity(cap.min(text.len() + 2 * '…'.len_utf8()));
         if self.before || start > 0 {
             excerpt.push('…');
         }
@@ -2668,7 +2725,8 @@ fn intent_preview(
         .map(|&range| intent_log_clause(justless, run_id, range))
         .unwrap_or_default();
 
-    let mut output = header;
+    let mut output = String::with_capacity(max_bytes);
+    output.push_str(&header);
     for shown in &shown {
         output.push_str(&shown.entry);
     }
@@ -3750,5 +3808,162 @@ done
         assert!(json_shaped.len() < rows.len());
         assert!(!json_shaped.contains("more lines of this view"));
         assert!(json_shaped.contains("svc-0") && json_shaped.contains("svc-59"));
+    }
+
+    #[test]
+    fn ansi_fast_path_and_wave8_to_11_compatibility_in_exec_shaper() {
+        let root = Path::new("/workspace");
+
+        // 1. Zero-alloc ANSI fast path borrows plain strings and strips colored ones.
+        assert!(matches!(strip_ansi("plain log line"), Cow::Borrowed(_)));
+        assert_eq!(strip_ansi("\x1b[31merror\x1b[0m"), "error");
+
+        // 2. UTF-8 BOM RFC 4180 CSV compacts in both default and lossless_only modes.
+        let mut bom_csv =
+            String::from("\u{feff}\"id\",\"service\",\"env\",\"status\",\"amount\"\n");
+        for i in 1..=60 {
+            let status = if i % 20 == 0 { "err" } else { "ok" };
+            bom_csv.push_str(&format!(
+                "\"{i}\",\"checkout\",\"prod\",\"{status}\",\"{:.2}\"\n",
+                10.0 + (i as f64) * 0.5
+            ));
+        }
+        let csv_lossless =
+            match shape_text_preview_with_mode(&bom_csv, 512, root, "stdout", false, None, true) {
+                ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+                _ => panic!("expected bijective csvview for UTF-8 BOM CSV in lossless_only mode"),
+            };
+        assert!(
+            csv_lossless.starts_with("[CSV 60 rows × 5 cols"),
+            "{csv_lossless}"
+        );
+        assert!(!csv_lossless.contains("rows omitted"), "{csv_lossless}");
+        assert!(csv_lossless.contains("service=checkout"), "{csv_lossless}");
+        assert!(csv_lossless.len() < bom_csv.len());
+
+        // 3. Escaped-pipe Markdown table compacts cleanly in lossless_only and bounded modes.
+        let mut md_table =
+            String::from("| id | env | expr | status |\n| --- | --- | --- | --- |\n");
+        for i in 1..=40 {
+            let status = if i == 17 { "fail" } else { "pass" };
+            md_table.push_str(&format!("| {i:03} | prod | a \\| b_{i:02} | {status} |\n"));
+        }
+        let table_lossless =
+            match shape_text_preview_with_mode(&md_table, 512, root, "stdout", false, None, true) {
+                ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+                _ => panic!("expected bijective tableview for escaped-pipe table"),
+            };
+        assert!(
+            table_lossless.starts_with("[table: 40 rows, TSV;"),
+            "{table_lossless}"
+        );
+        assert!(
+            table_lossless.contains(r"a \\| b_17") || table_lossless.contains("a | b_17"),
+            "{table_lossless}"
+        );
+        assert!(table_lossless.len() < md_table.len());
+
+        // 4. Zap/Pino/K8s JSON & plain klog bursts route to logview, and respect lossless_only.
+        let mut json_burst = String::new();
+        for i in 1..=40 {
+            json_burst.push_str(&format!(
+                r#"{{"time":{},"level":30,"service":"gateway","msg":"ok /orders/{i} 200 {}ms"}}"#,
+                1_712_001_700_000u64 + (i as u64) * 1000,
+                i + 2
+            ));
+            json_burst.push('\n');
+        }
+        json_burst.push_str(
+            r#"{"time":1712001750000,"level":50,"service":"gateway","msg":"upstream timeout","route":"/checkout","req_id":"req-42"}"#,
+        );
+        json_burst.push('\n');
+        let folded_json = match shape_text_preview(&json_burst, 2048, root, "stdout", false, None) {
+            ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+            _ => panic!("expected logview folding for Pino JSON burst"),
+        };
+        assert!(folded_json.contains("×40"), "{folded_json}");
+        assert!(
+            folded_json.contains("upstream timeout") && folded_json.contains("req_id=req-42"),
+            "{folded_json}"
+        );
+
+        let mut klog_burst = String::new();
+        for i in 1..=40 {
+            klog_burst.push_str(&format!(
+                "I1125 10:00:{:02}.123456       1 sync.go:88] Synced pod default/web-{i:04}\n",
+                i % 60
+            ));
+        }
+        klog_burst.push_str(
+            "E1125 10:01:00.654321       1 sync.go:104] Failed to bind volume pvc-orders\n",
+        );
+        let folded_klog = match shape_text_preview(&klog_burst, 2048, root, "stdout", false, None) {
+            ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+            _ => panic!("expected logview folding for klog burst"),
+        };
+        assert!(folded_klog.contains("×40"), "{folded_klog}");
+        assert!(
+            folded_klog.contains("Failed to bind volume pvc-orders"),
+            "{folded_klog}"
+        );
+        assert!(matches!(
+            shape_text_preview_with_mode(&klog_burst, 2048, root, "stdout", false, None, true),
+            ShapedText::Fallback
+        ));
+
+        // 5. Rust and Dart/Flutter stacktraces collapse external frames while lossless_only skips them.
+        let mut rust_trace = String::from(
+            "thread 'main' panicked at src/billing.rs:42:5:\noverflow\nstack backtrace:\n",
+        );
+        rust_trace.push_str("   0: billing::charge\n             at ./src/billing.rs:42:5\n");
+        for i in 1..=12 {
+            rust_trace.push_str(&format!(
+                "   {i}: std::rt::lang_start_internal\n             at /rustc/abcdef/library/std/src/rt.rs:{}\n",
+                100 + i
+            ));
+        }
+        let rust_collapsed =
+            match shape_text_preview(&rust_trace, 4096, root, "stderr", false, None) {
+                ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+                _ => panic!("expected Rust stacktrace collapse"),
+            };
+        assert!(
+            rust_collapsed.contains("src/billing.rs:42:5"),
+            "{rust_collapsed}"
+        );
+        assert!(
+            rust_collapsed.contains("runtime/dependency frames"),
+            "{rust_collapsed}"
+        );
+        assert!(matches!(
+            shape_text_preview_with_mode(&rust_trace, 4096, root, "stderr", false, None, true),
+            ShapedText::Fallback
+        ));
+
+        let mut dart_trace = String::from("Unhandled exception:\nStateError: bad state\n");
+        dart_trace.push_str("#0      CheckoutBloc.submit (package:app/checkout.dart:88:7)\n");
+        for i in 1..=12 {
+            dart_trace.push_str(&format!(
+                "#{i:<6} _rootRunUnary (dart:async/zone.dart:{}:47)\n",
+                1400 + i
+            ));
+        }
+        let dart_collapsed =
+            match shape_text_preview(&dart_trace, 4096, root, "stderr", false, None) {
+                ShapedText::Ready(bytes) => String::from_utf8(bytes).unwrap(),
+                _ => panic!("expected Dart stacktrace collapse"),
+            };
+        assert!(
+            dart_collapsed.contains("package:app/checkout.dart:88:7"),
+            "{dart_collapsed}"
+        );
+        assert!(
+            dart_collapsed.contains("runtime/dependency frames"),
+            "{dart_collapsed}"
+        );
+        assert!(matches!(
+            shape_text_preview_with_mode(&dart_trace, 4096, root, "stderr", false, None, true),
+            ShapedText::Fallback
+        ));
     }
 }

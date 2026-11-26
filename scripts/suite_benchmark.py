@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproducible Wave 1-6 benchmark suite exercising 18 real Justless compactors.
+"""Reproducible Wave 1-11 benchmark suite exercising 26 real Justless compactors.
 
 Every byte measured here is genuinely produced by the target `justless` binary
 inside an isolated temporary workspace (never modifying the repository's own
@@ -1851,6 +1851,976 @@ def case_18_graph_and_mask(binary: Path, repo_copy: Path, work: Path, home: Path
     )
 
 
+# ---------------------------------------------------------------------------
+# Case 19: csv_1000_rows (RFC 4180 CSV with UTF-8 BOM via `justless exec` / `csvview`)
+# ---------------------------------------------------------------------------
+def case_19_csv_1000_rows(binary: Path, work: Path, home: Path) -> dict[str, Any]:
+    case_dir = work / "case19"
+    ws = case_dir / "ws"
+    ws.mkdir(parents=True)
+    (ws / ".justless.toml").write_text("", encoding="utf-8")
+    env = clean_env(home)
+
+    csv_script = (
+        r"""printf '\357\273\277"id","timestamp","service","env","region","status","active","latency_ms","amount_usd","request_note"\n'
+i=1
+while [ $i -le 1000 ]; do
+  case $((i % 4)) in
+    0) region=us-east-1 ;;
+    1) region=eu-west-1 ;;
+    2) region=us-west-2 ;;
+    *) region=ap-south-1 ;;
+  esac
+  if [ $((i % 25)) -eq 0 ]; then
+    status=timeout
+  elif [ $((i % 50)) -eq 1 ]; then
+    status=err
+  else
+    status=ok
+  fi
+  if [ $((i % 3)) -eq 0 ]; then active=false; else active=true; fi
+  if [ $((i % 100)) -eq 0 ]; then latency=""; else latency=$((4 + (i * 19) % 1847)); fi
+  printf '"%d","2026-01-01T%02d:%02d:00Z","checkout","prod","%s","%s","%s","%s","%d.50","checkout,span_%06d_shard_%d"\n' \
+    "$i" "$(((i / 60) % 24))" "$((i % 60))" "$region" "$status" "$active" "$latency" "$((1 + (i % 400)))" "$i" "$((i % 16))"
+  i=$((i + 1))
+done
+"""
+    )
+
+    t0 = time.monotonic()
+    raw = run_cmd(["sh", "-c", csv_script], ws, env)
+    jl = run_cmd([str(binary), "exec", "--lang", "sh", csv_script], ws, env)
+    elapsed = (time.monotonic() - t0) * 1000.0
+
+    run_id = extract_run_id(jl)
+    if not run_id:
+        raise AssertionError(
+            f"[csv_1000_rows] missing run ID\nstdout:\n{jl.stdout.decode('utf-8', 'replace')}\n"
+            f"stderr:\n{jl.stderr.decode('utf-8', 'replace')}"
+        )
+    raw_out = raw.stdout.decode("utf-8", errors="replace")
+    jl_out = jl.stdout.decode("utf-8", errors="replace")
+    assert_contains(jl_out, "[CSV 1000 rows × 10 cols · exact data in full log]", "csv_1000_rows")
+    assert_contains(jl_out, "service=checkout", "csv_1000_rows")
+    assert_contains(jl_out, "env=prod", "csv_1000_rows")
+    assert_contains(jl_out, "status?=ok", "csv_1000_rows")
+    assert_contains(jl_out, "[stdout:10-997]", "csv_1000_rows")
+    assert_range_replays(binary, ws, env, run_id, jl_out, {"stdout": raw_out}, "csv_1000_rows", "stdout")
+    full_replay = replay_log(binary, ws, env, run_id, "stdout")
+    if full_replay != raw_out or not raw.stdout.startswith(b"\xef\xbb\xbf"):
+        raise AssertionError("[csv_1000_rows] full archive replay mismatch or missing UTF-8 BOM")
+
+    return make_case(
+        case_id="csv_1000_rows",
+        label="csvview (exec)",
+        subtitle="1,000-row RFC 4180 CSV",
+        category="tables",
+        raw_bytes=len(raw.stdout),
+        justless_bytes=len(jl.stdout) + len(jl.stderr),
+        raw_lines=count_lines(raw.stdout),
+        justless_lines=count_lines(jl.stdout) + count_lines(jl.stderr),
+        exit_code=jl.returncode,
+        expected_exit=0,
+        elapsed_ms=elapsed,
+        checks=[
+            "UTF-8 BOM + RFC 4180 quoted commas compacted via csvview",
+            "per-column schema + const/majority hoisting preserved",
+            "exact [stdout:10-997] & full BOM archive replay verified",
+        ],
+        run_id=run_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Case 20: kubectl_diff + helm_template (K8s managedFields folding + manifest Secret safety)
+# ---------------------------------------------------------------------------
+def case_20_kubectl_diff_helm_template(binary: Path, work: Path, home: Path) -> dict[str, Any]:
+    case_dir = work / "case20"
+    bin_dir = case_dir / "bin"
+    ws = case_dir / "ws"
+    ws.mkdir(parents=True)
+    (ws / ".justless.toml").write_text("", encoding="utf-8")
+
+    # 20a: kubectl diff with huge last-applied-configuration + managedFields noise + real spec diffs
+    last_applied_old = json.dumps(
+        {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "spec": {
+                "env": [
+                    {"name": f"VAR_{i:02d}", "value": f"old-val-{i:04d}"}
+                    for i in range(40)
+                ]
+            },
+        },
+        separators=(",", ":"),
+    )
+    last_applied_new = last_applied_old.replace("old-val-", "new-val-")
+    diff_lines = [
+        "diff -u -N /tmp/LIVE-12345/apps.v1.Deployment.prod.api /tmp/MERGED-12345/apps.v1.Deployment.prod.api",
+        "--- /tmp/LIVE-12345/apps.v1.Deployment.prod.api\t2026-11-25 10:00:00.000000000 +0000",
+        "+++ /tmp/MERGED-12345/apps.v1.Deployment.prod.api\t2026-11-25 10:00:00.000000000 +0000",
+        "@@ -1,150 +1,150 @@",
+        " apiVersion: apps/v1",
+        " kind: Deployment",
+        " metadata:",
+        "   annotations:",
+        "-    kubectl.kubernetes.io/last-applied-configuration: |",
+        f"-      {last_applied_old}",
+        "+    kubectl.kubernetes.io/last-applied-configuration: |",
+        f"+      {last_applied_new}",
+        '     prometheus.io/scrape: "true"',
+        '-  creationTimestamp: "2025-10-01T00:00:00Z"',
+        "-  generation: 14",
+        '+  creationTimestamp: "2025-10-01T00:00:00Z"',
+        "+  generation: 15",
+        "   managedFields:",
+        "   - apiVersion: apps/v1",
+        "     fieldsType: FieldsV1",
+        "     fieldsV1:",
+        "       f:metadata:",
+        "         f:annotations:",
+    ]
+    diff_lines.extend(f"           f:noise-field-{i:02d}: {{}}" for i in range(60))
+    diff_lines.extend(
+        [
+            "     manager: kubectl-client-side-apply",
+            "     operation: Update",
+            '     time: "2026-11-25T09:00:00Z"',
+            "   name: api",
+            "   namespace: prod",
+            '-  resourceVersion: "8841201"',
+            '+  resourceVersion: "8841202"',
+            "   uid: 9a8b7c6d-1111-2222-3333-444455556666",
+            " spec:",
+            "-  replicas: 2",
+            "+  replicas: 4",
+            "   selector:",
+            "     matchLabels:",
+            "       app: api",
+            "   template:",
+            "     metadata:",
+            "       labels:",
+            "         app: api",
+            "         tier: backend",
+            "     spec:",
+            "       serviceAccountName: api-sa",
+            "       containers:",
+            "       - name: api",
+            "-        image: ghcr.io/acme/api:1.4.1",
+            "+        image: ghcr.io/acme/api:1.4.2",
+            "         env:",
+            "         - name: LOG_LEVEL",
+            "-          value: info",
+            "+          value: debug",
+            "         ports:",
+            "         - containerPort: 8080",
+            "         resources:",
+            "           limits:",
+            "-            memory: 256Mi",
+            "+            memory: 512Mi",
+        ]
+    )
+    for svc in ("billing", "worker", "scheduler"):
+        diff_lines.extend(
+            [
+                f"diff -u -N /tmp/LIVE-12345/v1.Service.prod.{svc} /tmp/MERGED-12345/v1.Service.prod.{svc}",
+                f"--- /tmp/LIVE-12345/v1.Service.prod.{svc}\t2026-11-25 10:00:00.000000000 +0000",
+                f"+++ /tmp/MERGED-12345/v1.Service.prod.{svc}\t2026-11-25 10:00:00.000000000 +0000",
+                "@@ -1,40 +1,40 @@",
+                " apiVersion: v1",
+                " kind: Service",
+                " metadata:",
+                "   managedFields:",
+                "   - apiVersion: v1",
+                "     fieldsType: FieldsV1",
+                "     fieldsV1:",
+            ]
+        )
+        diff_lines.extend(f"       f:field-{i:02d}: {{}}" for i in range(25))
+        diff_lines.extend(
+            [
+                f"   name: {svc}",
+                "   namespace: prod",
+                '-  resourceVersion: "1001"',
+                '+  resourceVersion: "1002"',
+                "-  generation: 2",
+                "+  generation: 3",
+            ]
+        )
+    diff_out = "\n".join(diff_lines) + "\n"
+
+    # 20b: helm template multi-doc K8s manifests + Secret key-count safety
+    helm_lines = ["WARNING: Kubernetes configuration file is group-readable."]
+    for i in range(1, 9):
+        helm_lines.extend(
+            [
+                "---",
+                f"# Source: app/templates/deployment-{i}.yaml",
+                "apiVersion: apps/v1",
+                "kind: Deployment",
+                "metadata:",
+                f"  name: svc-{i:02d}",
+                "  namespace: prod",
+                "  labels:",
+                f"    app.kubernetes.io/name: svc-{i:02d}",
+                "    helm.sh/chart: app-1.4.2",
+                "spec:",
+                "  replicas: 3",
+                "  selector:",
+                "    matchLabels:",
+                f"      app: svc-{i:02d}",
+                "  template:",
+                "    metadata:",
+                "      labels:",
+                f"        app: svc-{i:02d}",
+                "    spec:",
+                f"      serviceAccountName: svc-{i:02d}",
+                "      containers:",
+                "        - name: app",
+                f'          image: "ghcr.io/acme/svc-{i:02d}:1.4.2"',
+                "          ports:",
+                "            - containerPort: 8080",
+                "          env:",
+                "            - name: ENV",
+                "              value: prod",
+                "          resources:",
+                "            requests:",
+                "              cpu: 100m",
+                "              memory: 128Mi",
+                "            limits:",
+                "              cpu: 500m",
+                "              memory: 512Mi",
+                "---",
+                f"# Source: app/templates/service-{i}.yaml",
+                "apiVersion: v1",
+                "kind: Service",
+                "metadata:",
+                f"  name: svc-{i:02d}",
+                "  namespace: prod",
+                "spec:",
+                "  type: ClusterIP",
+                "  ports:",
+                "    - port: 8080",
+                "      targetPort: 8080",
+                "      protocol: TCP",
+                "  selector:",
+                f"    app: svc-{i:02d}",
+                "---",
+                f"# Source: app/templates/configmap-{i}.yaml",
+                "apiVersion: v1",
+                "kind: ConfigMap",
+                "metadata:",
+                f"  name: cfg-{i:02d}",
+                "  namespace: prod",
+                "data:",
+            ]
+        )
+        helm_lines.extend(
+            f'  KEY_{k:02d}: "value-for-svc-{i:02d}-key-{k:02d}"' for k in range(1, 17)
+        )
+    secret_val_a = "".join(["c3VwZXIt", "c2VjcmV0", "LXZhbHVl"])
+    secret_val_b = "".join(["YW5vdGhlci", "1zZWNyZXQ", "tdmFsdWU="])
+    helm_lines.extend(
+        [
+            "---",
+            "# Source: app/templates/secret.yaml",
+            "apiVersion: v1",
+            "kind: Secret",
+            "metadata:",
+            "  name: db-creds",
+            "  namespace: prod",
+            "type: Opaque",
+            "data:",
+            f"  DB_PASS: {secret_val_a}",
+            f"  API_KEY: {secret_val_b}",
+        ]
+    )
+    helm_out = "\n".join(helm_lines) + "\n"
+
+    write_fixture_shim(bin_dir, "kubectl", case_dir, diff_out, "", exit_code=1)
+    write_fixture_shim(bin_dir, "helm", case_dir, helm_out, "", exit_code=0)
+    env = clean_env(home, bin_dir)
+
+    t0 = time.monotonic()
+    raw_a, jl_a, rid_a = run_hook_pair(binary, ws, env, ["kubectl", "-n", "prod", "diff", "-f", "k8s/"])
+    raw_b, jl_b, rid_b = run_hook_pair(binary, ws, env, ["helm", "template", "app", "./charts/app"])
+    elapsed = (time.monotonic() - t0) * 1000.0
+
+    out_a = jl_a.stdout.decode("utf-8", errors="replace")
+    out_b = jl_b.stdout.decode("utf-8", errors="replace")
+    if jl_a.returncode != 1 or jl_b.returncode != 0:
+        raise AssertionError(
+            f"[kubectl_diff_helm_template] exit codes: diff={jl_a.returncode}, helm={jl_b.returncode}"
+        )
+    assert_contains(out_a, "-  replicas: 2", "kubectl_diff")
+    assert_contains(out_a, "+  replicas: 4", "kubectl_diff")
+    assert_contains(out_a, "+        image: ghcr.io/acme/api:1.4.2", "kubectl_diff")
+    assert_contains(out_a, "folded metadata:", "kubectl_diff")
+    assert_contains(out_a, "managedFields", "kubectl_diff")
+    assert_contains(out_a, "Service/prod/billing (metadata-only diff;", "kubectl_diff")
+    if "f:noise-field-20" in out_a:
+        raise AssertionError(f"[kubectl_diff] managedFields noise leaked:\n{out_a}")
+    assert_range_replays(binary, ws, env, rid_a, out_a, {"stdout": diff_out}, "kubectl_diff", "stdout")
+
+    assert_contains(out_b, "WARNING: Kubernetes configuration file is group-readable. [stdout:1]", "helm_template")
+    assert_contains(out_b, "Deployment/svc-01 (3 replicas, image=ghcr.io/acme/svc-01:1.4.2)", "helm_template")
+    assert_contains(out_b, "Secret/db-creds (2 keys) [stdout:", "helm_template")
+    if secret_val_a in out_b or secret_val_b in out_b:
+        raise AssertionError(f"[helm_template] Secret base64 value leaked:\n{out_b}")
+    dep_line = next((ln for ln in out_b.splitlines() if "Deployment/svc-01 " in ln), "")
+    assert_range_replays(binary, ws, env, rid_b, dep_line, {"stdout": helm_out}, "helm_template", "stdout")
+    unredacted = run_cmd([str(binary), "log", rid_b, "--stream", "stdout", "--unredacted"], ws, env)
+    if unredacted.returncode != 0 or unredacted.stdout.decode("utf-8", errors="replace") != helm_out:
+        raise AssertionError("[helm_template] unredacted archive replay mismatch")
+
+    return make_case(
+        case_id="kubectl_diff_helm_template",
+        label="kubectl diff + helm",
+        subtitle="managedFields + Secret-safe",
+        category="infra",
+        raw_bytes=len(raw_a.stdout) + len(raw_b.stdout),
+        justless_bytes=len(jl_a.stdout) + len(jl_a.stderr) + len(jl_b.stdout) + len(jl_b.stderr),
+        raw_lines=count_lines(raw_a.stdout) + count_lines(raw_b.stdout),
+        justless_lines=count_lines(jl_a.stdout) + count_lines(jl_a.stderr) + count_lines(jl_b.stdout) + count_lines(jl_b.stderr),
+        exit_code=jl_a.returncode,
+        expected_exit=1,
+        elapsed_ms=elapsed,
+        checks=[
+            "kubectl diff folds managedFields + last-applied while keeping spec diffs",
+            "helm template summarizes multi-doc manifests & hides Secret base64 values",
+            "exact [stdout:A-B] replay on both",
+        ],
+        subcases=[
+            {
+                "id": "kubectl_diff",
+                "raw_bytes": len(raw_a.stdout),
+                "justless_bytes": len(jl_a.stdout) + len(jl_a.stderr),
+                "run_id": rid_a,
+            },
+            {
+                "id": "helm_template",
+                "raw_bytes": len(raw_b.stdout),
+                "justless_bytes": len(jl_b.stdout) + len(jl_b.stderr),
+                "run_id": rid_b,
+            },
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Case 21: aws_s3_ls_recursive (`aws s3 ls --recursive` prefix grouping)
+# ---------------------------------------------------------------------------
+def case_21_aws_s3_ls_recursive(binary: Path, work: Path, home: Path) -> dict[str, Any]:
+    case_dir = work / "case21"
+    bin_dir = case_dir / "bin"
+    ws = case_dir / "ws"
+    ws.mkdir(parents=True)
+    (ws / ".justless.toml").write_text("", encoding="utf-8")
+
+    lines = [
+        "                           PRE analytics/",
+        "                           PRE raw/",
+    ]
+    for i in range(1, 151):
+        lines.append(
+            f"2026-11-25 10:22:{i % 60:02d}    {1024 * 512 + i * 1024:>9} data/2026/01/part-{i:05d}.parquet"
+        )
+    for i in range(1, 101):
+        lines.append(
+            f"2026-11-25 11:10:{i % 60:02d}    {16384 + i * 256:>9} logs/app/2026-11-25-{i:04d}.log.gz"
+        )
+    lines.extend(
+        [
+            "2026-11-25 12:00:00       4096 manifest.json",
+            "Total Objects: 251",
+            "   Total Size: 92450000",
+        ]
+    )
+    s3_out = "\n".join(lines) + "\n"
+    write_fixture_shim(bin_dir, "aws", case_dir, s3_out, "", exit_code=0)
+    env = clean_env(home, bin_dir)
+
+    t0 = time.monotonic()
+    raw, jl, run_id = run_hook_pair(
+        binary, ws, env, ["aws", "s3", "ls", "s3://acme-lake/", "--recursive"]
+    )
+    elapsed = (time.monotonic() - t0) * 1000.0
+
+    jl_out = jl.stdout.decode("utf-8", errors="replace")
+    assert_contains(jl_out, "PRE analytics/ [stdout:1]", "aws_s3_ls_recursive")
+    assert_contains(jl_out, "data/2026/01/", "aws_s3_ls_recursive")
+    assert_contains(jl_out, "150 files", "aws_s3_ls_recursive")
+    assert_contains(jl_out, ".parquet ×150", "aws_s3_ls_recursive")
+    assert_contains(jl_out, "logs/app/", "aws_s3_ls_recursive")
+    assert_contains(jl_out, "100 files", "aws_s3_ls_recursive")
+    assert_contains(jl_out, ".log.gz ×100", "aws_s3_ls_recursive")
+    assert_contains(jl_out, "manifest.json", "aws_s3_ls_recursive")
+    assert_range_replays(binary, ws, env, run_id, jl_out, {"stdout": s3_out}, "aws_s3_ls_recursive", "stdout")
+
+    return make_case(
+        case_id="aws_s3_ls_recursive",
+        label="aws s3 ls",
+        subtitle="251 objects · prefix groups",
+        category="infra",
+        raw_bytes=len(raw.stdout),
+        justless_bytes=len(jl.stdout) + len(jl.stderr),
+        raw_lines=count_lines(raw.stdout),
+        justless_lines=count_lines(jl.stdout) + count_lines(jl.stderr),
+        exit_code=jl.returncode,
+        expected_exit=0,
+        elapsed_ms=elapsed,
+        checks=[
+            "PRE prefixes & root manifest.json preserved",
+            "250 nested objects grouped by directory & extension",
+            "exact [stdout:A-B] replay verified",
+        ],
+        run_id=run_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Case 22: flutter_test_noisy (`flutter test` noisy passing + multi-failure dedup)
+# ---------------------------------------------------------------------------
+def case_22_flutter_test_noisy(binary: Path, work: Path, home: Path) -> dict[str, Any]:
+    case_dir = work / "case22"
+    ws_pass = case_dir / "ws_pass"
+    ws_fail = case_dir / "ws_fail"
+    bin_pass = case_dir / "bin_pass"
+    bin_fail = case_dir / "bin_fail"
+    ws_pass.mkdir(parents=True)
+    ws_fail.mkdir(parents=True)
+    (ws_pass / ".justless.toml").write_text("", encoding="utf-8")
+    (ws_fail / ".justless.toml").write_text("", encoding="utf-8")
+
+    # 22a: noisy passing run
+    pass_lines = ["00:00 +0: loading test/widget_test.dart"]
+    for i in range(1, 81):
+        pass_lines.append(
+            f"00:{i // 10:02d} +{i}: test/widget_test.dart: widget scenario {i:02d} renders expected state"
+        )
+    pass_lines.append("00:08 +80: All tests passed!")
+    pass_out = "\n".join(pass_lines) + "\n"
+
+    # 22b: failing run with deduplicated auth failures + Flutter widget exception banner
+    fail_lines = ["00:00 +0: loading test/auth_test.dart"]
+    for i in range(1, 51):
+        fail_lines.append(f"00:01 +{i}: test/auth_test.dart: valid auth case {i:02d}")
+    fail_lines.extend(
+        [
+            "00:03 +50 -1: test/auth_test.dart: rejects expired token [E]",
+            "  Expected: <200>",
+            "    Actual: <401> at 2026-11-25T10:00:01Z (0x7f1234560001)",
+            "",
+            "  package:matcher                                     expect",
+            "  package:flutter_test/src/widget_tester.dart 473:18  expect",
+            "  test/auth_test.dart 42:5                            main.<fn>",
+            "",
+            "00:03 +50 -2: test/auth_test.dart: rejects revoked token [E]",
+            "  Expected: <200>",
+            "    Actual: <401> at 2026-11-25T10:00:02Z (0x7f1234560002)",
+            "",
+            "  package:matcher                                     expect",
+            "  package:flutter_test/src/widget_tester.dart 473:18  expect",
+            "  test/auth_test.dart 42:5                            main.<fn>",
+            "",
+            "00:04 +51 -2: test/widget_test.dart: counter increments",
+            "══╡ EXCEPTION CAUGHT BY FLUTTER TEST FRAMEWORK ╞════════════════════════════════════",
+            "The following TestFailure object was thrown running a test:",
+            "  Expected: exactly one matching candidate",
+            '  Actual: _TextWidgetFinder:<Found 0 widgets with text "1": []>',
+            "   Which: means none were found but one was expected",
+            "",
+            "When the exception was thrown, this was the stack:",
+            "#0      fail (package:matcher/src/expect/expect.dart:149:31)",
+            "#1      expect (package:flutter_test/src/widget_tester.dart:473:18)",
+            "#2      main.<anonymous closure> (file:///repo/test/widget_test.dart:28:5)",
+            "<asynchronous suspension>",
+            "",
+            "The test description was:",
+            "  counter increments",
+            "════════════════════════════════════════════════════════════════════════════════════",
+            "00:04 +51 -3: test/widget_test.dart: counter increments [E]",
+            "  Test failed. See exception logs above.",
+            "  The test description was: counter increments",
+            "",
+            "00:05 +51 -3: Some tests failed.",
+        ]
+    )
+    fail_out = "\n".join(fail_lines) + "\n"
+
+    (case_dir / "pass_fx").mkdir(parents=True, exist_ok=True)
+    (case_dir / "fail_fx").mkdir(parents=True, exist_ok=True)
+    write_fixture_shim(bin_pass, "flutter", case_dir / "pass_fx", pass_out, "", exit_code=0)
+    write_fixture_shim(bin_fail, "flutter", case_dir / "fail_fx", fail_out, "", exit_code=1)
+    env_pass = clean_env(home, bin_pass)
+    env_fail = clean_env(home, bin_fail)
+
+    t0 = time.monotonic()
+    raw_p, jl_p, rid_p = run_hook_pair(binary, ws_pass, env_pass, ["flutter", "test"])
+    raw_f, jl_f, rid_f = run_hook_pair(binary, ws_fail, env_fail, ["flutter", "test"])
+    elapsed = (time.monotonic() - t0) * 1000.0
+
+    out_p = jl_p.stdout.decode("utf-8", errors="replace")
+    out_f = jl_f.stdout.decode("utf-8", errors="replace")
+    if jl_p.returncode != 0 or jl_f.returncode != 1:
+        raise AssertionError(
+            f"[flutter_test_noisy] exit codes: pass={jl_p.returncode}, fail={jl_f.returncode}"
+        )
+    assert_contains(out_p, "All tests passed!", "flutter_test_pass")
+    assert_range_replays(binary, ws_pass, env_pass, rid_p, out_p, {"stdout": pass_out}, "flutter_test_pass", "stdout")
+
+    assert_contains(out_f, "3 reported failing test(s)", "flutter_test_fail")
+    assert_contains(out_f, "2 test(s): Expected: <200>, Actual: <401>", "flutter_test_fail")
+    assert_contains(out_f, "test/auth_test.dart:42:5", "flutter_test_fail")
+    assert_range_replays(binary, ws_fail, env_fail, rid_f, out_f, {"stdout": fail_out}, "flutter_test_fail", "stdout")
+
+    return make_case(
+        case_id="flutter_test_noisy",
+        label="flutter test",
+        subtitle="pass + multi-failure",
+        category="tests",
+        raw_bytes=len(raw_p.stdout) + len(raw_f.stdout),
+        justless_bytes=len(jl_p.stdout) + len(jl_p.stderr) + len(jl_f.stdout) + len(jl_f.stderr),
+        raw_lines=count_lines(raw_p.stdout) + count_lines(raw_f.stdout),
+        justless_lines=count_lines(jl_p.stdout) + count_lines(jl_p.stderr) + count_lines(jl_f.stdout) + count_lines(jl_f.stderr),
+        exit_code=jl_f.returncode,
+        expected_exit=1,
+        elapsed_ms=elapsed,
+        checks=[
+            "80 passing progress lines collapsed cleanly (exit 0)",
+            "identical failing root causes deduplicated + widget exception kept (exit 1)",
+            "exact [stdout:A-B] replay on both",
+        ],
+        subcases=[
+            {
+                "id": "flutter_test_pass",
+                "raw_bytes": len(raw_p.stdout),
+                "justless_bytes": len(jl_p.stdout) + len(jl_p.stderr),
+                "run_id": rid_p,
+            },
+            {
+                "id": "flutter_test_fail",
+                "raw_bytes": len(raw_f.stdout),
+                "justless_bytes": len(jl_f.stdout) + len(jl_f.stderr),
+                "run_id": rid_f,
+            },
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Case 23: flutter_pub_deps (`flutter pub deps` subtree deduplication)
+# ---------------------------------------------------------------------------
+def case_23_flutter_pub_deps(binary: Path, work: Path, home: Path) -> dict[str, Any]:
+    case_dir = work / "case23"
+    bin_dir = case_dir / "bin"
+    ws = case_dir / "ws"
+    ws.mkdir(parents=True)
+    (ws / ".justless.toml").write_text("", encoding="utf-8")
+
+    lines = [
+        "\x1b[1mDart SDK 3.5.4\x1b[0m",
+        "\x1b[1mFlutter SDK 3.24.5\x1b[0m",
+        "shop_mobile 2.4.0+18",
+        "Warning: You are using these overridden dependencies:",
+        "! intl 0.19.0 (overridden from ^0.18.1)",
+    ]
+    direct_pkgs = [
+        ("cupertino_icons", "1.0.8", False),
+        ("dio", "5.7.0", True),
+        ("flutter", "0.0.0", True),
+        ("go_router", "14.3.0", True),
+        ("http", "1.2.2", True),
+        ("intl", "0.19.0 (overridden)", False),
+        ("riverpod", "2.6.1", True),
+        ("sentry_flutter", "8.9.0", True),
+        ("shared_preferences", "2.3.2", True),
+        ("sqflite", "2.3.3", True),
+        ("url_launcher", "6.3.1", True),
+        ("workmanager", "0.5.2", True),
+    ]
+    for idx, (pkg, ver, has_sub) in enumerate(direct_pkgs):
+        last_root = idx + 1 == len(direct_pkgs)
+        conn = "└──" if last_root else "├──"
+        bar = " " if last_root else "│"
+        lines.append(f"{conn} \x1b[32m{pkg}\x1b[0m {ver}")
+        if has_sub:
+            lines.extend(
+                [
+                    f"{bar}   ├── http_parser 4.0.2",
+                    f"{bar}   │   ├── collection 1.18.0",
+                    f"{bar}   │   ├── source_span 1.10.0",
+                    f"{bar}   │   │   ├── collection...",
+                    f"{bar}   │   │   ├── path 1.9.0",
+                    f"{bar}   │   │   └── term_glyph 1.2.1",
+                    f"{bar}   │   ├── string_scanner 1.2.0",
+                    f"{bar}   │   │   └── source_span...",
+                    f"{bar}   │   └── typed_data 1.3.2",
+                    f"{bar}   │       └── collection...",
+                    f"{bar}   ├── meta 1.15.0",
+                    f"{bar}   └── async 2.11.0",
+                    f"{bar}       └── collection...",
+                ]
+            )
+    deps_out = "\n".join(lines) + "\n"
+    write_fixture_shim(bin_dir, "flutter", case_dir, deps_out, "", exit_code=0)
+    env = clean_env(home, bin_dir)
+
+    t0 = time.monotonic()
+    raw, jl, run_id = run_hook_pair(binary, ws, env, ["flutter", "pub", "deps"])
+    elapsed = (time.monotonic() - t0) * 1000.0
+
+    jl_out = jl.stdout.decode("utf-8", errors="replace")
+    assert_contains(
+        jl_out,
+        "flutter pub deps: shop_mobile 2.4.0+18 (Dart SDK 3.5.4, Flutter SDK 3.24.5)",
+        "flutter_pub_deps",
+    )
+    assert_contains(jl_out, "Warning: You are using these overridden dependencies: [stdout:4]", "flutter_pub_deps")
+    assert_contains(jl_out, "! intl 0.19.0 (overridden from ^0.18.1) [stdout:5]", "flutter_pub_deps")
+    assert_contains(jl_out, "repeated subtrees:", "flutter_pub_deps")
+    assert_contains(jl_out, "http_parser 4.0.2 (×10)", "flutter_pub_deps")
+    assert_range_replays(binary, ws, env, run_id, jl_out, {"stdout": deps_out}, "flutter_pub_deps", "stdout")
+
+    return make_case(
+        case_id="flutter_pub_deps",
+        label="flutter pub deps",
+        subtitle="ANSI tree · subtree dedup",
+        category="deps",
+        raw_bytes=len(raw.stdout),
+        justless_bytes=len(jl.stdout) + len(jl.stderr),
+        raw_lines=count_lines(raw.stdout),
+        justless_lines=count_lines(jl.stdout) + count_lines(jl.stderr),
+        exit_code=jl.returncode,
+        expected_exit=0,
+        elapsed_ms=elapsed,
+        checks=[
+            "override warnings preserved verbatim at top",
+            "10 repeated transitive subtrees deduplicated",
+            "exact [stdout:A-B] replay verified",
+        ],
+        run_id=run_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Case 24: ipynb_notebook_outline (`.ipynb` with 50 KB base64 PNG + error cell)
+# ---------------------------------------------------------------------------
+def case_24_ipynb_notebook_outline(binary: Path, work: Path, home: Path) -> dict[str, Any]:
+    case_dir = work / "case24"
+    ws = case_dir / "ws"
+    (ws / "notebooks").mkdir(parents=True)
+    (ws / ".justless.toml").write_text("", encoding="utf-8")
+    env = clean_env(home)
+
+    png_b64 = "iVBORw0KGgo" + ("QkJC" * 13_000)
+    nb_obj = {
+        "cells": [
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": ["# Sales Pipeline\n", "Quarterly revenue forecast notebook."],
+            },
+            {
+                "cell_type": "code",
+                "execution_count": 1,
+                "metadata": {"tags": ["chart"]},
+                "outputs": [
+                    {
+                        "output_type": "display_data",
+                        "data": {
+                            "image/png": png_b64,
+                            "text/plain": ["<Figure size 640x480 with 1 Axes>"],
+                        },
+                        "metadata": {},
+                    }
+                ],
+                "source": [
+                    "# Render revenue chart\n",
+                    "import matplotlib.pyplot as plt\n",
+                    "def build_chart(df):\n",
+                    "    return df.plot()\n",
+                ],
+            },
+            {
+                "cell_type": "code",
+                "execution_count": 2,
+                "metadata": {},
+                "outputs": [
+                    {
+                        "output_type": "error",
+                        "ename": "ZeroDivisionError",
+                        "evalue": "\x1b[31mdivision by zero\x1b[0m",
+                        "traceback": [
+                            "Traceback (most recent call last):",
+                            "ZeroDivisionError: division by zero",
+                        ],
+                    }
+                ],
+                "source": ["# Margin check\n", "ratio = total / 0\n"],
+            },
+            {
+                "cell_type": "raw",
+                "metadata": {},
+                "source": ["Raw appendix notes"],
+            },
+        ],
+        "metadata": {"kernelspec": {"language": "python"}},
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
+    nb_text = json.dumps(nb_obj, indent=2) + "\n"
+    nb_path = ws / "notebooks/analysis.ipynb"
+    nb_path.write_text(nb_text, encoding="utf-8")
+    raw_bytes_data = nb_path.read_bytes()
+
+    t0 = time.monotonic()
+    outline = run_cmd([str(binary), "read", "notebooks/analysis.ipynb", "--outline"], ws, env)
+    if outline.returncode != 0:
+        raise AssertionError(
+            f"[ipynb_notebook_outline] outline failed: {outline.stderr.decode('utf-8', 'replace')}"
+        )
+    outline_text = outline.stdout.decode("utf-8", errors="replace")
+    assert_contains(outline_text, " md # Sales Pipeline", "ipynb_notebook_outline")
+    assert_contains(outline_text, " cell [1] def build_chart(df):", "ipynb_notebook_outline")
+    assert_contains(outline_text, "image/png)", "ipynb_notebook_outline")
+    assert_contains(outline_text, "[error: ZeroDivisionError: division by zero]", "ipynb_notebook_outline")
+    if "iVBORw0KGgo" in outline_text or "QkJCQkJC" in outline_text:
+        raise AssertionError("[ipynb_notebook_outline] base64 PNG leaked into outline")
+
+    rev_match = re.search(r"^revision ([0-9a-f]+)", outline_text, re.MULTILINE)
+    if not rev_match:
+        raise AssertionError(f"[ipynb_notebook_outline] missing revision:\n{outline_text}")
+    anchor = f"{rev_match.group(1)}#3"
+    expanded = run_cmd([str(binary), "expand", "notebooks/analysis.ipynb", anchor], ws, env)
+    elapsed = (time.monotonic() - t0) * 1000.0
+    if expanded.returncode != 0:
+        raise AssertionError(
+            f"[ipynb_notebook_outline] expand failed: {expanded.stderr.decode('utf-8', 'replace')}"
+        )
+    expanded_cell = json.loads(expanded.stdout.decode("utf-8"))
+    if expanded_cell["cell_type"] != "code" or expanded_cell["execution_count"] != 2:
+        raise AssertionError(f"[ipynb_notebook_outline] unexpected expanded cell: {expanded_cell}")
+
+    return make_case(
+        case_id="ipynb_notebook_outline",
+        label="read --outline (.ipynb)",
+        subtitle="50 KB PNG + error cell",
+        category="source",
+        raw_bytes=len(raw_bytes_data),
+        justless_bytes=len(outline.stdout) + len(expanded.stdout),
+        raw_lines=count_lines(raw_bytes_data),
+        justless_lines=count_lines(outline.stdout) + count_lines(expanded.stdout),
+        exit_code=0,
+        expected_exit=0,
+        elapsed_ms=elapsed,
+        checks=[
+            "52 KB base64 image/png stripped from notebook outline",
+            "ZeroDivisionError cell surfaced verbatim with ANSI stripped",
+            f"expand {anchor} returns exact JSON cell object",
+        ],
+        subcases=[
+            {"id": "ipynb_outline", "raw_bytes": len(raw_bytes_data), "justless_bytes": len(outline.stdout)},
+            {"id": "ipynb_expand_error_cell", "raw_bytes": len(raw_bytes_data), "justless_bytes": len(expanded.stdout)},
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Case 25: json_klog_burst (Zap/Pino/K8s JSON log burst with pinned error via `justless run`)
+# ---------------------------------------------------------------------------
+def case_25_json_klog_burst(binary: Path, work: Path, home: Path) -> dict[str, Any]:
+    case_dir = work / "case25"
+    bin_dir = case_dir / "bin"
+    ws = case_dir / "ws"
+    ws.mkdir(parents=True)
+    (ws / ".justless.toml").write_text("", encoding="utf-8")
+
+    stdout_lines: list[str] = []
+    # 1) Zap float-second timestamps (100 info + 100 debug + 1 caller-annotated error)
+    for i in range(1, 101):
+        ts = 1712001600.0 + i * 1.25
+        stdout_lines.append(
+            f'{{"level":"info","ts":{ts:.6f},"service":"billing","caller":"billing/worker.go:42","msg":"processed invoice inv-{i:04d} in {i}ms"}}'
+        )
+        stdout_lines.append(
+            f'{{"level":"debug","ts":{ts:.6f},"service":"billing","msg":"cache lookup key=user-{i:04d} hit"}}'
+        )
+    stdout_lines.append(
+        '{"level":"error","ts":1712001790.500000,"service":"billing","caller":"billing/charge.go:91","msg":"stripe charge declined","error":"card_declined","req_id":"req-9001"}'
+    )
+    # 2) Pino numeric levels (80 info + 2 distinct warnings on different routes)
+    for i in range(1, 81):
+        ts_ms = 1712001800000 + i * 1000
+        stdout_lines.append(
+            f'{{"time":{ts_ms},"level":30,"service":"gateway","msg":"proxy ok 10.0.0.{(i % 20) + 1} GET /orders/{1000 + i} 200 {i + 2}ms"}}'
+        )
+    stdout_lines.append(
+        '{"time":1712001890000,"level":40,"service":"gateway","msg":"slow upstream","route":"/orders","latency_ms":2450}'
+    )
+    stdout_lines.append(
+        '{"time":1712001891000,"level":40,"service":"gateway","msg":"slow upstream","route":"/refunds","latency_ms":3100}'
+    )
+    # 3) Kubernetes klog JSON with float ms timestamps
+    for i in range(1, 61):
+        ts_ms = 1712001900000.25 + i * 500.0
+        stdout_lines.append(
+            f'{{"ts":{ts_ms:.3f},"caller":"controller/sync.go:88","service":"k8s","msg":"Synced pod default/web-{i:04d}","v":0}}'
+        )
+    raw_stdout = "\n".join(stdout_lines) + "\n"
+    raw_stderr = (
+        '{"time":"2026-11-25T12:05:00Z","level":"FATAL","service":"gateway",'
+        '"msg":"tls cert expired","err":{"message":"x509: certificate has expired",'
+        '"stack":"Error: x509\\n  at loadTls (/app/tls.js:18:9)"}}\n'
+    )
+
+    write_fixture_shim(bin_dir, "docker", case_dir, raw_stdout, raw_stderr, exit_code=0)
+    env = clean_env(home, bin_dir)
+
+    t0 = time.monotonic()
+    raw, jl, run_id = run_hook_pair(binary, ws, env, ["docker", "logs", "billing-api"])
+    elapsed = (time.monotonic() - t0) * 1000.0
+
+    jl_out = jl.stdout.decode("utf-8", errors="replace")
+    assert_contains(jl_out, "×100 [billing] INFO processed invoice", "json_klog_burst")
+    assert_contains(jl_out, "×80 [gateway] INFO proxy ok", "json_klog_burst")
+    assert_contains(jl_out, "×60 [k8s] INFO Synced pod", "json_klog_burst")
+    assert_contains(jl_out, "ERROR stripe charge declined", "json_klog_burst")
+    assert_contains(jl_out, "req_id=req-9001", "json_klog_burst")
+    assert_contains(jl_out, "route=/orders", "json_klog_burst")
+    assert_contains(jl_out, "route=/refunds", "json_klog_burst")
+    assert_contains(jl_out, "FATAL tls cert expired", "json_klog_burst")
+    assert_range_replays(
+        binary,
+        ws,
+        env,
+        run_id,
+        jl_out,
+        {"stdout": raw_stdout, "stderr": raw_stderr},
+        "json_klog_burst",
+        "stdout",
+    )
+
+    return make_case(
+        case_id="json_klog_burst",
+        label="JSON + klog logs",
+        subtitle="Zap/Pino/K8s · pinned errs",
+        category="logs",
+        raw_bytes=len(raw.stdout) + len(raw.stderr),
+        justless_bytes=len(jl.stdout) + len(jl.stderr),
+        raw_lines=count_lines(raw.stdout) + count_lines(raw.stderr),
+        justless_lines=count_lines(jl.stdout) + count_lines(jl.stderr),
+        exit_code=jl.returncode,
+        expected_exit=0,
+        elapsed_ms=elapsed,
+        checks=[
+            "Zap/Pino/K8s JSON info & debug bursts folded into ×N templates",
+            "ERROR, FATAL, and both distinct route warnings pinned verbatim",
+            "exact [stdout:A-B] replay verified",
+        ],
+        run_id=run_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Case 26: pipfile_lock_diff (`Pipfile.lock` 20-package diff via `git diff`)
+# ---------------------------------------------------------------------------
+def case_26_pipfile_lock_diff(binary: Path, work: Path, home: Path) -> dict[str, Any]:
+    repo = work / "case26_repo"
+    repo.mkdir(parents=True)
+    env = clean_env(home)
+    git_run(repo, env, "init", "-q", "-b", "main")
+    (repo / ".justless.toml").write_text("", encoding="utf-8")
+    (repo / ".git/info/exclude").write_text(".justless/\n.justless.toml\n", encoding="utf-8")
+    (repo / "src").mkdir()
+
+    def build_pipfile(meta_hash: str, default_pkgs: dict[str, tuple[str, str]], dev_pkgs: dict[str, tuple[str, str]]) -> str:
+        def encode_map(items: dict[str, tuple[str, str]]) -> dict[str, Any]:
+            out: dict[str, Any] = {}
+            for name, (ver, salt) in sorted(items.items()):
+                out[name] = {
+                    "hashes": [f"sha256:{salt}{k:02d}{'a1b2c3d4' * 6}" for k in range(4)],
+                    "index": "pypi",
+                    "version": f"=={ver}",
+                }
+            return out
+
+        doc = {
+            "_meta": {
+                "hash": {"sha256": meta_hash},
+                "pipfile-spec": 6,
+                "sources": [{"name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": True}],
+            },
+            "default": encode_map(default_pkgs),
+            "develop": encode_map(dev_pkgs),
+        }
+        return json.dumps(doc, indent=2) + "\n"
+
+    old_default = {f"service-lib-{i:02d}": (f"1.{i}.0", f"old{i:02d}") for i in range(1, 21)}
+    old_default["oldlib-alpha"] = ("0.4.0", "rm01")
+    old_default["oldlib-beta"] = ("0.9.1", "rm02")
+    old_dev = {f"lint-tool-{i:02d}": (f"2.{i}.0", f"dev{i:02d}") for i in range(1, 7)}
+
+    (repo / "Pipfile.lock").write_text(build_pipfile("metaold0001", old_default, old_dev), encoding="utf-8")
+    (repo / "src/billing.py").write_text(
+        "def invoice_total(subtotal: int, tax: int) -> int:\n"
+        "    return subtotal - tax\n",
+        encoding="utf-8",
+    )
+    git_run(repo, env, "add", "-A")
+    git_run(repo, env, "commit", "-q", "-m", "initial")
+
+    # 20 package changes: 16 updated + 2 added + 2 removed, plus 1 logic fix in src/billing.py
+    new_default = dict(old_default)
+    for i in range(1, 17):
+        new_default[f"service-lib-{i:02d}"] = (f"1.{i}.4", f"new{i:02d}")
+    del new_default["oldlib-alpha"]
+    del new_default["oldlib-beta"]
+    new_default["httpx"] = ("0.27.2", "add01")
+    new_default["orjson"] = ("3.10.11", "add02")
+
+    (repo / "Pipfile.lock").write_text(build_pipfile("metanew0002", new_default, old_dev), encoding="utf-8")
+    (repo / "src/billing.py").write_text(
+        "def invoice_total(subtotal: int, tax: int) -> int:\n"
+        "    return subtotal + tax\n",
+        encoding="utf-8",
+    )
+
+    t0 = time.monotonic()
+    raw, jl, run_id = run_hook_pair(binary, repo, env, ["git", "diff", "HEAD"])
+    elapsed = (time.monotonic() - t0) * 1000.0
+
+    raw_out = raw.stdout.decode("utf-8", errors="replace")
+    jl_out = jl.stdout.decode("utf-8", errors="replace")
+    assert_contains(jl_out, "-    return subtotal - tax", "pipfile_lock_diff")
+    assert_contains(jl_out, "+    return subtotal + tax", "pipfile_lock_diff")
+    assert_contains(jl_out, "Pipfile.lock", "pipfile_lock_diff")
+    assert_contains(jl_out, "httpx 0.27.2", "pipfile_lock_diff")
+    assert_contains(jl_out, "oldlib-alpha 0.4.0", "pipfile_lock_diff")
+    assert_range_replays(binary, repo, env, run_id, jl_out, {"stdout": raw_out}, "pipfile_lock_diff", "stdout")
+
+    return make_case(
+        case_id="pipfile_lock_diff",
+        label="git diff (Pipfile.lock)",
+        subtitle="20-pkg lock + logic edit",
+        category="git",
+        raw_bytes=len(raw.stdout) + len(raw.stderr),
+        justless_bytes=len(jl.stdout) + len(jl.stderr),
+        raw_lines=count_lines(raw.stdout),
+        justless_lines=count_lines(jl.stdout) + count_lines(jl.stderr),
+        exit_code=jl.returncode,
+        expected_exit=0,
+        elapsed_ms=elapsed,
+        checks=[
+            "20-package Pipfile.lock diff folded into semantic deltas",
+            "src/billing.py logic edit preserved verbatim",
+            "exact [stdout:A-B] replay verified",
+        ],
+        run_id=run_id,
+    )
+
+
 def format_bytes(n: int) -> str:
     if n >= 1024:
         return f"{n / 1024:.1f} KB"
@@ -1898,7 +2868,7 @@ def run_suite(binary: Path) -> dict[str, Any]:
 
         # Run independent cases concurrently in their own isolated temp dirs while preserving
         # exact deterministic ordering (Cases 16-18 share the read-only repo_copy sequentially).
-        independent = [
+        independent_pre = [
             lambda: case_01_cargo_test(binary, work, home),
             lambda: case_02_vitest(binary, work, home),
             lambda: case_03_pytest(binary, work, home),
@@ -1915,6 +2885,16 @@ def run_suite(binary: Path) -> dict[str, Any]:
             lambda: case_14_git_diff(binary, work, home),
             lambda: case_15_git_status_blame(binary, work, home),
         ]
+        independent_post = [
+            lambda: case_19_csv_1000_rows(binary, work, home),
+            lambda: case_20_kubectl_diff_helm_template(binary, work, home),
+            lambda: case_21_aws_s3_ls_recursive(binary, work, home),
+            lambda: case_22_flutter_test_noisy(binary, work, home),
+            lambda: case_23_flutter_pub_deps(binary, work, home),
+            lambda: case_24_ipynb_notebook_outline(binary, work, home),
+            lambda: case_25_json_klog_burst(binary, work, home),
+            lambda: case_26_pipfile_lock_diff(binary, work, home),
+        ]
 
         def run_repo_cases() -> list[dict[str, Any]]:
             return [
@@ -1926,8 +2906,13 @@ def run_suite(binary: Path) -> dict[str, Any]:
         max_workers = min(8, os.cpu_count() or 4)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             repo_future = pool.submit(run_repo_cases)
-            ind_futures = [pool.submit(fn) for fn in independent]
-            cases = [f.result() for f in ind_futures] + repo_future.result()
+            pre_futures = [pool.submit(fn) for fn in independent_pre]
+            post_futures = [pool.submit(fn) for fn in independent_post]
+            cases = (
+                [f.result() for f in pre_futures]
+                + repo_future.result()
+                + [f.result() for f in post_futures]
+            )
 
     total_raw = sum(c["raw_bytes"] for c in cases)
     total_jl = sum(c["justless_bytes"] for c in cases)
@@ -1973,15 +2958,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Verify all 18 invariants, exit codes, strict compression, and exact replays",
+        help="Verify all 26 invariants, exit codes, strict compression, and exact replays",
     )
     args = parser.parse_args(argv)
 
     report = run_suite(args.binary)
 
     if args.check:
-        if len(report["cases"]) != 18:
-            raise AssertionError(f"expected 18 benchmark cases, got {len(report['cases'])}")
+        if len(report["cases"]) != 26:
+            raise AssertionError(f"expected 26 benchmark cases, got {len(report['cases'])}")
         for c in report["cases"]:
             if not c["checks"]:
                 raise AssertionError(f"[{c['id']}] recorded no invariant checks")

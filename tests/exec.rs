@@ -1097,3 +1097,126 @@ fn exec_output_is_capped_by_max_run_bytes() {
     let message = stderr(&output);
     contains(&message, "[stdout archive truncated at 1000 B of 4.6 KB]");
 }
+
+/// UTF-8 BOM RFC 4180 CSV compacts cleanly via `csvview` (both bounded Tier 2 and
+/// `lossless_only = true` Tier 1) while archiving and replaying the exact BOM bytes.
+#[test]
+fn exec_compacts_utf8_bom_csv_and_replays_exact_bytes() {
+    let (_directory, root) = workspace();
+    let script = r#"
+printf '\357\273\277"id","service","env","region","status","amount_usd","note"\n'
+i=1
+while [ $i -le 1000 ]; do
+  case $((i % 4)) in
+    0) region=us-east-1 ;;
+    1) region=eu-west-1 ;;
+    2) region=us-west-2 ;;
+    *) region=ap-south-1 ;;
+  esac
+  if [ $((i % 25)) -eq 0 ]; then status=timeout; else status=ok; fi
+  printf '"%d","checkout","prod","%s","%s","%d.50","trace,span_%06d"\n' \
+    "$i" "$region" "$status" "$((10 + (i % 400)))" "$i"
+  i=$((i + 1))
+done
+"#;
+    let output = sh(&root, script);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let shown = stdout(&output);
+    starts(
+        &shown,
+        "[CSV 1000 rows × 7 cols · exact data in full log]\n",
+    );
+    contains(&shown, "service=checkout");
+    contains(&shown, "env=prod");
+    contains(&shown, "status?=ok");
+    contains(&shown, "[stdout:10-997]");
+    assert!(shown.len() <= 4096, "len={}", shown.len());
+
+    let id = run_id(&output);
+    let replay = cli(&root, &["log", &id, "--stream", "stdout"]);
+    assert!(replay.status.success(), "{}", stderr(&replay));
+    assert!(
+        replay
+            .stdout
+            .starts_with(b"\xef\xbb\xbf\"id\",\"service\","),
+        "exact UTF-8 BOM prefix must be preserved in archive"
+    );
+    assert!(
+        shown.len() * 15 < replay.stdout.len(),
+        "expected >93% CSV compaction: shown={} raw={}",
+        shown.len(),
+        replay.stdout.len()
+    );
+
+    // Under `lossless_only = true`, a smaller UTF-8 BOM CSV emits Tier 1 bijective output without dropping rows.
+    fs::write(root.join(".justless.toml"), "lossless_only = true\n").unwrap();
+    let small_script = r#"
+printf '\357\273\277"id","service","env","status","amount_usd"\n'
+i=1
+while [ $i -le 80 ]; do
+  if [ $((i % 20)) -eq 0 ]; then status=err; else status=ok; fi
+  printf '"%d","checkout","prod","%s","%d.25"\n' "$i" "$status" "$((10 + i))"
+  i=$((i + 1))
+done
+"#;
+    let lossless = exec(&root, &["--lang", "sh", "--max-bytes", "512", small_script]);
+    assert!(lossless.status.success(), "{}", stderr(&lossless));
+    let lossless_out = stdout(&lossless);
+    starts(&lossless_out, "[CSV 80 rows × 5 cols");
+    assert!(!lossless_out.contains("rows omitted"), "{lossless_out}");
+    contains(&lossless_out, "service=checkout");
+    contains(&lossless_out, "79\t.\t89.25");
+    contains(&lossless_out, "80\terr\t90.25");
+}
+
+/// Mixed Zap/Pino/K8s JSON log bursts emitted by `justless exec` route to `logview`,
+/// fold repetitive info lines, pin errors/warnings verbatim, and replay exact lines.
+#[test]
+fn exec_compacts_json_log_burst_and_pins_errors_with_exact_replay() {
+    let (_directory, root) = workspace();
+    let script = r#"
+i=1
+while [ $i -le 120 ]; do
+  printf '{"level":"info","ts":17120016%02d.500000,"service":"billing","msg":"processed invoice inv-%04d in %dms"}\n' "$((i % 60))" "$i" "$((5 + i % 20))"
+  i=$((i + 1))
+done
+printf '{"level":"error","ts":1712001690.500000,"service":"billing","caller":"billing/charge.go:91","msg":"stripe charge declined","error":"card_declined","req_id":"req-9001"}\n'
+i=1
+while [ $i -le 80 ]; do
+  printf '{"time":%d,"level":30,"service":"gateway","msg":"proxy ok 10.0.0.%d GET /orders/%d 200 %dms"}\n' "$((1712001700000 + i * 1000))" "$((i % 20 + 1))" "$((1000 + i))" "$((i + 2))"
+  i=$((i + 1))
+done
+printf '{"time":1712001790000,"level":40,"service":"gateway","msg":"slow upstream","route":"/checkout","latency_ms":2450}\n'
+"#;
+    let output = sh(&root, script);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let shown = stdout(&output);
+    contains(&shown, "×120 [billing] INFO processed invoice");
+    contains(&shown, "×80 [gateway] INFO proxy ok");
+    contains(&shown, "ERROR stripe charge declined");
+    contains(&shown, "req_id=req-9001");
+    contains(&shown, "[stdout:121]");
+    contains(&shown, "WARN slow upstream");
+    contains(&shown, "route=/checkout");
+    contains(&shown, "[stdout:202]");
+
+    let id = run_id(&output);
+    let raw = cli(&root, &["log", &id, "--stream", "stdout"]);
+    assert!(raw.status.success(), "{}", stderr(&raw));
+    assert!(
+        shown.len() * 8 < raw.stdout.len(),
+        "expected >87% JSON log compaction: shown={} raw={}",
+        shown.len(),
+        raw.stdout.len()
+    );
+    let pinned_err = stdout(&cli(
+        &root,
+        &[
+            "log", &id, "--stream", "stdout", "--from", "121", "--to", "121",
+        ],
+    ));
+    assert_eq!(
+        pinned_err,
+        "{\"level\":\"error\",\"ts\":1712001690.500000,\"service\":\"billing\",\"caller\":\"billing/charge.go:91\",\"msg\":\"stripe charge declined\",\"error\":\"card_declined\",\"req_id\":\"req-9001\"}\n"
+    );
+}
