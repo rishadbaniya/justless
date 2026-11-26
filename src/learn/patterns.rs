@@ -8,7 +8,7 @@
 //! left out on purpose: a wrong signature produces confident wrong rules.
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -1956,7 +1956,7 @@ fn prerequisite_step(hit: &Hit, f: &Cmd, g: &Cmd) -> Option<Outcome> {
                 && g_words.get(2).map(String::as_str) == Some("use-context") =>
         {
             let ctx = g_words.get(3)?.as_str();
-            if ctx.is_empty() || ctx.starts_with('-') {
+            if !safe_kubectl_context(ctx) {
                 return None;
             }
             (
@@ -2156,6 +2156,13 @@ fn strip_opt<'a>(argv: &'a [String], flags: &[&str]) -> (Option<(&'a str, &'a st
     (found, rest)
 }
 
+/// Reject empty, flag-like, or colon-qualified kubectl context names (such as
+/// AWS EKS ARNs `arn:aws:eks:...:123456789012:cluster/prod`) so cloud account
+/// identifiers never enter learned rules.
+fn safe_kubectl_context(ctx: &str) -> bool {
+    !ctx.is_empty() && !ctx.starts_with('-') && !ctx.contains(':')
+}
+
 fn kubectl_option(hit: &Hit, f: &Cmd, g: &Cmd) -> Option<Outcome> {
     if basename(f.program()) != "kubectl" || basename(g.program()) != "kubectl" || !f.same_place(g)
     {
@@ -2183,6 +2190,12 @@ fn kubectl_option(hit: &Hit, f: &Cmd, g: &Cmd) -> Option<Outcome> {
             continue;
         }
         let from_value = f_opt.map(|(_, v)| v).unwrap_or("");
+        if flag == "--context"
+            && (!safe_kubectl_context(value)
+                || (!from_value.is_empty() && !safe_kubectl_context(from_value)))
+        {
+            continue;
+        }
         if from_value == value {
             continue;
         }
@@ -2855,7 +2868,9 @@ pub fn scope(class: Class, slots: &BTreeMap<String, String>) -> Scope {
         }
         Class::MissingOption => {
             let head = get("stem").split(' ').next().unwrap_or("");
-            if head.contains('/')
+            if head == "kubectl" && get("flag") == "--context" {
+                Scope::Machine
+            } else if head.contains('/')
                 || slots.contains_key("value")
                 || matches!(
                     head,
@@ -2876,6 +2891,7 @@ pub fn scope(class: Class, slots: &BTreeMap<String, String>) -> Scope {
                 Scope::Machine
             }
         }
+        Class::PrerequisiteStep if get("kind") == "kubectl_context" => Scope::Machine,
         _ => Scope::Project,
     }
 }
@@ -2925,6 +2941,45 @@ fn find_tf_manifest(root: &Path, dir: &str) -> Option<String> {
         }
     }
     find_tf_file(&base).map(|name| joined(dir, &name))
+}
+
+/// Verify that `dir/value` is a regular file (not a symlink) whose canonical path
+/// remains inside the canonical workspace `root`.
+fn workspace_regular_file(root: &Path, dir: &str, value: &str) -> bool {
+    let rel = Path::new(value);
+    if value.is_empty()
+        || !rel
+            .components()
+            .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
+    {
+        return false;
+    }
+    let base = if dir.is_empty() {
+        root.to_path_buf()
+    } else {
+        let dir_path = Path::new(dir);
+        if !dir_path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
+        {
+            return false;
+        }
+        root.join(dir_path)
+    };
+    let candidate = base.join(rel);
+    let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    let Ok(canonical_root) = root.canonicalize() else {
+        return false;
+    };
+    let Ok(canonical_file) = candidate.canonicalize() else {
+        return false;
+    };
+    canonical_file.starts_with(&canonical_root)
 }
 
 /// Confirm a rule against the current tree, `PATH` or `$SHELL`, without running anything.
@@ -3089,7 +3144,7 @@ pub fn check(root: &Path, env: &Env, class: Class, slots: &BTreeMap<String, Stri
             let (stem_text, flag, value, dir) =
                 (get("stem"), get("flag"), get("value"), get("dir"));
             if matches!(flag, "-f" | "--file" | "--kubeconfig") && !value.is_empty() {
-                if at(dir).join(value).is_file() {
+                if workspace_regular_file(root, dir, value) {
                     return Check::Verified(joined(dir, value));
                 }
                 return Check::Stale(format!("{} is missing", joined(dir, value)));
@@ -4778,6 +4833,153 @@ mod tests {
             assert!(!text.contains("secret123"), "{text}");
             assert!(!text.contains("APP_ENV=staging"), "{text}");
             assert!(!text.contains("-n prod"), "{text}");
+        }
+    }
+
+    #[test]
+    fn rejects_eks_arn_contexts_and_scopes_kubectl_contexts_to_machine() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let mk = |thread: &str, time_ms: u64, argv: &[&str], code: i32, body: &str| {
+            let cmd = Cmd {
+                checkout: String::new(),
+                dir: String::new(),
+                argv: argv.iter().map(|s| (*s).to_owned()).collect(),
+                masked: false,
+            };
+            Event {
+                thread: thread.to_owned(),
+                session: thread.to_owned(),
+                transcript: false,
+                codex: false,
+                time_ms,
+                raw: argv.join(" "),
+                env: Vec::new(),
+                shape: events::Shape::Simple(cmd),
+                status: Status::Code(code),
+                texts: vec![events::Text {
+                    run: Some(format!("run-{time_ms}")),
+                    stream: "stderr",
+                    body: body.to_owned(),
+                }],
+                tests: events::Tests::default(),
+                failure_bytes: body.len() as u64,
+                pointer: Pointer::Run {
+                    id: format!("run-{time_ms}"),
+                    stream: "stderr",
+                },
+            }
+        };
+        let arn = "arn:aws:eks:us-east-1:123456789012:cluster/prod";
+        let unset = "The connection to the server localhost:8080 was refused - did you specify the right host or port?\n";
+        let events = vec![
+            // ARN via `--context`
+            mk("a1", 1_000, &["kubectl", "get", "pods"], 1, unset),
+            mk(
+                "a1",
+                2_000,
+                &["kubectl", "--context", arn, "get", "pods"],
+                0,
+                "NAME\napi-0\n",
+            ),
+            // ARN via `kubectl config use-context`
+            mk("a2", 3_000, &["kubectl", "get", "pods"], 1, unset),
+            mk(
+                "a2",
+                4_000,
+                &["kubectl", "config", "use-context", arn],
+                0,
+                "Switched to context\n",
+            ),
+            // Plain local context via `--context`
+            mk("b1", 5_000, &["kubectl", "get", "pods"], 1, unset),
+            mk(
+                "b1",
+                6_000,
+                &["kubectl", "--context", "dev-cluster", "get", "pods"],
+                0,
+                "NAME\napi-0\n",
+            ),
+            // Plain local context via `kubectl config use-context`
+            mk("b2", 7_000, &["kubectl", "get", "pods"], 1, unset),
+            mk(
+                "b2",
+                8_000,
+                &["kubectl", "config", "use-context", "dev-cluster"],
+                0,
+                "Switched to context\n",
+            ),
+        ];
+        let analysis = analyze(root, &events);
+        let env = Env {
+            path: None,
+            shell: None,
+        };
+        assert_eq!(analysis.candidates.len(), 2);
+        for c in &analysis.candidates {
+            assert_eq!(
+                scope(c.class, &c.slots),
+                Scope::Machine,
+                "kubectl context rule must be machine-scoped: {:?}",
+                c.slots
+            );
+            let chk = check(root, &env, c.class, &c.slots);
+            let text = render(c.class, &c.slots, &chk).unwrap();
+            assert!(!text.contains("123456789012"), "{text}");
+            assert!(!text.contains("arn:"), "{text}");
+            assert!(text.contains("dev-cluster"), "{text}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_rejects_symlinked_file_and_kubeconfig_outside_workspace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let outside = tempfile::TempDir::new().unwrap();
+        let outside_kube = outside.path().join("config");
+        std::fs::write(&outside_kube, "apiVersion: v1\n").unwrap();
+
+        std::fs::write(root.join("local-kube.yaml"), "apiVersion: v1\n").unwrap();
+        std::os::unix::fs::symlink(&outside_kube, root.join("link-kube.yaml")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("symdir")).unwrap();
+
+        let env = Env {
+            path: None,
+            shell: None,
+        };
+        let slots_for = |flag: &str, value: &str| {
+            BTreeMap::from([
+                ("stem".to_owned(), "kubectl".to_owned()),
+                ("flag".to_owned(), flag.to_owned()),
+                ("value".to_owned(), value.to_owned()),
+                ("dir".to_owned(), String::new()),
+            ])
+        };
+
+        assert_eq!(
+            check(
+                root,
+                &env,
+                Class::MissingOption,
+                &slots_for("--kubeconfig", "local-kube.yaml")
+            ),
+            Check::Verified("local-kube.yaml".into())
+        );
+        for (flag, value) in [
+            ("--kubeconfig", "link-kube.yaml"),
+            ("--kubeconfig", "symdir/config"),
+            ("-f", "link-kube.yaml"),
+            ("--file", "symdir/config"),
+            ("--kubeconfig", "../config"),
+        ] {
+            assert!(
+                matches!(
+                    check(root, &env, Class::MissingOption, &slots_for(flag, value)),
+                    Check::Stale(_)
+                ),
+                "expected stale for {flag} {value}"
+            );
         }
     }
 }

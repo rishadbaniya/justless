@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
-use std::path::{Component, Path};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -616,7 +616,8 @@ pub fn record_graph_use(
 
 /// Sums on-disk byte lengths of distinct workspace-relative `files` using
 /// metadata only (never reading file bodies). Rejects non-normal path
-/// components and skips symlinks or missing files silently.
+/// components, direct symlinks, intermediate directory symlinks, and missing
+/// files silently via `workspace.source_path`.
 pub(crate) fn referenced_file_bytes<'a>(
     workspace: &Workspace,
     files: impl IntoIterator<Item = &'a str>,
@@ -627,14 +628,8 @@ pub(crate) fn referenced_file_bytes<'a>(
         if file.is_empty() || !seen.insert(file) {
             continue;
         }
-        let rel = Path::new(file);
-        if !rel
-            .components()
-            .all(|part| matches!(part, Component::Normal(_)))
-        {
-            continue;
-        }
-        if let Ok(meta) = fs::symlink_metadata(workspace.root.join(rel))
+        if let Ok(path) = workspace.source_path(file)
+            && let Ok(meta) = fs::symlink_metadata(&path)
             && meta.is_file()
         {
             total = total.saturating_add(meta.len());
@@ -3547,6 +3542,33 @@ mod tests {
                 "(≈{expected_tokens} tokens, estimated at {expected_ratio} bytes per token for code)"
             )),
             "{line}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn referenced_file_bytes_rejects_intermediate_directory_symlinks() {
+        let (_dir, ws) = temp_workspace();
+        let outside = TempDir::new().unwrap();
+        let outside_file = outside.path().join("outside.txt");
+        fs::write(&outside_file, "x".repeat(4096)).unwrap();
+
+        let alpha = "fn alpha() -> u32 { 1 }\n";
+        fs::write(ws.root.join("alpha.rs"), alpha).unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.root.join("symdir")).unwrap();
+        std::os::unix::fs::symlink(&outside_file, ws.root.join("direct.txt")).unwrap();
+
+        assert_eq!(
+            referenced_file_bytes(
+                &ws,
+                [
+                    "alpha.rs",
+                    "symdir/outside.txt",
+                    "direct.txt",
+                    "../outside.txt",
+                ]
+            ),
+            alpha.len() as u64
         );
     }
 }

@@ -80,8 +80,12 @@ function runClaudeHook(directory, mode, payload) {
   });
 }
 
-const RETRIEVAL_SUBCOMMANDS = new Set([
-  "recall", "log", "expand", "search", "read", "code", "run", "exec",
+const JUSTLESS_SUBCOMMANDS = new Set([
+  "affected", "code", "context", "discover", "doctor", "drain", "edit", "exec",
+  "expand", "find", "history", "index", "init", "learn", "log", "lookup", "map",
+  "mask", "mcp", "pack", "path", "proxy", "query", "read", "recall", "rename",
+  "resume", "review", "rewrite", "run", "search", "stats", "statusline", "test",
+  "wrap",
 ]);
 
 const RUN_MARKER_RE = /^\[justless run-[A-Za-z0-9]+(?:\]| · )/m;
@@ -181,32 +185,128 @@ function tokenizeSegment(segment) {
   return tokens;
 }
 
-function parseJustlessInvocation(segment) {
-  const tokens = tokenizeSegment(segment);
+function inspectSegment(segment, depth = 0) {
+  const tokens = [...tokenizeSegment(segment)];
   let i = 0;
+  let disableVal;
   while (i < tokens.length) {
-    const tok = tokens[i];
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) {
+    // Strip leading shell grouping tokens `(` / `{` (standalone or attached).
+    const tok = tokens[i].replace(/^[({]+/, "");
+    if (!tok) {
       i += 1;
       continue;
     }
-    if (tok === "env" || tok === "command" || tok === "exec" || tok === "nohup" || tok === "time") {
+    tokens[i] = tok;
+    if (tok === "!") {
       i += 1;
-      while (i < tokens.length && (tokens[i].startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i]))) {
+      continue;
+    }
+    const assign = tok.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (assign) {
+      if (assign[1] === "JUSTLESS_DISABLE") disableVal = assign[2];
+      i += 1;
+      continue;
+    }
+    if (tok === "export") {
+      i += 1;
+      while (i < tokens.length) {
+        const next = tokens[i].replace(/[)}]+$/, "");
+        if (next.startsWith("-")) {
+          i += 1;
+          continue;
+        }
+        const exp = next.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+        if (exp) {
+          if (exp[1] === "JUSTLESS_DISABLE") disableVal = exp[2];
+          i += 1;
+          continue;
+        }
+        break;
+      }
+      continue;
+    }
+    if (tok === "env") {
+      i += 1;
+      while (i < tokens.length) {
+        const arg = tokens[i];
+        if (arg === "--") {
+          i += 1;
+          break;
+        }
+        const envAssign = arg.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+        if (envAssign) {
+          if (envAssign[1] === "JUSTLESS_DISABLE") disableVal = envAssign[2];
+          i += 1;
+          continue;
+        }
+        if (!arg.startsWith("-") || arg === "-") break;
+        i += 1;
+        if (arg === "-i" || arg === "--ignore-environment") {
+          disableVal = undefined;
+          continue;
+        }
+        if (arg === "-u" || arg === "--unset" || /^-[i0v]*u$/.test(arg)) {
+          if (arg.includes("i")) disableVal = undefined;
+          if (i < tokens.length) {
+            if (tokens[i] === "JUSTLESS_DISABLE") disableVal = undefined;
+            i += 1;
+          }
+          continue;
+        }
+        if (arg.startsWith("--unset=") || (arg.startsWith("-u") && arg.length > 2)) {
+          const unsetName = arg.startsWith("--unset=") ? arg.slice("--unset=".length) : arg.slice(2);
+          if (unsetName === "JUSTLESS_DISABLE") disableVal = undefined;
+          continue;
+        }
+        if (arg === "-C" || arg === "--chdir" || /^-[i0v]*C$/.test(arg)) {
+          if (arg.includes("i")) disableVal = undefined;
+          if (i < tokens.length) i += 1;
+          continue;
+        }
+        if (arg === "-S" || arg === "--split-string" || /^-[i0v]*S$/.test(arg)) {
+          if (arg.includes("i")) disableVal = undefined;
+          if (i < tokens.length) {
+            const splitArg = tokens[i];
+            i += 1;
+            if (depth < 4) {
+              tokens.splice(i, 0, ...tokenizeSegment(splitArg));
+              depth += 1;
+            }
+          }
+          continue;
+        }
+        if (arg.startsWith("--split-string=") || (arg.startsWith("-S") && arg.length > 2)) {
+          const splitArg = arg.startsWith("--split-string=")
+            ? arg.slice("--split-string=".length)
+            : arg.slice(2);
+          if (depth < 4) {
+            tokens.splice(i, 0, ...tokenizeSegment(splitArg));
+            depth += 1;
+          }
+          continue;
+        }
+      }
+      continue;
+    }
+    if (tok === "command" || tok === "exec" || tok === "nohup" || tok === "time") {
+      i += 1;
+      while (i < tokens.length && tokens[i].startsWith("-")) {
         const flag = tokens[i];
         i += 1;
         if (flag === "--") break;
+        if (tok === "exec" && flag === "-a" && i < tokens.length) i += 1;
       }
       continue;
     }
     break;
   }
-  if (i >= tokens.length) return undefined;
-  const exe = tokens[i];
+  const inlineDisabled = Boolean(disableVal) && disableVal !== "0";
+  if (i >= tokens.length) return { inlineDisabled, invocation: undefined };
+  const exe = tokens[i].replace(/[)}]+$/, "");
   const base = exe.split(/[\\/]/).pop();
   const configured = binary().split(/[\\/]/).pop();
   if (base !== "justless" && base !== "justless.exe" && base !== configured) {
-    return undefined;
+    return { inlineDisabled, invocation: undefined };
   }
   i += 1;
   while (i < tokens.length && tokens[i].startsWith("-")) {
@@ -216,7 +316,17 @@ function parseJustlessInvocation(segment) {
       i += 1;
     }
   }
-  return { subcommand: tokens[i] ?? "" };
+  const subcommand = (tokens[i] ?? "").replace(/[)}]+$/, "");
+  return { inlineDisabled, invocation: { subcommand } };
+}
+
+function parseJustlessInvocation(segment) {
+  return inspectSegment(segment).invocation;
+}
+
+function hasInlineDisable(command) {
+  if (typeof command !== "string" || !command.trim()) return false;
+  return splitShellSegments(command).some((seg) => inspectSegment(seg).inlineDisabled);
 }
 
 function isJustlessCommand(command) {
@@ -228,14 +338,16 @@ function isJustlessCommand(command) {
   }
   return segments.some((seg) => {
     const inv = parseJustlessInvocation(seg);
-    return inv !== undefined && RETRIEVAL_SUBCOMMANDS.has(inv.subcommand);
+    return inv !== undefined && JUSTLESS_SUBCOMMANDS.has(inv.subcommand);
   });
 }
 
 async function afterBash(directory, command, stdout, sessionId) {
-  // Never re-compact explicit `justless recall|log|expand|search|...` calls or
-  // outputs already carrying Justless compaction/recall markers.
-  if (isJustlessCommand(command) || isCompactedOutput(stdout)) return undefined;
+  // Never re-compact explicit `justless ...` calls, commands with inline
+  // `JUSTLESS_DISABLE=<non-0>`, or outputs already carrying Justless markers.
+  if (hasInlineDisable(command) || isJustlessCommand(command) || isCompactedOutput(stdout)) {
+    return undefined;
+  }
   const payload = {
     hook_event_name: "PostToolUse",
     tool_name: "Bash",
@@ -411,34 +523,157 @@ function normalizePathKey(raw) {
   return s || undefined;
 }
 
+function normalizeCommand(raw) {
+  if (typeof raw !== "string") return;
+  const trimmed = raw.trim();
+  if (!trimmed) return;
+  let out = "";
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+  let pendingSpace = false;
+  for (let i = 0; i < trimmed.length; i += 1) {
+    const ch = trimmed[i];
+    if (escaped) {
+      if (pendingSpace && out) {
+        out += " ";
+        pendingSpace = false;
+      }
+      out += ch;
+      escaped = false;
+      continue;
+    }
+    if (!inSingle && ch === "\\") {
+      if (pendingSpace && out) {
+        out += " ";
+        pendingSpace = false;
+      }
+      out += ch;
+      escaped = true;
+      continue;
+    }
+    if (!inDouble && ch === "'") {
+      if (pendingSpace && out) {
+        out += " ";
+        pendingSpace = false;
+      }
+      inSingle = !inSingle;
+      out += ch;
+      continue;
+    }
+    if (!inSingle && ch === "\"") {
+      if (pendingSpace && out) {
+        out += " ";
+        pendingSpace = false;
+      }
+      inDouble = !inDouble;
+      out += ch;
+      continue;
+    }
+    if (!inSingle && !inDouble && /\s/.test(ch)) {
+      pendingSpace = true;
+    } else {
+      if (pendingSpace && out) {
+        out += " ";
+        pendingSpace = false;
+      }
+      out += ch;
+    }
+  }
+  return out || undefined;
+}
+
+function optUintField(input, keys) {
+  for (const key of keys) {
+    const val = input[key];
+    if (val !== undefined && val !== null) {
+      const n = parsePositiveInt(val);
+      if (n === undefined) return { ok: false };
+      return { ok: true, value: n };
+    }
+  }
+  return { ok: true, value: undefined };
+}
+
+function scopeFingerprint(input, keys) {
+  const parts = [];
+  for (const key of keys) {
+    const val = input[key];
+    if (val !== undefined && val !== null) {
+      parts.push(`${key}=${JSON.stringify(val)}`);
+    }
+  }
+  return parts.join("\0");
+}
+
 function partTargetKey(part) {
   const input = part?.state?.input;
-  if (!input || typeof input !== "object") return;
+  if (!input || typeof input !== "object" || Array.isArray(input)) return;
   const tool = typeof part.tool === "string" ? part.tool.trim().toLowerCase() : "";
   if (tool === "read" || tool === "read_file" || tool === "view_file") {
     if (input.pages != null || input.ByteOffset != null || input.byte_offset != null) return;
-    const p = normalizePathKey(input.filePath ?? input.file_path ?? input.path ?? input.Path ?? input.file);
+    const p = normalizePathKey(
+      input.file_path ?? input.filePath ?? input.path ?? input.Path ?? input.AbsolutePath ?? input.file,
+    );
     if (!p) return;
-    const whole = input.offset == null && input.limit == null
-      && input.StartLine == null && input.EndLine == null
-      && input.start_line == null && input.end_line == null;
-    const range = whole
-      ? "whole"
-      : `${input.offset ?? ""}:${input.limit ?? ""}:${input.StartLine ?? input.start_line ?? ""}:${input.EndLine ?? input.end_line ?? ""}`;
+    const hasLineSpan = input.StartLine != null || input.start_line != null || input.startLine != null
+      || input.EndLine != null || input.end_line != null || input.endLine != null;
+    let whole = false;
+    let range;
+    if (hasLineSpan) {
+      const start = optUintField(input, ["StartLine", "start_line", "startLine"]);
+      const end = optUintField(input, ["EndLine", "end_line", "endLine"]);
+      if (!start.ok || !end.ok) return;
+      if (start.value === undefined && end.value === undefined) {
+        whole = true;
+        range = "whole";
+      } else {
+        range = `lines:${start.value ?? ""}:${end.value ?? ""}`;
+      }
+    } else {
+      const offset = optUintField(input, ["offset", "Offset"]);
+      const limit = optUintField(input, ["limit", "Limit"]);
+      if (!offset.ok || !limit.ok) return;
+      if (offset.value === undefined && limit.value === undefined) {
+        whole = true;
+        range = "whole";
+      } else {
+        range = `offset:${offset.value ?? ""}:${limit.value ?? ""}`;
+      }
+    }
     return { key: `read:${p}:${range}`, readPath: p, wholeRead: whole };
   }
-  if (tool === "bash" || tool === "run_command" || tool === "exec_command" || tool === "shell") {
-    const cmd = input.command ?? input.CommandLine ?? input.cmd;
-    if (typeof cmd !== "string" || !cmd.trim() || isJustlessCommand(cmd)) return;
-    const cwd = normalizePathKey(input.cwd ?? input.workdir) ?? "";
-    return { key: `bash:${cwd}:${cmd.trim()}` };
+  if (
+    tool === "bash" || tool === "run_command" || tool === "exec_command"
+    || tool === "shell" || tool === "sh" || tool === "terminal"
+  ) {
+    const rawCmd = input.command ?? input.CommandLine ?? input.cmd ?? input.script;
+    const cmd = normalizeCommand(rawCmd);
+    if (!cmd || isJustlessCommand(cmd)) return;
+    const cwd = normalizePathKey(input.cwd ?? input.workdir ?? input.Cwd ?? input.working_directory) ?? "";
+    return { key: `bash:${cwd}:${cmd}` };
   }
-  if (tool === "grep" || tool === "grep_search" || tool === "glob" || tool === "find_by_name") {
-    const pat = input.pattern ?? input.Query ?? input.query;
+  if (tool === "grep" || tool === "grep_search" || tool === "ripgrep" || tool === "rg") {
+    const pat = input.pattern ?? input.Query ?? input.query ?? input.regex;
     if (typeof pat !== "string" || !pat.trim()) return;
-    const p = normalizePathKey(input.path ?? input.directory ?? input.SearchPath) ?? "";
-    const extra = `${input.glob ?? ""}|${input.include ?? ""}|${input.type ?? ""}|${input.output_mode ?? ""}`;
-    return { key: `${tool}:${p}:${pat.trim()}:${extra}` };
+    const p = normalizePathKey(
+      input.path ?? input.SearchPath ?? input.directory ?? input.dir ?? input.cwd ?? input.file,
+    ) ?? "";
+    const scope = scopeFingerprint(input, [
+      "-A", "-B", "-C", "-i", "-n",
+      "CaseInsensitive", "FixedStrings", "Includes", "MatchPerLine",
+      "context", "glob", "head_limit", "include", "multiline", "offset", "output_mode", "type",
+    ]);
+    return { key: `grep:${p}:${pat.trim()}:${scope}` };
+  }
+  if (tool === "glob" || tool === "find_by_name" || tool === "list_files") {
+    const pat = input.pattern ?? input.Pattern ?? input.glob;
+    if (typeof pat !== "string" || !pat.trim()) return;
+    const p = normalizePathKey(
+      input.path ?? input.SearchDirectory ?? input.directory ?? input.dir ?? input.cwd,
+    ) ?? "";
+    const scope = scopeFingerprint(input, ["Excludes", "Extensions", "MaxDepth", "Type", "type"]);
+    return { key: `glob:${p}:${pat.trim()}:${scope}` };
   }
 }
 
@@ -573,7 +808,11 @@ export const Justless = async ({ directory }) => {
         status: part.state.status,
         output: send ? out : "",
       };
-      if (part.state.input !== undefined) state.input = part.state.input;
+      // Only forward `input` when the real output is also sent; blanked unsent
+      // parts (already-retired stubs, attachments, errors, or non-shared calls)
+      // must never look like valid superseding calls to `justless mask`.
+      if (send && part.state.input !== undefined) state.input = part.state.input;
+      if (!send && part.state.attachments?.length) state.attachments = [true];
       return { type: "tool", callID: part.callID, tool: part.tool, state };
     });
     if (!hasCandidate) return;

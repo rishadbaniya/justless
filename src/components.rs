@@ -16,7 +16,6 @@ pub(crate) fn scripts(source: &str, frontmatter: bool) -> (String, bool) {
         at = fence.end;
         keep.push(fence);
     }
-    let bytes = source.as_bytes();
     while let Some(offset) = source[at..].find('<') {
         let start = at + offset;
         let rest = &source[start..];
@@ -24,16 +23,24 @@ pub(crate) fn scripts(source: &str, frontmatter: bool) -> (String, bool) {
             at = rest.find("-->").map_or(source.len(), |end| start + end + 3);
             continue;
         }
-        let opens = bytes[start..]
-            .get(..7)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"<script"))
-            && {
-                let after = &source[start + 7..];
-                after.is_empty()
-                    || after.starts_with(|c: char| c.is_whitespace() || c == '>' || c == '/')
+        if opens_tag(source, start, b"<style") {
+            let Some(tag_end) = tag_end(source, start) else {
+                break;
             };
-        if !opens {
-            at = start + 1;
+            let tag = &source[start + "<style".len()..tag_end - 1];
+            at = if tag.trim_end().ends_with('/') {
+                tag_end
+            } else {
+                find_close_tag(source, tag_end, b"</style").unwrap_or(source.len())
+            };
+            continue;
+        }
+        if !opens_tag(source, start, b"<script") {
+            at = if is_start_tag(source, start) {
+                tag_end(source, start).unwrap_or(start + 1)
+            } else {
+                start + 1
+            };
             continue;
         }
         let Some(tag_end) = tag_end(source, start) else {
@@ -44,7 +51,7 @@ pub(crate) fn scripts(source: &str, frontmatter: bool) -> (String, bool) {
             at = tag_end;
             continue;
         }
-        let close = find_close_script(source, tag_end).unwrap_or(source.len());
+        let close = find_close_tag(source, tag_end, b"</script").unwrap_or(source.len());
         if let Some(dialect_jsx) = dialect(tag) {
             jsx |= dialect_jsx;
             keep.push(tag_end..close);
@@ -62,14 +69,49 @@ pub(crate) fn scripts(source: &str, frontmatter: bool) -> (String, bool) {
     (masked, jsx)
 }
 
-/// Find the byte offset of the next ASCII-case-insensitive `</script` starting at `from`.
-fn find_close_script(source: &str, mut from: usize) -> Option<usize> {
+/// Whether `source[start..]` begins with an ASCII-case-insensitive `<tag` boundary
+/// (followed by whitespace, `>`, `/`, or end of input).
+fn opens_tag(source: &str, start: usize, tag: &[u8]) -> bool {
+    let bytes = source.as_bytes();
+    bytes[start..]
+        .get(..tag.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(tag))
+        && {
+            let after = &source[start + tag.len()..];
+            after.is_empty()
+                || after.starts_with(|c: char| c.is_whitespace() || c == '>' || c == '/')
+        }
+}
+
+/// Whether `source[start..]` starts an HTML/component opening tag (`<tagName ...>`),
+/// as opposed to a text comparison such as `a < b`.
+fn is_start_tag(source: &str, start: usize) -> bool {
+    let bytes = source.as_bytes();
+    let Some(&first) = bytes.get(start + 1) else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    let mut i = start + 2;
+    while let Some(&b) = bytes.get(i) {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.') {
+            i += 1;
+        } else {
+            return b.is_ascii_whitespace() || matches!(b, b'>' | b'/');
+        }
+    }
+    false
+}
+
+/// Find the byte offset of the next ASCII-case-insensitive closing tag starting at `from`.
+fn find_close_tag(source: &str, mut from: usize, close: &[u8]) -> Option<usize> {
     let bytes = source.as_bytes();
     while let Some(offset) = source[from..].find('<') {
         let at = from + offset;
         if bytes[at..]
-            .get(..8)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"</script"))
+            .get(..close.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(close))
         {
             return Some(at);
         }
@@ -223,6 +265,24 @@ mod tests {
                 false,
                 vec!["const s = \"é\""],
                 true,
+            ),
+            (
+                "<template>\n  <p title=\"<!-- not a real comment\">hi</p>\n</template>\n<script lang=\"ts\">\nexport const ok = 1\n</script>\n",
+                false,
+                vec!["\nexport const ok = 1\n"],
+                false,
+            ),
+            (
+                "<template><p title='<!-- single quoted'>hi</p><p data-x=\"<script>fake()</script>\">ok</p></template>\n<script>\nconst real = 2\n</script>\n",
+                false,
+                vec!["\nconst real = 2\n"],
+                false,
+            ),
+            (
+                "<template><p>{a < b && \"don't\"}</p></template>\n<style>p::before { content: \"<!--\"; }</style>\n<script lang=\"ts\">\nconst afterStyle = 3\n</script>\n",
+                false,
+                vec!["\nconst afterStyle = 3\n"],
+                false,
             ),
         ] {
             let (masked, found_jsx) = scripts(source, frontmatter);

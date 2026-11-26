@@ -1920,3 +1920,81 @@ fn learn_reads_antigravity_cli_transcripts() {
         "Also read 1 Antigravity CLI session(s) (2 shell results).",
     );
 }
+
+#[test]
+fn learn_hardens_privacy_eks_arn_and_symlink_kubeconfig() {
+    let lab = Lab::new();
+    lab.write("server/Makefile", "test:\n");
+    // Simple commands paired as wrong-directory corrections (hit `privacy::unsafe_command`).
+    let simple_leaks = [
+        "helm upgrade app ./chart --set a=1,db.password=q6hunter2",
+        "cargo publish --token -q6hunter2",
+        "terraform apply -var=db_password = q6hunter2",
+        "kubectl get secret/db-creds",
+        "kubectl config view --raw",
+        "kubectl -n prod auth can-i get pods",
+        "helm --kube-context prod registry login",
+        "docker --context prod login",
+    ];
+    for (index, command) in simple_leaks.iter().enumerate() {
+        let failed = format!("{command} => 2: make: *** No rule to make target `test'.  Stop.");
+        let fixed = format!("cd server && {command} => ok");
+        lab.session(&format!("q6_{index}"), DAY, &[&failed, &fixed]);
+    }
+    // Unspaced chained commands and `sh -c '...'` scripts (hit `privacy::carries_credential`
+    // via self-evident zsh glob screening).
+    let chained_leaks = [
+        "true&&terraform login&&terraform init *.log => 1: (eval):1: no matches found: *.log",
+        "sh -c 'true&&kubectl get secrets' *.log => 1: (eval):1: no matches found: *.log",
+    ];
+    for (index, line) in chained_leaks.iter().enumerate() {
+        lab.session(&format!("q6_chain_{index}"), DAY, &[line]);
+    }
+
+    // AWS EKS ARN in kubectl context must never appear in rules, held, or AGENTS.md.
+    let unset = "The connection to the server localhost:8080 was refused - did you specify the right host or port?";
+    let arn = "arn:aws:eks:us-east-1:123456789012:cluster/prod";
+    lab.sessions(
+        "eks",
+        2,
+        &[
+            &format!("kubectl get pods => 1: {unset}"),
+            &format!("kubectl --context {arn} get pods => NAME\napi-0"),
+            &format!("kubectl get pods => 1: {unset}"),
+            &format!("kubectl config use-context {arn} => Switched"),
+        ],
+    );
+
+    let report = lab.json(&["--min-sessions", "1"]);
+    assert_eq!(report["rules"], json!([]), "{report:#}");
+    assert_eq!(
+        report["skipped"]["credentials"],
+        simple_leaks.len() + chained_leaks.len(),
+        "{report:#}"
+    );
+    let serialized = report.to_string();
+    assert!(!serialized.contains("q6hunter2"), "{serialized}");
+    assert!(!serialized.contains("123456789012"), "{serialized}");
+    assert!(!serialized.contains("arn:aws:eks"), "{serialized}");
+
+    // Symlinked --kubeconfig pointing outside the workspace must be rejected as stale.
+    #[cfg(unix)]
+    {
+        let lab = Lab::new();
+        let outside = TempDir::new().unwrap();
+        let outside_kube = outside.path().join("external-kubeconfig");
+        fs::write(&outside_kube, "apiVersion: v1\n").unwrap();
+        std::os::unix::fs::symlink(&outside_kube, lab.root.join("kube.yaml")).unwrap();
+        lab.sessions(
+            "sym",
+            2,
+            &[
+                &format!("kubectl get pods => 1: {unset}"),
+                "kubectl --kubeconfig kube.yaml get pods => NAME\napi-0",
+            ],
+        );
+        let report = lab.json(&["--min-sessions", "1"]);
+        assert_eq!(report["rules"], json!([]), "{report:#}");
+        assert_eq!(reason(&report, "missing_option"), "stale");
+    }
+}
