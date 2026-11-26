@@ -1,7 +1,8 @@
 //! Dependency changes in lockfile patches (`Cargo.lock`, `package-lock.json`,
 //! `pnpm-lock.yaml`, `yarn.lock`, `bun.lock`, `uv.lock`, `go.sum`, `poetry.lock`,
-//! `Gemfile.lock`, `composer.lock`, `flake.lock`, `Package.resolved`, and `mix.lock`)
-//! plus generated/snapshot file folding.
+//! `Gemfile.lock`, `composer.lock`, `flake.lock`, `Package.resolved`, `mix.lock`,
+//! `pubspec.lock`, `gradle.lockfile`, `Podfile.lock`, `packages.lock.json`, and
+//! `Pipfile.lock`) plus generated/snapshot file folding.
 //!
 //! A lockfile hunk says where lines changed, not which packages did. For each
 //! supported lockfile section of a `git diff`, `git show`, `git log -p`,
@@ -12,6 +13,7 @@
 //! `checksum` that changed on a version present in both revisions, or a source
 //! added to or removed from such a version, is flagged on its own line, since
 //! that is how a substituted package looks.
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -50,9 +52,13 @@ pub struct Section {
 impl Section {
     /// The description, flags first so they stay when the rest is clipped.
     pub fn text(&self) -> String {
-        let mut text = self.head.clone();
+        let flags_len: usize = self.flags.iter().map(|f| f.len() + 5).sum();
+        let mut text = String::with_capacity(self.head.len() + flags_len + self.body.len());
+        text.push_str(&self.head);
         for flag in &self.flags {
-            text.push_str(&format!("  ! {flag}\n"));
+            text.push_str("  ! ");
+            text.push_str(flag);
+            text.push('\n');
         }
         text.push_str(&self.body);
         text
@@ -132,6 +138,11 @@ enum LockFormat {
     Flake,
     SwiftResolved,
     Mix,
+    Pubspec,
+    Gradle,
+    Podfile,
+    NuGet,
+    Pipfile,
 }
 
 impl LockFormat {
@@ -150,6 +161,13 @@ impl LockFormat {
             "flake.lock" => Some(Self::Flake),
             "Package.resolved" => Some(Self::SwiftResolved),
             "mix.lock" => Some(Self::Mix),
+            "pubspec.lock" => Some(Self::Pubspec),
+            "Podfile.lock" => Some(Self::Podfile),
+            "packages.lock.json" => Some(Self::NuGet),
+            "Pipfile.lock" => Some(Self::Pipfile),
+            name if name == "gradle.lockfile" || name.ends_with("-gradle.lockfile") => {
+                Some(Self::Gradle)
+            }
             _ => None,
         }
     }
@@ -194,6 +212,9 @@ pub(crate) fn is_svg_path(path: &str) -> bool {
 }
 
 fn diff_section_path(line: &str) -> Option<&str> {
+    if !line.starts_with("diff --") {
+        return None;
+    }
     if let Some(names) = line.strip_prefix("diff --git ") {
         names
             .rsplit_once(" b/")
@@ -211,16 +232,23 @@ fn diff_section_path(line: &str) -> Option<&str> {
 }
 
 fn combined_parents(line: &str) -> Option<usize> {
-    let at = line.bytes().take_while(|&b| b == b'@').count();
-    if at < 3 {
+    if !line.starts_with("@@@") {
         return None;
     }
+    let at = line.bytes().take_while(|&b| b == b'@').count();
     let rest = line.get(at..)?;
     if !rest.starts_with(" -") {
         return None;
     }
-    let closing = format!(" {}", "@".repeat(at));
-    rest.contains(&closing).then_some(at - 1)
+    let bytes = rest.as_bytes();
+    let mut i = 2;
+    while i + at < bytes.len() {
+        if bytes[i] == b' ' && bytes[i + 1..i + 1 + at].iter().all(|&b| b == b'@') {
+            return Some(at - 1);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn is_hunk_line(line: &str) -> bool {
@@ -255,39 +283,13 @@ struct ActiveSection<'a> {
 /// remote hunks) and fold large generated/snapshot file sections. Line numbers
 /// start at 1, as in `justless log`.
 pub fn sections(patch: &str, cwd: &Path) -> Vec<Section> {
-    const NEEDLES: &[&str] = &[
-        "Cargo.lock",
-        "package-lock.json",
-        "yarn.lock",
-        "pnpm-lock.yaml",
-        "bun.lock",
-        "uv.lock",
-        "go.sum",
-        "poetry.lock",
-        "Gemfile.lock",
-        "composer.lock",
-        "flake.lock",
-        "Package.resolved",
-        "mix.lock",
-        ".terraform.lock.hcl",
-        ".snap",
-        ".min.js",
-        ".min.css",
-        ".pb.go",
-        ".pb.rs",
-        ".pb.ts",
-        ".pb.js",
-        ".generated.",
-        "_pb2.py",
-        ".g.dart",
-        ".freezed.dart",
-        ".Designer.cs",
-        ".g.cs",
-        ".g.i.cs",
-        ".svg",
-        ".SVG",
-    ];
-    if !NEEDLES.iter().any(|name| patch.contains(name)) {
+    let clean: Cow<'_, str> = if patch.contains('\x1b') {
+        crate::capture::ANSI.replace_all(patch, "")
+    } else {
+        Cow::Borrowed(patch)
+    };
+    let patch = clean.as_ref();
+    if !patch.contains("diff --") {
         return Vec::new();
     }
     let mut found = Vec::new();
@@ -1273,47 +1275,53 @@ fn pnpm_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
 
 /// Remove trailing commas before `]` or `}` outside JSON strings so Bun's JSONC
 /// `bun.lock` parses as standard JSON.
-fn strip_jsonc_trailing_commas(text: &str) -> String {
+fn strip_jsonc_trailing_commas(text: &str) -> Cow<'_, str> {
+    if !text.contains(',') {
+        return Cow::Borrowed(text);
+    }
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
+    let mut chunk_start = 0;
     let mut i = 0;
     let mut in_string = false;
     let mut escaped = false;
     while i < bytes.len() {
-        let ch = text[i..].chars().next().unwrap();
-        let len = ch.len_utf8();
+        let b = bytes[i];
         if in_string {
-            out.push(ch);
             if escaped {
                 escaped = false;
-            } else if ch == '\\' {
+            } else if b == b'\\' {
                 escaped = true;
-            } else if ch == '"' {
+            } else if b == b'"' {
                 in_string = false;
             }
-            i += len;
+            i += 1;
             continue;
         }
-        if ch == '"' {
+        if b == b'"' {
             in_string = true;
-            out.push(ch);
-            i += len;
+            i += 1;
             continue;
         }
-        if ch == ',' {
-            let mut j = i + len;
+        if b == b',' {
+            let mut j = i + 1;
             while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                 j += 1;
             }
             if matches!(bytes.get(j), Some(b']' | b'}')) {
-                i += len;
+                out.push_str(&text[chunk_start..i]);
+                i += 1;
+                chunk_start = i;
                 continue;
             }
         }
-        out.push(ch);
-        i += len;
+        i += 1;
     }
-    out
+    if chunk_start == 0 {
+        return Cow::Borrowed(text);
+    }
+    out.push_str(&text[chunk_start..]);
+    Cow::Owned(out)
 }
 
 /// The locked third-party packages of a Bun `bun.lock` (text JSONC format).
@@ -1878,11 +1886,18 @@ fn mix_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
     if text.is_empty() {
         return Some(BTreeMap::new());
     }
-    let stripped: String = text
-        .lines()
-        .filter(|line| !line.trim_start().starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let stripped: Cow<'_, str> = if text.contains('#') {
+        let mut buf = String::with_capacity(text.len());
+        for line in text.lines() {
+            if !line.trim_start().starts_with('#') {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+        }
+        Cow::Owned(buf)
+    } else {
+        Cow::Borrowed(text)
+    };
     let trimmed = stripped.trim();
     let inner = trimmed.strip_prefix("%{")?.strip_suffix('}')?;
     let mut packages = BTreeMap::new();
@@ -1945,6 +1960,517 @@ fn mix_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
     Some(packages)
 }
 
+/// The locked dependencies of a Dart / Flutter `pubspec.lock`.
+fn pubspec_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
+    if text.is_empty() {
+        return Some(BTreeMap::new());
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TopSection {
+        None,
+        Packages,
+        Sdks,
+    }
+    #[derive(Default)]
+    struct PubspecEntry {
+        name: Option<String>,
+        version: Option<String>,
+        source_kind: Option<String>,
+        desc_scalar: Option<String>,
+        url: Option<String>,
+        sha256: Option<String>,
+        resolved_ref: Option<String>,
+        path: Option<String>,
+        in_description: bool,
+    }
+    let flush = |entry: PubspecEntry, packages: &mut BTreeMap<Key, Package>| -> Option<()> {
+        let Some(name) = entry.name else {
+            return Some(());
+        };
+        let version = entry.version?;
+        let source = match entry.source_kind.as_deref() {
+            Some("hosted") => Some(match entry.url {
+                Some(url) => format!("hosted:{url}"),
+                None => "hosted".to_owned(),
+            }),
+            Some("git") => Some(match entry.url {
+                Some(url) => format!("git:{url}"),
+                None => "git".to_owned(),
+            }),
+            Some("path") => Some(match entry.path {
+                Some(path) => format!("path:{path}"),
+                None => "path".to_owned(),
+            }),
+            Some("sdk") => Some(match entry.desc_scalar {
+                Some(sdk) => format!("sdk:{sdk}"),
+                None => "sdk".to_owned(),
+            }),
+            Some(other) => Some(other.to_owned()),
+            None => entry.url.or(entry.path),
+        };
+        let checksum = entry.sha256.or(entry.resolved_ref);
+        insert_merged(packages, name, version, source, checksum, BTreeSet::new())
+    };
+    let mut top = TopSection::None;
+    let mut saw_packages = false;
+    let mut cur = PubspecEntry::default();
+    let mut packages = BTreeMap::new();
+    for raw in text.lines() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.bytes().take_while(|&b| b == b' ').count();
+        if indent == 0 {
+            flush(std::mem::take(&mut cur), &mut packages)?;
+            match trimmed {
+                "packages:" => {
+                    saw_packages = true;
+                    top = TopSection::Packages;
+                }
+                "packages: {}" => {
+                    saw_packages = true;
+                    top = TopSection::None;
+                }
+                "sdks:" => top = TopSection::Sdks,
+                "sdks: {}" => top = TopSection::None,
+                _ => return None,
+            }
+            continue;
+        }
+        match top {
+            TopSection::Sdks => {
+                if !trimmed.contains(':') {
+                    return None;
+                }
+            }
+            TopSection::Packages => match indent {
+                2 => {
+                    flush(std::mem::take(&mut cur), &mut packages)?;
+                    let raw_name = trimmed.strip_suffix(':')?;
+                    let name = unquote_lock_scalar(raw_name);
+                    if name.is_empty() {
+                        return None;
+                    }
+                    cur.name = Some(name.to_owned());
+                }
+                4 => {
+                    cur.name.as_ref()?;
+                    let (k, v) = trimmed.split_once(':')?;
+                    let key = unquote_lock_scalar(k);
+                    let val = v.trim();
+                    cur.in_description = false;
+                    match key {
+                        "version" => {
+                            let s = unquote_lock_scalar(val);
+                            if s.is_empty() {
+                                return None;
+                            }
+                            cur.version = Some(s.to_owned());
+                        }
+                        "source" => {
+                            let s = unquote_lock_scalar(val);
+                            if !s.is_empty() {
+                                cur.source_kind = Some(s.to_owned());
+                            }
+                        }
+                        "description" => {
+                            if val.is_empty() {
+                                cur.in_description = true;
+                            } else if val.starts_with('{') && val.ends_with('}') {
+                                for (dk, dv) in parse_inline_yaml_map(val) {
+                                    match dk.as_str() {
+                                        "url" if !dv.is_empty() => cur.url = Some(dv),
+                                        "sha256" if !dv.is_empty() => cur.sha256 = Some(dv),
+                                        "resolved-ref" if !dv.is_empty() => {
+                                            cur.resolved_ref = Some(dv)
+                                        }
+                                        "path" if !dv.is_empty() => cur.path = Some(dv),
+                                        _ => {}
+                                    }
+                                }
+                            } else {
+                                let s = unquote_lock_scalar(val);
+                                if !s.is_empty() {
+                                    cur.desc_scalar = Some(s.to_owned());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                6.. if cur.in_description => {
+                    let (k, v) = trimmed.split_once(':')?;
+                    let key = unquote_lock_scalar(k);
+                    let val = unquote_lock_scalar(v);
+                    match key {
+                        "url" if !val.is_empty() => cur.url = Some(val.to_owned()),
+                        "sha256" if !val.is_empty() => cur.sha256 = Some(val.to_owned()),
+                        "resolved-ref" if !val.is_empty() => {
+                            cur.resolved_ref = Some(val.to_owned())
+                        }
+                        "path" if !val.is_empty() => cur.path = Some(val.to_owned()),
+                        _ => {}
+                    }
+                }
+                _ => return None,
+            },
+            TopSection::None => return None,
+        }
+    }
+    flush(cur, &mut packages)?;
+    saw_packages.then_some(packages)
+}
+
+/// The locked `group:artifact:version=configs` coordinates of a Gradle `gradle.lockfile`.
+fn gradle_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
+    if text.is_empty() {
+        return Some(BTreeMap::new());
+    }
+    let mut packages = BTreeMap::new();
+    let mut saw_entry = false;
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let (coord, configs_raw) = trimmed.split_once('=')?;
+        if coord == "empty" {
+            if configs_raw.chars().any(char::is_whitespace) {
+                return None;
+            }
+            saw_entry = true;
+            continue;
+        }
+        if coord.chars().any(char::is_whitespace) || configs_raw.chars().any(char::is_whitespace) {
+            return None;
+        }
+        let (group, rest) = coord.split_once(':')?;
+        let (artifact, version) = rest.split_once(':')?;
+        if group.is_empty() || artifact.is_empty() || version.is_empty() || version.contains(':') {
+            return None;
+        }
+        let configs: BTreeSet<String> = configs_raw
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let name = format!("{group}:{artifact}");
+        insert_merged(&mut packages, name, version.to_owned(), None, None, configs)?;
+        saw_entry = true;
+    }
+    saw_entry.then_some(packages)
+}
+
+fn parse_pod_spec(raw: &str) -> Option<(String, String)> {
+    let rest = raw.strip_prefix("- ")?.trim();
+    let rest = rest.strip_suffix(':').unwrap_or(rest).trim();
+    let unquoted = unquote_lock_scalar(rest);
+    let (name, ver_rest) = unquoted.split_once(" (")?;
+    let version = ver_rest.strip_suffix(')')?;
+    if name.is_empty()
+        || name.contains(' ')
+        || version.is_empty()
+        || version.chars().any(char::is_whitespace)
+        || version.starts_with(['~', '=', '>', '<'])
+    {
+        return None;
+    }
+    Some((name.to_owned(), version.to_owned()))
+}
+
+fn parse_pod_dep_name(raw: &str) -> Option<&str> {
+    let rest = raw.strip_prefix("- ")?.trim();
+    let unquoted = unquote_lock_scalar(rest);
+    let name = unquoted
+        .split_once(" (")
+        .map_or(unquoted, |(n, _)| n)
+        .trim();
+    (!name.is_empty() && !name.contains(' ')).then_some(name)
+}
+
+/// The locked pods of a CocoaPods `Podfile.lock`.
+fn podfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
+    if text.is_empty() {
+        return Some(BTreeMap::new());
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Section {
+        None,
+        Pods,
+        SpecRepos,
+        SpecChecksums,
+        ExternalSources,
+        CheckoutOptions,
+        Other,
+    }
+    let mut section = Section::None;
+    let mut saw_pods = false;
+    let mut pods: Vec<(String, String, BTreeSet<String>)> = Vec::new();
+    let mut repos: BTreeMap<String, String> = BTreeMap::new();
+    let mut ext_sources: BTreeMap<String, String> = BTreeMap::new();
+    let mut checksums: BTreeMap<String, String> = BTreeMap::new();
+    let mut current_repo: Option<String> = None;
+    let mut current_ext_pod: Option<String> = None;
+
+    for raw in text.lines() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.bytes().take_while(|&b| b == b' ').count();
+        if indent == 0 {
+            current_repo = None;
+            current_ext_pod = None;
+            section = match trimmed {
+                "PODS:" => {
+                    saw_pods = true;
+                    Section::Pods
+                }
+                "SPEC REPOS:" => Section::SpecRepos,
+                "SPEC CHECKSUMS:" => Section::SpecChecksums,
+                "EXTERNAL SOURCES:" => Section::ExternalSources,
+                "CHECKOUT OPTIONS:" => Section::CheckoutOptions,
+                "DEPENDENCIES:" => Section::Other,
+                _ if trimmed.starts_with("PODFILE CHECKSUM:")
+                    || trimmed.starts_with("COCOAPODS:")
+                    || trimmed.starts_with("COCOAPODS PLUGINS:") =>
+                {
+                    Section::Other
+                }
+                _ => return None,
+            };
+            continue;
+        }
+        match section {
+            Section::Pods => match indent {
+                2 => {
+                    let (name, version) = parse_pod_spec(trimmed)?;
+                    pods.push((name, version, BTreeSet::new()));
+                }
+                4 => {
+                    let dep = parse_pod_dep_name(trimmed)?;
+                    pods.last_mut()?.2.insert(dep.to_owned());
+                }
+                _ => return None,
+            },
+            Section::SpecRepos => match indent {
+                2 => {
+                    let repo = unquote_lock_scalar(trimmed.strip_suffix(':')?);
+                    current_repo = (!repo.is_empty()).then(|| repo.to_owned());
+                }
+                4 => {
+                    if let (Some(repo), Some(pod)) = (&current_repo, trimmed.strip_prefix("- ")) {
+                        let pod = unquote_lock_scalar(pod);
+                        if !pod.is_empty() {
+                            repos.insert(pod.to_owned(), repo.clone());
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Section::ExternalSources | Section::CheckoutOptions => match indent {
+                2 => {
+                    let pod = unquote_lock_scalar(trimmed.strip_suffix(':')?);
+                    current_ext_pod = (!pod.is_empty()).then(|| pod.to_owned());
+                }
+                4 => {
+                    if let (Some(pod), Some((k, v))) = (&current_ext_pod, trimmed.split_once(": "))
+                    {
+                        let val = unquote_lock_scalar(v);
+                        match k.trim() {
+                            ":git" if !val.is_empty() => {
+                                ext_sources.insert(pod.clone(), format!("git:{val}"));
+                            }
+                            ":path" if !val.is_empty() => {
+                                ext_sources.insert(pod.clone(), format!("path:{val}"));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Section::SpecChecksums if indent == 2 => {
+                let (k, v) = trimmed.split_once(':')?;
+                let pod = unquote_lock_scalar(k);
+                let hash = unquote_lock_scalar(v);
+                if pod.is_empty() || hash.is_empty() {
+                    return None;
+                }
+                checksums.insert(pod.to_owned(), hash.to_owned());
+            }
+            Section::Other => {}
+            _ => return None,
+        }
+    }
+    if !saw_pods {
+        return None;
+    }
+    let exact_names: BTreeSet<String> = pods.iter().map(|(n, _, _)| n.clone()).collect();
+    let mut attached_root_checksum: BTreeSet<String> = BTreeSet::new();
+    let mut packages = BTreeMap::new();
+    for (name, version, deps) in pods {
+        let root = name.split('/').next().unwrap_or(&name);
+        let source = ext_sources.get(root).or_else(|| repos.get(root)).cloned();
+        let checksum = if let Some(hash) = checksums.get(&name) {
+            Some(hash.clone())
+        } else if !exact_names.contains(root) && attached_root_checksum.insert(root.to_owned()) {
+            checksums.get(root).cloned()
+        } else {
+            None
+        };
+        insert_merged(&mut packages, name, version, source, checksum, deps)?;
+    }
+    Some(packages)
+}
+
+/// The locked packages of a .NET NuGet `packages.lock.json`.
+fn nuget_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
+    if text.is_empty() {
+        return Some(BTreeMap::new());
+    }
+    let root: serde_json::Value = serde_json::from_str(text).ok()?;
+    root.get("version")?.as_u64()?;
+    let tfms = root.get("dependencies")?.as_object()?;
+    let mut packages = BTreeMap::new();
+    for tfm_val in tfms.values() {
+        let tfm_map = tfm_val.as_object()?;
+        for (name, pkg_val) in tfm_map {
+            let pkg = pkg_val.as_object()?;
+            let pkg_type = pkg.get("type")?.as_str()?;
+            let (version, source) = match pkg
+                .get("resolved")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                Some(ver) => (
+                    ver.to_owned(),
+                    (pkg_type == "Project").then(|| "project".to_owned()),
+                ),
+                None if pkg_type == "Project" => ("project".to_owned(), Some("project".to_owned())),
+                None => return None,
+            };
+            let checksum = pkg
+                .get("contentHash")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let mut deps = BTreeSet::new();
+            if let Some(dep_map) = pkg
+                .get("dependencies")
+                .and_then(serde_json::Value::as_object)
+            {
+                deps.extend(dep_map.keys().cloned());
+            }
+            insert_merged(&mut packages, name.clone(), version, source, checksum, deps)?;
+        }
+    }
+    Some(packages)
+}
+
+/// The locked packages of a Python Pipenv `Pipfile.lock`.
+fn pipfile_packages(text: &str) -> Option<BTreeMap<Key, Package>> {
+    if text.is_empty() {
+        return Some(BTreeMap::new());
+    }
+    let root: serde_json::Value = serde_json::from_str(text).ok()?;
+    let meta = root.get("_meta")?.as_object()?;
+    meta.get("pipfile-spec")?.as_u64()?;
+    let default_map = root.get("default")?.as_object()?;
+    let mut sources_map: BTreeMap<&str, &str> = BTreeMap::new();
+    if let Some(sources) = meta.get("sources").and_then(serde_json::Value::as_array) {
+        for src in sources {
+            if let (Some(name), Some(url)) = (
+                src.get("name").and_then(serde_json::Value::as_str),
+                src.get("url").and_then(serde_json::Value::as_str),
+            ) {
+                sources_map.insert(name, url);
+            }
+        }
+    }
+    let develop_map = match root.get("develop") {
+        Some(val) => Some(val.as_object()?),
+        None => None,
+    };
+    let mut packages = BTreeMap::new();
+    for map in [Some(default_map), develop_map].into_iter().flatten() {
+        for (name, pkg_val) in map {
+            let pkg = pkg_val.as_object()?;
+            let git_ref = pkg
+                .get("ref")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty());
+            let version = if let Some(ver) = pkg.get("version").and_then(serde_json::Value::as_str)
+            {
+                let v = ver.strip_prefix("==").unwrap_or(ver).trim();
+                if v.is_empty() {
+                    return None;
+                }
+                v.to_owned()
+            } else if let Some(r) = git_ref {
+                short_rev(r).to_owned()
+            } else if pkg.get("path").is_some() || pkg.get("file").is_some() {
+                "local".to_owned()
+            } else {
+                return None;
+            };
+            let source = if let Some(idx) = pkg
+                .get("index")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                Some(
+                    sources_map
+                        .get(idx)
+                        .copied()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("index:{idx}")),
+                )
+            } else if let Some(url) = pkg
+                .get("git")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                Some(format!("git:{url}"))
+            } else if let Some(file) = pkg
+                .get("file")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                Some(format!("file:{file}"))
+            } else {
+                pkg.get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(|path| format!("path:{path}"))
+            };
+            let checksum =
+                if let Some(arr) = pkg.get("hashes").and_then(serde_json::Value::as_array) {
+                    let hashes: BTreeSet<&str> = arr
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    (!hashes.is_empty()).then(|| hashes.into_iter().collect::<Vec<_>>().join(", "))
+                } else {
+                    git_ref.map(str::to_owned)
+                };
+            insert_merged(
+                &mut packages,
+                name.clone(),
+                version,
+                source,
+                checksum,
+                BTreeSet::new(),
+            )?;
+        }
+    }
+    Some(packages)
+}
+
 fn parse_format(format: LockFormat, text: &str) -> Option<BTreeMap<Key, Package>> {
     match format {
         LockFormat::Cargo => packages(text),
@@ -1960,6 +2486,11 @@ fn parse_format(format: LockFormat, text: &str) -> Option<BTreeMap<Key, Package>
         LockFormat::Flake => flake_packages(text),
         LockFormat::SwiftResolved => swift_resolved_packages(text),
         LockFormat::Mix => mix_packages(text),
+        LockFormat::Pubspec => pubspec_packages(text),
+        LockFormat::Gradle => gradle_packages(text),
+        LockFormat::Podfile => podfile_packages(text),
+        LockFormat::NuGet => nuget_packages(text),
+        LockFormat::Pipfile => pipfile_packages(text),
     }
 }
 
@@ -2259,6 +2790,466 @@ fn extract_json_hunk_entries(
     }
 }
 
+fn json_brace_delta(line: &str) -> isize {
+    let mut delta = 0isize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for b in line.bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => delta += 1,
+            b'}' => delta -= 1,
+            _ => {}
+        }
+    }
+    delta
+}
+
+fn split_raw_hunks<'a>(hunk_lines: &[&'a str]) -> Option<Vec<Vec<(char, &'a str)>>> {
+    let mut hunks = Vec::new();
+    let mut cur = Vec::new();
+    let mut saw_change = false;
+    for &line in hunk_lines {
+        if is_hunk_line(line) {
+            if !cur.is_empty() {
+                hunks.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(' ') {
+            cur.push((' ', rest));
+        } else if let Some(rest) = line.strip_prefix('-') {
+            saw_change = true;
+            cur.push(('-', rest));
+        } else if let Some(rest) = line.strip_prefix('+') {
+            saw_change = true;
+            cur.push(('+', rest));
+        }
+    }
+    if !cur.is_empty() {
+        hunks.push(cur);
+    }
+    saw_change.then_some(hunks)
+}
+
+fn merge_parsed(parsed: BTreeMap<Key, Package>, out: &mut BTreeMap<Key, Package>) -> Option<()> {
+    for (_, pkg) in parsed {
+        insert_merged(
+            out,
+            pkg.name,
+            pkg.version,
+            pkg.source,
+            pkg.checksum,
+            pkg.dependencies.into_iter().collect(),
+        )?;
+    }
+    Some(())
+}
+
+fn compare_pubspec_hunks(
+    hunk_lines: &[&str],
+    old_pkgs: &mut BTreeMap<Key, Package>,
+    new_pkgs: &mut BTreeMap<Key, Package>,
+) -> Option<()> {
+    let hunks = split_raw_hunks(hunk_lines)?;
+    let flush_block = |old_lines: &mut Vec<&str>,
+                       new_lines: &mut Vec<&str>,
+                       changed: &mut bool,
+                       old_pkgs: &mut BTreeMap<Key, Package>,
+                       new_pkgs: &mut BTreeMap<Key, Package>|
+     -> Option<()> {
+        let was_changed = *changed;
+        *changed = false;
+        let old_blk = std::mem::take(old_lines);
+        let new_blk = std::mem::take(new_lines);
+        if !was_changed {
+            return Some(());
+        }
+        if !old_blk.is_empty() {
+            let snippet = format!("packages:\n{}\n", old_blk.join("\n"));
+            merge_parsed(pubspec_packages(&snippet)?, old_pkgs)?;
+        }
+        if !new_blk.is_empty() {
+            let snippet = format!("packages:\n{}\n", new_blk.join("\n"));
+            merge_parsed(pubspec_packages(&snippet)?, new_pkgs)?;
+        }
+        Some(())
+    };
+    for hunk in hunks {
+        let mut in_block = false;
+        let mut in_sdks = false;
+        let mut blk_old: Vec<&str> = Vec::new();
+        let mut blk_new: Vec<&str> = Vec::new();
+        let mut blk_changed = false;
+        for (kind, rest) in hunk {
+            let line = rest.strip_suffix('\r').unwrap_or(rest);
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let indent = line.bytes().take_while(|&b| b == b' ').count();
+            if indent == 0 {
+                flush_block(
+                    &mut blk_old,
+                    &mut blk_new,
+                    &mut blk_changed,
+                    old_pkgs,
+                    new_pkgs,
+                )?;
+                in_block = false;
+                match trimmed {
+                    "packages:" | "packages: {}" | "sdks: {}" => in_sdks = false,
+                    "sdks:" => in_sdks = true,
+                    _ if kind != ' ' => return None,
+                    _ => {}
+                }
+                continue;
+            }
+            if in_sdks {
+                if kind != ' ' {
+                    return None;
+                }
+                continue;
+            }
+            if indent == 2 {
+                flush_block(
+                    &mut blk_old,
+                    &mut blk_new,
+                    &mut blk_changed,
+                    old_pkgs,
+                    new_pkgs,
+                )?;
+                in_block = true;
+                if kind != '+' {
+                    blk_old.push(line);
+                }
+                if kind != '-' {
+                    blk_new.push(line);
+                }
+                if kind != ' ' {
+                    blk_changed = true;
+                }
+            } else {
+                if !in_block {
+                    if kind != ' ' {
+                        return None;
+                    }
+                    continue;
+                }
+                if kind != '+' {
+                    blk_old.push(line);
+                }
+                if kind != '-' {
+                    blk_new.push(line);
+                }
+                if kind != ' ' {
+                    blk_changed = true;
+                }
+            }
+        }
+        flush_block(
+            &mut blk_old,
+            &mut blk_new,
+            &mut blk_changed,
+            old_pkgs,
+            new_pkgs,
+        )?;
+    }
+    Some(())
+}
+
+fn compare_podfile_hunks(
+    hunk_lines: &[&str],
+    old_pkgs: &mut BTreeMap<Key, Package>,
+    new_pkgs: &mut BTreeMap<Key, Package>,
+) -> Option<()> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum HunkSection {
+        Unknown,
+        Pods,
+        SpecChecksums,
+        Ignored,
+        FailClosed,
+    }
+    let hunks = split_raw_hunks(hunk_lines)?;
+    let mut old_checksums: BTreeMap<String, String> = BTreeMap::new();
+    let mut new_checksums: BTreeMap<String, String> = BTreeMap::new();
+    let flush_pod = |pod: Option<(String, String, BTreeSet<String>)>,
+                     out: &mut BTreeMap<Key, Package>| {
+        if let Some((name, version, deps)) = pod {
+            insert_merged(out, name, version, None, None, deps)?;
+        }
+        Some(())
+    };
+    for hunk in hunks {
+        let mut section = HunkSection::Unknown;
+        let mut old_cur: Option<(String, String, BTreeSet<String>)> = None;
+        let mut new_cur: Option<(String, String, BTreeSet<String>)> = None;
+        for (kind, rest) in hunk {
+            let line = rest.strip_suffix('\r').unwrap_or(rest);
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let indent = line.bytes().take_while(|&b| b == b' ').count();
+            if indent == 0 {
+                flush_pod(old_cur.take(), old_pkgs)?;
+                flush_pod(new_cur.take(), new_pkgs)?;
+                section = match trimmed {
+                    "PODS:" => HunkSection::Pods,
+                    "SPEC CHECKSUMS:" => HunkSection::SpecChecksums,
+                    "DEPENDENCIES:" | "SPEC REPOS:" => HunkSection::Ignored,
+                    "EXTERNAL SOURCES:" | "CHECKOUT OPTIONS:" => HunkSection::FailClosed,
+                    _ if trimmed.starts_with("PODFILE CHECKSUM:")
+                        || trimmed.starts_with("COCOAPODS:")
+                        || trimmed.starts_with("COCOAPODS PLUGINS:") =>
+                    {
+                        HunkSection::Ignored
+                    }
+                    _ => {
+                        if kind != ' ' {
+                            return None;
+                        }
+                        HunkSection::Unknown
+                    }
+                };
+                continue;
+            }
+            match section {
+                HunkSection::Ignored => continue,
+                HunkSection::FailClosed => {
+                    if kind != ' ' {
+                        return None;
+                    }
+                    continue;
+                }
+                HunkSection::Pods | HunkSection::SpecChecksums | HunkSection::Unknown => {}
+            }
+            if indent == 2 {
+                if section != HunkSection::SpecChecksums
+                    && let Some((name, version)) = parse_pod_spec(trimmed)
+                {
+                    if kind != '+' {
+                        flush_pod(old_cur.take(), old_pkgs)?;
+                        old_cur = Some((name.clone(), version.clone(), BTreeSet::new()));
+                    }
+                    if kind != '-' {
+                        flush_pod(new_cur.take(), new_pkgs)?;
+                        new_cur = Some((name, version, BTreeSet::new()));
+                    }
+                    continue;
+                }
+                if section != HunkSection::Pods
+                    && let Some((k, v)) = trimmed.split_once(':')
+                {
+                    let pod = unquote_lock_scalar(k);
+                    let hash = unquote_lock_scalar(v);
+                    if !pod.is_empty()
+                        && hash.len() == 40
+                        && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                    {
+                        if kind != '+' {
+                            old_checksums.insert(pod.to_owned(), hash.to_owned());
+                        }
+                        if kind != '-' {
+                            new_checksums.insert(pod.to_owned(), hash.to_owned());
+                        }
+                        continue;
+                    }
+                }
+                if kind != ' ' {
+                    return None;
+                }
+            } else if indent == 4
+                && section != HunkSection::SpecChecksums
+                && trimmed.starts_with("- ")
+            {
+                let Some(dep) = parse_pod_dep_name(trimmed) else {
+                    if kind != ' ' {
+                        return None;
+                    }
+                    continue;
+                };
+                if kind != '+' {
+                    if let Some((_, _, deps)) = old_cur.as_mut() {
+                        deps.insert(dep.to_owned());
+                    } else if kind == '-' {
+                        return None;
+                    }
+                }
+                if kind != '-' {
+                    if let Some((_, _, deps)) = new_cur.as_mut() {
+                        deps.insert(dep.to_owned());
+                    } else if kind == '+' {
+                        return None;
+                    }
+                }
+            } else if kind != ' ' {
+                return None;
+            }
+        }
+        flush_pod(old_cur.take(), old_pkgs)?;
+        flush_pod(new_cur.take(), new_pkgs)?;
+    }
+    let attach = |checksums: &BTreeMap<String, String>, pkgs: &mut BTreeMap<Key, Package>| {
+        for (pod, hash) in checksums {
+            for pkg in pkgs.values_mut() {
+                if pkg.name == *pod {
+                    pkg.checksum = Some(hash.clone());
+                }
+            }
+        }
+    };
+    attach(&old_checksums, old_pkgs);
+    attach(&new_checksums, new_pkgs);
+    // Fail closed if a changed SPEC CHECKSUMS entry belongs to a pod absent from PODS hunks.
+    for pod in old_checksums.keys().chain(new_checksums.keys()) {
+        if old_checksums.get(pod) != new_checksums.get(pod)
+            && !old_pkgs.values().any(|p| p.name == *pod)
+            && !new_pkgs.values().any(|p| p.name == *pod)
+        {
+            return None;
+        }
+    }
+    Some(())
+}
+
+fn compare_json_map_hunks(
+    format: LockFormat,
+    hunk_lines: &[&str],
+    old_pkgs: &mut BTreeMap<Key, Package>,
+    new_pkgs: &mut BTreeMap<Key, Package>,
+) -> Option<()> {
+    let hunks = split_raw_hunks(hunk_lines)?;
+    let parse_side = |side_char: char, out: &mut BTreeMap<Key, Package>| -> Option<()> {
+        let mut entries: Vec<String> = Vec::new();
+        for hunk in &hunks {
+            let side: Vec<(bool, &str)> = hunk
+                .iter()
+                .filter_map(|&(kind, rest)| {
+                    (kind == ' ' || kind == side_char).then_some((kind == side_char, rest))
+                })
+                .collect();
+            let mut key: Option<String> = None;
+            let mut buf = String::new();
+            let mut depth = 0isize;
+            let mut obj_changed = false;
+            for (idx, &(changed, raw)) in side.iter().enumerate() {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if depth == 0 {
+                    if let Some((k, rest)) = trimmed.split_once(':') {
+                        let rest_t = rest.trim();
+                        if rest_t.starts_with('{') {
+                            let name = unquote_lock_scalar(k);
+                            let is_pkg = match format {
+                                LockFormat::NuGet => {
+                                    !name.is_empty()
+                                        && name != "dependencies"
+                                        && (rest_t.contains("\"type\"")
+                                            || side[idx + 1..]
+                                                .iter()
+                                                .find(|(_, l)| !l.trim().is_empty())
+                                                .is_some_and(|(_, l)| {
+                                                    l.trim().starts_with("\"type\"")
+                                                }))
+                                }
+                                LockFormat::Pipfile => {
+                                    !name.is_empty()
+                                        && !matches!(
+                                            name,
+                                            "_meta" | "default" | "develop" | "hash" | "requires"
+                                        )
+                                }
+                                _ => false,
+                            };
+                            if is_pkg {
+                                key = Some(name.to_owned());
+                                buf.clear();
+                                buf.push_str(rest_t);
+                                obj_changed = changed;
+                                depth = json_brace_delta(rest_t);
+                                if depth <= 0 {
+                                    depth = 0;
+                                    if let Some(name) = key.take()
+                                        && obj_changed
+                                    {
+                                        entries.push(format!(
+                                            "\"{name}\":{}",
+                                            buf.trim_end_matches(',')
+                                        ));
+                                    }
+                                    buf.clear();
+                                    obj_changed = false;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    if changed {
+                        let ok_outside = matches!(trimmed, "{" | "}" | "}," | "]" | "]," | ",")
+                            || (format == LockFormat::Pipfile
+                                && trimmed.starts_with("\"sha256\":"));
+                        if !ok_outside {
+                            return None;
+                        }
+                    }
+                } else {
+                    buf.push('\n');
+                    buf.push_str(trimmed);
+                    obj_changed |= changed;
+                    depth += json_brace_delta(trimmed);
+                    if depth <= 0 {
+                        depth = 0;
+                        if let Some(name) = key.take()
+                            && obj_changed
+                        {
+                            entries.push(format!("\"{name}\":{}", buf.trim_end_matches(',')));
+                        }
+                        buf.clear();
+                        obj_changed = false;
+                    }
+                }
+            }
+            if depth > 0 && obj_changed {
+                return None;
+            }
+        }
+        if entries.is_empty() {
+            return Some(());
+        }
+        for entry in &entries {
+            let wrapped = match format {
+                LockFormat::NuGet => {
+                    format!("{{\"version\":1,\"dependencies\":{{\"hunk\":{{{entry}}}}}}}")
+                }
+                LockFormat::Pipfile => {
+                    format!("{{\"_meta\":{{\"pipfile-spec\":6}},\"default\":{{{entry}}}}}")
+                }
+                _ => unreachable!(),
+            };
+            let parsed = parse_format(format, &wrapped)?;
+            merge_parsed(parsed, out)?;
+        }
+        Some(())
+    };
+    parse_side('-', old_pkgs)?;
+    parse_side('+', new_pkgs)?;
+    Some(())
+}
+
 /// Fallback hunk-based dependency diff when git blobs are absent locally (such as
 /// remote `gh pr diff` / `glab mr diff` patches). Conservative: returns `None` if
 /// changed lines cannot be confidently attributed to parsed packages.
@@ -2267,22 +3258,48 @@ fn compare_hunks(format: LockFormat, hunk_lines: &[&str]) -> Option<Changes> {
     let mut old_pkgs: BTreeMap<Key, Package> = BTreeMap::new();
     let mut new_pkgs: BTreeMap<Key, Package> = BTreeMap::new();
     match format {
-        LockFormat::GoSum => {
+        LockFormat::GoSum | LockFormat::Gradle => {
             let mut old_text = String::new();
             let mut new_text = String::new();
+            let skip_comment = format == LockFormat::Gradle;
             for (old, new) in &hunks {
                 for line in old {
+                    let trimmed = line.trim();
+                    if skip_comment && (trimmed.is_empty() || trimmed.starts_with('#')) {
+                        continue;
+                    }
                     old_text.push_str(line);
                     old_text.push('\n');
                 }
                 for line in new {
+                    let trimmed = line.trim();
+                    if skip_comment && (trimmed.is_empty() || trimmed.starts_with('#')) {
+                        continue;
+                    }
                     new_text.push_str(line);
                     new_text.push('\n');
                 }
             }
-            return compare_format(LockFormat::GoSum, &old_text, &new_text);
+            old_pkgs = parse_format(format, &old_text)?;
+            new_pkgs = parse_format(format, &new_text)?;
         }
         LockFormat::Mix => {
+            for &line in hunk_lines {
+                if let Some(rest) = line.strip_prefix('+').or_else(|| line.strip_prefix('-')) {
+                    let trimmed = rest.trim();
+                    if trimmed.is_empty()
+                        || trimmed.starts_with('#')
+                        || matches!(trimmed, "%{" | "}")
+                    {
+                        continue;
+                    }
+                    if !(trimmed.starts_with('"')
+                        && (trimmed.ends_with("},") || trimmed.ends_with('}')))
+                    {
+                        return None;
+                    }
+                }
+            }
             let build = |sides: Vec<&str>| -> Option<BTreeMap<Key, Package>> {
                 let mut entries = String::from("%{\n");
                 for line in sides {
@@ -2304,6 +3321,15 @@ fn compare_hunks(format: LockFormat, hunk_lines: &[&str]) -> Option<Changes> {
             let new_all: Vec<&str> = hunks.iter().flat_map(|(_, n)| n.iter().copied()).collect();
             old_pkgs = build(old_all)?;
             new_pkgs = build(new_all)?;
+        }
+        LockFormat::Pubspec => {
+            compare_pubspec_hunks(hunk_lines, &mut old_pkgs, &mut new_pkgs)?;
+        }
+        LockFormat::Podfile => {
+            compare_podfile_hunks(hunk_lines, &mut old_pkgs, &mut new_pkgs)?;
+        }
+        LockFormat::NuGet | LockFormat::Pipfile => {
+            compare_json_map_hunks(format, hunk_lines, &mut old_pkgs, &mut new_pkgs)?;
         }
         LockFormat::Bun => {
             let build = |sides: Vec<&str>| -> Option<BTreeMap<Key, Package>> {
@@ -3747,5 +4773,677 @@ mod tests {
             found[1].head,
             "=== assets/diagram.svg (generated, +105 -1) [stdout:83-193]\n"
         );
+    }
+
+    #[test]
+    fn all_eighteen_lockfile_formats_recognized() {
+        let cases = [
+            ("Cargo.lock", LockFormat::Cargo),
+            ("web/package-lock.json", LockFormat::Npm),
+            ("yarn.lock", LockFormat::Yarn),
+            ("pnpm-lock.yaml", LockFormat::Pnpm),
+            ("bun.lock", LockFormat::Bun),
+            ("uv.lock", LockFormat::Uv),
+            ("go.sum", LockFormat::GoSum),
+            ("poetry.lock", LockFormat::Poetry),
+            ("Gemfile.lock", LockFormat::Gemfile),
+            ("composer.lock", LockFormat::Composer),
+            ("flake.lock", LockFormat::Flake),
+            ("ios/Package.resolved", LockFormat::SwiftResolved),
+            ("mix.lock", LockFormat::Mix),
+            ("app/pubspec.lock", LockFormat::Pubspec),
+            ("gradle.lockfile", LockFormat::Gradle),
+            ("buildscript-gradle.lockfile", LockFormat::Gradle),
+            ("ios/Podfile.lock", LockFormat::Podfile),
+            ("src/App/packages.lock.json", LockFormat::NuGet),
+            ("Pipfile.lock", LockFormat::Pipfile),
+        ];
+        let mut distinct = BTreeSet::new();
+        for (path, expected) in cases {
+            assert_eq!(LockFormat::of_path(path), Some(expected), "{path}");
+            assert!(is_lockfile_path(path), "{path}");
+            distinct.insert(format!("{expected:?}"));
+        }
+        assert_eq!(distinct.len(), 18);
+        assert!(!is_lockfile_path("src/lib.rs"));
+        assert!(!is_lockfile_path("gradle.lockfile.bak"));
+    }
+
+    #[test]
+    fn pubspec_lock_full_hunk_and_tamper_detection() {
+        let old = "\
+# Generated by pub
+packages:
+  async:
+    dependency: transitive
+    description:
+      name: async
+      sha256: \"aaa111\"
+      url: \"https://pub.dev\"
+    source: hosted
+    version: \"2.11.0\"
+  http:
+    dependency: \"direct main\"
+    description:
+      name: http
+      sha256: \"bbb222\"
+      url: \"https://pub.dev\"
+    source: hosted
+    version: \"1.2.1\"
+  old_pkg:
+    dependency: transitive
+    description:
+      name: old_pkg
+      sha256: \"ccc333\"
+      url: \"https://pub.dev\"
+    source: hosted
+    version: \"0.9.0\"
+  flutter:
+    dependency: \"direct main\"
+    description: flutter
+    source: sdk
+    version: \"0.0.0\"
+sdks:
+  dart: \">=3.2.0 <4.0.0\"
+";
+        let new = "\
+# Generated by pub
+packages:
+  async:
+    dependency: transitive
+    description:
+      name: async
+      sha256: \"tampered\"
+      url: \"https://pub.dev\"
+    source: hosted
+    version: \"2.11.0\"
+  http:
+    dependency: \"direct main\"
+    description:
+      name: http
+      sha256: \"bbb999\"
+      url: \"https://pub.dev\"
+    source: hosted
+    version: \"1.2.2\"
+  path:
+    dependency: \"direct main\"
+    description:
+      name: path
+      sha256: \"ddd444\"
+      url: \"https://pub.dev\"
+    source: hosted
+    version: \"1.9.0\"
+  flutter:
+    dependency: \"direct main\"
+    description: flutter
+    source: sdk
+    version: \"0.0.0\"
+sdks:
+  dart: \">=3.2.0 <4.0.0\"
+";
+        let changes = compare_format(LockFormat::Pubspec, old, new).unwrap();
+        assert_eq!(changes.added, vec!["path 1.9.0"]);
+        assert_eq!(changes.removed, vec!["old_pkg 0.9.0"]);
+        assert_eq!(changes.updated, vec!["http 1.2.1 -> 1.2.2"]);
+        assert!(
+            changes.flags.iter().any(|f| f
+                .contains("checksum changed on existing version async 2.11.0: aaa111 -> tampered")),
+            "{:?}",
+            changes.flags
+        );
+        assert!(pubspec_packages("not_a_pubspec: true\n").is_none());
+
+        // Remote hunk fallback (no local git blobs) + byte-reduction check.
+        let dir = tempfile::tempdir().unwrap();
+        let mut hunk = String::from(concat!(
+            "diff --git a/pubspec.lock b/pubspec.lock\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/pubspec.lock\n",
+            "+++ b/pubspec.lock\n",
+            "@@ -2,20 +2,20 @@\n",
+            " packages:\n",
+        ));
+        for i in 0..8 {
+            hunk.push_str(&format!(
+                concat!(
+                    "-  pkg_{i:02}:\n",
+                    "-    dependency: transitive\n",
+                    "-    description:\n",
+                    "-      name: pkg_{i:02}\n",
+                    "-      sha256: \"old{i:02}\"\n",
+                    "-      url: \"https://pub.dev\"\n",
+                    "-    source: hosted\n",
+                    "-    version: \"1.{i}.0\"\n",
+                    "+  pkg_{i:02}:\n",
+                    "+    dependency: transitive\n",
+                    "+    description:\n",
+                    "+      name: pkg_{i:02}\n",
+                    "+      sha256: \"new{i:02}\"\n",
+                    "+      url: \"https://pub.dev\"\n",
+                    "+    source: hosted\n",
+                    "+    version: \"1.{i}.1\"\n",
+                ),
+                i = i
+            ));
+        }
+        let found = sections(&hunk, dir.path());
+        assert_eq!(found.len(), 1);
+        let rendered = found[0].text();
+        assert!(rendered.contains("8 updated"), "{rendered}");
+        assert!(rendered.contains("pkg_00 1.0.0 -> 1.0.1"), "{rendered}");
+        assert!(
+            rendered.len() * 5 < hunk.len(),
+            "raw={} rendered={}\n{rendered}",
+            hunk.len(),
+            rendered.len()
+        );
+
+        // Fail closed when hunk edits `sdks:` or lacks enclosing package header.
+        let orphan = "\
+diff --git a/pubspec.lock b/pubspec.lock
+index 1111111..2222222 100644
+--- a/pubspec.lock
++++ b/pubspec.lock
+@@ -10,3 +10,3 @@
+-      sha256: \"old\"
++      sha256: \"new\"
+";
+        assert!(sections(orphan, dir.path()).is_empty());
+    }
+
+    #[test]
+    fn gradle_lockfile_full_hunk_and_variant_names() {
+        let old = "\
+# This is a Gradle generated file for dependency locking.
+com.google.guava:guava:32.1.3-jre=compileClasspath,runtimeClasspath
+org.slf4j:slf4j-api:2.0.12=compileClasspath
+org.legacy:old-lib:1.0.0=runtimeClasspath
+empty=annotationProcessor
+";
+        let new = "\
+# This is a Gradle generated file for dependency locking.
+com.google.guava:guava:32.1.3-jre=compileClasspath,runtimeClasspath,testCompileClasspath
+org.slf4j:slf4j-api:2.0.13=compileClasspath
+org.junit.jupiter:junit-jupiter-api:5.10.2=testCompileClasspath
+empty=annotationProcessor
+";
+        let changes = compare_format(LockFormat::Gradle, old, new).unwrap();
+        assert_eq!(
+            changes.added,
+            vec!["org.junit.jupiter:junit-jupiter-api 5.10.2"]
+        );
+        assert_eq!(changes.removed, vec!["org.legacy:old-lib 1.0.0"]);
+        assert_eq!(
+            changes.updated,
+            vec!["org.slf4j:slf4j-api 2.0.12 -> 2.0.13"]
+        );
+        assert_eq!(
+            changes.links,
+            vec!["com.google.guava:guava +testCompileClasspath"]
+        );
+        assert!(gradle_packages("not valid gradle line\n").is_none());
+
+        // Remote hunk fallback adding right below `#` header comments & `*-gradle.lockfile`.
+        let dir = tempfile::tempdir().unwrap();
+        let mut patch = String::from(concat!(
+            "diff --git a/buildscript-gradle.lockfile b/buildscript-gradle.lockfile\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/buildscript-gradle.lockfile\n",
+            "+++ b/buildscript-gradle.lockfile\n",
+            "@@ -1,4 +1,14 @@\n",
+            " # This is a Gradle generated file for dependency locking.\n",
+        ));
+        for i in 0..10 {
+            patch.push_str(&format!(
+                "+com.example.longgroup.service:module-{i:02}:2.{i}.0=compileClasspath,runtimeClasspath,testCompileClasspath\n"
+            ));
+        }
+        let found = sections(&patch, dir.path());
+        assert_eq!(found.len(), 1);
+        let rendered = found[0].text();
+        assert!(rendered.contains("10 added"), "{rendered}");
+        assert!(
+            rendered.len() * 2 < patch.len(),
+            "raw={} rendered={}\n{rendered}",
+            patch.len(),
+            rendered.len()
+        );
+    }
+
+    #[test]
+    fn podfile_lock_full_hunk_and_tamper_detection() {
+        let old = "\
+PODS:
+  - Alamofire (5.9.0)
+  - FirebaseCore (10.24.0):
+    - GoogleUtilities/Environment (~> 7.12)
+  - OldPod (1.0.0)
+
+DEPENDENCIES:
+  - Alamofire (~> 5.9)
+  - FirebaseCore
+
+SPEC REPOS:
+  trunk:
+    - Alamofire
+    - FirebaseCore
+    - OldPod
+
+EXTERNAL SOURCES:
+  LocalKit:
+    :path: ../LocalKit
+
+SPEC CHECKSUMS:
+  Alamofire: 1111111111111111111111111111111111111111
+  FirebaseCore: 2222222222222222222222222222222222222222
+  OldPod: 3333333333333333333333333333333333333333
+
+PODFILE CHECKSUM: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+COCOAPODS: 1.15.2
+";
+        let new = "\
+PODS:
+  - Alamofire (5.9.1)
+  - FirebaseCore (10.24.0):
+    - GoogleUtilities/Environment (~> 7.12)
+  - SnapKit (5.7.1)
+
+DEPENDENCIES:
+  - Alamofire (~> 5.9)
+  - FirebaseCore
+  - SnapKit
+
+SPEC REPOS:
+  trunk:
+    - Alamofire
+    - FirebaseCore
+    - SnapKit
+
+EXTERNAL SOURCES:
+  LocalKit:
+    :path: ../LocalKit
+
+SPEC CHECKSUMS:
+  Alamofire: 4444444444444444444444444444444444444444
+  FirebaseCore: 9999999999999999999999999999999999999999
+  SnapKit: 5555555555555555555555555555555555555555
+
+PODFILE CHECKSUM: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+COCOAPODS: 1.15.2
+";
+        let changes = compare_format(LockFormat::Podfile, old, new).unwrap();
+        assert_eq!(changes.added, vec!["SnapKit 5.7.1"]);
+        assert_eq!(changes.removed, vec!["OldPod 1.0.0"]);
+        assert_eq!(changes.updated, vec!["Alamofire 5.9.0 -> 5.9.1"]);
+        assert!(
+            changes.flags.iter().any(|f| f.contains(
+                "checksum changed on existing version FirebaseCore 10.24.0: 2222222222222222222222222222222222222222 -> 9999999999999999999999999999999999999999"
+            )),
+            "{:?}",
+            changes.flags
+        );
+        assert!(podfile_packages("DEPENDENCIES:\n  - Foo\n").is_none());
+
+        // Remote hunk fallback: ignores DEPENDENCIES constraints (`~> 5.9`) and SPEC REPOS
+        // while flagging SPEC CHECKSUMS tampering and failing closed on EXTERNAL SOURCES edits.
+        let dir = tempfile::tempdir().unwrap();
+        let patch = "\
+diff --git a/ios/Podfile.lock b/ios/Podfile.lock
+index 1111111..2222222 100644
+--- a/ios/Podfile.lock
++++ b/ios/Podfile.lock
+@@ -1,6 +1,6 @@
+ PODS:
+-  - Alamofire (5.9.0)
++  - Alamofire (5.9.1)
+   - FirebaseCore (10.24.0)
++  - SnapKit (5.7.1)
+@@ -10,4 +10,5 @@
+ DEPENDENCIES:
+-  - Alamofire (~> 5.8)
++  - Alamofire (~> 5.9)
++  - SnapKit (~> 5.7)
+@@ -20,3 +21,4 @@
+ SPEC CHECKSUMS:
+-  Alamofire: 1111111111111111111111111111111111111111
++  Alamofire: 4444444444444444444444444444444444444444
+-  FirebaseCore: 2222222222222222222222222222222222222222
++  FirebaseCore: 9999999999999999999999999999999999999999
++  SnapKit: 5555555555555555555555555555555555555555
+@@ -30,1 +32,1 @@
+-PODFILE CHECKSUM: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
++PODFILE CHECKSUM: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+";
+        let found = sections(patch, dir.path());
+        assert_eq!(found.len(), 1);
+        let rendered = found[0].text();
+        assert!(rendered.contains("added: SnapKit 5.7.1"), "{rendered}");
+        assert!(
+            rendered.contains("updated: Alamofire 5.9.0 -> 5.9.1"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("~>"), "{rendered}");
+        assert!(
+            found[0]
+                .flags
+                .iter()
+                .any(|f| f.contains("checksum changed on existing version FirebaseCore 10.24.0")),
+            "{:?}",
+            found[0].flags
+        );
+
+        let ext_swap = "\
+diff --git a/ios/Podfile.lock b/ios/Podfile.lock
+index 1111111..2222222 100644
+--- a/ios/Podfile.lock
++++ b/ios/Podfile.lock
+@@ -15,3 +15,3 @@
+ EXTERNAL SOURCES:
+   MyPod:
+-    :git: https://github.com/org/pod.git
++    :git: https://evil.example/pod.git
+";
+        assert!(sections(ext_swap, dir.path()).is_empty());
+    }
+
+    #[test]
+    fn nuget_packages_lock_full_hunk_and_multi_tfm() {
+        let old = r#"{
+  "version": 1,
+  "dependencies": {
+    "net8.0": {
+      "Newtonsoft.Json": {
+        "type": "Direct",
+        "requested": "[13.0.1, )",
+        "resolved": "13.0.1",
+        "contentHash": "hashOld=="
+      },
+      "Serilog": {
+        "type": "Direct",
+        "requested": "[3.1.1, )",
+        "resolved": "3.1.1",
+        "contentHash": "serilogHash=="
+      },
+      "Legacy.Pkg": {
+        "type": "Transitive",
+        "resolved": "1.0.0",
+        "contentHash": "legacyHash=="
+      },
+      "App.Core": {
+        "type": "Project",
+        "dependencies": {
+          "Serilog": "[3.1.1, )"
+        }
+      }
+    }
+  }
+}"#;
+        let new = r#"{
+  "version": 1,
+  "dependencies": {
+    "net8.0": {
+      "Newtonsoft.Json": {
+        "type": "Direct",
+        "requested": "[13.0.3, )",
+        "resolved": "13.0.3",
+        "contentHash": "hashNew=="
+      },
+      "Serilog": {
+        "type": "Direct",
+        "requested": "[3.1.1, )",
+        "resolved": "3.1.1",
+        "contentHash": "tamperedHash=="
+      },
+      "Polly": {
+        "type": "Direct",
+        "requested": "[8.4.0, )",
+        "resolved": "8.4.0",
+        "contentHash": "pollyHash=="
+      },
+      "App.Core": {
+        "type": "Project",
+        "dependencies": {
+          "Serilog": "[3.1.1, )",
+          "Polly": "[8.4.0, )"
+        }
+      }
+    }
+  }
+}"#;
+        let changes = compare_format(LockFormat::NuGet, old, new).unwrap();
+        assert_eq!(changes.added, vec!["Polly 8.4.0"]);
+        assert_eq!(changes.removed, vec!["Legacy.Pkg 1.0.0"]);
+        assert_eq!(changes.updated, vec!["Newtonsoft.Json 13.0.1 -> 13.0.3"]);
+        assert_eq!(changes.links, vec!["App.Core +Polly"]);
+        assert!(
+            changes.flags.iter().any(|f| f.contains(
+                "checksum changed on existing version Serilog 3.1.1: serilogHash== -> tamperedHash=="
+            )),
+            "{:?}",
+            changes.flags
+        );
+        assert!(nuget_packages("{\"version\":1}").is_none());
+
+        // Remote hunk fallback with multi-TFM entries for the same package name:
+        // a checksum conflict between TFMs must fail closed rather than silently overwrite.
+        let dir = tempfile::tempdir().unwrap();
+        let mut patch = String::from(concat!(
+            "diff --git a/src/App/packages.lock.json b/src/App/packages.lock.json\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/src/App/packages.lock.json\n",
+            "+++ b/src/App/packages.lock.json\n",
+            "@@ -4,30 +4,30 @@\n",
+        ));
+        for i in 0..8 {
+            patch.push_str(&format!(
+                concat!(
+                    "       \"Company.Package.{i:02}\": {{\n",
+                    "-        \"type\": \"Direct\",\n",
+                    "-        \"requested\": \"[1.{i}.0, )\",\n",
+                    "-        \"resolved\": \"1.{i}.0\",\n",
+                    "-        \"contentHash\": \"oldHash{i:02}==\"\n",
+                    "+        \"type\": \"Direct\",\n",
+                    "+        \"requested\": \"[1.{i}.1, )\",\n",
+                    "+        \"resolved\": \"1.{i}.1\",\n",
+                    "+        \"contentHash\": \"newHash{i:02}==\"\n",
+                    "       }},\n",
+                ),
+                i = i
+            ));
+        }
+        let found = sections(&patch, dir.path());
+        assert_eq!(found.len(), 1);
+        let rendered = found[0].text();
+        assert!(rendered.contains("8 updated"), "{rendered}");
+        assert!(
+            rendered.len() * 4 < patch.len(),
+            "raw={} rendered={}\n{rendered}",
+            patch.len(),
+            rendered.len()
+        );
+
+        let conflicting_tfm = "\
+diff --git a/packages.lock.json b/packages.lock.json
+index 1111111..2222222 100644
+--- a/packages.lock.json
++++ b/packages.lock.json
+@@ -4,12 +4,12 @@
+       \"Shared.Pkg\": {
+         \"type\": \"Direct\",
+         \"resolved\": \"1.0.0\",
+-        \"contentHash\": \"orig==\"
++        \"contentHash\": \"tampered==\"
+       },
+@@ -40,12 +40,12 @@
+       \"Shared.Pkg\": {
+         \"type\": \"Direct\",
+         \"resolved\": \"1.0.0\",
+-        \"contentHash\": \"orig==\"
++        \"contentHash\": \"orig==\"
+       },
+";
+        // Per-entry merging catches conflicting hashes across TFMs and fails closed!
+        assert!(sections(conflicting_tfm, dir.path()).is_empty());
+    }
+
+    #[test]
+    fn pipfile_lock_full_hunk_and_tamper_detection() {
+        let old = r#"{
+  "_meta": {
+    "hash": { "sha256": "metaold" },
+    "pipfile-spec": 6,
+    "sources": [
+      { "name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": true }
+    ]
+  },
+  "default": {
+    "requests": {
+      "hashes": ["sha256:aaa", "sha256:bbb"],
+      "index": "pypi",
+      "version": "==2.31.0"
+    },
+    "urllib3": {
+      "hashes": ["sha256:ccc"],
+      "index": "pypi",
+      "version": "==2.2.1"
+    },
+    "oldlib": {
+      "hashes": ["sha256:ddd"],
+      "index": "pypi",
+      "version": "==0.5.0"
+    }
+  },
+  "develop": {
+    "pytest": {
+      "hashes": ["sha256:eee"],
+      "index": "pypi",
+      "version": "==8.2.0"
+    }
+  }
+}"#;
+        let new = r#"{
+  "_meta": {
+    "hash": { "sha256": "metanew" },
+    "pipfile-spec": 6,
+    "sources": [
+      { "name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": true }
+    ]
+  },
+  "default": {
+    "requests": {
+      "hashes": ["sha256:zzz"],
+      "index": "pypi",
+      "version": "==2.32.3"
+    },
+    "urllib3": {
+      "hashes": ["sha256:tampered"],
+      "index": "pypi",
+      "version": "==2.2.1"
+    },
+    "httpx": {
+      "hashes": ["sha256:fff"],
+      "index": "pypi",
+      "version": "==0.27.0"
+    }
+  },
+  "develop": {
+    "pytest": {
+      "hashes": ["sha256:eee"],
+      "index": "pypi",
+      "version": "==8.2.0"
+    }
+  }
+}"#;
+        let changes = compare_format(LockFormat::Pipfile, old, new).unwrap();
+        assert_eq!(changes.added, vec!["httpx 0.27.0"]);
+        assert_eq!(changes.removed, vec!["oldlib 0.5.0"]);
+        assert_eq!(changes.updated, vec!["requests 2.31.0 -> 2.32.3"]);
+        assert!(
+            changes.flags.iter().any(|f| f.contains(
+                "checksum changed on existing version urllib3 2.2.1: sha256:ccc -> sha256:tampered"
+            )),
+            "{:?}",
+            changes.flags
+        );
+        assert!(pipfile_packages("{\"default\":{}}").is_none());
+
+        // Remote hunk fallback handles `_meta.hash.sha256` change + multiple updated packages.
+        let dir = tempfile::tempdir().unwrap();
+        let mut patch = String::from(concat!(
+            "diff --git a/Pipfile.lock b/Pipfile.lock\n",
+            "index 1111111..2222222 100644\n",
+            "--- a/Pipfile.lock\n",
+            "+++ b/Pipfile.lock\n",
+            "@@ -2,4 +2,4 @@\n",
+            "   \"_meta\": {\n",
+            "     \"hash\": {\n",
+            "-      \"sha256\": \"metaold\"\n",
+            "+      \"sha256\": \"metanew\"\n",
+            "     },\n",
+            "@@ -20,40 +20,40 @@\n",
+        ));
+        for i in 0..8 {
+            patch.push_str(&format!(
+                concat!(
+                    "     \"pkg_{i:02}\": {{\n",
+                    "-      \"hashes\": [\n",
+                    "-        \"sha256:old_a_{i:02}\",\n",
+                    "-        \"sha256:old_b_{i:02}\"\n",
+                    "-      ],\n",
+                    "-      \"index\": \"pypi\",\n",
+                    "-      \"version\": \"==1.{i}.0\"\n",
+                    "+      \"hashes\": [\n",
+                    "+        \"sha256:new_a_{i:02}\",\n",
+                    "+        \"sha256:new_b_{i:02}\"\n",
+                    "+      ],\n",
+                    "+      \"index\": \"pypi\",\n",
+                    "+      \"version\": \"==1.{i}.1\"\n",
+                    "     }},\n",
+                ),
+                i = i
+            ));
+        }
+        let found = sections(&patch, dir.path());
+        assert_eq!(found.len(), 1);
+        let rendered = found[0].text();
+        assert!(rendered.contains("8 updated"), "{rendered}");
+        assert!(
+            rendered.len() * 5 < patch.len(),
+            "raw={} rendered={}\n{rendered}",
+            patch.len(),
+            rendered.len()
+        );
+    }
+
+    #[test]
+    fn ansi_colored_lockfile_patch_folds_identically_to_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = "\
+diff --git a/gradle.lockfile b/gradle.lockfile
+index 1111111..2222222 100644
+--- a/gradle.lockfile
++++ b/gradle.lockfile
+@@ -1,3 +1,3 @@
+ # This is a Gradle generated file for dependency locking.
+-org.slf4j:slf4j-api:2.0.12=compileClasspath
++org.slf4j:slf4j-api:2.0.13=compileClasspath
+";
+        let colored = "\
+\x1b[1mdiff --git a/gradle.lockfile b/gradle.lockfile\x1b[m
+\x1b[1mindex 1111111..2222222 100644\x1b[m
+\x1b[1m--- a/gradle.lockfile\x1b[m
+\x1b[1m+++ b/gradle.lockfile\x1b[m
+\x1b[36m@@ -1,3 +1,3 @@\x1b[m
+ # This is a Gradle generated file for dependency locking.
+\x1b[31m-org.slf4j:slf4j-api:2.0.12=compileClasspath\x1b[m
+\x1b[32m+org.slf4j:slf4j-api:2.0.13=compileClasspath\x1b[m
+";
+        let plain_sec = sections(plain, dir.path());
+        let color_sec = sections(colored, dir.path());
+        assert_eq!(plain_sec.len(), 1);
+        assert_eq!(color_sec.len(), 1);
+        assert_eq!(color_sec[0].text(), plain_sec[0].text());
     }
 }

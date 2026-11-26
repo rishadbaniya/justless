@@ -23,12 +23,10 @@
 //! declines unrecognized or machine-formatted output (`--porcelain`, `-z`, `-p`,
 //! `--graph`, `--format` on branch/tag/stash), and replaces the output only when
 //! strictly smaller and within `budget`.
-use std::collections::{BTreeMap, VecDeque};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::LazyLock;
-
-use regex::Regex;
 
 use crate::listing::Listing;
 use crate::search::plural;
@@ -66,6 +64,12 @@ impl View {
     }
 
     pub fn observe(&mut self, text: &str, n: usize) {
+        let clean: Cow<'_, str> = if text.contains('\x1b') {
+            crate::capture::ANSI.replace_all(text, "")
+        } else {
+            Cow::Borrowed(text)
+        };
+        let text = clean.as_ref();
         match self {
             Self::Log(log) => log.observe(text, n),
             Self::Status(status) => status.observe(text, n),
@@ -125,10 +129,16 @@ fn subcommand<'a>(words: &'a [&'a str]) -> Option<(&'a str, &'a [&'a str])> {
 }
 
 fn line_range_tag(first: usize, last: usize) -> String {
+    let mut out = String::with_capacity(24);
+    write_line_range_tag(&mut out, first, last);
+    out
+}
+
+fn write_line_range_tag(out: &mut String, first: usize, last: usize) {
     if first == last {
-        format!("[stdout:{first}]")
+        let _ = write!(out, "[stdout:{first}]");
     } else {
-        format!("[stdout:{first}-{last}]")
+        let _ = write!(out, "[stdout:{first}-{last}]");
     }
 }
 
@@ -136,9 +146,22 @@ fn line_range_tag(first: usize, last: usize) -> String {
 // git log / git reflog
 // ---------------------------------------------------------------------------
 
-static HEADER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^commit [0-9a-f]{7,64}(?: |$)").unwrap());
-static ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-f]{4,64}(?: |$)").unwrap());
+fn is_lower_hex(s: &str) -> bool {
+    s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn is_commit_header(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("commit ") else {
+        return false;
+    };
+    let hex = rest.split(' ').next().unwrap_or("");
+    (7..=64).contains(&hex.len()) && is_lower_hex(hex)
+}
+
+fn starts_with_hex_id(line: &str, min_len: usize) -> bool {
+    let hex = line.split(' ').next().unwrap_or("");
+    (min_len..=64).contains(&hex.len()) && is_lower_hex(hex)
+}
 
 /// How a log's commits are separated.
 #[derive(Clone, Copy, PartialEq)]
@@ -161,10 +184,12 @@ struct KeptCommit {
 
 /// Incremental parser for a single multi-line `git log` commit header + body.
 struct ParsedCommit {
+    store: bool,
     hash: String,
     decorations: String,
     merge: Option<String>,
     author: Option<String>,
+    has_author: bool,
     committer: Option<String>,
     date: Option<String>,
     subject: Option<String>,
@@ -176,15 +201,22 @@ struct ParsedCommit {
 }
 
 impl ParsedCommit {
-    fn start(line: &str, n: usize) -> Self {
+    fn start(line: &str, n: usize, store: bool) -> Self {
         let rest = line.strip_prefix("commit ").unwrap_or("");
         let (hash, tail) = rest.split_once(' ').unwrap_or((rest, ""));
         let short_hash = &hash[..hash.len().min(7)];
+        let (hash, decorations) = if store {
+            (short_hash.to_owned(), tail.trim().to_owned())
+        } else {
+            (String::new(), String::new())
+        };
         Self {
-            hash: short_hash.to_owned(),
-            decorations: tail.trim().to_owned(),
+            store,
+            hash,
+            decorations,
             merge: None,
             author: None,
+            has_author: false,
             committer: None,
             date: None,
             subject: None,
@@ -198,7 +230,7 @@ impl ParsedCommit {
 
     fn observe_line(&mut self, line: &str, n: usize) {
         self.raw_end_line = n;
-        if !line.trim().is_empty() {
+        if self.store && !line.trim().is_empty() {
             self.body_end_line = n;
         }
         if !self.valid {
@@ -210,16 +242,23 @@ impl ParsedCommit {
                 return;
             }
             if let Some(val) = line.strip_prefix("Merge:") {
-                self.merge = Some(val.trim().to_owned());
+                if self.store {
+                    self.merge = Some(val.trim().to_owned());
+                }
             } else if let Some(val) = line.strip_prefix("Author:") {
-                self.author = Some(compact_author(val.trim()).to_owned());
+                self.has_author = true;
+                if self.store {
+                    self.author = Some(compact_author(val.trim()).to_owned());
+                }
             } else if let Some(val) = line.strip_prefix("Commit:") {
-                self.committer = Some(compact_author(val.trim()).to_owned());
+                if self.store {
+                    self.committer = Some(compact_author(val.trim()).to_owned());
+                }
             } else if let Some(val) = line
                 .strip_prefix("Date:")
                 .or_else(|| line.strip_prefix("AuthorDate:"))
             {
-                if self.date.is_none() {
+                if self.store && self.date.is_none() {
                     self.date = Some(compact_date(val.trim()));
                 }
             } else if line.starts_with("CommitDate:")
@@ -241,7 +280,7 @@ impl ParsedCommit {
             .strip_prefix("    ")
             .or_else(|| line.strip_prefix('\t'))
         {
-            if self.subject.is_none() {
+            if self.store && self.subject.is_none() {
                 let trimmed = msg.trim();
                 if !trimmed.is_empty() {
                     self.subject = Some(trimmed.to_owned());
@@ -259,7 +298,13 @@ impl ParsedCommit {
             return None;
         }
         let author = self.author.as_deref()?;
-        let mut out = String::with_capacity(96);
+        let mut out = String::with_capacity(
+            self.hash.len()
+                + self.decorations.len()
+                + author.len()
+                + self.subject.as_deref().map_or(0, str::len)
+                + 48,
+        );
         out.push_str(&self.hash);
         if !self.decorations.is_empty() {
             out.push(' ');
@@ -284,7 +329,7 @@ impl ParsedCommit {
             let _ = write!(out, " (Merge: {merge})");
         }
         out.push(' ');
-        out.push_str(&line_range_tag(self.first_line, self.body_end_line));
+        write_line_range_tag(&mut out, self.first_line, self.body_end_line);
         out.push('\n');
         Some(out)
     }
@@ -340,26 +385,32 @@ fn compact_date(raw: &str) -> String {
     {
         return s[..10].to_owned();
     }
-    let parts: Vec<&str> = s.split_whitespace().collect();
-    // Default / local ctime: `Wed Nov 25 14:52:23 2026 +0000`
-    if parts.len() >= 5
-        && let Some(month) = month_number(parts[1])
-        && let Ok(day) = parts[2].parse::<u8>()
-        && (1..=31).contains(&day)
-        && parts[3].contains(':')
-        && is_digits(parts[4], 4)
-    {
-        return format!("{}-{month:02}-{day:02}", parts[4]);
-    }
-    // RFC 2822: `Wed, 25 Nov 2026 14:52:23 +0000`
-    if parts.len() >= 5
-        && let Ok(day) = parts[1].parse::<u8>()
-        && (1..=31).contains(&day)
-        && let Some(month) = month_number(parts[2])
-        && is_digits(parts[3], 4)
-        && parts[4].contains(':')
-    {
-        return format!("{}-{month:02}-{day:02}", parts[3]);
+    let mut parts = s.split_whitespace();
+    if let (Some(_), Some(p1), Some(p2), Some(p3), Some(p4)) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        // Default / local ctime: `Wed Nov 25 14:52:23 2026 +0000`
+        if let Some(month) = month_number(p1)
+            && let Ok(day) = p2.parse::<u8>()
+            && (1..=31).contains(&day)
+            && p3.contains(':')
+            && is_digits(p4, 4)
+        {
+            return format!("{p4}-{month:02}-{day:02}");
+        }
+        // RFC 2822: `Wed, 25 Nov 2026 14:52:23 +0000`
+        if let Ok(day) = p1.parse::<u8>()
+            && (1..=31).contains(&day)
+            && let Some(month) = month_number(p2)
+            && is_digits(p3, 4)
+            && p4.contains(':')
+        {
+            return format!("{p3}-{month:02}-{day:02}");
+        }
     }
     s.to_owned()
 }
@@ -548,8 +599,8 @@ impl Log {
         }
         let line = text.trim_end_matches(['\n', '\r']);
         let starts = match self.shape {
-            Shape::Headers => HEADER.is_match(line),
-            Shape::Ids => ID.is_match(line),
+            Shape::Headers => is_commit_header(line),
+            Shape::Ids => starts_with_hex_id(line, 4),
             Shape::Lines => true,
         };
         // A header format's first line, and every line of `--oneline`, starts
@@ -562,9 +613,12 @@ impl Log {
         if starts {
             self.close();
             self.commits += 1;
-            self.current_raw = Some((String::new(), n, n));
+            if !self.raw_full || self.reverse {
+                self.current_raw = Some((String::new(), n, n));
+            }
             if self.can_compact {
-                self.current_parsed = Some(ParsedCommit::start(line, n));
+                let store = !self.compact_full || self.reverse;
+                self.current_parsed = Some(ParsedCommit::start(line, n, store));
             }
         } else if let Some(parsed) = self.current_parsed.as_mut() {
             parsed.observe_line(line, n);
@@ -574,10 +628,9 @@ impl Log {
                 self.kept_compact_bytes = 0;
             }
         }
-        let want_raw = !self.raw_full || self.reverse;
         if let Some((current, _, end)) = self.current_raw.as_mut() {
             *end = n;
-            if want_raw && current.len() <= self.budget {
+            if (!self.raw_full || self.reverse) && current.len() <= self.budget {
                 current.push_str(text);
             }
         }
@@ -602,6 +655,14 @@ impl Log {
         if let Some(parsed) = self.current_parsed.take()
             && self.can_compact
         {
+            if !parsed.store {
+                if !parsed.valid || !parsed.has_author {
+                    self.can_compact = false;
+                    self.kept_compact.clear();
+                    self.kept_compact_bytes = 0;
+                }
+                return;
+            }
             if let Some(line) = parsed.format_compact() {
                 let want = !self.compact_full || self.reverse;
                 if want {
@@ -888,7 +949,20 @@ pub struct Status {
     unknown: bool,
 }
 
-static SHORT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[ MTADRCU?!]{2} \S").unwrap());
+fn is_short_status_line(line: &str) -> bool {
+    let b = line.as_bytes();
+    b.len() >= 4
+        && b[2] == b' '
+        && matches!(
+            b[0],
+            b' ' | b'M' | b'T' | b'A' | b'D' | b'R' | b'C' | b'U' | b'?' | b'!'
+        )
+        && matches!(
+            b[1],
+            b' ' | b'M' | b'T' | b'A' | b'D' | b'R' | b'C' | b'U' | b'?' | b'!'
+        )
+        && line[3..].chars().next().is_some_and(|c| !c.is_whitespace())
+}
 
 impl Status {
     fn new() -> Self {
@@ -920,7 +994,7 @@ impl Status {
         let line = text.trim_end_matches(['\n', '\r']);
         let short = *self
             .short
-            .get_or_insert_with(|| line.starts_with("## ") || SHORT.is_match(line));
+            .get_or_insert_with(|| line.starts_with("## ") || is_short_status_line(line));
         let known = if short {
             self.short_line(line, n)
         } else {
@@ -955,8 +1029,12 @@ impl Status {
                 _ => {}
             }
         }
-        let (parent, _) = split_status_path(path);
-        *self.dir_counts[idx].entry(parent.to_owned()).or_insert(0) += 1;
+        let parent = status_parent(path);
+        if let Some(count) = self.dir_counts[idx].get_mut(parent) {
+            *count += 1;
+        } else {
+            self.dir_counts[idx].insert(parent.to_owned(), 1);
+        }
         // Keep full entry metadata for conflicts (always), renames (always), and
         // sections that may render verbatim (cap non-conflict/non-rename entries
         // only when huge so memory stays bounded on 100k-file repos).
@@ -979,7 +1057,7 @@ impl Status {
             self.lead.push(line.to_owned());
             return true;
         }
-        if !SHORT.is_match(line) {
+        if !is_short_status_line(line) {
             return false;
         }
         let (code, path) = line.split_at(3);
@@ -1088,17 +1166,22 @@ impl Status {
         if self.unknown || total == 0 || !should_compact {
             return None;
         }
-        let mut head = String::new();
+        let mut head = String::with_capacity(budget.min(self.bytes));
         for line in &self.lead {
             head.push_str(line);
             head.push('\n');
         }
-        let counts: Vec<String> = STATES
-            .iter()
-            .filter(|state| **state != State::Ignored || self.counts[state.index()] > 0)
-            .map(|state| format!("{} {}", self.counts[state.index()], state.name()))
-            .collect();
-        head.push_str(&counts.join(" · "));
+        let mut first_count = true;
+        for state in STATES {
+            if state == State::Ignored && self.counts[state.index()] == 0 {
+                continue;
+            }
+            if !first_count {
+                head.push_str(" · ");
+            }
+            first_count = false;
+            let _ = write!(head, "{} {}", self.counts[state.index()], state.name());
+        }
         head.push('\n');
 
         // Always allocate conflicted paths first so they are never squeezed out,
@@ -1176,38 +1259,37 @@ fn short_change_kind(code: u8) -> &'static str {
     }
 }
 
-fn split_status_path(path: &str) -> (&str, String) {
-    let is_dir = path.len() > 1 && path.ends_with('/');
+fn status_parent(path: &str) -> &str {
     let trimmed = path.trim_start_matches("./").trim_end_matches('/');
-    let (parent, name) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
-    let display_name = if is_dir {
-        format!("{name}/")
-    } else {
-        name.to_owned()
-    };
-    (parent, display_name)
+    trimmed.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
-fn format_verbatim_status_entry(entry: &StatusEntry) -> String {
-    let (parent, name) = split_status_path(&entry.path);
-    let dir = if parent.is_empty() {
-        "./".to_owned()
+fn write_verbatim_status_entry(out: &mut String, entry: &StatusEntry) {
+    let is_dir = entry.path.len() > 1 && entry.path.ends_with('/');
+    let trimmed = entry.path.trim_start_matches("./").trim_end_matches('/');
+    let (parent, name) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+    if parent.is_empty() {
+        out.push_str("./ 1: ");
     } else {
-        format!("{parent}/")
-    };
-    let mut detail = String::new();
+        out.push_str(parent);
+        out.push_str("/ 1: ");
+    }
+    out.push_str(name);
+    if is_dir {
+        out.push('/');
+    }
     if let Some(from) = &entry.from {
-        let _ = write!(detail, " ({} from {from})", entry.kind);
+        let _ = write!(out, " ({} from {from})", entry.kind);
     } else if !entry.kind.is_empty() {
         if let Some(note) = &entry.note {
-            let _ = write!(detail, " ({}, {note})", entry.kind);
+            let _ = write!(out, " ({}, {note})", entry.kind);
         } else {
-            let _ = write!(detail, " ({})", entry.kind);
+            let _ = write!(out, " ({})", entry.kind);
         }
     } else if let Some(note) = &entry.note {
-        let _ = write!(detail, " ({note})");
+        let _ = write!(out, " ({note})");
     }
-    format!("{dir} 1: {name}{detail} [stdout:{}]\n", entry.line)
+    let _ = writeln!(out, " [stdout:{}]", entry.line);
 }
 
 fn render_status_section(
@@ -1222,9 +1304,15 @@ fn render_status_section(
     // Keep 100% of conflicted paths and small sections verbatim whenever they fit.
     let want_verbatim = state == State::Conflicted || count <= SMALL_SECTION;
     if want_verbatim && entries.len() == count {
-        let mut out = format!("{}: {}\n", state.name(), plural(count, "entry", "entries"));
+        let mut out = String::with_capacity(entries.len() * 48 + 32);
+        let _ = writeln!(
+            out,
+            "{}: {}",
+            state.name(),
+            plural(count, "entry", "entries")
+        );
         for entry in entries {
-            out.push_str(&format_verbatim_status_entry(entry));
+            write_verbatim_status_entry(&mut out, entry);
         }
         if out.len() <= priority_share {
             return Some(out);
@@ -1239,9 +1327,9 @@ fn render_status_section(
         && count > SMALL_SECTION
         && let Some(nr_listing) = non_rename_listing
     {
-        let mut rename_lines = String::new();
+        let mut rename_lines = String::with_capacity(renames.len() * 64);
         for entry in &renames {
-            rename_lines.push_str(&format_verbatim_status_entry(entry));
+            write_verbatim_status_entry(&mut rename_lines, entry);
         }
         let non_rename_count = count - renames.len();
         if non_rename_count == 0 {
@@ -1259,7 +1347,8 @@ fn render_status_section(
                 && let Some((group_header, body)) = report.split_once('\n')
             {
                 let suffix = group_header
-                    .strip_prefix(&format!("{}: ", state.name()))
+                    .strip_prefix(state.name())
+                    .and_then(|s| s.strip_prefix(": "))
                     .unwrap_or(group_header);
                 let header = format!(
                     "{}: {} ({} renamed, {suffix})\n",
@@ -1300,13 +1389,7 @@ fn split_submodule_path(path: &str) -> (&str, Option<&str>) {
 // git branch
 // ---------------------------------------------------------------------------
 
-static BRANCH_HASH: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[0-9a-f]{7,64}(?: |$)").unwrap());
-static TRACKING_BRACKET: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\[[^\]\s]+: (?:gone|ahead \d+(?:, behind \d+)?|behind \d+)\]").unwrap()
-});
-
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TrackState {
     None,
     Diverged,
@@ -1678,28 +1761,77 @@ fn tighten_branch_detail(raw: &str, marker: char) -> String {
     }
     // Preserve symbolic ref targets cleanly (`-> origin/main`).
     if let Some(target) = trimmed.strip_prefix("->") {
-        return format!("-> {}", target.trim());
+        let target = target.trim();
+        let mut out = String::with_capacity(target.len() + 3);
+        out.push_str("-> ");
+        out.push_str(target);
+        return out;
     }
     // Collapse column padding between optional `(/path/to/wt)`, `<hash>`, and subject.
-    let mut parts = Vec::new();
+    let mut out = String::with_capacity(trimmed.len());
     let mut rest = trimmed;
     if marker == '+'
         && rest.starts_with('(')
         && let Some(close) = rest.find(')')
     {
-        parts.push(&rest[..=close]);
+        out.push_str(&rest[..=close]);
         rest = rest[close + 1..].trim_start();
     }
     if let Some((first, tail)) = rest.split_once(char::is_whitespace) {
-        parts.push(first);
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(first);
         let tail = tail.trim_start();
         if !tail.is_empty() {
-            parts.push(tail);
+            out.push(' ');
+            out.push_str(tail);
         }
     } else if !rest.is_empty() {
-        parts.push(rest);
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(rest);
     }
-    parts.join(" ")
+    out
+}
+
+fn is_nonempty_ascii_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn tracking_state_from_bracket(s: &str) -> TrackState {
+    let Some(rest) = s.strip_prefix('[') else {
+        return TrackState::None;
+    };
+    let Some(close) = rest.find(']') else {
+        return TrackState::None;
+    };
+    let inside = &rest[..close];
+    let Some((upstream, status)) = inside.split_once(": ") else {
+        return TrackState::None;
+    };
+    if upstream.is_empty() || upstream.chars().any(char::is_whitespace) {
+        return TrackState::None;
+    }
+    if status == "gone" {
+        return TrackState::Gone;
+    }
+    if let Some(after_ahead) = status.strip_prefix("ahead ") {
+        let ok = if let Some((ahead, behind)) = after_ahead.split_once(", behind ") {
+            is_nonempty_ascii_digits(ahead) && is_nonempty_ascii_digits(behind)
+        } else {
+            is_nonempty_ascii_digits(after_ahead)
+        };
+        if ok {
+            return TrackState::Diverged;
+        }
+    } else if let Some(behind) = status.strip_prefix("behind ")
+        && is_nonempty_ascii_digits(behind)
+    {
+        return TrackState::Diverged;
+    }
+    TrackState::None
 }
 
 fn detect_tracking_state(detail: &str, marker: char) -> TrackState {
@@ -1710,22 +1842,13 @@ fn detect_tracking_state(detail: &str, marker: char) -> TrackState {
     {
         rest = rest[close + 1..].trim_start();
     }
-    if !BRANCH_HASH.is_match(rest) {
+    if !starts_with_hex_id(rest, 7) {
         return TrackState::None;
     }
     let Some((_, after_hash)) = rest.split_once(' ') else {
         return TrackState::None;
     };
-    let after_hash = after_hash.trim_start();
-    let Some(m) = TRACKING_BRACKET.find(after_hash) else {
-        return TrackState::None;
-    };
-    let bracket = m.as_str();
-    if bracket.contains(": gone]") {
-        TrackState::Gone
-    } else {
-        TrackState::Diverged
-    }
+    tracking_state_from_bracket(after_hash.trim_start())
 }
 
 fn format_branch_header(
@@ -1736,28 +1859,39 @@ fn format_branch_header(
     diverged: usize,
     gone: usize,
 ) -> String {
-    let mut parts = Vec::new();
+    let mut out = String::with_capacity(96);
+    let _ = write!(out, "git branch: {} (", plural(total, "branch", "branches"));
+    let mut sep = false;
+    let mut push_sep = |out: &mut String| {
+        if sep {
+            out.push_str(" · ");
+        }
+        sep = true;
+    };
     if local > 0 && remote > 0 {
-        parts.push(format!("{local} local, {remote} remote"));
+        push_sep(&mut out);
+        let _ = write!(out, "{local} local, {remote} remote");
     } else if local > 0 {
-        parts.push(format!("{local} local"));
+        push_sep(&mut out);
+        let _ = write!(out, "{local} local");
     } else if remote > 0 {
-        parts.push(format!("{remote} remote"));
+        push_sep(&mut out);
+        let _ = write!(out, "{remote} remote");
     }
     if current > 0 {
-        parts.push(format!("{current} current"));
+        push_sep(&mut out);
+        let _ = write!(out, "{current} current");
     }
     if diverged > 0 {
-        parts.push(format!("{diverged} ahead/behind"));
+        push_sep(&mut out);
+        let _ = write!(out, "{diverged} ahead/behind");
     }
     if gone > 0 {
-        parts.push(format!("{gone} gone"));
+        push_sep(&mut out);
+        let _ = write!(out, "{gone} gone");
     }
-    format!(
-        "git branch: {} ({})\n",
-        plural(total, "branch", "branches"),
-        parts.join(" · ")
-    )
+    out.push_str(")\n");
+    out
 }
 
 fn format_branch_entry(entry: &BranchEntry) -> String {
@@ -2113,7 +2247,15 @@ fn tag_display(args: &[&str]) -> Option<bool> {
 // git stash list
 // ---------------------------------------------------------------------------
 
-static STASH_LINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^stash@\{[^}]+\}: ").unwrap());
+fn is_stash_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("stash@{") else {
+        return false;
+    };
+    let Some(close) = rest.find('}') else {
+        return false;
+    };
+    close > 0 && rest[close + 1..].starts_with(": ")
+}
 
 /// A `git stash list` view that keeps the newest stashes and folds older ones
 /// with exact count and `[stdout:A-B]` links.
@@ -2155,7 +2297,7 @@ impl Stash {
             return;
         }
         let line = text.trim_end_matches(['\n', '\r']);
-        if !STASH_LINE.is_match(line) {
+        if !is_stash_line(line) {
             self.unknown = true;
             return;
         }
@@ -2250,7 +2392,7 @@ fn stash_list_display(args: &[&str]) -> bool {
 
 const MAX_BLAME_LINES: usize = 50_000;
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct BlameCommitKey {
     sha: String,
     orig_file: Option<String>,
@@ -2270,7 +2412,7 @@ struct BlameEntry {
 pub struct Blame {
     bytes: usize,
     commits: Vec<BlameCommitKey>,
-    commit_ids: BTreeMap<BlameCommitKey, usize>,
+    commit_ids: HashMap<BlameCommitKey, usize>,
     entries: Vec<BlameEntry>,
     unknown: bool,
 }
@@ -2283,7 +2425,7 @@ impl Blame {
         Some(Self {
             bytes: 0,
             commits: Vec::new(),
-            commit_ids: BTreeMap::new(),
+            commit_ids: HashMap::new(),
             entries: Vec::new(),
             unknown: false,
         })
@@ -2511,7 +2653,13 @@ fn parse_blame_line(line: &str) -> Option<ParsedBlameLine<'_>> {
         if lineno_str.is_empty() || !lineno_str.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        let meta = meta_raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut meta = String::with_capacity(meta_raw.len());
+        for (idx, word) in meta_raw.split_whitespace().enumerate() {
+            if idx > 0 {
+                meta.push(' ');
+            }
+            meta.push_str(word);
+        }
         if meta.is_empty() {
             continue;
         }
@@ -3454,5 +3602,105 @@ mod tests {
             moved_view.contains("10->1|fn moved(x: i32) {"),
             "{moved_view}"
         );
+    }
+
+    #[test]
+    fn ansi_colored_git_views_strip_escapes_and_match_plain() {
+        let mut plain_log = String::new();
+        let mut color_log = String::new();
+        for i in 0..8 {
+            let _ = write!(
+                plain_log,
+                "commit {i:040x}\nAuthor: Alice <a@example.com>\nDate:   Wed Nov 25 14:52:23 2026 +0000\n\n    step {i}\n\n"
+            );
+            let _ = write!(
+                color_log,
+                "\x1b[33mcommit {i:040x}\x1b[m\nAuthor: Alice <a@example.com>\nDate:   Wed Nov 25 14:52:23 2026 +0000\n\n    step {i}\n\n"
+            );
+        }
+        assert_eq!(
+            view("git log", &color_log, 2048),
+            view("git log", &plain_log, 2048)
+        );
+        assert!(view("git log", &color_log, 2048).is_some());
+
+        let mut plain_status = String::from("## main...origin/main\n");
+        let mut color_status = String::from("\x1b[32m## main...origin/main\x1b[m\n");
+        for i in 0..24 {
+            let _ = writeln!(plain_status, " M src/mod_{i:02}.rs");
+            let _ = writeln!(color_status, " \x1b[31mM\x1b[m src/mod_{i:02}.rs");
+        }
+        assert_eq!(
+            view("git status -sb", &color_status, 2048),
+            view("git status -sb", &plain_status, 2048)
+        );
+        assert!(view("git status -sb", &color_status, 2048).is_some());
+
+        let mut plain_stash = String::new();
+        let mut color_stash = String::new();
+        for i in 0..30 {
+            let _ = writeln!(
+                plain_stash,
+                "stash@{{{i}}}: WIP on main: abc{i:04} step {i}"
+            );
+            let _ = writeln!(
+                color_stash,
+                "\x1b[36mstash@{{{i}}}\x1b[m: WIP on main: abc{i:04} step {i}"
+            );
+        }
+        assert_eq!(
+            view("git stash list", &color_stash, 400),
+            view("git stash list", &plain_stash, 400)
+        );
+        assert!(view("git stash list", &color_stash, 400).is_some());
+    }
+
+    #[test]
+    fn zero_regex_git_matchers_handle_edge_cases() {
+        assert!(is_commit_header("commit 1234567"));
+        assert!(is_commit_header("commit 1234567890abcdef (HEAD -> main)"));
+        assert!(!is_commit_header("commit 123456"));
+        assert!(!is_commit_header("commit 123456G"));
+        assert!(starts_with_hex_id("abcd subject", 4));
+        assert!(!starts_with_hex_id("abc subject", 4));
+
+        assert!(is_short_status_line(" M src/lib.rs"));
+        assert!(is_short_status_line("?? README.md"));
+        assert!(is_short_status_line("UU conflict.rs"));
+        assert!(!is_short_status_line(" M  leading-space"));
+        assert!(!is_short_status_line("XX bad.rs"));
+
+        assert_eq!(
+            tracking_state_from_bracket("[origin/main: gone] msg"),
+            TrackState::Gone
+        );
+        assert_eq!(
+            tracking_state_from_bracket("[origin/main: ahead 2] msg"),
+            TrackState::Diverged
+        );
+        assert_eq!(
+            tracking_state_from_bracket("[origin/main: ahead 2, behind 5] msg"),
+            TrackState::Diverged
+        );
+        assert_eq!(
+            tracking_state_from_bracket("[origin/main: behind 1] msg"),
+            TrackState::Diverged
+        );
+        assert_eq!(
+            tracking_state_from_bracket("[origin/main] msg"),
+            TrackState::None
+        );
+        assert_eq!(
+            tracking_state_from_bracket("[bad ref: gone] msg"),
+            TrackState::None
+        );
+        assert_eq!(
+            tracking_state_from_bracket("[origin/main: ahead ] msg"),
+            TrackState::None
+        );
+
+        assert!(is_stash_line("stash@{0}: WIP on main"));
+        assert!(!is_stash_line("stash@{}: empty"));
+        assert!(!is_stash_line("stash@{0} missing colon"));
     }
 }

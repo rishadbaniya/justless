@@ -9,7 +9,10 @@
 //! preserving every row's size, timestamp, filename, symlink target and metadata
 //! override. Each group links to the original lines it came from. When the groups do
 //! not fit the budget, deeper directories fold into their ancestors with a count.
+use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -40,8 +43,6 @@ const MAX_LONG_ROWS: usize = 2_000;
 const MAX_BARE_CANDIDATES: usize = 2_048;
 const MAX_TRACKED_EXTS: usize = 64;
 
-static PERMISSIONS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[-dlcbpsDnw?][-rwxsStTl]{9}[@+.]?\s").unwrap());
 // Mode, links, owner, group, size, month, day, then a time or year before the name.
 static LONG: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -49,8 +50,57 @@ static LONG: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
-static TREE_COUNT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\d+ director(?:y|ies)(?:, \d+ files?)?$").unwrap());
+
+fn is_permissions_prefix(line: &str) -> bool {
+    let b = line.as_bytes();
+    if b.len() < 11 {
+        return false;
+    }
+    if !matches!(
+        b[0],
+        b'-' | b'd' | b'l' | b'c' | b'b' | b'p' | b's' | b'D' | b'n' | b'w' | b'?'
+    ) {
+        return false;
+    }
+    if !b[1..10].iter().all(|c| {
+        matches!(
+            c,
+            b'-' | b'r' | b'w' | b'x' | b's' | b'S' | b't' | b'T' | b'l'
+        )
+    }) {
+        return false;
+    }
+    let idx = if matches!(b[10], b'@' | b'+' | b'.') {
+        11
+    } else {
+        10
+    };
+    line.get(idx..)
+        .and_then(|s| s.chars().next())
+        .is_some_and(char::is_whitespace)
+}
+
+fn is_tree_count(line: &str) -> bool {
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return false;
+    }
+    let rest = &line[digits..];
+    let Some(after_dir) = rest
+        .strip_prefix(" directories")
+        .or_else(|| rest.strip_prefix(" directory"))
+    else {
+        return false;
+    };
+    if after_dir.is_empty() {
+        return true;
+    }
+    let Some(after_comma) = after_dir.strip_prefix(", ") else {
+        return false;
+    };
+    let file_digits = after_comma.bytes().take_while(u8::is_ascii_digit).count();
+    file_digits > 0 && matches!(&after_comma[file_digits..], " file" | " files")
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Format {
@@ -133,41 +183,58 @@ impl Dir {
         }
     }
 
-    fn record_entry(&mut self, name: String, is_dir: bool) {
+    fn record_entry(&mut self, name: &str, is_dir: bool) {
         self.entries += 1;
         let bare = name.trim_end_matches('/');
+        let needs_slash = is_dir && !name.ends_with('/');
+        let make_owned = || {
+            if needs_slash {
+                let mut s = String::with_capacity(name.len() + 1);
+                s.push_str(name);
+                s.push('/');
+                s
+            } else {
+                name.to_owned()
+            }
+        };
         if self
             .min_name
             .as_deref()
             .is_none_or(|min| bare < min.trim_end_matches('/'))
         {
-            self.min_name = Some(name.clone());
+            self.min_name = Some(make_owned());
         }
         if self
             .max_name
             .as_deref()
             .is_none_or(|max| bare > max.trim_end_matches('/'))
         {
-            self.max_name = Some(name.clone());
+            self.max_name = Some(make_owned());
         }
         if is_dir {
             self.subdirs += 1;
             self.last_bare = None;
         } else {
             self.files += 1;
-            let ext = extension_of(&name);
-            add_ext(&mut self.exts, &mut self.other_exts, ext, 1);
-            self.last_bare = Some(name.clone());
+            add_file_ext(&mut self.exts, &mut self.other_exts, name, 1);
+            if let Some(last) = self.last_bare.as_mut() {
+                last.clear();
+                last.push_str(name);
+            } else {
+                self.last_bare = Some(name.to_owned());
+            }
             if let Some(set) = self.bare_candidates.as_mut() {
                 if set.len() < MAX_BARE_CANDIDATES {
-                    set.insert(name.clone());
+                    if !set.contains(name) {
+                        set.insert(name.to_owned());
+                    }
                 } else {
                     self.bare_candidates = None;
                 }
             }
         }
         if self.names.len() < NAMES {
-            self.names.push(name);
+            self.names.push(make_owned());
         }
     }
 
@@ -189,10 +256,11 @@ impl Dir {
             self.files -= 1;
         }
         self.subdirs += 1;
-        let ext = extension_of(name);
-        if let Some(count) = self.exts.get_mut(&ext) {
+        let mut buf = [0u8; 17];
+        let ext = ext_into_buf(name, &mut buf).unwrap_or("(no ext)");
+        if let Some(count) = self.exts.get_mut(ext) {
             if *count <= 1 {
-                self.exts.remove(&ext);
+                self.exts.remove(ext);
             } else {
                 *count -= 1;
             }
@@ -305,7 +373,12 @@ impl Listing {
         if self.overflow {
             return;
         }
-        let line = text.trim_end_matches(['\n', '\r']);
+        let clean: Cow<'_, str> = if text.contains('\x1b') {
+            crate::capture::ANSI.replace_all(text, "")
+        } else {
+            Cow::Borrowed(text)
+        };
+        let line = clean.trim_end_matches(['\n', '\r']);
         self.raw_bytes = self.raw_bytes.saturating_add(line.len() + 1);
         match self.format {
             Format::Paths if !line.is_empty() => {
@@ -323,7 +396,7 @@ impl Listing {
             self.blank = true;
             return;
         }
-        let long = PERMISSIONS.is_match(line);
+        let long = is_permissions_prefix(line);
         let header = (self.blank || !self.started) && line.ends_with(':') && !long;
         self.started = true;
         self.blank = false;
@@ -344,11 +417,6 @@ impl Listing {
                 return;
             };
             let perms = c.get(1).unwrap().as_str();
-            let links = c.get(2).unwrap().as_str();
-            let owner = c.get(3).unwrap().as_str();
-            let group = c.get(4).unwrap().as_str();
-            let size = collapse_spaces(c.get(5).unwrap().as_str());
-            let date = collapse_spaces(c.get(6).unwrap().as_str());
             let raw_name = c.get(7).unwrap().as_str();
             let is_dir = perms.starts_with('d');
             let is_link = perms.starts_with('l');
@@ -368,10 +436,18 @@ impl Listing {
                     self.long_rows.clear();
                     self.long_overflow = true;
                 } else {
+                    let links = c.get(2).unwrap().as_str();
+                    let owner = c.get(3).unwrap().as_str();
+                    let group = c.get(4).unwrap().as_str();
+                    let size = collapse_spaces(c.get(5).unwrap().as_str());
+                    let date = collapse_spaces(c.get(6).unwrap().as_str());
                     let norm = normalize(&path);
                     let dir_key = parent_key(norm).to_owned();
                     let display_name = if is_dir && !raw_name.ends_with('/') {
-                        format!("{raw_name}/")
+                        let mut s = String::with_capacity(raw_name.len() + 1);
+                        s.push_str(raw_name);
+                        s.push('/');
+                        s
                     } else {
                         raw_name.to_owned()
                     };
@@ -406,11 +482,11 @@ impl Listing {
         if line.trim().is_empty() {
             return;
         }
-        let Some(root) = self.root.clone() else {
+        if self.root.is_none() {
             self.root = Some(normalize(line).to_owned());
             return;
-        };
-        if TREE_COUNT.is_match(line) {
+        }
+        if is_tree_count(line) {
             self.count_line = Some(line.to_owned());
             return;
         }
@@ -421,20 +497,25 @@ impl Listing {
         };
         self.stack.truncate(depth);
         let parent = if depth == 0 {
-            root
+            self.root.as_deref().unwrap_or("")
         } else {
-            self.stack[depth - 1].clone()
+            self.stack[depth - 1].as_str()
         };
         let name = name.split(" -> ").next().unwrap_or(name);
         let clean = normalize(name);
         // `tree -f` prints each entry's full path.
-        let path = if !parent.is_empty() && clean.starts_with(&format!("{parent}/")) {
+        let path = if !parent.is_empty()
+            && clean
+                .strip_prefix(parent)
+                .is_some_and(|rest| rest.starts_with('/'))
+        {
             clean.to_owned()
         } else {
-            join(&parent, clean)
+            join(parent, clean)
         };
-        self.stack.push(path.clone());
-        self.add(&path, n, name.ends_with('/'));
+        let is_dir = name.ends_with('/');
+        self.add(&path, n, is_dir);
+        self.stack.push(path);
     }
 
     fn unparsed_line(&mut self, n: usize, line: &str) {
@@ -458,11 +539,6 @@ impl Listing {
         }
         let dir = dir || trailing_slash || self.dirs.contains_key(path);
         let (parent, name) = split_parent(path);
-        let name = if dir {
-            format!("{name}/")
-        } else {
-            name.to_owned()
-        };
         if let Some(group) = self.dir(parent, n) {
             group.record_entry(name, dir);
         }
@@ -482,7 +558,11 @@ impl Listing {
                     parent_dir.promote_to_subdir(child_name);
                 }
             }
-            self.dirs.insert(key.to_owned(), Dir::new(n));
+            return Some(
+                self.dirs
+                    .entry(key.to_owned())
+                    .or_insert_with(|| Dir::new(n)),
+            );
         }
         let dir = self.dirs.get_mut(key)?;
         dir.first = dir.first.min(n);
@@ -609,41 +689,52 @@ impl Listing {
         let room = budget.saturating_sub(header.len() + other.len() + 64);
         let deepest = active.iter().map(|d| components(d.key)).max().unwrap_or(0);
         let top = (components(&common) + 1).min(deepest).max(1);
+        let mut body = String::with_capacity(room.min(self.raw_bytes));
         for depth in (top..=deepest.max(1)).rev() {
             let views = self.views(&active, depth);
             for k in [NAMES, 4, 2] {
-                let mut body = String::new();
+                body.clear();
                 for view in &views {
-                    body.push_str(&self.line(view, k, pointers, &common));
+                    self.write_line(&mut body, view, k, pointers, &common);
                     if body.len() > room {
                         break;
                     }
                 }
                 if body.len() <= room {
-                    return Some((format!("{header}{body}{other}"), summary));
+                    let mut out = String::with_capacity(header.len() + body.len() + other.len());
+                    out.push_str(&header);
+                    out.push_str(&body);
+                    out.push_str(&other);
+                    return Some((out, summary));
                 }
             }
         }
         // Too many top-level directories: show them in order, then count the rest.
         let views = self.views(&active, top);
-        let mut body = String::new();
+        body.clear();
         let mut shown = 0;
         for view in &views {
-            let line = self.line(view, 2, pointers, &common);
-            if body.len() + line.len() > room {
+            let prev_len = body.len();
+            self.write_line(&mut body, view, 2, pointers, &common);
+            if body.len() > room {
+                body.truncate(prev_len);
                 break;
             }
-            body.push_str(&line);
             shown += 1;
         }
         let rest = &views[shown..];
         let entries: usize = rest.iter().map(|v| v.own + v.nested).sum();
-        body.push_str(&format!(
-            "+{} with {}\n",
+        let _ = writeln!(
+            body,
+            "+{} with {}",
             plural(rest.len(), "more directory", "more directories"),
             plural(entries, "entry", "entries")
-        ));
-        Some((format!("{header}{body}{other}"), summary))
+        );
+        let mut out = String::with_capacity(header.len() + body.len() + other.len());
+        out.push_str(&header);
+        out.push_str(&body);
+        out.push_str(&other);
+        Some((out, summary))
     }
 
     fn long_kind_breakdown(&self) -> String {
@@ -772,7 +863,7 @@ impl Listing {
 
         // Multi-directory non-recursive `ls -l`: keep every section when it fits whole
         // and saves bytes over the raw listing.
-        let mut body = String::new();
+        let mut body = String::with_capacity(room.min(self.raw_bytes));
         let mut i = 0;
         while i < self.long_rows.len() {
             let dir_key = &self.long_rows[i].dir_key;
@@ -785,21 +876,20 @@ impl Listing {
                 i += 1;
             }
             let section = &self.long_rows[start..i];
-            let label = relative_dir(dir_key, common);
-            let ptr = format_pointer(pointers, first, last);
-            body.push_str(&format!(
-                "{label} ({}){ptr}\n",
-                plural(section.len(), "entry", "entries")
-            ));
+            write_relative_dir(&mut body, dir_key, common);
+            let _ = write!(body, " ({})", plural(section.len(), "entry", "entries"));
+            write_pointer(&mut body, pointers, first, last);
+            body.push('\n');
             for row in section {
                 body.push_str("  ");
-                body.push_str(&format_long_row(
+                write_long_row(
+                    &mut body,
                     row,
                     modal_perms,
                     modal_links,
                     modal_owner,
                     modal_group,
-                ));
+                );
                 if body.len() > room {
                     return None;
                 }
@@ -807,7 +897,12 @@ impl Listing {
         }
         let total_len = fixed + body.len();
         if total_len <= budget && total_len < self.raw_bytes {
-            Some(format!("{header}{default_line}{body}{other}"))
+            let mut out = String::with_capacity(total_len);
+            out.push_str(header);
+            out.push_str(&default_line);
+            out.push_str(&body);
+            out.push_str(other);
+            Some(out)
         } else {
             None
         }
@@ -866,19 +961,14 @@ impl Listing {
 
     /// Directories at most `depth` levels deep, with deeper ones folded into them.
     fn views<'a>(&'a self, active: &[ActiveDir<'a>], depth: usize) -> Vec<View<'a>> {
-        let mut views: BTreeMap<Vec<&'a str>, View<'a>> = BTreeMap::new();
+        let mut views: BTreeMap<PathKey<'a>, View<'a>> = BTreeMap::new();
         for item in active {
             let (target, own) = if components(item.key) <= depth {
                 (item.key, true)
             } else {
                 (ancestor(item.key, depth), false)
             };
-            let parts = if target.is_empty() {
-                Vec::new()
-            } else {
-                target.split('/').collect()
-            };
-            let view = views.entry(parts).or_insert(View {
+            let view = views.entry(PathKey(target)).or_insert(View {
                 key: target,
                 dir: None,
                 sole: None,
@@ -942,109 +1032,150 @@ impl Listing {
         result
     }
 
-    fn line(&self, view: &View, k: usize, pointers: bool, common: &str) -> String {
-        let mut text = relative_dir(view.key, common);
-        let nested = (view.nested > 0).then(|| {
-            let base = format!(
-                "+{} in {}",
-                view.nested,
-                plural(view.nested_dirs, "subdirectory", "subdirectories")
-            );
-            if !view.nested_exts.is_empty() || view.nested_other_exts > 0 {
-                let max_exts = match k {
-                    6.. => 4,
-                    4.. => 3,
-                    _ => 2,
-                };
-                format!(
-                    "{base}: {}",
-                    format_exts(&view.nested_exts, view.nested_other_exts, max_exts)
-                )
-            } else {
-                base
-            }
-        });
+    fn write_line(&self, out: &mut String, view: &View, k: usize, pointers: bool, common: &str) {
+        write_relative_dir(out, view.key, common);
         match view.dir {
-            Some(dir) if dir.noise => text.push_str(&format!(
-                " {} collapsed",
-                plural(view.own + view.nested, "entry", "entries")
-            )),
+            Some(dir) if dir.noise => {
+                let _ = write!(
+                    out,
+                    " {} collapsed",
+                    plural(view.own + view.nested, "entry", "entries")
+                );
+            }
             Some(dir) if self.dense_breakdown && view.own > DENSE_DIR => {
-                text.push(' ');
-                text.push_str(&self.format_dense_dir(view.key, dir, k, nested.as_deref()));
+                out.push(' ');
+                self.write_dense_dir(out, view.key, dir, k, view);
             }
             Some(dir) => {
-                text.push_str(&format!(" {}", view.own));
-                if let Some(nested) = nested {
-                    text.push_str(&format!(" ({nested})"));
+                let _ = write!(out, " {}", view.own);
+                if view.nested > 0 {
+                    out.push_str(" (");
+                    write_nested(out, view, k);
+                    out.push(')');
                 }
-                let names: Vec<_> = dir
-                    .names
-                    .iter()
-                    .take(k)
-                    .map(|name| self.mark(view.key, name))
-                    .collect();
-                text.push_str(&format!(": {}", names.join(", ")));
-                if view.own > names.len() {
-                    text.push_str(&format!(" +{} more", view.own - names.len()));
+                out.push_str(": ");
+                let mut shown = 0;
+                for name in dir.names.iter().take(k) {
+                    if shown > 0 {
+                        out.push_str(", ");
+                    }
+                    self.write_mark(out, view.key, name);
+                    shown += 1;
+                }
+                if view.own > shown {
+                    let _ = write!(out, " +{} more", view.own - shown);
                 }
             }
-            None => text.push_str(&format!(" ({})", nested.unwrap_or_default())),
+            None => {
+                out.push_str(" (");
+                if view.nested > 0 {
+                    write_nested(out, view, k);
+                }
+                out.push(')');
+            }
         }
-        text.push_str(&format_pointer(pointers, view.first, view.last));
-        text.push('\n');
-        text
+        write_pointer(out, pointers, view.first, view.last);
+        out.push('\n');
     }
 
-    fn format_dense_dir(&self, key: &str, dir: &Dir, k: usize, nested: Option<&str>) -> String {
+    fn write_dense_dir(&self, out: &mut String, key: &str, dir: &Dir, k: usize, view: &View) {
         let max_exts = match k {
             6.. => 5,
             4.. => 3,
             _ => 2,
         };
-        let mut out = String::from("(");
+        out.push('(');
         if dir.files > 0 && dir.subdirs == 0 {
-            out.push_str(&format!(
-                "{}: {}",
-                plural(dir.files, "file", "files"),
-                format_exts(&dir.exts, dir.other_exts, max_exts)
-            ));
+            let _ = write!(out, "{}: ", plural(dir.files, "file", "files"));
+            write_exts(out, &dir.exts, dir.other_exts, max_exts);
         } else if dir.files > 0 && dir.subdirs > 0 {
-            out.push_str(&format!(
-                "{}, {}: {}",
+            let _ = write!(
+                out,
+                "{}, {}: ",
                 plural(dir.files, "file", "files"),
-                plural(dir.subdirs, "dir", "dirs"),
-                format_exts(&dir.exts, dir.other_exts, max_exts)
-            ));
+                plural(dir.subdirs, "dir", "dirs")
+            );
+            write_exts(out, &dir.exts, dir.other_exts, max_exts);
         } else {
             out.push_str(&plural(dir.subdirs, "dir", "dirs"));
         }
-        if let Some(nested) = nested {
+        if view.nested > 0 {
             out.push_str("; ");
-            out.push_str(nested);
+            write_nested(out, view, k);
         }
         if k >= 4
             && let (Some(first), Some(last)) = (&dir.min_name, &dir.max_name)
         {
-            let first = self.mark(key, first);
-            let last = self.mark(key, last);
-            if first == last {
-                out.push_str(&format!("; first: {first}"));
-            } else {
-                out.push_str(&format!("; first: {first} … last: {last}"));
+            let first_slash = !first.ends_with('/') && self.has_subdir(key, first);
+            let last_slash = !last.ends_with('/') && self.has_subdir(key, last);
+            out.push_str("; first: ");
+            out.push_str(first);
+            if first_slash {
+                out.push('/');
+            }
+            if first != last || first_slash != last_slash {
+                out.push_str(" … last: ");
+                out.push_str(last);
+                if last_slash {
+                    out.push('/');
+                }
             }
         }
         out.push(')');
-        out
+    }
+
+    fn has_subdir(&self, parent: &str, name: &str) -> bool {
+        if parent.is_empty() {
+            self.dirs.contains_key(name)
+        } else {
+            self.dirs.contains_key(&join(parent, name))
+        }
     }
 
     /// Mark a name as a directory when other listed paths sit inside it.
-    fn mark(&self, parent: &str, name: &str) -> String {
-        if !name.ends_with('/') && self.dirs.contains_key(&join(parent, name)) {
-            format!("{name}/")
-        } else {
-            name.to_owned()
+    fn write_mark(&self, out: &mut String, parent: &str, name: &str) {
+        out.push_str(name);
+        if !name.ends_with('/') && self.has_subdir(parent, name) {
+            out.push('/');
         }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PathKey<'a>(&'a str);
+
+impl Ord for PathKey<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self.0.is_empty(), other.0.is_empty()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => self.0.split('/').cmp(other.0.split('/')),
+        }
+    }
+}
+
+impl PartialOrd for PathKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn write_nested(out: &mut String, view: &View, k: usize) {
+    let _ = write!(
+        out,
+        "+{} in {}",
+        view.nested,
+        plural(view.nested_dirs, "subdirectory", "subdirectories")
+    );
+    if !view.nested_exts.is_empty() || view.nested_other_exts > 0 {
+        let max_exts = match k {
+            6.. => 4,
+            4.. => 3,
+            _ => 2,
+        };
+        out.push_str(": ");
+        write_exts(out, &view.nested_exts, view.nested_other_exts, max_exts);
     }
 }
 
@@ -1070,11 +1201,11 @@ pub(crate) fn named_noise(words: &[&str]) -> Vec<String> {
 
 /// The path up to the first dependency or build directory that contains it.
 pub(crate) fn noise_prefix<'a>(path: &'a str, keep: &[String]) -> Option<&'a str> {
-    let segments: Vec<&str> = path.split('/').collect();
     let mut end = 0;
-    for (i, segment) in segments.iter().enumerate() {
+    let mut iter = path.split('/').peekable();
+    while let Some(segment) = iter.next() {
         end += segment.len();
-        if i + 1 < segments.len() && NOISE.contains(segment) && !keep.iter().any(|k| k == segment) {
+        if iter.peek().is_some() && NOISE.contains(&segment) && !keep.iter().any(|k| k == segment) {
             return Some(&path[..end]);
         }
         end += 1;
@@ -1131,16 +1262,23 @@ pub fn paths(
 }
 
 fn format_pointer(pointers: bool, first: usize, last: usize) -> String {
+    let mut out = String::new();
+    write_pointer(&mut out, pointers, first, last);
+    out
+}
+
+fn write_pointer(out: &mut String, pointers: bool, first: usize, last: usize) {
     if !pointers {
-        String::new()
-    } else if first == last {
-        format!(" [stdout:{first}]")
+        return;
+    }
+    if first == last {
+        let _ = write!(out, " [stdout:{first}]");
     } else {
-        format!(" [stdout:{first}-{last}]")
+        let _ = write!(out, " [stdout:{first}-{last}]");
     }
 }
 
-fn relative_dir(key: &str, common: &str) -> String {
+fn write_relative_dir(out: &mut String, key: &str, common: &str) {
     let relative = if common.is_empty() {
         key
     } else if key == common {
@@ -1151,11 +1289,12 @@ fn relative_dir(key: &str, common: &str) -> String {
             .unwrap_or(key)
     };
     if relative.is_empty() {
-        "./".to_owned()
+        out.push_str("./");
     } else if relative == "/" {
-        "/".to_owned()
+        out.push('/');
     } else {
-        format!("{relative}/")
+        out.push_str(relative);
+        out.push('/');
     }
 }
 
@@ -1215,7 +1354,26 @@ fn format_long_row(
     modal_owner: &str,
     modal_group: &str,
 ) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(row.size.len() + row.date.len() + row.name.len() + 24);
+    write_long_row(
+        &mut out,
+        row,
+        modal_perms,
+        modal_links,
+        modal_owner,
+        modal_group,
+    );
+    out
+}
+
+fn write_long_row(
+    out: &mut String,
+    row: &LongRow,
+    modal_perms: &str,
+    modal_links: &str,
+    modal_owner: &str,
+    modal_group: &str,
+) {
     let perms_diff = row.perms != modal_perms;
     let links_diff = row.links != modal_links;
     let og_diff = row.owner != modal_owner || row.group != modal_group;
@@ -1243,7 +1401,6 @@ fn format_long_row(
     out.push(' ');
     out.push_str(&row.name);
     out.push('\n');
-    out
 }
 
 fn format_hoisted_middle(
@@ -1272,12 +1429,7 @@ fn format_hoisted_middle(
         match row.kind() {
             EntryKind::File => {
                 files += 1;
-                add_ext(
-                    &mut exts,
-                    &mut other_exts,
-                    extension_of(row.plain_name()),
-                    1,
-                );
+                add_file_ext(&mut exts, &mut other_exts, row.plain_name(), 1);
             }
             EntryKind::Dir => dirs += 1,
             EntryKind::Symlink => links += 1,
@@ -1308,24 +1460,33 @@ fn format_hoisted_middle(
     format!("… +{} more ({}){ptr}\n", middle.len(), details.join("; "))
 }
 
-fn extension_of(name: &str) -> String {
+fn ext_into_buf<'a>(name: &str, buf: &'a mut [u8; 17]) -> Option<&'a str> {
     let bare = name.trim_end_matches('/');
-    match Path::new(bare).extension().and_then(|e| e.to_str()) {
-        Some(ext) if !ext.is_empty() && ext.len() <= 16 && !ext.contains(char::is_whitespace) => {
-            format!(".{}", ext.to_ascii_lowercase())
-        }
-        _ => "(no ext)".to_owned(),
+    let ext = Path::new(bare).extension().and_then(|e| e.to_str())?;
+    if ext.is_empty() || ext.len() > 16 || ext.contains(char::is_whitespace) {
+        return None;
     }
+    buf[0] = b'.';
+    for (dst, &src) in buf[1..=ext.len()].iter_mut().zip(ext.as_bytes()) {
+        *dst = src.to_ascii_lowercase();
+    }
+    std::str::from_utf8(&buf[..=ext.len()]).ok()
 }
 
-fn add_ext(exts: &mut BTreeMap<String, usize>, other: &mut usize, ext: String, count: usize) {
-    if let Some(existing) = exts.get_mut(&ext) {
+fn add_ext_str(exts: &mut BTreeMap<String, usize>, other: &mut usize, ext: &str, count: usize) {
+    if let Some(existing) = exts.get_mut(ext) {
         *existing += count;
     } else if exts.len() < MAX_TRACKED_EXTS {
-        exts.insert(ext, count);
+        exts.insert(ext.to_owned(), count);
     } else {
         *other += count;
     }
+}
+
+fn add_file_ext(exts: &mut BTreeMap<String, usize>, other: &mut usize, name: &str, count: usize) {
+    let mut buf = [0u8; 17];
+    let ext = ext_into_buf(name, &mut buf).unwrap_or("(no ext)");
+    add_ext_str(exts, other, ext, count);
 }
 
 fn merge_exts(
@@ -1335,19 +1496,22 @@ fn merge_exts(
     src_other: usize,
 ) {
     for (ext, count) in src {
-        add_ext(target, target_other, ext.clone(), *count);
+        add_ext_str(target, target_other, ext, *count);
     }
     *target_other += src_other;
 }
 
-fn format_exts(exts: &BTreeMap<String, usize>, other: usize, max_shown: usize) -> String {
+fn write_exts(out: &mut String, exts: &BTreeMap<String, usize>, other: usize, max_shown: usize) {
     let mut ranked: Vec<(&str, usize)> = exts.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-    let mut parts: Vec<String> = ranked
-        .iter()
-        .take(max_shown)
-        .map(|(ext, count)| format!("{count} {ext}"))
-        .collect();
+    let mut shown = 0;
+    for (ext, count) in ranked.iter().take(max_shown) {
+        if shown > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "{count} {ext}");
+        shown += 1;
+    }
     let rest: usize = ranked
         .iter()
         .skip(max_shown)
@@ -1355,9 +1519,17 @@ fn format_exts(exts: &BTreeMap<String, usize>, other: usize, max_shown: usize) -
         .sum::<usize>()
         + other;
     if rest > 0 {
-        parts.push(format!("+{rest} other"));
+        if shown > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "+{rest} other");
     }
-    parts.join(", ")
+}
+
+fn format_exts(exts: &BTreeMap<String, usize>, other: usize, max_shown: usize) -> String {
+    let mut out = String::new();
+    write_exts(&mut out, exts, other, max_shown);
+    out
 }
 
 fn collapse_spaces(text: &str) -> String {
@@ -1416,11 +1588,13 @@ fn tree_entry(line: &str) -> Option<(usize, &str)> {
     let mut rest = line;
     let mut depth = 0;
     loop {
-        let unit: Vec<char> = rest.chars().take(4).collect();
-        let [a, b, c, d] = unit[..] else {
+        let mut chars = rest.chars();
+        let (Some(a), Some(b), Some(c), Some(d)) =
+            (chars.next(), chars.next(), chars.next(), chars.next())
+        else {
             return None;
         };
-        let width: usize = unit.iter().map(|c| c.len_utf8()).sum();
+        let width = a.len_utf8() + b.len_utf8() + c.len_utf8() + d.len_utf8();
         if (matches!(a, '├' | '└') && b == '─' && c == '─'
             || matches!(a, '|' | '`') && b == '-' && c == '-')
             && blank(d)
@@ -1924,6 +2098,78 @@ mod tests {
                 "\nfixtures/ (31 files, 2 dirs: 20 .json, 10 .txt, 1 (no ext); first: Makefile … last: nested_b/) [stdout:"
             ),
             "{report}"
+        );
+    }
+
+    #[test]
+    fn ansi_colored_listings_strip_escapes_and_match_plain() {
+        let mut plain_ls = String::from("total 64\n");
+        let mut color_ls = String::from("total 64\n");
+        for i in 0..16 {
+            plain_ls.push_str(&format!(
+                "-rw-r--r-- 1 alice staff  1024 Nov 25 10:00 file_{i:02}.rs\n"
+            ));
+            color_ls.push_str(&format!(
+                "-rw-r--r-- 1 alice staff  1024 Nov 25 10:00 \x1b[32mfile_{i:02}.rs\x1b[0m\n"
+            ));
+        }
+        assert_eq!(
+            run_listing(&["ls", "-la"], "ls -la", &color_ls, 4096),
+            run_listing(&["ls", "-la"], "ls -la", &plain_ls, 4096)
+        );
+
+        let plain_tree =
+            ".\n├── src\n│   ├── lib.rs\n│   └── main.rs\n└── Cargo.toml\n\n1 directory, 3 files\n";
+        let color_tree = ".\n├── \x1b[1;34msrc\x1b[0m\n│   ├── lib.rs\n│   └── main.rs\n└── Cargo.toml\n\n1 directory, 3 files\n";
+        assert_eq!(
+            run_listing(&["tree"], "tree", color_tree, 4096),
+            run_listing(&["tree"], "tree", plain_tree, 4096)
+        );
+    }
+
+    #[test]
+    fn zero_regex_listing_helpers_handle_edge_cases() {
+        assert!(super::is_permissions_prefix(
+            "-rw-r--r-- 1 user group 10 Jan  1 00:00 a"
+        ));
+        assert!(super::is_permissions_prefix(
+            "drwxr-xr-x@ 4 user staff 128 Jan  1 00:00 dir"
+        ));
+        assert!(super::is_permissions_prefix(
+            "lrwxrwxrwx+ 1 user group 5 Jan  1 00:00 link"
+        ));
+        assert!(!super::is_permissions_prefix("-rw-r--r--x 1 user"));
+        assert!(!super::is_permissions_prefix("total 42"));
+
+        assert!(super::is_tree_count("1 directory, 1 file"));
+        assert!(super::is_tree_count("12 directories, 45 files"));
+        assert!(super::is_tree_count("3 directories"));
+        assert!(!super::is_tree_count("directories, 3 files"));
+        assert!(!super::is_tree_count("3 directories, files"));
+
+        let mut buf = [0u8; 17];
+        assert_eq!(super::ext_into_buf("MAIN.RS", &mut buf), Some(".rs"));
+        assert_eq!(
+            super::ext_into_buf("a.1234567890123456", &mut buf),
+            Some(".1234567890123456")
+        );
+        assert_eq!(super::ext_into_buf("a.12345678901234567", &mut buf), None);
+        assert_eq!(super::ext_into_buf("Makefile", &mut buf), None);
+        assert_eq!(super::ext_into_buf(".gitignore", &mut buf), None);
+        assert_eq!(super::ext_into_buf("src/", &mut buf), None);
+        assert_eq!(super::ext_into_buf("a.bad ext", &mut buf), None);
+
+        assert_eq!(
+            super::noise_prefix("app/node_modules/pkg/index.js", &[]),
+            Some("app/node_modules")
+        );
+        assert_eq!(super::noise_prefix("app/node_modules", &[]), None);
+        assert_eq!(
+            super::noise_prefix(
+                "app/node_modules/pkg/index.js",
+                &["node_modules".to_owned()]
+            ),
+            None
         );
     }
 }
