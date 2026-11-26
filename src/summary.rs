@@ -73,6 +73,14 @@ pub struct XcodebuildDetails {
     pub failed_commands_first: usize,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub failed_commands_last: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub testing_failed: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub testing_failed_stream: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub testing_failed_first: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub testing_failed_last: usize,
     #[serde(default, skip_serializing_if = "is_false")]
     pub succeeded: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -332,7 +340,10 @@ pub fn family(args: &[OsString]) -> String {
                     | "-showdestinations"
                     | "-showBuildSettings"
                     | "-showBuildSettingsForIndex"
+                    | "-showBuildTimingSummary"
                     | "-showTestPlans"
+                    | "-dry-run"
+                    | "-n"
                     | "-list"
                     | "-json"
                     | "-exportLocalizations"
@@ -2648,10 +2659,19 @@ fn format_line_range(first: usize, last: usize) -> String {
 // Modern Xcode 15/16 `xcodebuild` build/test/archive parser (`rtk PR #4480`)
 // ---------------------------------------------------------------------------
 
+const MAX_XCODE_BLOCK_DETAILS: usize = 8;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ActiveXcodeKind {
     Located,
     LinkerBlock,
+    ErrorBlock,
+}
+
+struct BlockDetail {
+    text: String,
+    primary: bool,
+    group: usize,
 }
 
 struct ActiveXcodeDiag {
@@ -2659,7 +2679,112 @@ struct ActiveXcodeDiag {
     stream: crate::capture::Stream,
     item: Item,
     context_lines: usize,
-    detail_lines: usize,
+    details: Vec<BlockDetail>,
+    omitted_lines: usize,
+    base_indent: Option<usize>,
+    has_ref_headers: bool,
+    current_group: usize,
+}
+
+impl ActiveXcodeDiag {
+    fn new(kind: ActiveXcodeKind, stream: crate::capture::Stream, item: Item) -> Self {
+        Self {
+            kind,
+            stream,
+            item,
+            context_lines: 0,
+            details: Vec::new(),
+            omitted_lines: 0,
+            base_indent: None,
+            has_ref_headers: false,
+            current_group: 0,
+        }
+    }
+
+    fn push_linker_line(&mut self, line: &str, trimmed: &str) {
+        let indent = leading_indent(line);
+        let is_ref_header = trimmed.ends_with("referenced from:");
+        if is_ref_header {
+            self.has_ref_headers = true;
+        }
+        let base = *self.base_indent.get_or_insert(indent);
+        let primary = if self.has_ref_headers {
+            is_ref_header
+        } else {
+            indent <= base
+        };
+        if primary {
+            self.current_group += 1;
+        }
+        let group = self.current_group;
+        let entry = BlockDetail {
+            text: short(trimmed, 180),
+            primary,
+            group,
+        };
+        if self.details.len() < MAX_XCODE_BLOCK_DETAILS {
+            self.details.push(entry);
+            return;
+        }
+        if primary {
+            if let Some(evict_idx) = self.pick_secondary_to_evict(false) {
+                self.details.remove(evict_idx);
+                self.omitted_lines += 1;
+                self.details.push(entry);
+                return;
+            }
+        } else {
+            let group_secondary_count = self
+                .details
+                .iter()
+                .filter(|d| !d.primary && d.group == group)
+                .count();
+            if group_secondary_count == 0
+                && let Some(evict_idx) = self.pick_secondary_to_evict(true)
+            {
+                self.details.remove(evict_idx);
+                self.omitted_lines += 1;
+                self.details.push(entry);
+                return;
+            }
+        }
+        self.omitted_lines += 1;
+    }
+
+    fn pick_secondary_to_evict(&self, only_redundant: bool) -> Option<usize> {
+        let mut best: Option<(usize, usize)> = None;
+        for (idx, detail) in self.details.iter().enumerate() {
+            if detail.primary {
+                continue;
+            }
+            let count = self
+                .details
+                .iter()
+                .filter(|d| !d.primary && d.group == detail.group)
+                .count();
+            if only_redundant && count < 2 {
+                continue;
+            }
+            if best.is_none_or(|(best_count, best_idx)| {
+                count > best_count || (count == best_count && idx > best_idx)
+            }) {
+                best = Some((count, idx));
+            }
+        }
+        best.map(|(_, idx)| idx)
+    }
+
+    fn push_error_line(&mut self, trimmed: &str) {
+        if self.details.len() < MAX_XCODE_BLOCK_DETAILS {
+            self.details.push(BlockDetail {
+                text: short(trimmed, 180),
+                primary: true,
+                group: 0,
+            });
+        } else {
+            self.omitted_lines += 1;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2669,12 +2794,25 @@ struct XcodebuildScan {
     details: XcodebuildDetails,
     active: Option<ActiveXcodeDiag>,
     in_failed_commands: Option<crate::capture::Stream>,
+    in_testing_failed: Option<crate::capture::Stream>,
     overflowed: bool,
 }
 
 impl XcodebuildScan {
     fn flush_active(&mut self) {
         if let Some(mut diag) = self.active.take() {
+            for detail in &diag.details {
+                if !diag.item.detail.is_empty() {
+                    diag.item.detail.push(' ');
+                }
+                diag.item.detail.push_str(&detail.text);
+            }
+            if diag.omitted_lines > 0 {
+                if !diag.item.detail.is_empty() {
+                    diag.item.detail.push(' ');
+                }
+                let _ = write!(diag.item.detail, "(+{} more line(s))", diag.omitted_lines);
+            }
             if diag.item.digest.is_empty() {
                 let mut hash = Sha256::new();
                 hash.update(diag.item.name.as_bytes());
@@ -2724,11 +2862,23 @@ impl XcodebuildScan {
         if self.in_failed_commands.is_some_and(|s| s != stream) {
             self.in_failed_commands = None;
         }
+        if self.in_testing_failed.is_some_and(|s| s != stream) {
+            self.in_testing_failed = None;
+        }
 
         if trimmed.is_empty() {
-            self.flush_active();
+            if !self
+                .active
+                .as_ref()
+                .is_some_and(|a| a.kind == ActiveXcodeKind::ErrorBlock)
+            {
+                self.flush_active();
+            }
             if self.in_failed_commands == Some(stream) && !self.details.failed_commands.is_empty() {
                 self.in_failed_commands = None;
+            }
+            if self.in_testing_failed == Some(stream) && !self.details.testing_failed.is_empty() {
+                self.in_testing_failed = None;
             }
             return;
         }
@@ -2737,6 +2887,7 @@ impl XcodebuildScan {
         if let Some(succeeded) = parse_xcodebuild_banner(trimmed) {
             self.flush_active();
             self.in_failed_commands = None;
+            self.in_testing_failed = None;
             if succeeded {
                 self.details.succeeded = true;
             } else {
@@ -2752,18 +2903,23 @@ impl XcodebuildScan {
         // 2. `The following build commands failed:` block.
         if trimmed == "The following build commands failed:" {
             self.flush_active();
+            self.in_testing_failed = None;
             self.in_failed_commands = Some(stream);
             if self.details.failed_commands_first == 0 {
                 self.details.failed_commands_stream = stream.name().to_owned();
                 self.details.failed_commands_first = n;
             }
-            self.details.failed_commands_last = n;
+            if self.details.failed_commands_stream == stream.name() {
+                self.details.failed_commands_last = n;
+            }
             return;
         }
         if self.in_failed_commands == Some(stream) {
             let is_count = is_xcodebuild_failure_count(trimmed);
             if indented || is_count {
-                self.details.failed_commands_last = n;
+                if self.details.failed_commands_stream == stream.name() {
+                    self.details.failed_commands_last = n;
+                }
                 if self.details.failed_commands.len() < 64 {
                     self.details.failed_commands.push(short(trimmed, 260));
                 }
@@ -2775,19 +2931,40 @@ impl XcodebuildScan {
             self.in_failed_commands = None;
         }
 
+        // 2b. `Testing failed:` block (XCTest failures and test runner crashes).
+        if trimmed == "Testing failed:" {
+            self.flush_active();
+            self.in_failed_commands = None;
+            self.in_testing_failed = Some(stream);
+            if self.details.testing_failed_first == 0 {
+                self.details.testing_failed_stream = stream.name().to_owned();
+                self.details.testing_failed_first = n;
+            }
+            if self.details.testing_failed_stream == stream.name() {
+                self.details.testing_failed_last = n;
+            }
+            return;
+        }
+        if self.in_testing_failed == Some(stream) {
+            if indented {
+                if self.details.testing_failed_stream == stream.name() {
+                    self.details.testing_failed_last = n;
+                }
+                if self.details.testing_failed.len() < 64 {
+                    self.details.testing_failed.push(short(trimmed, 260));
+                }
+                return;
+            }
+            self.in_testing_failed = None;
+        }
+
         // 3. New compiler, linker, tool, or test error line.
         if let Some((kind, name, detail)) = parse_xcodebuild_error(line, trimmed, indented) {
             self.flush_active();
             let item = Item::new_in_stream(name, detail, n, stream);
             match kind {
                 Some(active_kind) => {
-                    self.active = Some(ActiveXcodeDiag {
-                        kind: active_kind,
-                        stream,
-                        item,
-                        context_lines: 0,
-                        detail_lines: 0,
-                    });
+                    self.active = Some(ActiveXcodeDiag::new(active_kind, stream, item));
                 }
                 None => {
                     let mut item = item;
@@ -2806,22 +2983,20 @@ impl XcodebuildScan {
             return;
         }
 
-        // 4. Continuation lines for an active multi-line diagnostic (linker symbols or source/caret).
+        // 4. Continuation lines for an active multi-line diagnostic (linker symbols, xcodebuild error block, or source/caret).
         if let Some(active) = self.active.as_mut() {
             match active.kind {
                 ActiveXcodeKind::LinkerBlock => {
                     if indented {
                         active.item.last = n;
-                        if active.detail_lines < 4 {
-                            let snippet = short(trimmed, 180);
-                            if active.item.detail.is_empty() {
-                                active.item.detail = snippet;
-                            } else {
-                                let combined = format!("{} {snippet}", active.item.detail);
-                                active.item.detail = short(&combined, 360);
-                            }
-                            active.detail_lines += 1;
-                        }
+                        active.push_linker_line(line, trimmed);
+                        return;
+                    }
+                }
+                ActiveXcodeKind::ErrorBlock => {
+                    if indented {
+                        active.item.last = n;
+                        active.push_error_line(trimmed);
                         return;
                     }
                 }
@@ -2863,6 +3038,7 @@ impl XcodebuildScan {
         if self.items.is_empty()
             && self.outcomes.is_empty()
             && self.details.failed_commands.is_empty()
+            && self.details.testing_failed.is_empty()
         {
             return None;
         }
@@ -2870,9 +3046,25 @@ impl XcodebuildScan {
     }
 }
 
+fn leading_indent(line: &str) -> usize {
+    line.bytes()
+        .take_while(|&b| b == b' ' || b == b'\t')
+        .map(|b| if b == b'\t' { 4 } else { 1 })
+        .sum()
+}
+
 fn starts_with_ignore_ascii_case(text: &str, prefix: &str) -> bool {
     text.len() >= prefix.len()
         && text.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+fn find_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || h.len() < n.len() {
+        return None;
+    }
+    h.windows(n.len()).position(|w| w.eq_ignore_ascii_case(n))
 }
 
 fn parse_xcodebuild_banner(trimmed: &str) -> Option<bool> {
@@ -2937,6 +3129,17 @@ fn is_xcodebuild_path_location(lhs: &str) -> bool {
         ".xcconfig",
         ".modulemap",
         ".sh",
+        ".xcstrings",
+        ".xcdatamodeld",
+        ".xcdatamodel",
+        ".strings",
+        ".stringsdict",
+        ".mlmodel",
+        ".app",
+        ".framework",
+        ".xcframework",
+        ".dylib",
+        ".appex",
     ];
     EXTS.iter().any(|ext| path.ends_with(ext))
 }
@@ -2948,6 +3151,27 @@ fn is_xcodebuild_source_path(path: &str) -> bool {
             || path.contains('/')
             || path == "<unknown>"
             || path == "<module-includes>")
+}
+
+fn parse_xcodebuild_codesign_error(line: &str) -> Option<(&str, &str)> {
+    const MARKERS: &[&str] = &[
+        ": errSec",
+        ": code object is not signed",
+        ": resource fork, Finder information, or similar detritus not allowed",
+        ": CSSMERR_",
+        ": A timestamp was expected",
+        ": invalid signature",
+        ": unsealed contents present",
+    ];
+    for &marker in MARKERS {
+        if let Some(pos) = line.find(marker) {
+            let lhs = &line[..pos];
+            if !lhs.is_empty() && !lhs.starts_with(char::is_whitespace) {
+                return Some((&line[..pos + 1], &line[pos + 2..]));
+            }
+        }
+    }
+    None
 }
 
 fn parse_xcodebuild_error<'a>(
@@ -2969,25 +3193,43 @@ fn parse_xcodebuild_error<'a>(
     }
 
     // Multi-line linker blocks (classic ld64 and Xcode 15/16 ld_prime).
+    let is_ld_symbol_header = |prefix: &str| {
+        starts_with_ignore_ascii_case(trimmed, prefix) && {
+            let tail = &trimmed[prefix.len()..];
+            tail.is_empty()
+                || tail == ":"
+                || starts_with_ignore_ascii_case(tail, " for architecture ")
+        }
+    };
     if line.starts_with("Undefined symbols for architecture ")
         || line.starts_with("Duplicate symbols for architecture ")
-        || line.starts_with("ld: Undefined symbols:")
-        || line.starts_with("ld: duplicate symbols:")
+        || is_ld_symbol_header("ld: undefined symbols")
+        || is_ld_symbol_header("ld: duplicate symbols")
         || (line.starts_with("duplicate symbol '") && line.ends_with(" in:"))
     {
-        return Some((Some(ActiveXcodeKind::LinkerBlock), line, ""));
+        return Some((Some(ActiveXcodeKind::LinkerBlock), trimmed, ""));
     }
 
-    // Located Swift / Clang / ObjC / Metal / project compiler errors and fatal errors.
+    // Located Swift / Clang / ObjC / Metal / project compiler errors and fatal errors
+    // (including Swift runtime `Fatal error:`).
     if line.contains(": ") {
         for marker in [": fatal error: ", ": error: "] {
-            if let Some(pos) = line.find(marker) {
+            if let Some(pos) = find_ignore_ascii_case(line, marker) {
                 let lhs = &line[..pos];
                 if is_xcodebuild_path_location(lhs) {
                     return Some((Some(ActiveXcodeKind::Located), lhs, &line[pos + 2..]));
                 }
             }
         }
+    }
+
+    // Bundle/path-prefixed `codesign` diagnostics (macOS `codesign` prefixes with the
+    // bundle or binary path rather than `codesign:`).
+    if !is_xcodebuild_warning(line, trimmed)
+        && !trimmed.starts_with("note: ")
+        && let Some((target, rest)) = parse_xcodebuild_codesign_error(line)
+    {
+        return Some((None, target, rest));
     }
 
     // Tool-prefixed diagnostics (`clang:`, `ld:`, `swift:`, `swiftc:`, `xcodebuild:`, etc.).
@@ -3040,7 +3282,9 @@ fn parse_xcodebuild_error<'a>(
                         || rest.contains("not signed")
                         || rest.contains("failed")))
             {
-                return Some((None, &line[..tool.len() + 1], rest));
+                let kind = (tool_base == "xcodebuild" && rest.trim_end().ends_with(':'))
+                    .then_some(ActiveXcodeKind::ErrorBlock);
+                return Some((kind, &line[..tool.len() + 1], rest));
             }
         }
     }
@@ -3212,6 +3456,27 @@ impl XcodebuildDetails {
         for cmd in &self.failed_commands {
             out.push_str("  ");
             out.push_str(cmd);
+            out.push('\n');
+        }
+    }
+
+    fn write_testing_failed(&self, out: &mut String) {
+        if self.testing_failed.is_empty() {
+            return;
+        }
+        let stream = if self.testing_failed_stream.is_empty() {
+            "stdout"
+        } else {
+            self.testing_failed_stream.as_str()
+        };
+        let _ = writeln!(
+            out,
+            "Testing failed: [{stream}:{}-{}]",
+            self.testing_failed_first, self.testing_failed_last
+        );
+        for line in &self.testing_failed {
+            out.push_str("  ");
+            out.push_str(line);
             out.push('\n');
         }
     }
@@ -4116,10 +4381,19 @@ impl Summary {
         }
         if self.kind == "xcodebuild" {
             let xb = self.xcodebuild.as_ref()?;
-            if status != 0 && self.items.is_empty() && xb.failed_commands.is_empty() {
+            if status != 0
+                && self.items.is_empty()
+                && xb.failed_commands.is_empty()
+                && xb.testing_failed.is_empty()
+            {
                 return None;
             }
-            if status == 0 && self.items.is_empty() && (!xb.succeeded || xb.failed) {
+            if status == 0
+                && self.items.is_empty()
+                && xb.failed_commands.is_empty()
+                && xb.testing_failed.is_empty()
+                && (!xb.succeeded || xb.failed)
+            {
                 return None;
             }
         }
@@ -4228,6 +4502,7 @@ impl Summary {
                 && let Some(xb) = &self.xcodebuild
             {
                 xb.write_failed_commands(&mut report);
+                xb.write_testing_failed(&mut report);
             }
         } else if self.kind == "tests" {
             let mut groups: BTreeMap<(&str, &str), Vec<&Item>> = BTreeMap::new();
@@ -4295,7 +4570,11 @@ impl Summary {
             }
         } else if self.kind == "xcodebuild" {
             if let Some(xb) = &self.xcodebuild {
-                if self.items.is_empty() && xb.failed_commands.is_empty() && xb.succeeded {
+                if self.items.is_empty()
+                    && xb.failed_commands.is_empty()
+                    && xb.testing_failed.is_empty()
+                    && xb.succeeded
+                {
                     for line in &self.outcomes {
                         report.push_str(line);
                         report.push('\n');
@@ -4329,6 +4608,7 @@ impl Summary {
                     }
                 }
                 xb.write_failed_commands(&mut report);
+                xb.write_testing_failed(&mut report);
             }
         } else {
             for item in &self.items {
@@ -6464,5 +6744,161 @@ Tests: 9, Assertions: 14, Failures: 1.
             "note: Using new build system\nCompileSwift normal arm64 a.swift\n",
         );
         assert!(truncated.render(None, 0).is_none());
+    }
+
+    #[test]
+    fn xcodebuild_linker_blocks_duplicate_symbols_and_codesign_paths() {
+        let log = concat!(
+            "Undefined symbols for architecture arm64:\n",
+            "  \"_sym_one\", referenced from:\n",
+            "      _callA in A.o\n",
+            "      _callB in B.o\n",
+            "      _callC in C.o\n",
+            "      _callD in D.o\n",
+            "      _callE in E.o\n",
+            "  \"_sym_two\", referenced from:\n",
+            "      _callF in F.o\n",
+            "  \"_sym_three\", referenced from:\n",
+            "      _callG in G.o\n",
+            "  \"_sym_four\", referenced from:\n",
+            "      _callH in H.o\n",
+            "ld: duplicate symbols\n",
+            "  _sharedHelper in Foo.o\n",
+            "  _sharedHelper in Bar.o\n",
+            "/Users/dev/DerivedData/Build/Products/Debug/MyApp.app: errSecInternalComponent\n",
+            "/Users/dev/DerivedData/Build/Products/Debug/MyApp.app: resource fork, Finder information, or similar detritus not allowed\n",
+            "/Users/dev/DerivedData/Build/Products/Debug/MyApp.app/Contents/MacOS/MyApp: code object is not signed at all\n",
+            "/Users/dev/App/Localizable.xcstrings: error: invalid catalog format\n",
+            "** BUILD FAILED **\n",
+        );
+        let summary = parse("xcodebuild", log);
+        let report = summary.render(None, 65).expect("xcodebuild failure report");
+
+        // All 4 distinct undefined symbols are preserved despite 5 `referenced from:` lines on `_sym_one`,
+        // and the omitted indented lines are explicitly reported.
+        assert!(
+            report.contains("\"_sym_one\", referenced from:"),
+            "{report}"
+        );
+        assert!(
+            report.contains("\"_sym_two\", referenced from:"),
+            "{report}"
+        );
+        assert!(
+            report.contains("\"_sym_three\", referenced from:"),
+            "{report}"
+        );
+        assert!(
+            report.contains("\"_sym_four\", referenced from:"),
+            "{report}"
+        );
+        assert!(report.contains("(+4 more line(s))"), "{report}");
+        assert!(report.contains("[stdout:1-13]"), "{report}");
+
+        // `ld: duplicate symbols` (without trailing colon) attaches its indented symbol block.
+        assert!(
+            report.contains(
+                "ld: duplicate symbols _sharedHelper in Foo.o _sharedHelper in Bar.o [stdout:14-16]"
+            ),
+            "{report}"
+        );
+
+        // Bundle/path-prefixed codesign errors and extended Apple resource paths are pinned.
+        assert!(
+            report.contains(
+                "/Users/dev/DerivedData/Build/Products/Debug/MyApp.app: errSecInternalComponent [stdout:17-17]"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "resource fork, Finder information, or similar detritus not allowed [stdout:18-18]"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("code object is not signed at all [stdout:19-19]"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "/Users/dev/App/Localizable.xcstrings error: invalid catalog format [stdout:20-20]"
+            ),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn xcodebuild_swift_fatal_error_testing_failed_multiline_error_and_dry_run_exclusion() {
+        let argv =
+            |s: &str| -> Vec<OsString> { s.split_whitespace().map(OsString::from).collect() };
+        assert_eq!(
+            family(&argv("xcodebuild -scheme MyApp -dry-run build")),
+            "other"
+        );
+        assert_eq!(family(&argv("xcodebuild -scheme MyApp -n build")), "other");
+        assert_eq!(
+            family(&argv(
+                "xcodebuild -scheme MyApp -showBuildTimingSummary build"
+            )),
+            "other"
+        );
+
+        let log = concat!(
+            "MyApp/Auth.swift:12: Fatal error: Unexpectedly found nil while unwrapping an Optional value\n",
+            "xcodebuild: error: Unable to find a destination matching the provided destination specifier:\n",
+            "\t\t{ platform:iOS Simulator, OS:18.0, name:iPhone 16 Pro }\n",
+            "\n",
+            "\tThe requested device could not be found because no available devices matched the request.\n",
+            "Testing failed:\n",
+            "\tMyAppTests-Runner.app (12345) encountered an error (Early unexpected exit)\n",
+            "\tTest target MyAppTests encountered an error (Early unexpected exit)\n",
+            "\n",
+            "** TEST FAILED **\n",
+        );
+        let summary = parse("xcodebuild", log);
+        let report = summary.render(None, 65).expect("xcodebuild test failure");
+        assert!(
+            report.contains(
+                "MyApp/Auth.swift:12 Fatal error: Unexpectedly found nil while unwrapping an Optional value [stdout:1-1]"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "xcodebuild: error: Unable to find a destination matching the provided destination specifier: { platform:iOS Simulator, OS:18.0, name:iPhone 16 Pro } The requested device could not be found because no available devices matched the request. [stdout:2-5]"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("Testing failed: [stdout:6-8]"), "{report}");
+        assert!(
+            report.contains(
+                "  MyAppTests-Runner.app (12345) encountered an error (Early unexpected exit)"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("** TEST FAILED ** [stdout:10-10]"),
+            "{report}"
+        );
+
+        // Runner crash with zero parsed `items` still renders `Testing failed:` (does not fail closed).
+        let crash_only = concat!(
+            "Testing failed:\n",
+            "\tMyAppTests-Runner.app (999) encountered an error (Early unexpected exit)\n",
+            "** TEST FAILED **\n",
+        );
+        let crash_summary = parse("xcodebuild", crash_only);
+        let crash_report = crash_summary
+            .render(None, 65)
+            .expect("runner crash summary");
+        assert!(
+            crash_report.contains("Testing failed: [stdout:1-2]"),
+            "{crash_report}"
+        );
+        assert!(
+            crash_report.contains("Early unexpected exit"),
+            "{crash_report}"
+        );
     }
 }

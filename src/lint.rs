@@ -511,7 +511,8 @@ fn build_status(line: &str) -> Option<(StatusKind, bool, bool)> {
             false,
         ));
     }
-    if (matches!(first, b'M' | b'B' | b'T') || line.starts_with(char::is_whitespace))
+    if (matches!(first, b'M' | b'B' | b'T' | b'D' | b'A' | b'N' | b'R' | b'0')
+        || line.starts_with(char::is_whitespace))
         && DOTNET_STATUS.is_match(line)
     {
         return Some((
@@ -1424,7 +1425,7 @@ impl Lint {
             return Classify::Matched;
         }
         if !starts_ws
-            && line.contains(" MD")
+            && line.contains("MD")
             && let Some(c) = MARKDOWNLINT.captures(line)
         {
             let severity = c
@@ -1437,8 +1438,8 @@ impl Lint {
             return Classify::Matched;
         }
         if !starts_ws
-            && line.contains(": ")
-            && line.contains("line ")
+            && line.contains(':')
+            && line.contains("line")
             && let Some(c) = STYLELINT_COMPACT.captures(line)
         {
             let rule = c.get(6).map(|m| m.as_str().to_owned());
@@ -4242,5 +4243,55 @@ lib/parser.ex:102:7: F: Function is too complex (cyclomatic complexity is 12, ma
         let (r_plain, _) = feed("", plain).finish("cargo check", 4096, None).unwrap();
         let (r_colored, _) = feed("", colored).finish("cargo check", 4096, None).unwrap();
         assert_eq!(r_plain, r_colored);
+    }
+
+    #[test]
+    fn dotnet_9_unindented_status_and_tab_separated_markdownlint_and_stylelint() {
+        // .NET 9 Terminal Logger prints unindented `Restore complete (0.4s)` etc. at column 0.
+        let dotnet_out = concat!(
+            "Determining projects to restore...\n",
+            "Restore complete (0.4s)\n",
+            "  MyApp succeeded (1.2s) → bin/Debug/net9.0/MyApp.dll\n",
+            "Build succeeded in 1.7s\n",
+        );
+        let clean = feed(dotnet_out, "").clean("dotnet build").unwrap();
+        assert!(
+            clean.contains("dotnet build: 0 findings") && clean.contains("Build succeeded in 1.7s"),
+            "{clean}"
+        );
+
+        let dotnet_classic = concat!(
+            "MSBuild version 17.12.0+1\n",
+            "All projects are up-to-date for restore.\n",
+            "0 Warning(s)\n",
+            "0 Error(s)\n",
+            "Build succeeded.\n",
+            "Time Elapsed 00:00:01.02\n",
+        );
+        assert!(feed(dotnet_classic, "").clean("dotnet build").is_some());
+
+        // Tab-separated markdownlint output groups identically to space-separated output.
+        let md_out = concat!(
+            "docs/guide.md:12:1\tMD013/line-length\tLine length [Expected: 80; Actual: 120]\n",
+            "docs/guide.md:24:1\tMD013/line-length\tLine length [Expected: 80; Actual: 110]\n",
+        );
+        let (md_report, _) = feed(md_out, "").finish("markdownlint", 4096, None).unwrap();
+        assert!(
+            md_report.contains("error MD013/line-length ×2"),
+            "{md_report}"
+        );
+        assert!(md_report.contains("docs/guide.md:12:1"), "{md_report}");
+
+        // Tab-separated stylelint compact output groups identically to space-separated output.
+        let css_out = concat!(
+            "src/app.css:\tline\t5,\tcol\t3,\terror\t-\tUnexpected duplicate \"color\" (declaration-block-no-duplicate-properties)\n",
+            "src/nav.css:\tline\t9,\tcol\t1,\terror\t-\tUnexpected duplicate \"color\" (declaration-block-no-duplicate-properties)\n",
+        );
+        let (css_report, _) = feed(css_out, "").finish("stylelint", 4096, None).unwrap();
+        assert!(
+            css_report.contains("error declaration-block-no-duplicate-properties ×2"),
+            "{css_report}"
+        );
+        assert!(css_report.contains("src/app.css:5:3"), "{css_report}");
     }
 }

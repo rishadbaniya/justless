@@ -1652,6 +1652,7 @@ impl Capture<'_> {
         if !run.produced_bytes.is_empty() {
             run.summary.cargo = None;
             run.summary.js = None;
+            run.summary.xcodebuild = None;
         }
         let mut key = Sha256::new();
         for field in std::iter::once(workspace.cwd.as_os_str().as_encoded_bytes())
@@ -1737,16 +1738,19 @@ impl Capture<'_> {
             run.summary = summary.clone();
         }
         let shown: usize = previews.iter().map(|(_, bytes)| bytes.len()).sum();
-        // `cargo test` totals and structured JS/TS test reports account for every
-        // line of stdout, and of stderr when they cover it, so they replace what
-        // they cover.
-        let whole = run.summary.cargo.is_some() || run.summary.js.is_some();
+        // `cargo test` totals, structured JS/TS test reports, and `xcodebuild`
+        // summaries account for every line of stdout, and of stderr when they
+        // cover it, so they replace what they cover.
+        let whole = run.summary.cargo.is_some()
+            || run.summary.js.is_some()
+            || run.summary.xcodebuild.is_some();
         let covers_stderr = run
             .summary
             .cargo
             .as_ref()
             .is_some_and(|totals| totals.stderr)
-            || run.summary.js.as_ref().is_some_and(|report| report.stderr);
+            || run.summary.js.as_ref().is_some_and(|report| report.stderr)
+            || run.summary.xcodebuild.is_some();
         let covered = if run.summary.js.is_some() {
             let stdout_raw = usize::try_from(lengths[0]).unwrap_or(usize::MAX);
             let stderr_raw = if covers_stderr {
@@ -5277,5 +5281,137 @@ done"#,
             shown.contains("api-0") && shown.contains("api-79"),
             "{shown}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xcodebuild_combined_capture_dedups_stderr_handles_merged_and_fails_closed_on_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = test_workspace(dir.path());
+        let settings = ws.settings().unwrap();
+
+        let mut stdout_body = String::from("note: Using new build system\n");
+        for i in 1..=60 {
+            stdout_body.push_str(&format!(
+                "CompileSwift normal arm64 /Users/dev/App/Sources/File{i}.swift (in target 'MyApp' from project 'MyApp')\n"
+            ));
+        }
+        stdout_body.push_str(concat!(
+            "/Users/dev/App/Sources/Auth.swift:42:10: error: cannot find 'tokenStore' in scope\n",
+            "The following build commands failed:\n",
+            "\tSwiftCompile normal arm64 Compiling\\ Auth.swift\n",
+            "(1 failure)\n",
+            "** BUILD FAILED **\n",
+        ));
+        let mut stderr_body = String::new();
+        for i in 1..=15 {
+            stderr_body.push_str(&format!(
+                "ld: warning: ignoring duplicate libraries: '-lfoo{i}'\n"
+            ));
+        }
+        stderr_body.push_str("ld: error: Undefined symbol: _legacy_init\n");
+
+        let out_file = dir.path().join("xb.out");
+        let err_file = dir.path().join("xb.err");
+        fs::write(&out_file, &stdout_body).unwrap();
+        fs::write(&err_file, &stderr_body).unwrap();
+
+        let script = fake_script(
+            dir.path(),
+            "xcodebuild",
+            &format!(
+                "cat '{}'; cat '{}' >&2; exit 65",
+                out_file.display(),
+                err_file.display()
+            ),
+        );
+        let args = vec![
+            script.as_os_str().to_os_string(),
+            OsString::from("-scheme"),
+            OsString::from("MyApp"),
+            OsString::from("build"),
+        ];
+        let words: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
+        let selection = crate::filters::Selection::for_run(&args, &settings.filters).unwrap();
+        let family = family_of(&args, &selection);
+        assert_eq!(family, "xcodebuild");
+
+        let run_case = |merged: bool, cap: u64, session: &str| {
+            let mut archive = Archive::create(&ws, &family, &history::label(&words), true).unwrap();
+            let mut cmd = Command::new(&args[0]);
+            cmd.current_dir(&ws.cwd).args(&args[1..]);
+            let status = exit_code(archive.run(&mut cmd, cap, merged).unwrap().unwrap());
+            let capture = Capture {
+                workspace: &ws,
+                args: &args,
+                words: &words,
+                selection: &selection,
+                max_bytes: 8192,
+                explicit_budget: true,
+                session,
+                fresh: true,
+                window: false,
+                hook: true,
+                agent_footer: true,
+                merge: merged,
+                merged,
+                redactor: None,
+                retention: (settings.max_runs, settings.max_archive_bytes),
+                origin: None,
+                pieces: &[],
+                json_grouping: settings.json_grouping,
+                lossless_only: settings.lossless_only,
+                ends_early: false,
+            };
+            capture
+                .record(&mut archive, family.clone(), status, None)
+                .unwrap()
+        };
+
+        // 1. Separate stdout + stderr: summary covers both streams and clears raw stderr preview.
+        let ((previews, report), _footer, run) =
+            run_case(false, settings.max_run_bytes, "xb-split");
+        assert!(report, "expected xcodebuild summary report");
+        assert_eq!(run.replaced.as_deref(), Some("both"));
+        assert!(
+            previews[1].1.is_empty(),
+            "stderr preview must be cleared so warnings are not duplicated raw: {:?}",
+            String::from_utf8_lossy(&previews[1].1)
+        );
+        let shown = String::from_utf8(previews[0].1.clone()).unwrap();
+        assert!(
+            shown.contains("ld: error: Undefined symbol: _legacy_init [stderr:16-16]"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("15 warning(s)"),
+            "stderr warnings must be folded into the summary count:\n{shown}"
+        );
+        assert!(
+            !shown.contains("ignoring duplicate libraries"),
+            "raw stderr warning lines must not appear in summary:\n{shown}"
+        );
+
+        // 2. Merged (`2>&1`): `whole` allows merged runs to route through XcodebuildScan.
+        let ((merged_previews, merged_report), _footer, merged_run) =
+            run_case(true, settings.max_run_bytes, "xb-merged");
+        assert!(merged_report, "merged xcodebuild must still summarize");
+        assert_eq!(merged_run.replaced.as_deref(), Some("both"));
+        assert!(merged_previews[1].1.is_empty());
+        let merged_shown = String::from_utf8(merged_previews[0].1.clone()).unwrap();
+        assert!(
+            merged_shown.contains("ld: error: Undefined symbol: _legacy_init"),
+            "{merged_shown}"
+        );
+
+        // 3. Truncated archive (`!run.produced_bytes.is_empty()`): clears `summary.xcodebuild` and fails closed.
+        let ((_trunc_previews, trunc_report), _footer, trunc_run) =
+            run_case(false, 512, "xb-truncated");
+        assert!(!trunc_run.produced_bytes.is_empty());
+        assert!(
+            trunc_run.summary.xcodebuild.is_none(),
+            "truncated xcodebuild log must invalidate summary.xcodebuild"
+        );
+        assert!(!trunc_report, "truncated xcodebuild log must fail closed");
     }
 }
