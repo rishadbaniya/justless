@@ -56,3 +56,6 @@ rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[profile.release]
+strip = "symbols"
